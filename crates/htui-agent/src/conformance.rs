@@ -862,6 +862,26 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     ) -> StoreResult<CasOutcome<Option<StoredSetting>>> {
         self.inner.set_box_probe_spec(overlay, expected).await
     }
+    async fn create_target(
+        &self,
+        new: htui_core::model::NewTarget,
+    ) -> StoreResult<htui_core::model::Target> {
+        self.inner.create_target(new).await
+    }
+    async fn edit_target(
+        &self,
+        id: htui_core::model::TargetId,
+        expected: DateTime<Utc>,
+        edit: htui_core::model::TargetEdit,
+    ) -> StoreResult<CasOutcome<htui_core::model::Target>> {
+        self.inner.edit_target(id, expected, edit).await
+    }
+    async fn attach_child_box(
+        &self,
+        new: htui_core::model::NewChildBox,
+    ) -> StoreResult<htui_core::model::AttachedBox> {
+        self.inner.attach_child_box(new).await
+    }
     async fn set_agent_box_quota(
         &self,
         agent_id: AgentId,

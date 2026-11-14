@@ -1,0 +1,136 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id          AS \"id: TargetId\",\n                   name,\n                   kind        AS \"kind: TargetKind\",\n                   locator,\n                   box_id      AS \"box_id: BoxId\",\n                   probed_at,\n                   probe_error,\n                   retired_at,\n                   created_at,\n                   updated_at\n              FROM target\n             WHERE id = $1\n               FOR UPDATE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: TargetId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind: TargetKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "locator",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "locator"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "probed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "probed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "probe_error",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "probe_error"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "retired_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "retired_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "target",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "44d4a0bfa12f03872a00cb78363bf7afb2866b5b87e10da58dc422b3dd161d62"
+}

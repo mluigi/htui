@@ -547,6 +547,38 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn create_target(
+        &self,
+        new: htui_core::model::NewTarget,
+    ) -> Result<htui_core::model::Target> {
+        match self {
+            Self::Memory(store) => store.create_target(new).await,
+            Self::Online(pg) => pg.create_target(new).await,
+        }
+    }
+
+    async fn edit_target(
+        &self,
+        id: htui_core::model::TargetId,
+        expected: DateTime<Utc>,
+        edit: htui_core::model::TargetEdit,
+    ) -> Result<CasOutcome<htui_core::model::Target>> {
+        match self {
+            Self::Memory(store) => store.edit_target(id, expected, edit).await,
+            Self::Online(pg) => pg.edit_target(id, expected, edit).await,
+        }
+    }
+
+    async fn attach_child_box(
+        &self,
+        new: htui_core::model::NewChildBox,
+    ) -> Result<htui_core::model::AttachedBox> {
+        match self {
+            Self::Memory(store) => store.attach_child_box(new).await,
+            Self::Online(pg) => pg.attach_child_box(new).await,
+        }
+    }
+
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
         match self {
             Self::Memory(store) => store.start_chat_run(chat).await,

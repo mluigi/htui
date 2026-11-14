@@ -54,6 +54,10 @@ use htui_core::model::{
     canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{ArtifactLinkId, DocumentId};
+use htui_core::model::{
+    AttachedBox, BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind,
+    locator_refusal, target_name_refusal,
+};
 use htui_core::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
 use htui_core::model::{NewRunPlan, PlanAdmission, PlanStatus, PlanToAdmit, RunPlan, RunPlanId};
@@ -70,6 +74,11 @@ use htui_core::store::traits::{
     note_needs_a_step, parent_cycle, parent_too_deep, project_settings_not_an_object, reaped_note,
     run_workspace_for, scope_row_run_workspace, second_canonical, second_parent, self_link,
     step_document_refusal, step_note_refusal, step_writes_own_item, workspace_prefix_taken,
+};
+use htui_core::store::traits::{
+    box_bound_to_other_target, box_hostname_is_blank, box_not_a_child_of,
+    child_box_needs_a_machine, has_nul, target_bound_elsewhere, target_built_in, target_name_taken,
+    target_retired, target_takes_no_container,
 };
 use htui_core::store::traits::{
     document_already_pinned, document_outside_reach, document_ref_label,
@@ -1999,6 +2008,94 @@ async fn revise_requirement(
 // MOD-9 milestone 3 helpers (plan D75-D79, blueprint D89, D92).
 // ------------------------------------------------------------------------------------------------
 
+/// MOD-130 M1 T2 (P9): a race the in-code checks lost, in `MemStore`'s sentence: `target_pkey` is
+/// the id, `uq_target_name` the name; anything else through [`map_sqlx`].
+fn target_write_refused(err: sqlx::Error, id: TargetId, name: Option<&str>) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("target_pkey") => {
+            StoreError::Constraint(already_exists("target", id))
+        }
+        sqlx::Error::Database(db) if db.constraint() == Some("uq_target_name") => {
+            StoreError::Constraint(target_name_taken(name.unwrap_or_default()))
+        }
+        _ => map_sqlx(err),
+    }
+}
+
+/// MOD-130 M1 T2 (blueprint B7): the target row locked `FOR UPDATE` for the rest of `conn`'s
+/// transaction, or `NotFound`.
+async fn lock_target(conn: &mut PgConnection, id: TargetId) -> Result<Target> {
+    sqlx::query_as!(
+        Target,
+        r#"
+            SELECT id          AS "id: TargetId",
+                   name,
+                   kind        AS "kind: TargetKind",
+                   locator,
+                   box_id      AS "box_id: BoxId",
+                   probed_at,
+                   probe_error,
+                   retired_at,
+                   created_at,
+                   updated_at
+              FROM target
+             WHERE id = $1
+               FOR UPDATE
+            "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or_else(|| StoreError::NotFound {
+        entity: "target",
+        id: id.to_string(),
+    })
+}
+
+/// MOD-130 M1 T2 (blueprint B7): a whole `box` row locked `FOR UPDATE` for the rest of `conn`'s
+/// transaction, if there is one.
+async fn lock_box_row(conn: &mut PgConnection, id: BoxId) -> Result<Option<BoxRow>> {
+    sqlx::query_as!(
+        BoxRow,
+        r#"
+        SELECT id             AS "id: BoxId",
+               user_id        AS "user_id: UserId",
+               hostname,
+               os_family      AS "os_family: htui_core::model::OsFamily",
+               os_version, arch, cpu, ram_mb, gpu_present, gpu_vendor, htui_version,
+               probed_tags, declared_tags, quirks, settings,
+               registered_at, last_seen_at, last_probed_at, updated_at, edit_version,
+               kind           AS "kind: BoxKind",
+               parent_box_id  AS "parent_box_id: BoxId"
+          FROM box WHERE id = $1
+           FOR UPDATE
+        "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// MOD-130 M1 T2: whether a target other than `except` holds `name`.
+async fn target_name_held(
+    conn: &mut PgConnection,
+    name: &str,
+    except: Option<TargetId>,
+) -> Result<bool> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS (SELECT 1 FROM target WHERE name = $1 AND id IS DISTINCT FROM $2) AS "held!"
+        "#,
+        name,
+        except.map(TargetId::as_uuid),
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(map_sqlx)
+}
+
 /// MOD-26 D4: `uq_persona_name`'s `23505` in `MemStore`'s sentence; anything else through
 /// [`map_sqlx`].
 fn persona_name_taken(err: sqlx::Error, name: &str) -> StoreError {
@@ -3733,6 +3830,249 @@ impl WriteStore for PgStore {
             }))),
             None => Ok(CasOutcome::Stale(self.box_probe_spec().await?)),
         }
+    }
+
+    /// MOD-130 M1 T2: the input refusals in code, then the id and the name read before the
+    /// `INSERT`, so no `23505` reaches the caller; a race lost after the read is mapped to the
+    /// same sentences by `target_write_refused`.
+    async fn create_target(&self, new: NewTarget) -> Result<Target> {
+        if new.kind == TargetKind::Local {
+            return Err(StoreError::Constraint(target_built_in()));
+        }
+        if let Some(refusal) =
+            target_name_refusal(&new.name).or_else(|| locator_refusal(&new.locator))
+        {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let id_taken = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM target WHERE id = $1) AS "taken!""#,
+            new.id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if id_taken {
+            return Err(StoreError::Constraint(already_exists("target", new.id)));
+        }
+        if target_name_held(&mut tx, &new.name, None).await? {
+            return Err(StoreError::Constraint(target_name_taken(&new.name)));
+        }
+        let created = sqlx::query_as!(
+            Target,
+            r#"
+            INSERT INTO target (id, name, kind, locator)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id          AS "id: TargetId",
+                      name,
+                      kind        AS "kind: TargetKind",
+                      locator,
+                      box_id      AS "box_id: BoxId",
+                      probed_at,
+                      probe_error,
+                      retired_at,
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.name,
+            new.kind.as_str(),
+            new.locator,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| target_write_refused(err, new.id, Some(&new.name)))?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(created)
+    }
+
+    /// MOD-130 M1 T2 (P6): the row is locked `FOR UPDATE`, then decided in `MemStore`'s order;
+    /// the `set_updated_at` trigger moves the token.
+    async fn edit_target(
+        &self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+        edit: TargetEdit,
+    ) -> Result<CasOutcome<Target>> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let current = lock_target(&mut tx, id).await?;
+        if current.kind == TargetKind::Local {
+            return Err(StoreError::Constraint(target_built_in()));
+        }
+        if let Some(refusal) = edit
+            .name
+            .as_deref()
+            .and_then(target_name_refusal)
+            .or_else(|| edit.locator.as_ref().and_then(locator_refusal))
+        {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(name) = &edit.name
+            && target_name_held(&mut tx, name, Some(id)).await?
+        {
+            return Err(StoreError::Constraint(target_name_taken(name)));
+        }
+        let updated = sqlx::query_as!(
+            Target,
+            r#"
+            UPDATE target
+               SET name    = COALESCE($2, name),
+                   locator = COALESCE($3, locator)
+             WHERE id = $1
+            RETURNING id          AS "id: TargetId",
+                      name,
+                      kind        AS "kind: TargetKind",
+                      locator,
+                      box_id      AS "box_id: BoxId",
+                      probed_at,
+                      probe_error,
+                      retired_at,
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            edit.name.as_deref(),
+            edit.locator.as_ref(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| target_write_refused(err, id, edit.name.as_deref()))?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(CasOutcome::Applied(updated))
+    }
+
+    /// MOD-130 M1 T2 (P4, P5, blueprint B7, B10): one transaction. The target row is locked
+    /// `FOR UPDATE` and the parent `FOR KEY SHARE` before their refusals; the child is inserted
+    /// `ON CONFLICT DO NOTHING` and then locked `FOR UPDATE`, so two attaches of one child are
+    /// serialised before the binding checks. A refusal drops the transaction, insert included.
+    async fn attach_child_box(&self, new: NewChildBox) -> Result<AttachedBox> {
+        if new.hostname.trim().is_empty() {
+            return Err(StoreError::Constraint(box_hostname_is_blank()));
+        }
+        if new.hostname.contains('\0') {
+            return Err(StoreError::Constraint(has_nul("box.hostname")));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let target = lock_target(&mut tx, new.target).await?;
+        if target.retired_at.is_some() {
+            return Err(StoreError::Constraint(target_retired(&target.name)));
+        }
+        if !matches!(target.kind, TargetKind::Docker | TargetKind::SshDocker) {
+            return Err(StoreError::Constraint(target_takes_no_container(
+                &target.name,
+                target.kind,
+            )));
+        }
+        let parent = sqlx::query!(
+            r#"
+            SELECT user_id AS "user_id: UserId", kind AS "kind: BoxKind"
+              FROM box WHERE id = $1
+               FOR KEY SHARE
+            "#,
+            new.parent.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(parent) = parent else {
+            return Err(StoreError::Constraint(references_no_row(
+                "box.parent_box_id",
+                new.parent,
+                "box",
+            )));
+        };
+        if parent.kind == BoxKind::Container {
+            return Err(StoreError::Constraint(child_box_needs_a_machine(
+                new.parent,
+            )));
+        }
+        // A CHECK is judged on the proposed row before `ON CONFLICT`, so a stored id is read
+        // first and inserted only when absent; the second read sees a racing insert's row.
+        let child = match lock_box_row(&mut tx, new.id).await? {
+            Some(row) => row,
+            None => {
+                sqlx::query!(
+                    r#"
+                    INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version,
+                                     kind, parent_box_id)
+                    VALUES ($1, $2, $3, NULL, '', '', '', 'container', $4)
+                    ON CONFLICT (id) DO NOTHING
+                    "#,
+                    new.id.as_uuid(),
+                    parent.user_id.as_uuid(),
+                    new.hostname,
+                    new.parent.as_uuid(),
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+                lock_box_row(&mut tx, new.id)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "box",
+                        id: new.id.to_string(),
+                    })?
+            }
+        };
+        if child.kind != BoxKind::Container || child.parent_box_id != Some(new.parent) {
+            return Err(StoreError::Constraint(box_not_a_child_of(
+                new.id, new.parent,
+            )));
+        }
+        let other = sqlx::query_scalar!(
+            r#"
+            SELECT name FROM target
+             WHERE box_id = $1 AND id <> $2
+             ORDER BY name COLLATE "C"
+             LIMIT 1
+            "#,
+            new.id.as_uuid(),
+            target.id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(other) = other {
+            return Err(StoreError::Constraint(box_bound_to_other_target(
+                new.id, &other,
+            )));
+        }
+        if let Some(bound) = target.box_id.filter(|bound| *bound != new.id) {
+            return Err(StoreError::Constraint(target_bound_elsewhere(
+                &target.name,
+                bound,
+            )));
+        }
+        let target = if target.box_id == Some(new.id) {
+            target
+        } else {
+            sqlx::query_as!(
+                Target,
+                r#"
+                UPDATE target SET box_id = $2 WHERE id = $1
+                RETURNING id          AS "id: TargetId",
+                          name,
+                          kind        AS "kind: TargetKind",
+                          locator,
+                          box_id      AS "box_id: BoxId",
+                          probed_at,
+                          probe_error,
+                          retired_at,
+                          created_at,
+                          updated_at
+                "#,
+                target.id.as_uuid(),
+                new.id.as_uuid(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+        };
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(AttachedBox { child, target })
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
