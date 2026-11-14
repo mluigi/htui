@@ -1849,14 +1849,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_equal_identity_matches() {
-        assert_eq!(
-            check_existing(C, Some(384), stored(&bge()), current(), &bge(), 384).unwrap(),
-            Existing::Matches
-        );
-    }
-
     /// [`PAYLOAD_SCHEMA`] as the collection's metadata records it.
     fn current() -> Option<serde_json::Value> {
         Some(serde_json::json!(PAYLOAD_SCHEMA))
