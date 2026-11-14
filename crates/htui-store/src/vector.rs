@@ -402,6 +402,9 @@ fn backend(context: &str, e: impl std::fmt::Display) -> StoreError {
 /// wrong API key.
 const REFUSING_GRPC_CODES: [i32; 2] = [7, 16];
 
+/// gRPC `ALREADY_EXISTS`: Qdrant's answer to creating a collection another call created first.
+const ALREADY_EXISTS_GRPC_CODE: i32 = 6;
+
 /// A failed call to Qdrant: [`QDRANT_REFUSED`] when Qdrant answered and refused the credentials,
 /// [`backend`]'s text otherwise.
 fn qdrant(context: &str, e: QdrantError) -> StoreError {
@@ -895,10 +898,12 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .collection_exists(&self.collection)
             .await
             .map_err(|e| qdrant("collection exists", e))?;
-        if exists {
+        // A create can lose to another one between the check and the create: two htui processes
+        // starting on a fresh Qdrant, or a retry after a create the client gave up on and the
+        // server finished. The collection is then checked as one that existed.
+        let created = !exists && self.create_collection().await?;
+        if !created {
             self.check_collection().await?;
-        } else {
-            self.create_collection().await?;
         }
         // Every time, not only on creation: re-creating an existing index is a no-op in Qdrant, and
         // a first run that died between the collection and its indexes is repaired here.
@@ -1028,7 +1033,8 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         Ok(HashMap::from([(EMBEDDER_KEY.to_owned(), identity)]))
     }
 
-    async fn create_collection(&self) -> Result<(), StoreError> {
+    /// Creates the collection: `Ok(true)`, or `Ok(false)` when another call created it first.
+    async fn create_collection(&self) -> Result<bool, StoreError> {
         let mut dense = VectorsConfigBuilder::default();
         dense.add_named_vector_params(
             DENSE,
@@ -1039,16 +1045,24 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             SPARSE,
             SparseVectorParamsBuilder::default().modifier(Modifier::Idf),
         );
-        self.client
+        let created = self
+            .client
             .create_collection(
                 CreateCollectionBuilder::new(&self.collection)
                     .vectors_config(dense)
                     .sparse_vectors_config(sparse)
                     .metadata(self.metadata()?),
             )
-            .await
-            .map_err(|e| qdrant("create collection", e))?;
-        Ok(())
+            .await;
+        match created {
+            Ok(_) => Ok(true),
+            Err(QdrantError::ResponseError { status })
+                if i32::from(status.code()) == ALREADY_EXISTS_GRPC_CODE =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(qdrant("create collection", e)),
+        }
     }
 
     /// [`VectorStore::search`] with a choice of arms. `Hybrid` is that search byte for byte;
