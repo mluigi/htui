@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-122](docs/decisions/mod/mod-122.md)** - Activity panel and Logs tab (done, 2026-11-14)
 - **[MOD-147](docs/decisions/mod/mod-147.md)** - Workspace scope: items, kinds, documents, folder (done, 2026-11-14)
 - **[TOOL-17](docs/decisions/tool/tool-17.md)** - cargo-nextest as the gate's test runner (done, 2026-11-13)
 - **[TOOL-16](docs/decisions/tool/tool-16.md)** - A gate that fits in a session: template databases, parallel tests, shorter long poles (done, 2026-11-13)

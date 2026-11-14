@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-122-activity-and-logs.prd.md`
 **Selected Milestone**: 3 — Activity panel
 **Complexity**: Large (seven tasks: new table with status triggers, a narrow store trait, a MemStore write hook, a shell-owned panel with its own key context, a Backlog default change with snapshot churn, one App setting)
-**Status**: in-progress (plan written 2026-11-14)
+**Status**: complete 2026-11-14 (hr/MOD-122 4c032f88): T1–T7 + T5b landed, review fix round R1 applied (both instances; nothing deferred)
 **Routing**: PRD path by `/handoff-run MOD-122` (C2, C4 fired; resumed at `plan` for M3); ultracode accepted for the implement phase.
 **Grounded at**: `e99acd97` (branch `hr/MOD-122`). Requirements: `R-TUI-16` (activity panel); touches `R-TUI-12` (layout presets), `R-TUI-13` (history), `R-TUI-11` (the waiting reasons), `R-TUI-8` (one retention field). PRD milestone 3.
 **Blueprint**: .claude/plans/mod-122-activity-and-logs-m3.blueprint.md (F1–F13 folded into the task sections on 2026-11-14)
