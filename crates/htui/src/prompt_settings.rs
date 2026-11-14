@@ -1,7 +1,8 @@
-//! The prompt settings behind `Settings > Prompt`: the thirteen `app_setting` keys of the registry
-//! (`0002`'s ten plus MOD-163's unseeded `memory_capture`, MOD-141's unseeded `compete_fan_out`
-//! and MOD-164's unseeded `light_model`), the agent registry the `light_model` row picks from, and,
-//! per project of the scope, the keys the `Project` rung accepts (MOD-15 milestone 5, D1/D3).
+//! The prompt settings behind `Settings > Prompt`: the fourteen `app_setting` keys of the registry
+//! (`0002`'s ten plus MOD-163's unseeded `memory_capture`, MOD-141's unseeded `compete_fan_out`,
+//! MOD-164's unseeded `light_model` and MOD-122's unseeded `log_retention_days`), the agent
+//! registry the `light_model` row picks from, and, per project of the scope, the keys the
+//! `Project` rung accepts (MOD-15 milestone 5, D1/D3).
 //!
 //! One read per event and never one per keystroke (M3 D5's trade), one reply out, and every write
 //! through milestone 1's compare-and-set seam. The section renders from the snapshot and never
@@ -27,7 +28,7 @@ use serde_json::Value;
 
 use crate::store_worker::{StoreReply, StoreRequest};
 
-/// One read of the scope: the thirteen `App` rows, the agents, then every project of the scope that
+/// One read of the scope: the fourteen `App` rows, the agents, then every project of the scope that
 /// still names a row, each with the keys the `Project` rung accepts.
 ///
 /// `Eq` is absent for the reason [`CatalogueSnapshot`](crate::catalogue::CatalogueSnapshot) gives:
@@ -35,7 +36,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 /// convenience is not this milestone's to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsSnapshot {
-    /// The `App` rung, in [`SettingKey::app_keys`] order — always thirteen entries;
+    /// The `App` rung, in [`SettingKey::app_keys`] order — always fourteen entries;
     /// `memory_capture` (MOD-163 D19), `compete_fan_out` (MOD-141 M2 D5) and `light_model`
     /// (MOD-164 D7) have no `0002` seed row, so each reads `value: None` until someone sets it.
     pub app: Vec<AppEntry>,
@@ -106,7 +107,7 @@ impl SettingsSnapshot {
             .collect()
     }
 
-    /// The `App` entry for `key`; `None` only on a snapshot built by hand with fewer than thirteen.
+    /// The `App` entry for `key`; `None` only on a snapshot built by hand with fewer than fourteen.
     #[must_use]
     pub fn app_entry(&self, key: SettingKey) -> Option<&AppEntry> {
         self.app.iter().find(|entry| entry.key == key)
@@ -124,14 +125,14 @@ pub fn project_keys() -> impl Iterator<Item = SettingKey> {
         .filter(|key| key.spec().rungs.contains(Rungs::PROJECT))
 }
 
-/// One read of the whole scope: the thirteen `App` rows with their tokens, `agents` as the caller
+/// One read of the whole scope: the fourteen `App` rows with their tokens, `agents` as the caller
 /// read them in the same request, then every project of `scope.project_ids` that still names a
 /// row, with the keys the `Project` rung accepts.
 ///
 /// `agents` is a parameter rather than a read here because the registry is an inherent
 /// `Backend`/`PgStore` read that the [`Writer`] this runs over does not carry (MOD-164 D7).
 ///
-/// N+1 reads on purpose (D3, M3 D5's trade, same words): thirteen `setting(App, _)` plus, per
+/// N+1 reads on purpose (D3, M3 D5's trade, same words): fourteen `setting(App, _)` plus, per
 /// project, one `project()` and one `setting(Project(id), _)` per project key. They happen per
 /// event — activation, a scope change, after a write — never per keystroke.
 ///
@@ -282,3 +283,27 @@ pub const REQUEST_NAMES: [&str; 3] = ["prompt_settings", "set_setting", "clear_s
 /// Named rather than reached for as `REQUEST_NAMES[0]`, so the section's `Failed` arms say which
 /// request they mean instead of relying on the order of the array above.
 pub const READ_NAME: &str = REQUEST_NAMES[0];
+
+#[cfg(test)]
+mod tests {
+    use htui_core::prompt::{DEFAULTS, SettingKey};
+    use serde_json::Value;
+
+    use crate::worker_log::ship::{DEFAULT_RETENTION_DAYS, RETENTION_KEY};
+
+    /// MOD-122 M3 F13: the row `Settings > Prompt` writes is the key, range and default the
+    /// shipper's `retention_days` reads, so a day count the editor accepts is the one the sweep
+    /// uses and the editor refuses exactly what the sweep would ignore.
+    #[test]
+    fn log_retention_days_is_the_shippers_key() {
+        let key = SettingKey::LogRetentionDays;
+        let spec = key.spec();
+        assert_eq!(key.key(), RETENTION_KEY);
+        assert_eq!(spec.min..=spec.max, 1..=365);
+        assert_eq!(
+            DEFAULTS.value_of(key),
+            Value::from(DEFAULT_RETENTION_DAYS),
+            "the compiled default is the shipper's fallback"
+        );
+    }
+}
