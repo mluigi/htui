@@ -4,6 +4,7 @@
 //! `PgStore` is the only `WriteStore` in the product (ANA-9 §6.1); MOD-6 T2 adds the read and
 //! write impls on top of what this module builds.
 
+mod activity;
 #[cfg(feature = "demo")]
 mod demo;
 mod read;
