@@ -124,7 +124,7 @@ Decisions taken at the PRD gate (maintainer, 2026-10-18):
 | 1 | Stopped state and workspace gate | Runs and steps can be `stopped`; a run knows its workspace; a stopped workspace admits, claims and adopts nothing, on both stores | complete | `.claude/plans/mod-125-m1-stopped-state.plan.md` |
 | 2 | Stop applied by the executor | A durable stop request, graceful or forced, settles every run of the workspace as `stopped` with the conversation recorded, in process and on a worker | complete | `.claude/plans/mod-125-m2-stop-applied.plan.md` |
 | 3 | Resume through saved sessions | Resume reopens each agent step's session (ACP load/resume, CLI `--resume`), redoes a forced-stop turn, reruns checks, falls back to a fresh rerun with `resume_failed` | complete | `.claude/plans/mod-125-m3-resume.plan.md` |
-| 4 | CLI verbs | `htui stop [--force] <workspace>` and `htui resume <workspace>` confirm, report what stopped and how each run resumes, and the workspace's state reads as stopping or stopped | in-progress | `.claude/plans/mod-125-m4-verbs.plan.md` |
+| 4 | CLI verbs | `htui stop [--force] <workspace>` and `htui resume <workspace>` confirm, report what stopped and how each run resumes, and the workspace's state reads as stopping or stopped | complete | `.claude/plans/mod-125-m4-verbs.plan.md` |
 
 ## Open Questions
 
@@ -145,4 +145,4 @@ Decisions taken at the PRD gate (maintainer, 2026-10-18):
 | Engine walks near the 2 MiB debug stack | Low | SIGABRT in tests | Gate `--no-fail-fast`, grep for SIGABRT |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE — all four milestones landed; item closed 2026-11-14 (`docs/decisions/mod/mod-125.md`).*

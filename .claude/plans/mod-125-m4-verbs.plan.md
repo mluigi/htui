@@ -8,7 +8,7 @@ plan written at `18df483b`.
 **Requirements**: `R-ORCH-16`, `R-TUI-14`, `R-TUI-18`
 **Complexity**: Medium (one migration with its pins, one store read on five `WriteStore` implementors, two pure
 helpers, a new `htui stop` / `htui resume` module over the existing headless connect, docs)
-**Status**: FACT-CHECKED at `18df483b` (see "Verified claims"; amendments marked "fact-check").
+**Status**: COMPLETE (2026-11-14; T1-T4 `7e2af819`..`7fa2f5d6`, review fix round R1 `8e3d2c3c`..`43835c0c`). Fact-checked at `18df483b` (see "Verified claims"; amendments marked "fact-check").
 
 ## Summary
 

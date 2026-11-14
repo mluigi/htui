@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-125](docs/decisions/mod/mod-125.md)** - Stopping and resuming runs (done, 2026-11-14)
 - **[MOD-149](docs/decisions/mod/mod-149.md)** - Workspace requirements and nested keys (done, 2026-11-14)
 - **[MOD-147](docs/decisions/mod/mod-147.md)** - Workspace scope: items, kinds, documents, folder (done, 2026-11-14)
 - **[MOD-150](docs/decisions/mod/mod-150.md)** - Link kinds and links to documents and attachments (done, 2026-11-14)
