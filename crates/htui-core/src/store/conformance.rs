@@ -18079,7 +18079,9 @@ async fn requirement_refinements_list_every_owner<S: WriteStore>(store: &S) {
 }
 
 /// MOD-149 D8: a refined requirement's coverage is its refinements', all or any; a leaf's is its
-/// own `addresses` citations'.
+/// own `addresses` citations'. The split rule recurses (`W-ORCH-1 -> R-ENT-3 -> R-ENT-3.1`), a
+/// withdrawn refinement is ignored, and a requirement whose every refinement is withdrawn falls
+/// back to its own citations.
 async fn requirement_coverage_derives_from_splits<S: WriteStore>(store: &S) {
     const CASE: &str = "requirement_coverage_derives_from_splits";
 
@@ -18140,6 +18142,97 @@ async fn requirement_coverage_derives_from_splits<S: WriteStore>(store: &S) {
             .expect(CASE),
         CoverageState::Covered,
         "{CASE}: the fixture leaf R-STO-1 (FEAT-1 open, FIX-1 done)"
+    );
+
+    // Recursion: R-ENT-3's own citations still read Covered, but once split it follows its
+    // uncited child, and the root follows R-ENT-3's walk, not its citations.
+    let grandchild = store
+        .mint_requirement(ids::AREA_ENT, refining("ENT's share, split.", Some(ent.id)))
+        .await
+        .expect(CASE);
+    assert_eq!(grandchild.key, "R-ENT-3.1", "{CASE}: the nested child");
+    assert_eq!(
+        requirement_coverage_state(store, ent.id).await.expect(CASE),
+        CoverageState::Open,
+        "{CASE}: a split R-ENT-3 follows its uncited child, not its own `done` citation"
+    );
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::InProgress,
+        "{CASE}: the root walks down to R-ENT-3.1 (R-ENT-3 by its citations would read Covered)"
+    );
+
+    // One refinement withdrawn: the root follows only the others.
+    store
+        .withdraw_requirement(
+            sto.id,
+            sto.version,
+            ids::HTUI_ANA_2,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::Open,
+        "{CASE}: the withdrawn R-STO-2 (still cited `done`) no longer counts; R-ENT-3 alone is Open"
+    );
+
+    // Every refinement withdrawn: R-ENT-3 falls back to its own citations.
+    store
+        .withdraw_requirement(
+            grandchild.id,
+            grandchild.version,
+            ids::HTUI_ANA_2,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        requirement_coverage_state(store, ent.id).await.expect(CASE),
+        CoverageState::Covered,
+        "{CASE}: R-ENT-3's only refinement is withdrawn; its own `done` citation decides"
+    );
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::Covered,
+        "{CASE}: the root follows R-ENT-3 alone"
+    );
+
+    // The root's every refinement withdrawn: its own citations, an open item's, decide.
+    store
+        .cite(
+            ids::HTUI_FEAT_1,
+            workspace.id,
+            CitationKind::Addresses,
+            None,
+        )
+        .await
+        .expect(CASE);
+    store
+        .withdraw_requirement(
+            ent.id,
+            ent.version,
+            ids::HTUI_ANA_2,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        requirement_coverage_state(store, workspace.id)
+            .await
+            .expect(CASE),
+        CoverageState::InProgress,
+        "{CASE}: W-ORCH-1 has no live refinement; an open item addresses it"
     );
 }
 
