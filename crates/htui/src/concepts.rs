@@ -35,7 +35,7 @@ use htui_store::vector::{
     COLLECTION, EMBEDDER_MISMATCH, ExistingCollection, Hit, PointType, QdrantStore, SearchQuery,
     VectorStore, is_embedder_mismatch, is_qdrant_refused, is_query_embed_failure,
 };
-use htui_store::vector_sync::{Indexer, SyncReport};
+use htui_store::vector_sync::{Indexer, SyncReport, workspace_search_scope};
 use htui_store::{HeadlessError, Identity, PgStore, identity, secret};
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -177,28 +177,50 @@ fn store_context(err: &StoreError) -> &'static str {
     }
 }
 
-/// Every workspace's projects as scopes, narrowed to one project slug when given.
+/// The scopes `--search-items`, `--index-items` and the worker's index job cover (MOD-147 M4 D7).
+///
+/// With no `project`, every workspace's scope widened through [`workspace_search_scope`]: its
+/// scope row first, then its members by position, so the workspace's own `WS` items and
+/// documents are indexed and found. A workspace with neither members nor a scope row is left out.
+/// `@<workspace-slug>` narrows to that workspace's scope row alone; any other slug narrows to
+/// the member projects of that slug. A slug that matches nothing is an error, which
+/// `search_projects` answers as `unknown_project`.
 pub(crate) async fn scopes(pg: &PgStore, project: Option<&str>) -> anyhow::Result<Vec<Scope>> {
     let mut scopes = Vec::new();
-    let mut found = project.is_none();
     for ws in pg.workspaces().await? {
-        let mut scope = Scope::from_workspace(&ws);
-        if let Some(slug) = project {
-            let wanted: Vec<ProjectId> = ws
-                .projects
-                .iter()
-                .filter(|p| p.slug == slug)
-                .map(|p| p.project_id)
-                .collect();
-            scope.project_ids.retain(|id| wanted.contains(id));
-        }
-        found |= !scope.project_ids.is_empty();
+        let scope = match project {
+            None => workspace_search_scope(pg, &Scope::from_workspace(&ws)).await,
+            Some(slug) => match slug.strip_prefix('@') {
+                Some(workspace) if workspace == ws.slug => Scope {
+                    workspace_id: ws.workspace_id,
+                    project_ids: pg
+                        .scope_project(ws.workspace_id)
+                        .await?
+                        .into_iter()
+                        .collect(),
+                },
+                Some(_) => continue,
+                None => {
+                    let mut scope = Scope::from_workspace(&ws);
+                    let wanted: Vec<ProjectId> = ws
+                        .projects
+                        .iter()
+                        .filter(|p| p.slug == slug)
+                        .map(|p| p.project_id)
+                        .collect();
+                    scope.project_ids.retain(|id| wanted.contains(id));
+                    scope
+                }
+            },
+        };
         if !scope.project_ids.is_empty() {
             scopes.push(scope);
         }
     }
-    if !found {
-        bail!("no project with slug `{}`", project.unwrap_or_default());
+    if let Some(slug) = project
+        && scopes.is_empty()
+    {
+        bail!("no project with slug `{slug}`");
     }
     Ok(scopes)
 }
@@ -258,7 +280,8 @@ pub fn sync_interval(app: &BTreeMap<String, Value>) -> Duration {
 /// on a trait (MOD-41 plan D19).
 #[allow(async_fn_in_trait, reason = "no dyn IndexSource is formed")]
 pub trait IndexSource: ReadStore {
-    /// Every workspace's projects as scopes, a workspace without projects left out.
+    /// Every workspace's scope, its scope row first and then its members (MOD-147 M4 D7), a
+    /// workspace with neither left out.
     async fn index_scopes(&self) -> anyhow::Result<Vec<Scope>>;
     /// The `app_setting` map, [`sync_interval`]'s input.
     async fn index_settings(&self) -> Result<BTreeMap<String, Value>, StoreError>;
@@ -276,13 +299,14 @@ impl IndexSource for PgStore {
 
 impl IndexSource for MemStore {
     async fn index_scopes(&self) -> anyhow::Result<Vec<Scope>> {
-        Ok(self
-            .workspaces()
-            .await?
-            .iter()
-            .map(Scope::from_workspace)
-            .filter(|scope| !scope.project_ids.is_empty())
-            .collect())
+        let mut scopes = Vec::new();
+        for ws in self.workspaces().await? {
+            let scope = workspace_search_scope(self, &Scope::from_workspace(&ws)).await;
+            if !scope.project_ids.is_empty() {
+                scopes.push(scope);
+            }
+        }
+        Ok(scopes)
     }
 
     async fn index_settings(&self) -> Result<BTreeMap<String, Value>, StoreError> {
@@ -980,6 +1004,8 @@ mod tests {
     /// MOD-92 D6: without `--project` or `--cwd`, `--search-items` still searches every
     /// workspace's projects, in workspace order, each workspace's by position; `--project`
     /// narrows to one. Through the real scope code over the demo database (review R1 M4).
+    /// MOD-147 M4 D7: each workspace's scope row goes first, before its members; `--project
+    /// @<workspace>` answers that scope row alone, and an unknown `@` slug is `unknown_project`.
     #[tokio::test]
     async fn search_projects_default_to_every_workspace_and_project_narrows() {
         let Some(db) = htui_store::testkit::demo_db().await else {
@@ -998,10 +1024,16 @@ mod tests {
         };
         let workspaces = pg.workspaces().await.expect("workspaces");
         assert!(workspaces.len() >= 2, "{workspaces:?}");
-        let expected: Vec<ProjectId> = workspaces
-            .iter()
-            .flat_map(|ws| Scope::from_workspace(ws).project_ids)
-            .collect();
+        let mut expected = Vec::new();
+        for ws in &workspaces {
+            let row = pg
+                .scope_project(ws.workspace_id)
+                .await
+                .expect("the scope-row lookup")
+                .expect("every demo workspace has a scope row");
+            expected.push(row);
+            expected.extend(Scope::from_workspace(ws).project_ids);
+        }
         let every = search_projects(&pg, &options, None)
             .await
             .expect("the default scope");
@@ -1014,7 +1046,69 @@ mod tests {
             search_projects(&pg, &one, None).await.expect("htui"),
             [htui_core::fixtures::ids::PROJECT_HTUI]
         );
+        let platform = SearchOptions {
+            project: Some("@platform".into()),
+            ..options.clone()
+        };
+        assert_eq!(
+            search_projects(&pg, &platform, None)
+                .await
+                .expect("@platform"),
+            [htui_core::fixtures::ids::PROJECT_SCOPE_PLATFORM]
+        );
+        let nope = SearchOptions {
+            project: Some("@nope".into()),
+            ..options.clone()
+        };
+        let refused = search_projects(&pg, &nope, None)
+            .await
+            .expect_err("an unknown workspace slug");
+        assert_eq!(refused.error.code, ErrorCode::UnknownProject, "{refused:?}");
         pg.close().await;
+        db.drop_db().await;
+    }
+
+    /// MOD-147 M4 D7: a workspace with no member projects is still scoped when it has a scope
+    /// row, so its own `WS` items and documents are indexed and searched.
+    #[tokio::test]
+    async fn scopes_keep_a_workspace_whose_only_project_is_its_scope_row() {
+        use htui_core::model::{NewWorkspace, WorkspaceId};
+        use htui_core::store::WriteStore;
+        let Some(db) = htui_store::testkit::demo_db().await else {
+            return;
+        };
+        let lone = db
+            .store
+            .create_workspace(NewWorkspace {
+                id: WorkspaceId::new(),
+                slug: "lone".into(),
+                name: "Lone".into(),
+                description: String::new(),
+                created_by: htui_core::fixtures::ids::USER,
+            })
+            .await
+            .expect("create a workspace without members");
+        let row = db
+            .store
+            .scope_project(lone.id)
+            .await
+            .expect("the scope-row lookup")
+            .expect("create_workspace writes the scope row");
+        let every = scopes(&db.store, None).await.expect("every scope");
+        assert!(
+            every.contains(&Scope {
+                workspace_id: lone.id,
+                project_ids: vec![row],
+            }),
+            "{every:?}"
+        );
+        assert_eq!(
+            scopes(&db.store, Some("@lone")).await.expect("@lone"),
+            [Scope {
+                workspace_id: lone.id,
+                project_ids: vec![row],
+            }]
+        );
         db.drop_db().await;
     }
 
