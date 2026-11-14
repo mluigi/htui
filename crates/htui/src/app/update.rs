@@ -2694,6 +2694,93 @@ mod activity_tests {
         assert_eq!(sweeps(&sent(&mut rx)), 1);
     }
 
+    /// Review L6 (D9): `Enter` on another workspace's row while an in-pane editor is open is
+    /// refused: the status line says why, and neither the scope nor the tab moves.
+    #[test]
+    fn enter_on_another_workspaces_row_under_an_open_editor_is_refused() {
+        use htui_core::model::WorkspaceSummary;
+
+        use crate::editor::pane::PaneChild;
+        use crate::editor::{EditorCommand, ExternalEdit};
+        use crate::keys::Act;
+
+        /// A child that does nothing: the editor only has to be open.
+        #[derive(Debug)]
+        struct Idle;
+        impl PaneChild for Idle {
+            fn write(&mut self, _bytes: &[u8]) {}
+            fn resize(&mut self, _size: crate::editor::pane::PaneSize) {}
+            fn kill(&mut self) {}
+        }
+
+        let (mut app, _rx) = shell(Preset::IdeActivity);
+        // The shell starts on no workspace, so Platform's row is another workspace's.
+        let platform = WorkspaceSummary {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            slug: "platform".to_owned(),
+            name: "Platform".to_owned(),
+            projects: Vec::new(),
+        };
+        app.activity.merge(
+            ActivityPage {
+                events: vec![event(1)],
+                pinned: Vec::new(),
+            },
+            vec![platform],
+        );
+        app.open_editor(
+            SPLIT,
+            &ExternalEdit {
+                text: "body\n".to_owned(),
+                stem: "implement".to_owned(),
+            },
+            EditorCommand::resolve(|key| (key == "VISUAL").then(|| "nvim".to_owned())),
+            |_id, _command, _size| Ok(Box::new(Idle) as Box<dyn PaneChild>),
+        );
+        assert!(app.editor.is_some(), "the editor is open");
+        let (scope, tab) = (app.scope.clone(), app.tabs.active_id());
+
+        let jump = app
+            .activity
+            .on_act(Act::ActivityOpen, &app.scope)
+            .expect("Enter on the row jumps");
+        app.activity_jump(jump);
+        let refusal = app.editor_steer_refusal().expect("an editor is open");
+        assert_eq!(app.status.as_deref(), Some(refusal.as_str()));
+        assert!(refusal.contains("finish or abort it first"), "{refusal}");
+        assert_eq!(app.scope, scope, "the scope does not move");
+        assert_eq!(app.tabs.active_id(), tab, "nor the tab");
+    }
+
+    /// Review L6 (D9): `Enter` on a row whose item went says `<KEY> was deleted` and moves
+    /// nothing.
+    #[test]
+    fn enter_on_a_deleted_items_row_says_so_and_moves_nothing() {
+        use crate::keys::Act;
+
+        let (mut app, _rx) = shell(Preset::IdeActivity);
+        let gone = ActivityEvent {
+            item: None,
+            ..event(1)
+        };
+        app.activity.merge(
+            ActivityPage {
+                events: vec![gone],
+                pinned: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let (scope, tab) = (app.scope.clone(), app.tabs.active_id());
+        let jump = app
+            .activity
+            .on_act(Act::ActivityOpen, &app.scope)
+            .expect("Enter on the row jumps");
+        app.activity_jump(jump);
+        assert_eq!(app.status.as_deref(), Some("ANA-2 was deleted"));
+        assert_eq!(app.scope, scope);
+        assert_eq!(app.tabs.active_id(), tab);
+    }
+
     /// Review L3: a refused sweep stays off the status line, but leaves a `warn` line.
     #[test]
     fn a_refused_sweep_is_a_warning_in_the_log() {
