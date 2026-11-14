@@ -7243,6 +7243,10 @@ async fn resolve_graph_carries_edges_and_parts_as_mem_store_does() {
 /// MOD-26 plan D1, D5: `fk_step_graph_phase_persona` is `ON DELETE RESTRICT`, so a persona a
 /// phase is bound to cannot vanish under the graph (milestone 1 has no delete; this is the raw
 /// statement M2's delete will meet).
+///
+/// The SQLSTATE depends on the server: `23503` (*foreign key violation*) up to Postgres 17, `23001`
+/// (*restrict violation*) from 18 on. Both are class `23`, which `map_sqlx` turns into
+/// `StoreError::Constraint` either way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bound_persona_cannot_be_deleted() {
     let Some(db) = common::demo_db().await else {
@@ -7258,9 +7262,14 @@ async fn a_bound_persona_cannot_be_deleted() {
     let sqlx::Error::Database(error) = &refused else {
         panic!("a constraint refusal, got {refused:?}");
     };
+    assert!(
+        matches!(error.code().as_deref(), Some("23503" | "23001")),
+        "a foreign key refusal, got {:?}",
+        error.code()
+    );
     assert_eq!(
-        (error.code().as_deref(), error.constraint()),
-        (Some("23503"), Some("fk_step_graph_phase_persona")),
+        error.constraint(),
+        Some("fk_step_graph_phase_persona"),
         "the foreign key refuses, by name"
     );
     let survivors: i64 = sqlx::query_scalar("SELECT count(*) FROM persona WHERE id = $1")

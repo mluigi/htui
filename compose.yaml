@@ -1,15 +1,17 @@
-# Development Postgres for htui (MOD-6).
+# Development Postgres for htui (MOD-6), and a separate server for the test suites.
 #
-# Postgres 16 is the minimum server ANA-9 §3 names, so developing against it keeps every query
-# inside the supported floor. Port 5439 on the host so a locally installed Postgres on 5432 never
-# collides. Credentials are development-only; the real DSN lives in the OS keyring (R-STO-1).
+# `postgres` holds the `htui` database the TUI points at (`htui --set-dsn`). Postgres 16 is the
+# minimum server ANA-9 §3 names, so developing against it keeps every query inside the supported
+# floor. Port 5439 on the host so a locally installed Postgres on 5432 never collides. Credentials
+# are development-only; the real DSN lives in the OS keyring (R-STO-1).
+#
+# `postgres-test` is what the suites run against: Postgres 18, data in RAM, durability off.
 #
 #   docker compose up -d
-#   export HTUI_TEST_DATABASE_URL=postgres://postgres:<password from POSTGRES_PASSWORD below>@localhost:5439/postgres
+#   export HTUI_TEST_DATABASE_URL=postgres://postgres:<password from POSTGRES_PASSWORD below>@localhost:5440/postgres
 #   cargo test -p htui-store --all-features
 #
-# The store tests create and drop `htui_test_*` databases through this maintenance DSN; the
-# `htui` database below is the one to point the TUI at (`htui --set-dsn`).
+# The store tests create and drop `htui_test_*` databases through this maintenance DSN.
 
 services:
   postgres:
@@ -49,6 +51,45 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  postgres-test:
+    # The suites' server, kept apart from `postgres` so its settings can never cost the dev data.
+    # Every store test copies a template into a new `htui_test_*` database and drops it on its last
+    # line, and on 16 and 18 alike every DROP DATABASE waits for a checkpoint. Measured on this box
+    # (2026-11-14, htui-store minus the live Qdrant cases, 542 tests): 184 s against
+    # `postgres` above, 28 s on 16 with the settings below, 27 s on 18. pg_conformance's shards went
+    # from 113 s to 21 s each. Durability off is only safe because nothing here outlives a test:
+    # the data dir is a tmpfs, so a restart empties it and the next test rebuilds the template.
+    #   fsync / full_page_writes off: checkpoints and CREATE DATABASE stop waiting on the disk.
+    #   synchronous_commit off: a commit stops waiting for its WAL flush.
+    #   max_connections 300: twelve test processes with a pool each, plus the template builds.
+    # Settings that measured no gain on top (2026-11-14): wal_level=minimal, shared_buffers=1GB,
+    # max_wal_size=8GB, checkpoint_timeout=1h, autovacuum and jit off.
+    # 18, not 16: tests run on a current server, and ON DELETE RESTRICT reports SQLSTATE 23001 there
+    # (23503 on 16 and 17); htui-store maps the whole class 23 either way. The 16 floor stays what
+    # `postgres` above develops against.
+    image: postgres:18
+    container_name: htui-postgres-test
+    restart: unless-stopped
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off",
+              "-c", "full_page_writes=off", "-c", "max_connections=300"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: e08e7c24bdd7bb84d88c526fa11d48b6393bfb092e1368c1
+    ports:
+      - "127.0.0.1:5440:5432"
+    shm_size: 1gb
+    # The 18 image keeps its cluster under /var/lib/postgresql/18/docker. A test database is about
+    # 10 MB and lives seconds; 8g is a bound for a crashed run's leftovers, which the testkit's
+    # sweep drops after an hour.
+    tmpfs:
+      - /var/lib/postgresql:size=8g
+    healthcheck:
+      # -h localhost: the entrypoint's init-time server is socket-only (as docker/hr/compose.hr.yaml).
+      test: ["CMD-SHELL", "pg_isready -h localhost -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   qdrant:
     # MOD-34 D5: pinned to the server matching `qdrant-client 1.19`, as Postgres is pinned to 16.
