@@ -23,7 +23,10 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::ItemState;
 use htui_core::model::StepRole;
-use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
+use htui_core::model::link::{
+    ArtifactLinkKind, DocumentLink, DocumentRef, ItemArtifactLink, ItemLink, LinkKind,
+    LinkedDocument, ProposeDocumentLink, ProposeLink, WithdrawDocumentLink, WithdrawLink,
+};
 use htui_core::model::split_qualified;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchClose, BatchId,
@@ -50,6 +53,7 @@ use htui_core::model::{
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
     canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
 };
+use htui_core::model::{ArtifactLinkId, DocumentId};
 use htui_core::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
 use htui_core::model::{NewRunPlan, PlanAdmission, PlanStatus, PlanToAdmit, RunPlan, RunPlanId};
@@ -66,6 +70,9 @@ use htui_core::store::traits::{
     note_needs_a_step, parent_cycle, parent_too_deep, project_settings_not_an_object, reaped_note,
     run_workspace_for, scope_row_run_workspace, second_canonical, second_parent, self_link,
     step_document_refusal, step_note_refusal, step_writes_own_item, workspace_prefix_taken,
+};
+use htui_core::store::traits::{
+    document_already_pinned, document_outside_reach, document_ref_label,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored, QueueTarget,
@@ -347,6 +354,313 @@ async fn link_reaches(conn: &mut PgConnection, to: ItemId, project: ProjectId) -
     .ok_or_else(|| StoreError::NotFound {
         entity: "item",
         id: to.to_string(),
+    })
+}
+
+/// MOD-150 M3 D5: [`link_reaches`] measured on projects: whether a document of `target` is within
+/// the reach of a step of `project`. The SQL is `link_reaches`' text with the `item i` join
+/// replaced by the `target` parameter; `link_reaches` itself is unchanged, so its `.sqlx` entry
+/// keeps its hash.
+async fn project_reaches(
+    conn: &mut PgConnection,
+    target: ProjectId,
+    project: ProjectId,
+) -> Result<bool> {
+    sqlx::query_scalar!(
+        r#"
+            SELECT ($1::uuid = $2::uuid
+                    OR EXISTS (
+                         SELECT 1 FROM workspace w
+                          WHERE (w.id IN (SELECT wp.workspace_id FROM workspace_project wp
+                                           WHERE wp.project_id = $2)
+                                 OR w.id = (SELECT p.owner_workspace_id FROM project p
+                                             WHERE p.id = $2))
+                            AND (w.id = (SELECT t.owner_workspace_id FROM project t
+                                          WHERE t.id = $1)
+                                 OR EXISTS (SELECT 1 FROM workspace_project m
+                                             WHERE m.workspace_id = w.id
+                                               AND m.project_id = $1))))
+                   AS "reachable!"
+            "#,
+        target.as_uuid(),
+        project.as_uuid(),
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// MOD-150 M3 D3: whose documents a [`DocumentRef`] names, and the version it resolved to.
+struct ResolvedDocument {
+    /// `document.id` of the named version, or of the latest.
+    id: DocumentId,
+    /// `document.project_id`.
+    project: ProjectId,
+    /// `document.item_id`; `None` for an owner document.
+    item: Option<ItemId>,
+}
+
+/// MOD-150 M3 D3, in the caller's transaction so "latest" is read at write time: `to.owner` as an
+/// item key first (`item_by_key`'s rules: bare in `project`, a qualified key by its slug), else as
+/// an exact project slug (scope rows included); then the named version of `to.kind`, or the
+/// latest. `NotFound { entity: "document" }` when any part names nothing; a NUL in either text
+/// names nothing before a query sees it (Postgres would fail the parameter, `22021`).
+async fn resolve_document(
+    conn: &mut PgConnection,
+    project: ProjectId,
+    to: &DocumentRef,
+) -> Result<ResolvedDocument> {
+    let missing = || StoreError::NotFound {
+        entity: "document",
+        id: document_ref_label(to),
+    };
+    if to.owner.contains('\0') || to.kind.contains('\0') {
+        return Err(missing());
+    }
+    let item = match split_qualified(&to.owner) {
+        (None, key) => sqlx::query_scalar!(
+            r#"SELECT id AS "id: ItemId" FROM item WHERE project_id = $1 AND key = $2"#,
+            project.as_uuid(),
+            key,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx)?,
+        (Some(slug), key) => sqlx::query_scalar!(
+            r#"
+                SELECT i.id AS "id: ItemId"
+                  FROM item i JOIN project p ON p.id = i.project_id
+                 WHERE p.slug = $1 AND i.key = $2
+                "#,
+            slug,
+            key,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx)?,
+    };
+    let owner_project = match item {
+        Some(_) => None,
+        None => Some(
+            sqlx::query_scalar!(
+                r#"SELECT id AS "id: ProjectId" FROM project WHERE slug = $1"#,
+                to.owner,
+            )
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(missing)?,
+        ),
+    };
+    let row = sqlx::query!(
+        r#"
+        SELECT id         AS "id: DocumentId",
+               project_id AS "project_id: ProjectId",
+               item_id    AS "item_id: ItemId"
+          FROM document
+         WHERE kind = $3
+           AND (item_id = $2::uuid
+                OR ($2::uuid IS NULL AND item_id IS NULL AND project_id = $1::uuid))
+           AND ($4::int IS NULL OR version = $4::int)
+         ORDER BY version DESC
+         LIMIT 1
+        "#,
+        owner_project.map(ProjectId::as_uuid),
+        item.map(ItemId::as_uuid),
+        to.kind,
+        to.version,
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or_else(missing)?;
+    Ok(ResolvedDocument {
+        id: row.id,
+        project: row.project_id,
+        item: row.item_id,
+    })
+}
+
+/// MOD-150 M3 D2: the read shape of the document `item_artifact_link` row `link` pins, the
+/// latest version of its owner and kind read now.
+async fn linked_document_of(
+    conn: &mut PgConnection,
+    link: ArtifactLinkId,
+) -> Result<LinkedDocument> {
+    sqlx::query_as!(
+        LinkedDocument,
+        r#"
+        SELECT l.from_item_id AS "from_item_id: ItemId",
+               l.kind         AS "kind: ArtifactLinkKind",
+               d.id           AS "document_id: DocumentId",
+               d.project_id   AS "project_id: ProjectId",
+               p.slug         AS project_slug,
+               d.item_id      AS "owner_item: ItemId",
+               i.key          AS "owner_key?",
+               d.kind         AS doc_kind,
+               d.version,
+               (SELECT MAX(x.version) FROM document x
+                 WHERE x.project_id = d.project_id
+                   AND x.item_id IS NOT DISTINCT FROM d.item_id
+                   AND x.kind = d.kind) AS "latest_version!",
+               d.title
+          FROM item_artifact_link l
+          JOIN document d    ON d.id = l.to_document_id
+          JOIN project p     ON p.id = d.project_id
+          LEFT JOIN item i   ON i.id = d.item_id
+         WHERE l.id = $1
+        "#,
+        link.as_uuid(),
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// MOD-150 M3 D4: [`WriteStore::propose_document_link`]'s refusals and upsert, in `conn`'s
+/// transaction after `step_scope`. Boxed by its caller for `propose_link`'s stack reason.
+async fn propose_document_link_in(
+    conn: &mut PgConnection,
+    scope: &StepScope,
+    link: &ProposeDocumentLink,
+) -> Result<DocumentLink> {
+    let resolved = resolve_document(conn, scope.project, &link.to).await?;
+    let label = document_ref_label(&link.to);
+    if !project_reaches(conn, resolved.project, scope.project).await? {
+        return Err(StoreError::Constraint(document_outside_reach(&label)));
+    }
+    // D6: proposals and withdrawals from one item are serialised, so two versions proposed at
+    // once cannot both pass the pin check (they differ in `to_document_id`, so the unique would
+    // not stop the second). `claim_command`'s statement text, as `propose_link`'s locks.
+    advisory_xact_lock(conn, format!("item_artifact_link:{}", link.from)).await?;
+    let pinned = sqlx::query_scalar!(
+        r#"
+        SELECT d.version
+          FROM item_artifact_link l
+          JOIN document d ON d.id = l.to_document_id
+         WHERE l.from_item_id = $1 AND l.kind = $2 AND l.deleted_at IS NULL
+           AND d.project_id = $3 AND d.item_id IS NOT DISTINCT FROM $4::uuid AND d.kind = $5
+           AND d.id <> $6
+         ORDER BY d.version
+         LIMIT 1
+        "#,
+        link.from.as_uuid(),
+        link.kind.as_str(),
+        resolved.project.as_uuid(),
+        resolved.item.map(ItemId::as_uuid),
+        link.to.kind,
+        resolved.id.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    if let Some(pinned) = pinned {
+        return Err(StoreError::Constraint(document_already_pinned(
+            link.from, link.kind, pinned,
+        )));
+    }
+    let row = sqlx::query_as!(
+        ItemArtifactLink,
+        r#"
+        INSERT INTO item_artifact_link (from_item_id, kind, to_document_id, proposed_by_step_id)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT ON CONSTRAINT uq_item_artifact_link DO UPDATE
+           SET proposed_by_step_id = CASE WHEN item_artifact_link.deleted_at IS NULL
+                                          THEN item_artifact_link.proposed_by_step_id
+                                          ELSE EXCLUDED.proposed_by_step_id END,
+               deleted_at          = NULL
+        RETURNING id                  AS "id: ArtifactLinkId",
+                  from_item_id        AS "from_item_id: ItemId",
+                  kind                AS "kind: ArtifactLinkKind",
+                  to_document_id      AS "to_document_id: DocumentId",
+                  to_attachment_id,
+                  proposed_by_step_id AS "proposed_by_step_id: StepId",
+                  created_at,
+                  updated_at,
+                  deleted_at
+        "#,
+        link.from.as_uuid(),
+        link.kind.as_str(),
+        resolved.id.as_uuid(),
+        link.step.as_uuid(),
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    let document = linked_document_of(conn, row.id).await?;
+    Ok(DocumentLink {
+        link: row,
+        document,
+    })
+}
+
+/// MOD-150 M3 D4: [`WriteStore::withdraw_document_link`] after `step_scope`, in `conn`'s
+/// transaction. Boxed by its caller, as [`propose_document_link_in`] is.
+async fn withdraw_document_link_in(
+    conn: &mut PgConnection,
+    scope: &StepScope,
+    link: &WithdrawDocumentLink,
+) -> Result<DocumentLink> {
+    let resolved = resolve_document(conn, scope.project, &link.to).await?;
+    let label = document_ref_label(&link.to);
+    advisory_xact_lock(conn, format!("item_artifact_link:{}", link.from)).await?;
+    // At most one live link of this kind to the owner's kind: the single pin (D4).
+    let live = sqlx::query!(
+        r#"
+        SELECT l.id      AS "id: ArtifactLinkId",
+               d.version,
+               EXISTS (SELECT 1 FROM run_step s
+                        WHERE s.id = l.proposed_by_step_id AND s.run_id = $6) AS "ours!"
+          FROM item_artifact_link l
+          JOIN document d ON d.id = l.to_document_id
+         WHERE l.from_item_id = $1 AND l.kind = $2 AND l.deleted_at IS NULL
+           AND d.project_id = $3 AND d.item_id IS NOT DISTINCT FROM $4::uuid AND d.kind = $5
+         ORDER BY d.version
+         LIMIT 1
+        "#,
+        link.from.as_uuid(),
+        link.kind.as_str(),
+        resolved.project.as_uuid(),
+        resolved.item.map(ItemId::as_uuid),
+        link.to.kind,
+        scope.run.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    let Some(live) = live.filter(|live| link.to.version.is_none_or(|v| v == live.version)) else {
+        return Err(StoreError::NotFound {
+            entity: "item_artifact_link",
+            id: label,
+        });
+    };
+    if !live.ours {
+        return Err(StoreError::Constraint(link_not_proposed_by_run(&label)));
+    }
+    let row = sqlx::query_as!(
+        ItemArtifactLink,
+        r#"
+        UPDATE item_artifact_link SET deleted_at = clock_timestamp()
+         WHERE id = $1
+        RETURNING id                  AS "id: ArtifactLinkId",
+                  from_item_id        AS "from_item_id: ItemId",
+                  kind                AS "kind: ArtifactLinkKind",
+                  to_document_id      AS "to_document_id: DocumentId",
+                  to_attachment_id,
+                  proposed_by_step_id AS "proposed_by_step_id: StepId",
+                  created_at,
+                  updated_at,
+                  deleted_at
+        "#,
+        live.id.as_uuid(),
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    let document = linked_document_of(conn, row.id).await?;
+    Ok(DocumentLink {
+        link: row,
+        document,
     })
 }
 
@@ -876,6 +1190,10 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                  WHERE from_item_id IN (SELECT id FROM i)
                     OR to_item_id   IN (SELECT id FROM i))                    AS "links!",
                (SELECT count(*) FROM document WHERE project_id = $1)          AS "documents!",
+               (SELECT count(*) FROM item_artifact_link
+                 WHERE from_item_id IN (SELECT id FROM i)
+                    OR to_document_id IN (SELECT id FROM document
+                                           WHERE project_id = $1))            AS "document_links!",
                (SELECT count(*) FROM requirement_spec WHERE project_id = $1)  AS "requirement_specs!",
                (SELECT count(*) FROM ra)                                      AS "requirement_areas!",
                (SELECT count(*) FROM requirement_key_counter
@@ -922,6 +1240,7 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         revisions: rows(row.revisions),
         links: rows(row.links),
         documents: rows(row.documents),
+        document_links: rows(row.document_links),
         requirement_specs: rows(row.requirement_specs),
         requirement_areas: rows(row.requirement_areas),
         requirement_key_counters: rows(row.requirement_key_counters),
@@ -10522,6 +10841,54 @@ impl WriteStore for PgStore {
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(row)
+    }
+
+    /// MOD-150 M3 D4: one transaction: `step_scope`, the own item, then
+    /// [`propose_document_link_in`] (resolution, reach, the item's advisory lock, the pin check,
+    /// the upsert on `uq_item_artifact_link`).
+    ///
+    /// # Errors
+    ///
+    /// As [`WriteStore::propose_document_link`].
+    async fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+    ) -> Result<DocumentLink> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let scope = step_scope(&mut tx, link.step, fence).await?;
+        if scope.item != Some(link.from) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                link.step, link.from,
+            )));
+        }
+        let written = Box::pin(propose_document_link_in(&mut tx, &scope, &link)).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(written)
+    }
+
+    /// MOD-150 M3 D4: one transaction: `step_scope`, the own item, then
+    /// [`withdraw_document_link_in`] (resolution without the latest, the item's advisory lock,
+    /// the live link, its proposer, the tombstone).
+    ///
+    /// # Errors
+    ///
+    /// As [`WriteStore::withdraw_document_link`].
+    async fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+    ) -> Result<DocumentLink> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let scope = step_scope(&mut tx, link.step, fence).await?;
+        if scope.item != Some(link.from) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                link.step, link.from,
+            )));
+        }
+        let withdrawn = Box::pin(withdraw_document_link_in(&mut tx, &scope, &link)).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(withdrawn)
     }
 
     /// B-4: the item of `project` keyed `key`, on the pool. A key holding a NUL is `None` before

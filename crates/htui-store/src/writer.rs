@@ -21,7 +21,9 @@
 //! no test covers.
 
 use chrono::{DateTime, TimeDelta, Utc};
-use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
+use htui_core::model::link::{
+    DocumentLink, ItemLink, ProposeDocumentLink, ProposeLink, WithdrawDocumentLink, WithdrawLink,
+};
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
     BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
@@ -1469,6 +1471,28 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.withdraw_link(fence, link).await,
             Self::Online(pg) => pg.withdraw_link(fence, link).await,
+        }
+    }
+
+    async fn propose_document_link(
+        &self,
+        fence: StepFence,
+        link: ProposeDocumentLink,
+    ) -> Result<DocumentLink> {
+        match self {
+            Self::Memory(store) => store.propose_document_link(fence, link).await,
+            Self::Online(pg) => pg.propose_document_link(fence, link).await,
+        }
+    }
+
+    async fn withdraw_document_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawDocumentLink,
+    ) -> Result<DocumentLink> {
+        match self {
+            Self::Memory(store) => store.withdraw_document_link(fence, link).await,
+            Self::Online(pg) => pg.withdraw_document_link(fence, link).await,
         }
     }
 

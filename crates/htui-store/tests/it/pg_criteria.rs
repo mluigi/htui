@@ -3330,19 +3330,31 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
     .execute(&db.pool)
     .await
     .expect("seed a run_plan");
+    // MOD-150 M3 D8: one document link inside the project, so `document_links` below is 1 rather
+    // than `0 == 0`.
+    sqlx::query(
+        "INSERT INTO item_artifact_link (from_item_id, kind, to_document_id) \
+         SELECT d.item_id, 'relates', d.id FROM document d \
+          WHERE d.project_id = $1 AND d.item_id IS NOT NULL ORDER BY d.id LIMIT 1",
+    )
+    .bind(project.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("seed an item_artifact_link");
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Thirty-one entries for thirty-one fields: a field added without an entry leaves the struct
+    /// Thirty-two entries for thirty-two fields: a field added without an entry leaves the struct
     /// literal below incomplete and the crate does not compile. MOD-38's six requirement tables
     /// follow, in `DeleteReach` field order, then MOD-163's two memory tables (plan D8), and
-    /// MOD-139's `run_plan` closes it.
+    /// MOD-139's `run_plan` closes it. MOD-150 M3's `item_artifact_link` sits after `document`, as
+    /// `document_links` does in `DeleteReach`.
     ///
     /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
     /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
     /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
     /// comparing every later field against the wrong table (T1 audit A-3).
-    const TABLES: [&str; 31] = [
+    const TABLES: [&str; 32] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -3365,6 +3377,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "item_revision",
         "item_link",
         "document",
+        "item_artifact_link",
         "requirement_spec",
         "requirement_area",
         "requirement_key_counter",
@@ -3413,6 +3426,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         revisions,
         links,
         documents,
+        document_links,
         requirement_specs,
         requirement_areas,
         requirement_key_counters,
@@ -3423,7 +3437,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         memory_revisions,
         run_plans,
     } = report;
-    let claimed: [u64; 31] = [
+    let claimed: [u64; 32] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -3446,6 +3460,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         revisions,
         links,
         documents,
+        document_links,
         requirement_specs,
         requirement_areas,
         requirement_key_counters,
@@ -3479,9 +3494,10 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
             repo_box_paths,
             memory_entries,
             memory_revisions,
-            run_plans
-        ) == (1, 1, 1, 1, 1, 1, 2, 1),
-        "the nine seeded tables are non-zero, so none of them passed on `0 == 0`"
+            run_plans,
+            document_links
+        ) == (1, 1, 1, 1, 1, 1, 2, 1, 1),
+        "the ten seeded tables are non-zero, so none of them passed on `0 == 0`"
     );
 
     db.drop_db().await;
@@ -11974,6 +11990,146 @@ async fn two_concurrent_opposite_parents_close_no_cycle() {
 
     left.close().await;
     right.close().await;
+    db.drop_db().await;
+}
+
+/// MOD-150 M3 D6: two pools propose `x implements` v1 and v2 of one document at once. Both take
+/// the per-item advisory lock before the single-pin check, so exactly one lands and the loser is
+/// refused with `document_already_pinned` naming the winner's version, never a 23505 and never two
+/// live pins. Without the lock both checks would read no live link under READ COMMITTED and both
+/// rows would land (they differ in `to_document_id`, so the unique does not stop them). Twenty
+/// rounds, each on a fresh item and owner with an unleased run, released together by a barrier.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_concurrent_versions_of_one_document_pin_one() {
+    use htui_core::model::{ArtifactLinkKind, DocumentRef, NewDocument, ProposeDocumentLink};
+    use htui_core::store::StoreError;
+    use htui_core::store::traits::document_already_pinned;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mut pools = Vec::new();
+    for _ in 0..2 {
+        pools.push(
+            PgStore::connect(&db.url, &db.identity)
+                .await
+                .expect("a racing pool")
+                .store,
+        );
+    }
+
+    for round in 0..20 {
+        let mut minted = Vec::new();
+        for side in ["x", "owner"] {
+            minted.push(
+                db.store
+                    .mint_item(race_item(
+                        ids::KIND_HTUI_FEAT,
+                        &format!("round {round} {side}"),
+                    ))
+                    .await
+                    .expect("mint the round's item"),
+            );
+        }
+        let [ref x, ref owner] = minted[..] else {
+            unreachable!("round {round}: two items")
+        };
+        for _ in 0..2 {
+            db.store
+                .write_document(NewDocument {
+                    id: htui_core::model::DocumentId::new(),
+                    item_id: owner.id,
+                    kind: "verdict".to_owned(),
+                    title: format!("round {round} verdict"),
+                    body: String::new(),
+                    produced_by_step_id: None,
+                    created_by: ids::USER,
+                    created_at: Utc::now(),
+                })
+                .await
+                .expect("write a verdict version");
+        }
+        let run = db
+            .store
+            .create_run(race_run(x.id))
+            .await
+            .expect("queue a graph run")
+            .id;
+        let step = db
+            .store
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: None,
+                role: StepRole::Step,
+                parent_step_id: None,
+                node_key: None,
+            })
+            .await
+            .expect("create the round's step")
+            .id;
+
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for (pool, version) in pools.iter().zip([1, 2]) {
+            let (pool, start) = (pool.clone(), std::sync::Arc::clone(&start));
+            let link = ProposeDocumentLink {
+                from: x.id,
+                kind: ArtifactLinkKind::Implements,
+                to: DocumentRef {
+                    owner: owner.key.clone(),
+                    kind: "verdict".to_owned(),
+                    version: Some(version),
+                },
+                step,
+            };
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                pool.propose_document_link(StepFence::Unleased, link).await
+            }));
+        }
+        let mut outcomes = Vec::new();
+        for task in tasks {
+            outcomes.push(task.await.expect("the proposal task completes"));
+        }
+        let winner = match (&outcomes[0], &outcomes[1]) {
+            (Ok(_), Err(StoreError::Constraint(refusal))) => {
+                assert_eq!(
+                    *refusal,
+                    document_already_pinned(x.id, ArtifactLinkKind::Implements, 1),
+                    "round {round}: v2 lost to the pinned v1"
+                );
+                1
+            }
+            (Err(StoreError::Constraint(refusal)), Ok(_)) => {
+                assert_eq!(
+                    *refusal,
+                    document_already_pinned(x.id, ArtifactLinkKind::Implements, 2),
+                    "round {round}: v1 lost to the pinned v2"
+                );
+                2
+            }
+            other => panic!("round {round}: exactly one version is pinned, got {other:?}"),
+        };
+        let live: Vec<i32> = sqlx::query_scalar(
+            "SELECT d.version FROM item_artifact_link l JOIN document d ON d.id = l.to_document_id \
+              WHERE l.from_item_id = $1 AND l.deleted_at IS NULL",
+        )
+        .bind(x.id.as_uuid())
+        .fetch_all(&db.pool)
+        .await
+        .expect("read the item's live document links");
+        assert_eq!(live, [winner], "round {round}: one live pin, the winner's");
+    }
+
+    for pool in pools {
+        pool.close().await;
+    }
     db.drop_db().await;
 }
 

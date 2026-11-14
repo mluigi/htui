@@ -612,10 +612,12 @@ impl ReadStore for CacheStore {
             });
         }
 
+        // MOD-150 M3: the mirror's document links arrive with T2's `item_artifact_link` table.
         Ok(LinkGraph {
             root: id,
             nodes: out,
             edges,
+            documents: vec![],
         })
     }
 
