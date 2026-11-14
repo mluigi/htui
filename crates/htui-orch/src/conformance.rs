@@ -18261,6 +18261,30 @@ async fn assert_reopened_pre_stop_banner<O: Orchestrate>(
     );
 }
 
+/// MOD-125 M4 D4, D8: what `htui stop` and `htui resume` forecast for the stopped `step`
+/// ([`promote::stopped_step_resume`]), from its row, its log and the caps its agent row gives
+/// (`registry::caps_for`, `DriverCaps::default()` for an unknown agent, as `stopped_opening`
+/// reads them). Each M3 resume case computes it before `resume_stopped` and asserts the resume
+/// did what it said, so the verb's forecast and the engine's resume cannot drift unnoticed.
+async fn forecast_of<O: Orchestrate>(orch: &O, step: &RunStep) -> promote::StepResume {
+    assert_eq!(
+        step.status,
+        StepStatus::Stopped,
+        "a forecast reads a stopped row"
+    );
+    let agents = orch
+        .store()
+        .agents()
+        .await
+        .expect("MemStore never fails a read");
+    let caps = step
+        .agent_id
+        .and_then(|id| agents.into_iter().find(|summary| summary.agent.id == id))
+        .map(|summary| htui_agent::registry::caps_for(&summary.agent))
+        .unwrap_or_default();
+    promote::stopped_step_resume(step, caps, &events_of(orch, step.id).await)
+}
+
 /// An ungated `FEAT-3` over a primary repo, its walk dropped once `stalled` fires (a forced
 /// stop), then the stop settled: the run is `stopped` over its `prd` row.
 async fn stopped_feat_3<O: Orchestrate>(orch: &O, stalled: &Notify) -> (RunId, RunStep) {
@@ -18318,6 +18342,11 @@ async fn a_stopped_step_resumes_its_own_session_on_its_row<H: CaseHarness>(harne
         .await
         .expect("MemStore never fails a read");
     assert!(!trees.is_empty(), "stage 2 recorded the prd tree");
+    assert_eq!(
+        forecast_of(&orch, &prd).await,
+        promote::StepResume::Reopen(AgentSessionRef::new(PRE_STOP_BANNER)),
+        "the forecast names the session the resume reopens"
+    );
 
     resumed_to_done(&orch, run, &prd).await;
 
@@ -18419,6 +18448,10 @@ async fn a_stopped_step_without_session_caps_opens_fresh_with_the_handoff<H: Cas
         ),
         "the agent row takes the edit"
     );
+    assert_eq!(
+        forecast_of(&orch, &prd).await,
+        promote::StepResume::FreshWithHandoff
+    );
 
     let after = resumed_to_done(&orch, run, &prd).await;
 
@@ -18454,6 +18487,7 @@ async fn a_stopped_step_with_no_session_rows_is_walked_again<H: CaseHarness>(har
     let stalled = orch.isolator().stall_nth_prepare(1);
     let (run, prd) = stopped_feat_3(&orch, &stalled).await;
     assert!(events_of(&orch, prd.id).await.is_empty(), "no session row");
+    assert_eq!(forecast_of(&orch, &prd).await, promote::StepResume::Rerun);
 
     let after = resumed_to_done(&orch, run, &prd).await;
 
@@ -18503,6 +18537,10 @@ async fn a_stopped_step_with_no_banner_opens_fresh_on_its_rows<H: CaseHarness>(h
     let before = events_of(&orch, prd.id).await;
     assert_eq!(prompts_in(&before), 1, "the prompt row was written");
     assert!(promote::banner(&before).is_none(), "no banner");
+    assert_eq!(
+        forecast_of(&orch, &prd).await,
+        promote::StepResume::FreshWithHandoff
+    );
 
     let after = resumed_to_done(&orch, run, &prd).await;
 
@@ -19064,6 +19102,11 @@ async fn a_stopped_judge_reruns_fresh_and_reads_the_reruns_verdict<H: CaseHarnes
     let orch = harness.fresh();
     let (run, judge) = stopped_judge(&orch).await;
     let before = events_of(&orch, judge.id).await;
+    assert!(
+        promote::banner(&before).is_some(),
+        "the stopped judge's log holds a banner, which a judge never reopens"
+    );
+    assert_eq!(forecast_of(&orch, &judge).await, promote::StepResume::Rerun);
     // The re-run's verdict differs from the stopped attempt's.
     judge_both(&orch, "research", 1, 2, "third");
 
