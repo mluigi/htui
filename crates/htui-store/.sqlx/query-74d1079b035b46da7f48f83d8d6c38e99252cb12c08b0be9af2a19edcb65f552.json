@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id         AS \"id: RepoId\",\n                   project_id AS \"project_id: ProjectId\",\n                   name,\n                   remote_url,\n                   default_branch,\n                   is_primary,\n                   created_at,\n                   updated_at\n              FROM repo WHERE id = $1\n            ",
+  "query": "\n            INSERT INTO repo (id, project_id, name, remote_url, default_branch, is_primary)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            RETURNING id         AS \"id: RepoId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      remote_url,\n                      default_branch,\n                      is_primary,\n                      integrate  AS \"integrate: IntegrateMode\",\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "integrate: IntegrateMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repo",
+            "name": "integrate"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -94,7 +105,12 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Bool"
       ]
     },
     "nullable": [
@@ -104,9 +120,10 @@
       true,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "348e765f657035a5982ae03cc09577d6a4cc3104ac32fc0b9de586a84ada6eb5"
+  "hash": "74d1079b035b46da7f48f83d8d6c38e99252cb12c08b0be9af2a19edcb65f552"
 }

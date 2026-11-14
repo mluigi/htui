@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE repo SET\n                name           = COALESCE($3, name),\n                remote_url     = CASE WHEN $4 THEN $5 ELSE remote_url END,\n                default_branch = COALESCE($6, default_branch),\n                is_primary     = COALESCE($7, is_primary)\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id         AS \"id: RepoId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      remote_url,\n                      default_branch,\n                      is_primary,\n                      created_at,\n                      updated_at\n            ",
+  "query": "\n            SELECT id         AS \"id: RepoId\",\n                   project_id AS \"project_id: ProjectId\",\n                   name,\n                   remote_url,\n                   default_branch,\n                   is_primary,\n                   integrate  AS \"integrate: IntegrateMode\",\n                   created_at,\n                   updated_at\n              FROM repo WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "integrate: IntegrateMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repo",
+            "name": "integrate"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -94,13 +105,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Timestamptz",
-        "Text",
-        "Bool",
-        "Text",
-        "Text",
-        "Bool"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -110,9 +115,10 @@
       true,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "d49ebcf004d44e881ab1c16b93ed6fc7cb6218257ebffb350ca6b36ca69b3fbe"
+  "hash": "3ceb3065c9077369080bb89ae3605f001aa943e40a23e00e1b024bb924a1b961"
 }

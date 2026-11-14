@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use htui_core::model::IntegrateMode;
 use htui_core::model::OwnerDocument;
 use htui_core::model::StepRole;
 use htui_core::model::{
@@ -159,11 +160,19 @@ impl ReadStore for PgStore {
                         SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id
                          WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
                            AND l.deleted_at IS NULL AND t.status <> 'closed'
-                           AND (SELECT tr.status FROM run tr
-                                 WHERE tr.item_id = t.id AND tr.kind = 'graph'
-                                   AND tr.status <> 'cancelled'
-                                 ORDER BY tr.queued_at DESC, tr.id DESC
-                                 LIMIT 1) IS DISTINCT FROM 'done')))
+                           -- MOD-133 D7: released = closed, or a latest graph run `done` with every
+                           -- integration record landed (none, every `local` run, counts as landed).
+                           AND NOT EXISTS (
+                               SELECT 1 FROM (SELECT tr.id, tr.status FROM run tr
+                                               WHERE tr.item_id = t.id AND tr.kind = 'graph'
+                                                 AND tr.status <> 'cancelled'
+                                               ORDER BY tr.queued_at DESC, tr.id DESC
+                                               LIMIT 1) lt
+                                WHERE lt.status = 'done'
+                                  AND NOT EXISTS (
+                                       SELECT 1 FROM integration g
+                                        WHERE g.run_id = lt.id
+                                          AND g.state NOT IN ('landed', 'pr_merged'))))))
                AND ($7::text[] IS NULL OR (CASE
                         WHEN i.status = 'closed'  THEN 'closed'
                         WHEN i.status = 'blocked' THEN 'blocked'
@@ -2408,11 +2417,19 @@ impl PgStore {
                         SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id
                          WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
                            AND l.deleted_at IS NULL AND t.status <> 'closed'
-                           AND (SELECT tr.status FROM run tr
-                                 WHERE tr.item_id = t.id AND tr.kind = 'graph'
-                                   AND tr.status <> 'cancelled'
-                                 ORDER BY tr.queued_at DESC, tr.id DESC
-                                 LIMIT 1) IS DISTINCT FROM 'done')
+                           -- MOD-133 D7: released = closed, or a latest graph run `done` with every
+                           -- integration record landed (none, every `local` run, counts as landed).
+                           AND NOT EXISTS (
+                               SELECT 1 FROM (SELECT tr.id, tr.status FROM run tr
+                                               WHERE tr.item_id = t.id AND tr.kind = 'graph'
+                                                 AND tr.status <> 'cancelled'
+                                               ORDER BY tr.queued_at DESC, tr.id DESC
+                                               LIMIT 1) lt
+                                WHERE lt.status = 'done'
+                                  AND NOT EXISTS (
+                                       SELECT 1 FROM integration g
+                                        WHERE g.run_id = lt.id
+                                          AND g.state NOT IN ('landed', 'pr_merged'))))
                AND NOT EXISTS (
                         SELECT 1 FROM UNNEST(i.required_tags) t
                          WHERE t <> ALL (COALESCE(b.probed_tags, '{}')
@@ -2696,11 +2713,19 @@ impl PgStore {
                       FROM item_link l JOIN item t ON t.id = l.to_item_id
                      WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
                        AND l.deleted_at IS NULL AND t.status <> 'closed'
-                       AND (SELECT tr.status FROM run tr
-                             WHERE tr.item_id = t.id AND tr.kind = 'graph'
-                               AND tr.status <> 'cancelled'
-                             ORDER BY tr.queued_at DESC, tr.id DESC
-                             LIMIT 1) IS DISTINCT FROM 'done'
+                       -- MOD-133 D7: released = closed, or a latest graph run `done` with every
+                       -- integration record landed (none, every `local` run, counts as landed).
+                       AND NOT EXISTS (
+                           SELECT 1 FROM (SELECT tr.id, tr.status FROM run tr
+                                           WHERE tr.item_id = t.id AND tr.kind = 'graph'
+                                             AND tr.status <> 'cancelled'
+                                           ORDER BY tr.queued_at DESC, tr.id DESC
+                                           LIMIT 1) lt
+                            WHERE lt.status = 'done'
+                              AND NOT EXISTS (
+                                   SELECT 1 FROM integration g
+                                    WHERE g.run_id = lt.id
+                                      AND g.state NOT IN ('landed', 'pr_merged')))
                    ) ob ON true
              WHERE e.box_id = $1
              ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id
@@ -3086,6 +3111,7 @@ impl PgStore {
                    remote_url,
                    default_branch,
                    is_primary,
+                   integrate  AS "integrate: IntegrateMode",
                    created_at,
                    updated_at
               FROM repo WHERE id = $1
@@ -3170,6 +3196,7 @@ impl PgStore {
                    remote_url,
                    default_branch,
                    is_primary,
+                   integrate  AS "integrate: IntegrateMode",
                    created_at,
                    updated_at
               FROM repo

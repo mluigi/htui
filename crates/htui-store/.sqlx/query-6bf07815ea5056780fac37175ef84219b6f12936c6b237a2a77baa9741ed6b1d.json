@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id         AS \"id: RepoId\",\n                   project_id AS \"project_id: ProjectId\",\n                   name,\n                   remote_url,\n                   default_branch,\n                   is_primary,\n                   created_at,\n                   updated_at\n              FROM repo\n             WHERE project_id = $1\n             ORDER BY name COLLATE \"C\"\n            ",
+  "query": "\n            UPDATE repo SET\n                name           = COALESCE($3, name),\n                remote_url     = CASE WHEN $4 THEN $5 ELSE remote_url END,\n                default_branch = COALESCE($6, default_branch),\n                is_primary     = COALESCE($7, is_primary),\n                integrate      = CASE WHEN $8 THEN $9 ELSE integrate END\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id         AS \"id: RepoId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      remote_url,\n                      default_branch,\n                      is_primary,\n                      integrate  AS \"integrate: IntegrateMode\",\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "integrate: IntegrateMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repo",
+            "name": "integrate"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -94,7 +105,15 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Bool",
+        "Text",
+        "Text",
+        "Bool",
+        "Bool",
+        "Text"
       ]
     },
     "nullable": [
@@ -104,9 +123,10 @@
       true,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "f1c1a15447b8302d53935f4dc7c6e4354c9778ef7bc26482621ca0a05a5084f4"
+  "hash": "6bf07815ea5056780fac37175ef84219b6f12936c6b237a2a77baa9741ed6b1d"
 }

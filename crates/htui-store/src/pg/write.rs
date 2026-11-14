@@ -56,6 +56,7 @@ use htui_core::model::{
 use htui_core::model::{ArtifactLinkId, DocumentId};
 use htui_core::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
+use htui_core::model::{IntegrateMode, Integration, IntegrationState, LandOutcome};
 use htui_core::model::{NewRunPlan, PlanAdmission, PlanStatus, PlanToAdmit, RunPlan, RunPlanId};
 use htui_core::prompt::DEFAULT_TEMPLATES;
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -2659,6 +2660,48 @@ async fn finish_run_on(
     .await
     .map_err(map_sqlx)?;
 
+    // MOD-133 D4: a `done` run's integration records, in the same transaction.
+    if to == RunStatus::Done {
+        write_integrations(conn, run).await?;
+    }
+
+    Ok(())
+}
+
+/// MOD-133 D4: `finish_run(Done)`'s records, on the caller's transaction with the run held
+/// `FOR UPDATE`: one `pending` row per `graph_snapshot.integrate` entry whose mode is not `local`
+/// and whose repo has a `run_step_commit` with an `after_hash` in this run, carrying the entry's
+/// mode, remote and target and the run's project. An `integrate` that is not an object, or an entry
+/// whose fields are not the snapshot's strings, writes nothing, as `MemStore`'s decode of the same
+/// value would find no entry; an existing row is left (`ON CONFLICT DO NOTHING`).
+async fn write_integrations(conn: &mut PgConnection, run: RunId) -> Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO integration (run_id, repo_id, project_id, mode, remote, target_branch)
+        SELECT r.id, e.key::uuid, r.project_id,
+               e.value->>'mode', e.value->>'remote', e.value->>'target_branch'
+          FROM run r
+         CROSS JOIN LATERAL jsonb_each(
+                   CASE WHEN jsonb_typeof(r.graph_snapshot->'integrate') = 'object'
+                        THEN r.graph_snapshot->'integrate'
+                        ELSE '{}'::jsonb END) e
+         WHERE r.id = $1
+           AND e.value->>'mode' IN ('push', 'pull_request')
+           AND jsonb_typeof(e.value->'remote') = 'string'
+           AND jsonb_typeof(e.value->'target_branch') = 'string'
+           AND EXISTS (SELECT 1 FROM run_step_commit c
+                         JOIN run_step s ON s.id = c.run_step_id
+                        WHERE s.run_id = r.id
+                          AND c.repo_id = e.key::uuid
+                          AND c.after_hash IS NOT NULL)
+         ORDER BY 2
+        ON CONFLICT DO NOTHING
+        "#,
+        run.as_uuid(),
+    )
+    .execute(conn)
+    .await
+    .map_err(map_sqlx)?;
     Ok(())
 }
 
@@ -4344,6 +4387,7 @@ impl WriteStore for PgStore {
                       remote_url,
                       default_branch,
                       is_primary,
+                      integrate  AS "integrate: IntegrateMode",
                       created_at,
                       updated_at
             "#,
@@ -4370,7 +4414,7 @@ impl WriteStore for PgStore {
     /// out to be spent, so a stale promotion demotes nobody. `remote_url` needs two parameters for
     /// the reason [`update_item`](PgStore::update_item)'s `step_graph_id` does: it is a
     /// double-[`Option`] and `None` ("leave it") and `Some(None)` ("clear it") would both arrive as
-    /// SQL `NULL`.
+    /// SQL `NULL`. `integrate` (MOD-133 D2) is the same double-[`Option`] and takes two more.
     ///
     /// The demoted row's own `updated_at` advances, because its column changed and the trigger
     /// fires per row.
@@ -4407,7 +4451,8 @@ impl WriteStore for PgStore {
                 name           = COALESCE($3, name),
                 remote_url     = CASE WHEN $4 THEN $5 ELSE remote_url END,
                 default_branch = COALESCE($6, default_branch),
-                is_primary     = COALESCE($7, is_primary)
+                is_primary     = COALESCE($7, is_primary),
+                integrate      = CASE WHEN $8 THEN $9 ELSE integrate END
              WHERE id = $1 AND updated_at = $2
             RETURNING id         AS "id: RepoId",
                       project_id AS "project_id: ProjectId",
@@ -4415,6 +4460,7 @@ impl WriteStore for PgStore {
                       remote_url,
                       default_branch,
                       is_primary,
+                      integrate  AS "integrate: IntegrateMode",
                       created_at,
                       updated_at
             "#,
@@ -4425,6 +4471,8 @@ impl WriteStore for PgStore {
             patch.remote_url.flatten(),
             patch.default_branch,
             patch.is_primary,
+            patch.integrate.is_some(),
+            patch.integrate.flatten() as Option<IntegrateMode>,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -9876,6 +9924,143 @@ impl WriteStore for PgStore {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         finish_run_on(&mut tx, run, to, failure, at).await?;
         tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// MOD-133 D6: `run`'s records ordered by `repo_id` (Postgres orders `uuid` by its bytes, as
+    /// `MemStore`'s `RepoId` key does).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn integrations(&self, run: RunId) -> Result<Vec<Integration>> {
+        sqlx::query_as!(
+            Integration,
+            r#"
+            SELECT run_id        AS "run_id: RunId",
+                   repo_id       AS "repo_id: RepoId",
+                   project_id    AS "project_id: ProjectId",
+                   mode          AS "mode: IntegrateMode",
+                   remote,
+                   target_branch,
+                   state         AS "state: IntegrationState",
+                   refusal,
+                   landed_hash,
+                   pr_ref,
+                   pr_url,
+                   created_at,
+                   updated_at
+              FROM integration
+             WHERE run_id = $1
+             ORDER BY repo_id
+            "#,
+            run.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-133 D6: one compare-and-set `UPDATE` over every takeable record, the run joined for its
+    /// `executing_box_id`. Expiry is judged, and the new one stamped, by `clock_timestamp()`, as
+    /// [`take_lease`](WriteStore::take_lease) does: a take that waits on another's row lock
+    /// re-evaluates its `WHERE` against the committed row after the wait, so two sweeps of one box
+    /// never lease one record to two owners.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for a TTL out of range, before anything is read.
+    async fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> Result<Vec<Integration>> {
+        let ttl = lease_ttl_micros(ttl)?;
+        sqlx::query_as!(
+            Integration,
+            r#"
+            WITH taken AS (
+                UPDATE integration g
+                   SET lease_box_id     = $1,
+                       lease_owner      = $2,
+                       lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'
+                  FROM run r
+                 WHERE r.id = g.run_id
+                   AND r.executing_box_id = $1
+                   AND g.state = 'pending'
+                   AND ($4::uuid IS NULL OR g.run_id = $4)
+                   AND (g.lease_owner = $2 OR g.lease_owner IS NULL
+                        OR g.lease_expires_at IS NULL OR g.lease_expires_at <= clock_timestamp())
+             RETURNING g.*
+            )
+            SELECT run_id        AS "run_id: RunId",
+                   repo_id       AS "repo_id: RepoId",
+                   project_id    AS "project_id: ProjectId",
+                   mode          AS "mode: IntegrateMode",
+                   remote,
+                   target_branch,
+                   state         AS "state: IntegrationState",
+                   refusal,
+                   landed_hash,
+                   pr_ref,
+                   pr_url,
+                   created_at,
+                   updated_at
+              FROM taken
+             ORDER BY run_id, repo_id
+            "#,
+            box_id.as_uuid(),
+            owner,
+            ttl,
+            run.map(RunId::as_uuid),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-133 D6: one `UPDATE` guarded by `state = 'pending' AND lease_owner = $3`; a row it
+    /// does not match (lost lease, settled, unknown) is `Ok(false)` with nothing written.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+    ) -> Result<bool> {
+        let (state, landed_hash, refusal) = match outcome {
+            LandOutcome::Landed { hash } => (IntegrationState::Landed, Some(hash.as_str()), None),
+            LandOutcome::Refused { reason } => {
+                (IntegrationState::Refused, None, Some(reason.as_str()))
+            }
+        };
+        let settled = sqlx::query!(
+            "UPDATE integration \
+                SET state            = $4, \
+                    landed_hash      = $5, \
+                    refusal          = $6, \
+                    lease_box_id     = NULL, \
+                    lease_owner      = NULL, \
+                    lease_expires_at = NULL \
+              WHERE run_id = $1 AND repo_id = $2 \
+                AND state = 'pending' AND lease_owner = $3",
+            run.as_uuid(),
+            repo.as_uuid(),
+            owner,
+            state as IntegrationState,
+            landed_hash,
+            refusal,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        Ok(settled == 1)
     }
 
     /// `R-TUI-9`'s close-out: the summary, the commits and the item's move to `closed`, one
