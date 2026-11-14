@@ -12,7 +12,7 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps};
 use htui_agent::error::DriverError;
 use htui_agent::event::{DriverEvent, OtherEvent, RESUME_FAILED, SESSION_STARTED};
 use htui_agent::replay::envelope_from_row;
-use htui_core::model::{EventKind, PromptTemplate, SessionEvent, StepId, StepOpening};
+use htui_core::model::{EventKind, PromptTemplate, RunStep, SessionEvent, StepId, StepOpening};
 use htui_core::prompt::excerpt::RepoRoot;
 use htui_core::prompt::{
     DiffBlock, HandoffInputs, PromptSpec, StepSummary, TemplateRef, TemplateRole,
@@ -140,6 +140,48 @@ pub fn opening_kind(caps: DriverCaps, events: &[SessionEvent]) -> OpeningKind {
     banner(events).map_or(OpeningKind::Handoff, OpeningKind::Resume)
 }
 
+/// MOD-125 M4 D4: how a stopped step will resume (M3 D4), told before the resume runs. `htui stop`
+/// and `htui resume` print it; the engine's own resume (`resume_live_step`, `resumed_member`, the
+/// judge's re-run) decides the same thing from the same rows, which the conformance suite's
+/// agreement checks pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepResume {
+    /// A banner and `caps.resume`: the step's own session reopens (M3 D4 branch 3).
+    Reopen(AgentSessionRef),
+    /// Session rows but no banner, or no resume caps: a fresh session sent the handoff (branch 2).
+    FreshWithHandoff,
+    /// No session rows (branch 1), or a judge (re-run fresh, both calls, M3 D4): the step runs
+    /// again.
+    Rerun,
+}
+
+/// MOD-125 M4 D4: [`StepResume`] for a `stopped` row `step`, from `caps`, its agent's caps, and
+/// `events`, its `step_events`.
+///
+/// `caps` are what the engine's `stopped_opening` reads: the agent row's `caps_for`, and
+/// `DriverCaps::default()` for an unknown agent. The engine reads the agent from `step.agent_id`
+/// (the row is authority) and refuses a row with no agent and session rows; a caller forecasting
+/// such a row passes `DriverCaps::default()`, which answers [`StepResume::FreshWithHandoff`].
+///
+/// A judge (`fanout_index == -1`) is [`StepResume::Rerun`]; so is a step with no `events`;
+/// otherwise [`opening_kind`] decides: [`OpeningKind::Resume`] is [`StepResume::Reopen`] of the
+/// same session, [`OpeningKind::Handoff`] is [`StepResume::FreshWithHandoff`].
+#[must_use]
+pub fn stopped_step_resume(
+    step: &RunStep,
+    caps: DriverCaps,
+    events: &[SessionEvent],
+) -> StepResume {
+    // `fanout_index == -1` is the judge row (ANA-2 §4.5; the engine's `JUDGE_FANOUT_INDEX`).
+    if step.fanout_index == -1 || events.is_empty() {
+        return StepResume::Rerun;
+    }
+    match opening_kind(caps, events) {
+        OpeningKind::Resume(session_ref) => StepResume::Reopen(session_ref),
+        OpeningKind::Handoff => StepResume::FreshWithHandoff,
+    }
+}
+
 /// §4.6(c)'s handoff spec built from the phase's own spec: role `Handoff`, the pinned `handoff`
 /// template's body and ref, `handoff: Some(HandoffInputs { StepSummary::from_events(events,
 /// roots), diff_so_far, failure_reason })`, `verify_failure`/`previous_diff`/`judge` cleared, and
@@ -189,7 +231,10 @@ pub fn handoff_spec(
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use htui_core::model::{EventRole, ProjectId, PromptTemplateId, StepId, UserId};
+    use htui_core::model::{
+        AgentId, EventRole, ProjectId, PromptTemplateId, RunId, StepId, StepRole, StepStatus,
+        UserId,
+    };
     use htui_core::prompt::excerpt::RootSource;
     use htui_core::prompt::fixtures::{handoff_basic, phase_implement_attempt2};
     use htui_core::prompt::{PersonaBlock, assemble, body_of, parse};
@@ -757,5 +802,124 @@ mod tests {
 
         // An unknown step: the store answers `NotFound`, which is logged, never a panic.
         record_opening(&store, StepId::new(), StepOpening::ResumeFailed).await;
+    }
+
+    /// A `stopped` row at `fanout_index` of `fixtures`' abandoned step, on some agent.
+    fn stopped_step(fanout_index: i32) -> RunStep {
+        RunStep {
+            id: StepId::from_uuid(Uuid::parse_str(STEP).expect("a literal")),
+            run_id: RunId::from_uuid(Uuid::parse_str(RUN).expect("a literal")),
+            position: 0,
+            attempt: 1,
+            fanout_index,
+            phase_name: "implement".to_owned(),
+            agent_id: Some(AgentId::from_uuid(Uuid::from_u128(0x73))),
+            model: None,
+            status: StepStatus::Stopped,
+            gate_outcome: None,
+            gate_note: None,
+            selected: None,
+            exit_code: None,
+            prompt_digest: None,
+            trim_record: None,
+            usage: None,
+            isolation_path: None,
+            started_at: Some(fixed_at()),
+            finished_at: None,
+            verify_outcome: None,
+            verify_exit_code: None,
+            promoted_at: None,
+            branch: None,
+            role: StepRole::default(),
+            parent_step_id: None,
+            node_key: None,
+            updated_at: fixed_at(),
+        }
+    }
+
+    /// MOD-125 M4 D4 (M3 D4, D9): a judge re-runs fresh, both calls, whatever its log holds and
+    /// whatever its agent can resume.
+    #[test]
+    fn a_judge_reruns_whatever_its_rows() {
+        let judge = stopped_step(-1);
+        for events in [banner_events(), handoff_events(), Vec::new()] {
+            for caps in [cli_caps(), acp_caps(), DriverCaps::default()] {
+                assert_eq!(
+                    stopped_step_resume(&judge, caps, &events),
+                    StepResume::Rerun
+                );
+            }
+        }
+    }
+
+    /// M3 D4 branch 1: a step stopped before its session's recorder wrote a row is walked again.
+    #[test]
+    fn a_step_with_no_rows_reruns() {
+        for index in [0, 2] {
+            for caps in [cli_caps(), DriverCaps::default()] {
+                assert_eq!(
+                    stopped_step_resume(&stopped_step(index), caps, &[]),
+                    StepResume::Rerun
+                );
+            }
+        }
+    }
+
+    /// M3 D4 branch 2: rows but no banner (the session never answered) open a fresh session sent
+    /// the handoff, resume caps or not.
+    #[test]
+    fn rows_without_a_banner_start_fresh_with_the_handoff() {
+        let events: Vec<SessionEvent> = banner_events()
+            .into_iter()
+            .filter(|row| row.payload.get("update") != Some(&json!(SESSION_STARTED)))
+            .collect();
+        assert!(!events.is_empty());
+        for caps in [cli_caps(), acp_caps(), DriverCaps::default()] {
+            assert_eq!(
+                stopped_step_resume(&stopped_step(0), caps, &events),
+                StepResume::FreshWithHandoff
+            );
+        }
+        assert_eq!(
+            stopped_step_resume(&stopped_step(0), cli_caps(), &handoff_events()),
+            StepResume::FreshWithHandoff
+        );
+    }
+
+    /// M3 D4 branch 2: a banner the agent cannot resume opens a fresh session sent the handoff.
+    #[test]
+    fn a_banner_without_resume_caps_starts_fresh() {
+        let caps = DriverCaps {
+            resume: false,
+            ..acp_caps()
+        };
+        for caps in [caps, DriverCaps::default()] {
+            assert_eq!(
+                stopped_step_resume(&stopped_step(0), caps, &banner_events()),
+                StepResume::FreshWithHandoff
+            );
+        }
+    }
+
+    /// M3 D4 branch 3: a banner and resume caps reopen the session the latest banner by `seq`
+    /// names, which after a failed resume that fell back is the handoff's (MOD-37 M5 A-7).
+    #[test]
+    fn a_banner_with_resume_caps_reopens_that_session() {
+        for caps in [cli_caps(), acp_caps()] {
+            assert_eq!(
+                stopped_step_resume(&stopped_step(1), caps, &banner_events()),
+                StepResume::Reopen(AgentSessionRef("sess_2".to_owned()))
+            );
+        }
+        let fell_back = vec![
+            other(5, SESSION_STARTED, json!({ "session_id": "sess_new" })),
+            other(4, RESUME_FAILED, json!({ "session_id": "sess_old" })),
+            event(2, 0, EventKind::AssistantText, json!({ "text": "on it" })),
+            other(1, SESSION_STARTED, json!({ "session_id": "sess_old" })),
+        ];
+        assert_eq!(
+            stopped_step_resume(&stopped_step(0), cli_caps(), &fell_back),
+            StepResume::Reopen(AgentSessionRef("sess_new".to_owned()))
+        );
     }
 }
