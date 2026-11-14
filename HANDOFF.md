@@ -15,7 +15,9 @@
   Also refresh "Parallel runs" below: drop the closed ID and promote what it unblocked.
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-14):** **MOD-122 is done** (`docs/decisions/mod/mod-122.md`; merged on main): the Logs tab shows htui's own log (always in memory) and every worker's shipped log,
+**Current status (2026-11-14):** **ANA-42 is concluded** (`docs/decisions/ana/ana-42.md`): the maintainer accepted
+all six §8 decisions; MOD-130, MOD-131 and MOD-132 are no longer pending it, and MOD-43's queued-until-claimed rule
+now covers the enrolled kind only. **MOD-122 is done** (`docs/decisions/mod/mod-122.md`; merged on main): the Logs tab shows htui's own log (always in memory) and every worker's shipped log,
 and the activity panel fills the Backlog's activity slot (default preset `ide_activity`) with every wait and failure
 across all workspaces: `activity_event` rows written by deferred triggers on `run`/`run_step`/`item`/`step_permission`
 (MemStore: a status diff in `write`), needs-you pinned and counted, `f` filters, Enter jumps with history and switches
@@ -213,27 +215,6 @@ items it follows are done.
   work and bookkeeping. Wanted later, by maintainer decision. Not blocked: ANA-34 is concluded
   (`docs/decisions/ana/ana-34.md`) and hands this item which work to start next and landing several
   projects' work together (`docs/ANA-34.md` §7.1, §7.7); ANA-40 is concluded too (`docs/decisions/ana/ana-40.md`).
-- [ ] **ANA-42 - Execution targets: where an item runs** (from the UI redesign review,
-  `docs/ui-redesign-findings-2026-10-15.md` §4.2a). `R-ORCH-15`, `R-ORCH-12`, `R-ENT-17`, `R-SEC-5`, `R-AGT-11`, `R-BOX-4`,
-  `R-NF-2`. Each item runs on a target: this box, docker on this box (a sandbox like `scripts/hr`:
-  fresh clone, private compose project, toolchain image), a remote machine over SSH, docker on a
-  remote machine (a docker context over SSH), or a box enrolled with an `htui` server (MOD-47, phase
-  2). The default cascades Settings → workspace → project → workflow → item. Wherever it runs, `htui`
-  prepares the code, the item's components (compose), environment and secrets, and the agents, the
-  htui agent installing and logging in what is missing; the work comes back by collecting the branch
-  as `scripts/hr collect` does. Settle: what a target is in the store and how it relates to boxes
-  (`R-BOX-1..4`) and MOD-43's target box; where the agent process runs for each kind (MOD-44's container
-  environment is one answer); how sessions, permissions and the MCP relay reach a remote target
-  without the DSN leaving this box; how secrets reach it (`R-SEC-2`); collecting a branch from a
-  container or a remote checkout; and `R-NF-2` (docker as an opt-in per-target dependency). Not
-  blocked; read beside MOD-43, MOD-44 and MOD-47.
-  **Drafted (2026-10-17, `docs/ANA-42.md`):** verdict is a target record pointing at a box, the
-  executor staying on this box for the driven kinds, a forwarded relay socket, secrets injected, and
-  collection by bundle; spawns MOD-130, MOD-131, MOD-132. Stays open until the maintainer answers §8.
-  ANA-34 (concluded 2026-10-18, its Q9) narrows §7.5's "merging stays the person's step" to `local`
-  mode: after collect, the coordinator integrates per the repo's mode (MOD-133); fold into §8.
-  ANA-35 (concluded 2026-10-18) adds that a plain folder runs on this box only, never on a driven target,
-  and a repo-less project has nothing to clone (`docs/ANA-35.md` §7.2, MOD-145); fold into §8 too.
 
 ### Next features
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
@@ -377,7 +358,8 @@ items it follows are done.
 
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
-  until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
+  until its worker claims it (ANA-42 §8 Q2, accepted 2026-11-14: the enrolled kind only; a driven target
+  starts on this box, MOD-130); the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
   hints and a poll backstop, and shows worker liveness. Its auto-mode half builds on MOD-12, now done
   (`docs/decisions/mod/mod-12.md`: the queue runs on the local box only and reports a run live elsewhere)
   (MOD-42 is done: `docs/decisions/mod/mod-42.md`; its relay answers within a 1 s poll, which a
@@ -396,8 +378,8 @@ items it follows are done.
   per session as host UID/GID; trees bind-mounted at identical paths; a launch decorator under
   `TransportBuilder` (`docker exec -i`), adapters unchanged; kill-tree is container removal; agent
   credentials on a named volume; the container never holds the DSN. Linux and macOS first (Windows
-  via MOD-16). **Open question for the maintainer:** `R-NF-2` amendment (`dockerd` as an opt-in,
-  per-box dependency). The MOD-7 dependency is met (done, `docs/decisions/mod/mod-7.md`: id-keyed
+  via MOD-16). The `R-NF-2` amendment (`dockerd` opt-in per target) was accepted on ANA-42 §8 Q4
+  (2026-11-14) and is written by MOD-130. The MOD-7 dependency is met (done, `docs/decisions/mod/mod-7.md`: id-keyed
   registration, the box probe, capability tags); survives TUI exit through `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`).
   A child box's hostname never moves a digest, and the project's hostname switch covers it by
   construction (MOD-33 D275, `docs/decisions/mod/mod-33.md`).
@@ -420,7 +402,8 @@ items it follows are done.
   worker-facing DSN holder, no durable state (`R-ID-3` stands); enrolment with server-minted box ids
   (replacing MOD-7's `box.toml`-keyed registration for such workers; MOD-7 done,
   `docs/decisions/mod/mod-7.md`),
-  box-scoped auth, versioned worker protocol accepting N-1, worker-initiated WebSocket for dispatch,
+  box-scoped auth (ANA-42, `docs/ANA-42.md` §7.2, §7.4: an enrolled box is the one target kind whose own
+  worker drives the run; secrets for it are this item's and MOD-48's), versioned worker protocol accepting N-1, worker-initiated WebSocket for dispatch,
   event ingest, live and permission relay; a decision on server-down behaviour. The TUI keeps
   talking to Postgres. **Open questions for the maintainer (requirement amendments):** `R-NF-2`
   (optional self-hosted server), `R-ID-2` (self-hosted control plane is not a cloud service),
@@ -439,7 +422,7 @@ items it follows are done.
   the executing box resolves a project's secrets with the machine identity in its own keyring; a headless worker
   without one refuses, and delivering it is this item's.
 - [ ] **MOD-130 - Execution targets: target record, child boxes, target cascade** (from ANA-42,
-  `docs/ANA-42.md` §7.1, §7.2, §7.8; **proposed, pending the maintainer's acceptance of §8**).
+  `docs/ANA-42.md` §7.1, §7.2, §7.8; §8 accepted 2026-11-14, `docs/decisions/ana/ana-42.md`).
   `R-ORCH-15`, `R-ORCH-12`, `R-BOX-1..4`, `R-NF-2`. Migration for a `target` record (`kind`, `locator`,
   `box_id`, `status`) and `box.kind`/`parent_box_id` (relax the `os_family` CHECK for child boxes);
   `target_id` at workspace, project, workflow and item with the Settings default and an inherited-from
@@ -450,14 +433,14 @@ items it follows are done.
   MOD-158 no longer touches `workspace` and needs no coordination here. `R-NF-2` was replaced on ANA-37; this item's
   `dockerd`/`sshd` sentence was not in it, so merge that sentence into the new text rather than replace it.
 - [ ] **MOD-131 - Driven targets: ssh and docker exec launch, MCP relay tunnel, remote bootstrap**
-  (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; **proposed, pending §8**). `R-ORCH-15`, `R-AGT-11`,
+  (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; §8 accepted 2026-11-14). `R-ORCH-15`, `R-AGT-11`,
   `R-AGT-5`, `R-SEC-2`, `R-BOX-4`. The `TargetTransport` launch decorator under `TransportBuilder` for
   `ssh -T`, a docker context and `docker exec -i`; relay socket forwarding with the token as a stdin
   preamble (spike stream-local forwarding and `sun_path` length first, §9); a per-target `htui` helper
   path shipped from this box; remote probe, install and login through the channel; secrets injected into
   the exec's environment. Blocked on MOD-130 and MOD-44.
 - [ ] **MOD-132 - Target preparation and branch collection by bundle** (from ANA-42,
-  `docs/ANA-42.md` §7.5, §7.6; **proposed, pending §8**). `R-ORCH-15`, `R-SEC-5`, `R-ENT-17`.
+  `docs/ANA-42.md` §7.5, §7.6; §8 accepted 2026-11-14). `R-ORCH-15`, `R-SEC-5`, `R-ENT-17`.
   The `prepare · <target>` stage (clone with `pushurl` disabled, compose project on free ports) and the
   `collect branch` step: `git bundle create` on the target, verify, fetch into a temp ref under fsck and
   compare-and-swap, with `scripts/hr collect`'s refusals and config-path confirmation. **Amended by ANA-33
@@ -988,7 +971,7 @@ items it follows are done.
   second status line ("runs on … · workflow …") and `t` "how it runs": target (inherit or one) and
   workflow (auto or pinned). The status grouping, `h` and the state filter key on MOD-144's
   `htui_core::model::ItemState` (`ALL` is the attention order; `ItemFilter.states`); MOD-144 rekeyed the
-  facet, list, detail and graph marks, not grouping or `h`. MOD-115 is done (`docs/decisions/mod/mod-115.md`); targets beyond this box need ANA-42, workflows need MOD-124 and
+  facet, list, detail and graph marks, not grouping or `h`. MOD-115 is done (`docs/decisions/mod/mod-115.md`); targets beyond this box need MOD-130 (ANA-42 concluded, `docs/decisions/ana/ana-42.md`), workflows need MOD-124 and
   MOD-126.
   **Carried from MOD-115 (MOD-81):** cap the list width at about 160 columns so the detail takes the rest
   (the shell's `ListSize` has no maximum yet), wrap or scroll the Prompt pane (its rows end in `…` today),
@@ -1276,7 +1259,7 @@ items it follows are done.
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
+| ANA-N   | 5 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows) |
 | MOD-N   | 75 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-18 dev Postgres crash) |

@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-42](docs/decisions/ana/ana-42.md)** - Execution targets: where an item runs (concluded, 2026-11-14)
 - **[MOD-149](docs/decisions/mod/mod-149.md)** - Workspace requirements and nested keys (done, 2026-11-14)
 - **[MOD-122](docs/decisions/mod/mod-122.md)** - Activity panel and Logs tab (done, 2026-11-14)
 - **[MOD-147](docs/decisions/mod/mod-147.md)** - Workspace scope: items, kinds, documents, folder (done, 2026-11-14)

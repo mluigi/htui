@@ -13,8 +13,9 @@
 > (no agent-name keys), `R-AGT-9` (htui never holds an agent credential), `R-ID-2` (the DSN holder),
 > `R-BOX-1..3` (probe and capability tags).
 >
-> **Status (2026-10-17): drafted, awaiting maintainer acceptance of §8.** No implementation code is
-> written here. Verdict (§7): a **target is a record that points at a box and says how to reach it**;
+> **Status (2026-11-14): concluded.** The maintainer accepted all six §8 decisions as recommended on
+> 2026-11-14 (§8, "Answers"; write-up `docs/decisions/ana/ana-42.md`). Drafted 2026-10-17. No
+> implementation code is written here. Verdict (§7): a **target is a record that points at a box and says how to reach it**;
 > the engine, store writer, lease and MCP host **stay on this box** for every kind except an enrolled
 > box; only the agent process is remote, driven over stdio by a launch decorator; secrets are resolved
 > here and injected into that process's environment; the branch comes back as a **git bundle** through
@@ -318,6 +319,27 @@ needs neither. This is the amendment MOD-44 already lists as open; accepting it 
    all five kinds as the requirement?
 6. **Secrets by injection (7.4)** needs no `R-SEC-2` amendment; confirm that the server-resolution
    amendment stays with MOD-47/48.
+
+### Answers (2026-11-14)
+
+The maintainer accepted all six as recommended:
+
+1. **Accepted:** a target is a record that points at a box (7.1).
+2. **Accepted:** the executor stays on this box for the driven kinds; `target_box_id` is where the work
+   runs, `executing_box_id` who drives it. MOD-43's "a non-local target stays `queued` until its worker
+   claims it" now applies to the enrolled kind only.
+3. **Accepted:** bundle collect (7.5) is the single mechanism, ssh targets included.
+4. **Accepted:** `R-NF-2` is amended so `dockerd` and `sshd` are opt-in per target (7.8), merged into the
+   text ANA-37 replaced rather than replacing it (MOD-130 writes it). This also closes MOD-44's open
+   `R-NF-2` question.
+5. **Accepted:** this box and docker here ship first, then ssh and remote docker, then enrolled (7.7).
+6. **Accepted:** secrets by injection need no `R-SEC-2` amendment; the server-resolution amendment stays
+   with MOD-47/48.
+
+Folded in from later analyses: ANA-34 (Q9) narrows 7.5's "merging stays the person's step" to the
+`local` integration mode; after collect the coordinator integrates per the repo's mode (MOD-133).
+ANA-35 (§7.2) adds that a plain folder runs on this box only, never on a driven target, and a repo-less
+project has nothing to clone (MOD-145).
 
 ## 9. Risks and unknowns for the spawned items
 
