@@ -11,12 +11,19 @@
 //! Requirements follow (MOD-50 D226): one point per row, withdrawn ones included, rebuilt when the
 //! row's `version` differs from the point's (every amend and withdraw bumps it), and removed when
 //! the row is gone.
+//!
+//! Owner documents follow (MOD-147 M4 D5): a project's or a workspace's scope row's own documents
+//! (`item_id IS NULL`), the newest version of each kind indexed under its owner's slug. Such a
+//! row is never updated (a new version is a new row), so a newest document whose points exist is
+//! in step, one without points is built, and the points of a document no longer the newest of its
+//! kind are deleted. A workspace-scoped search reaches the scope row through
+//! [`workspace_search_scope`].
 use crate::vector::{
     ConceptPoint, DocumentRef, IndexedPoint, Owner, PointType, Subject, VectorStore,
 };
 use htui_core::model::{
-    Document, DocumentId, Item, ItemFilter, ItemId, ProjectId, Requirement, RequirementFilter,
-    RequirementId, Scope,
+    Document, DocumentId, Item, ItemFilter, ItemId, OwnerDocument, Project, ProjectId, Requirement,
+    RequirementFilter, RequirementId, Scope,
 };
 use htui_core::store::{ReadStore, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -26,7 +33,7 @@ use uuid::Uuid;
 /// tokens; 2000 characters of English prose stays under that.
 pub const MAX_CHUNK_CHARS: usize = 2000;
 
-/// Most requirement points written in one upsert.
+/// Most requirement or owner-document points written in one upsert.
 const UPSERT_BATCH: usize = 256;
 
 /// What one [`Indexer::sync`] did.
@@ -78,10 +85,12 @@ impl Indexer {
             let items = read.items(&one, &ItemFilter::default()).await?;
             let mut indexed: HashMap<ItemId, Vec<IndexedPoint>> = HashMap::new();
             let mut requirement_points: HashMap<RequirementId, Vec<IndexedPoint>> = HashMap::new();
+            let mut owner_points: HashMap<DocumentId, Vec<IndexedPoint>> = HashMap::new();
             for point in store.indexed(project).await? {
                 match point.owner {
                     Owner::Item(id) => indexed.entry(id).or_default().push(point),
                     Owner::Requirement(id) => requirement_points.entry(id).or_default().push(point),
+                    Owner::Document(id) => owner_points.entry(id).or_default().push(point),
                 }
             }
 
@@ -122,6 +131,8 @@ impl Indexer {
             }
 
             report += sync_requirements(read, project, requirement_points, store).await?;
+            // MOD-147 M4 D5: before the item orphans go, and never among them.
+            report += sync_owner_documents(read, project, owner_points, store).await?;
 
             let orphans: Vec<Uuid> = indexed.into_values().flatten().map(|p| p.id).collect();
             report.points_deleted += orphans.len();
@@ -170,6 +181,72 @@ async fn sync_requirements(
     }
     store.delete(stale).await?;
     Ok(report)
+}
+
+/// The owner-document half of one project's sync (MOD-147 M4 D5): one listing, the newest version
+/// of each kind built when it has no points yet, and the points of every other document deleted.
+/// An owner document is never updated, so points under a newest document's ID are in step. When
+/// a document is to be built and the owner row is gone, nothing is written for the project.
+async fn sync_owner_documents(
+    read: &impl ReadStore,
+    project: ProjectId,
+    mut indexed: HashMap<DocumentId, Vec<IndexedPoint>>,
+    store: &impl VectorStore,
+) -> Result<SyncReport, StoreError> {
+    let mut report = SyncReport::default();
+    let mut latest: BTreeMap<String, OwnerDocument> = BTreeMap::new();
+    for row in read.owner_documents(project).await? {
+        match latest.get(&row.kind) {
+            Some(newest) if newest.version >= row.version => {}
+            _ => {
+                latest.insert(row.kind.clone(), row);
+            }
+        }
+    }
+    let build: Vec<OwnerDocument> = latest
+        .into_values()
+        .filter(|doc| indexed.remove(&doc.id).is_none())
+        .collect();
+    let mut points = Vec::new();
+    if !build.is_empty() {
+        let Some(owner) = read.project(project).await? else {
+            return Ok(report); // gone since the listing; the next sync drops its points
+        };
+        for doc in &build {
+            points.extend(owner_document_points(&owner, doc));
+        }
+    }
+    let stale: Vec<Uuid> = indexed.into_values().flatten().map(|p| p.id).collect();
+    report.points_upserted += points.len();
+    report.points_deleted += stale.len();
+    for batch in points.chunks(UPSERT_BATCH) {
+        store.upsert(batch.to_vec()).await?;
+    }
+    store.delete(stale).await?;
+    Ok(report)
+}
+
+/// MOD-147 M4 D6: the scope a workspace-scoped search and index cover: `scope` with the
+/// workspace's scope row first ([`Scope::with_scope_row`]), so the workspace's own `WS` items and
+/// documents are found beside its members'. `scope` as it is for the nil startup workspace (no
+/// lookup), a workspace with no scope row, and a failed lookup, which is logged: a refused lookup
+/// costs the workspace's own row, not the search.
+pub async fn workspace_search_scope(read: &impl ReadStore, scope: &Scope) -> Scope {
+    if scope.workspace_id.as_uuid().is_nil() {
+        return scope.clone();
+    }
+    match read.scope_project(scope.workspace_id).await {
+        Ok(Some(row)) => scope.with_scope_row(row),
+        Ok(None) => scope.clone(),
+        Err(error) => {
+            tracing::warn!(
+                workspace = %scope.workspace_id,
+                %error,
+                "search: the workspace's scope-row lookup failed; searching its members alone"
+            );
+            scope.clone()
+        }
+    }
 }
 
 /// The ID of the latest version of each document kind the item has.
@@ -259,6 +336,36 @@ pub fn document_points(item: &Item, doc: &Document) -> Vec<ConceptPoint> {
         .collect()
 }
 
+/// One point per section of an owner document (MOD-147 M4 D4), each prefixed with the owner's
+/// slug and the document's title and kind, as [`document_points`] does with an item's key. The
+/// key is the slug (`htui`, or `@platform` for a workspace's scope row), the time the row's
+/// `created_at`. An empty body gives one point.
+#[must_use]
+pub fn owner_document_points(owner: &Project, doc: &OwnerDocument) -> Vec<ConceptPoint> {
+    let heading = format!("{} {} ({})", owner.slug, doc.title, doc.kind);
+    let mut sections = chunk_markdown(&doc.body, MAX_CHUNK_CHARS);
+    if sections.is_empty() {
+        sections.push(String::new());
+    }
+    sections
+        .into_iter()
+        .enumerate()
+        .map(|(chunk, section)| ConceptPoint {
+            subject: Subject::OwnerDocument { id: doc.id },
+            key: owner.slug.clone(),
+            project_id: doc.project_id,
+            updated_at: doc.created_at,
+            document: Some(DocumentRef {
+                id: doc.id,
+                kind: doc.kind.clone(),
+                version: doc.version,
+                chunk: u32::try_from(chunk).unwrap_or(u32::MAX),
+            }),
+            text: format!("{heading}\n\n{section}").trim_end().to_owned(),
+        })
+        .collect()
+}
+
 /// Splits markdown at `#` and `##` headings, then splits any section longer than `max` characters
 /// at line boundaries (a single longer line is kept whole rather than cut mid-word). Blank
 /// sections are dropped.
@@ -289,11 +396,13 @@ pub fn chunk_markdown(text: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::MemVectorStore;
+    use crate::vector::{MemVectorStore, SearchQuery};
     use chrono::Utc;
     use htui_core::fixtures::ids;
+    use htui_core::model::document::GOALS_KIND;
     use htui_core::model::{
-        ItemPatch, NewDocument, RequirementPatch, RequirementState, Resolution, Status,
+        ItemPatch, NewDocument, NewItem, NewOwnerDocument, RequirementPatch, RequirementState,
+        Resolution, Status, WorkspaceId,
     };
     use htui_core::store::{MemStore, WriteStore};
 
@@ -630,6 +739,294 @@ mod tests {
         let report = Indexer::sync(&read, &s, &store).await.unwrap();
         assert_eq!(report.points_deleted, 1);
         assert!(store.points().iter().all(|p| p.id() != ghost.id()));
+    }
+
+    async fn write_owner_document(
+        read: &MemStore,
+        project: ProjectId,
+        kind: &str,
+        title: &str,
+        body: &str,
+    ) -> OwnerDocument {
+        read.write_owner_document(NewOwnerDocument {
+            id: DocumentId::new(),
+            project_id: project,
+            kind: kind.into(),
+            title: title.into(),
+            body: body.into(),
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap()
+    }
+
+    fn owner_document_points(store: &MemVectorStore) -> Vec<ConceptPoint> {
+        store
+            .points()
+            .into_iter()
+            .filter(|p| matches!(p.subject, Subject::OwnerDocument { .. }))
+            .collect()
+    }
+
+    fn indexed_documents(points: &[ConceptPoint]) -> BTreeSet<DocumentId> {
+        points
+            .iter()
+            .filter_map(|p| p.document.as_ref().map(|d| d.id))
+            .collect()
+    }
+
+    /// MOD-147 M4 D4, D5: each kind's newest version only, keyed by the owner's slug, headed
+    /// `"{slug} {title} ({kind})"`; an empty body is one point.
+    #[tokio::test]
+    async fn the_first_sync_indexes_each_kinds_newest_owner_document_keyed_by_the_slug() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        assert!(
+            read.owner_documents(ids::PROJECT_HTUI)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the demo htui project owns no document"
+        );
+        let p = ids::PROJECT_HTUI;
+        let v1 = write_owner_document(&read, p, GOALS_KIND, "Goals", "## Aim\nfirst").await;
+        let v2 = write_owner_document(
+            &read,
+            p,
+            GOALS_KIND,
+            "Goals",
+            "## Aim\nsecond\n## Next\nmore",
+        )
+        .await;
+        let notes = write_owner_document(&read, p, "notes", "Notes", "").await;
+        let report = Indexer::sync(&read, &scope(vec![p]), &store).await.unwrap();
+
+        let points = owner_document_points(&store);
+        assert_eq!(
+            indexed_documents(&points),
+            BTreeSet::from([v2.id, notes.id])
+        );
+        assert!(!indexed_documents(&points).contains(&v1.id));
+        assert_eq!(points.len(), 3, "two goals sections, one empty notes point");
+        let slug = read.project(p).await.unwrap().unwrap().slug;
+        for point in &points {
+            let doc = point
+                .document
+                .as_ref()
+                .expect("an owner document is a document point");
+            assert_eq!(point.key, slug);
+            assert_eq!(point.project_id, p);
+            assert_eq!(point.point_type(), PointType::Document);
+            assert_eq!(point.subject.owner(), Owner::Document(doc.id));
+            assert_eq!(
+                point.id(),
+                crate::vector::document_point_id(doc.id, doc.chunk)
+            );
+        }
+        let goals = points
+            .iter()
+            .find(|q| {
+                q.document
+                    .as_ref()
+                    .is_some_and(|d| d.id == v2.id && d.chunk == 0)
+            })
+            .unwrap();
+        assert_eq!(
+            goals.text,
+            format!("{slug} Goals (goals)\n\n## Aim\nsecond")
+        );
+        assert_eq!(goals.updated_at, v2.created_at);
+        assert_eq!(goals.document.as_ref().unwrap().version, 2);
+        let empty = points
+            .iter()
+            .find(|q| q.document.as_ref().is_some_and(|d| d.id == notes.id))
+            .unwrap();
+        assert_eq!(empty.text, format!("{slug} Notes (notes)"));
+        assert_eq!(report.points_upserted, store.points().len());
+    }
+
+    /// MOD-147 M4 D5: an owner document in step is neither rewritten nor deleted.
+    #[tokio::test]
+    async fn a_second_sync_writes_and_deletes_no_owner_document_point() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        write_owner_document(
+            &read,
+            ids::PROJECT_HTUI,
+            GOALS_KIND,
+            "Goals",
+            "## Aim\nship",
+        )
+        .await;
+        Indexer::sync(&read, &s, &store).await.unwrap();
+        let before = store.upserted();
+        let report = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(report.points_upserted, 0);
+        assert_eq!(report.points_deleted, 0);
+        assert_eq!(store.upserted(), before);
+        assert_eq!(owner_document_points(&store).len(), 1);
+    }
+
+    /// MOD-147 M4 D5: a new version's points replace the old version's.
+    #[tokio::test]
+    async fn a_new_owner_document_version_replaces_the_old_ones_points() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        let p = ids::PROJECT_HTUI;
+        let old = write_owner_document(&read, p, GOALS_KIND, "Goals", "## A\none\n## B\ntwo").await;
+        Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(owner_document_points(&store).len(), 2);
+        let new = write_owner_document(&read, p, GOALS_KIND, "Goals", "## A\nrewritten").await;
+        let report = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(report.items_rebuilt, 0);
+        assert_eq!(report.points_upserted, 1, "the new version's one section");
+        assert_eq!(report.points_deleted, 2, "the old version's two sections");
+        let points = owner_document_points(&store);
+        assert_eq!(indexed_documents(&points), BTreeSet::from([new.id]));
+        assert!(!indexed_documents(&points).contains(&old.id));
+    }
+
+    /// MOD-147 M4 D5: the item pass never takes an owner-document point for an item orphan.
+    #[tokio::test]
+    async fn an_item_sync_leaves_owner_document_points_alone() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        write_owner_document(
+            &read,
+            ids::PROJECT_HTUI,
+            GOALS_KIND,
+            "Goals",
+            "## Aim\nship",
+        )
+        .await;
+        Indexer::sync(&read, &s, &store).await.unwrap();
+        let owned = owner_document_points(&store);
+        let item = item_with_documents(&read).await;
+        read.update_item(
+            item.id,
+            item.version,
+            ItemPatch {
+                body: Some("an edit beside an owner document".into()),
+                author_id: ids::USER,
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+        let report = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(report.items_rebuilt, 1);
+        assert_eq!(report.points_deleted, 0);
+        assert_eq!(owner_document_points(&store), owned);
+    }
+
+    fn search(projects: &[ProjectId], text: &str) -> SearchQuery {
+        SearchQuery {
+            text: text.into(),
+            projects: projects.to_vec(),
+            types: vec![],
+            statuses: vec![],
+            resolutions: vec![],
+            limit: 100,
+        }
+    }
+
+    /// MOD-147 M4 D6: syncing the Platform workspace's search scope indexes its scope row's `WS`
+    /// items and its goals document, which a search of the widened projects finds and one of the
+    /// members alone does not.
+    #[tokio::test]
+    async fn a_sync_over_the_workspace_search_scope_indexes_the_scope_row() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let ws = read
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_SCOPE_PLATFORM,
+                kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+                title: "Cross-project zircon search".into(),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .unwrap();
+        let goals = write_owner_document(
+            &read,
+            ids::PROJECT_SCOPE_PLATFORM,
+            GOALS_KIND,
+            "Goals",
+            "## Aim\none zircon search for the platform",
+        )
+        .await;
+        let members = scope(vec![ids::PROJECT_HTUI, ids::PROJECT_AGY]);
+        let wide = workspace_search_scope(&read, &members).await;
+        Indexer::sync(&read, &wide, &store).await.unwrap();
+
+        let points = store.points();
+        assert!(
+            points
+                .iter()
+                .any(|p| item_of(p) == Some(ws.id) && p.key == ws.key && ws.key.starts_with("WS-")),
+            "the scope row's WS item"
+        );
+        let goal = points
+            .iter()
+            .find(|p| p.subject.owner() == Owner::Document(goals.id))
+            .expect("the workspace's goals document");
+        assert_eq!(goal.key, "@platform");
+        assert_eq!(goal.project_id, ids::PROJECT_SCOPE_PLATFORM);
+
+        let found = |hits: &[crate::vector::Hit]| {
+            (
+                hits.iter().any(|h| h.owner == Owner::Item(ws.id)),
+                hits.iter().any(|h| h.owner == Owner::Document(goals.id)),
+            )
+        };
+        let wide_hits = store
+            .search(&search(&wide.project_ids, "zircon"))
+            .await
+            .unwrap();
+        assert_eq!(found(&wide_hits), (true, true));
+        let member_hits = store
+            .search(&search(&members.project_ids, "zircon"))
+            .await
+            .unwrap();
+        assert_eq!(found(&member_hits), (false, false));
+    }
+
+    /// MOD-147 M4 D6: the scope row goes first; a nil workspace and one without a scope row keep
+    /// the scope as asked.
+    #[tokio::test]
+    async fn the_workspace_search_scope_puts_the_scope_row_first_or_keeps_the_scope() {
+        let read = MemStore::demo();
+        let members = scope(vec![ids::PROJECT_HTUI, ids::PROJECT_AGY]);
+        let wide = workspace_search_scope(&read, &members).await;
+        assert_eq!(
+            wide.project_ids,
+            [
+                ids::PROJECT_SCOPE_PLATFORM,
+                ids::PROJECT_HTUI,
+                ids::PROJECT_AGY
+            ]
+        );
+        assert_eq!(wide.workspace_id, members.workspace_id);
+        let nil = Scope {
+            workspace_id: WorkspaceId::from_uuid(Uuid::nil()),
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        assert_eq!(workspace_search_scope(&read, &nil).await, nil);
+        let rowless = Scope {
+            workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(0xdead)),
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        assert_eq!(workspace_search_scope(&read, &rowless).await, rowless);
     }
 
     #[tokio::test]

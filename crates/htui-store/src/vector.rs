@@ -2,8 +2,9 @@
 //! term at once (MOD-34, `R-STO-8`, `docs/ANA-19.md` §3.3, `docs/ANA-20.md` §3).
 //!
 //! One collection holds every project (ANA-20 §3.4); the tenant is `project_id`, and a point's
-//! `type` says what it indexes: an item, a section of one of its documents, or a requirement
-//! (MOD-50). Postgres stays the source of truth (`R-STO-1`): every point can be rebuilt from an
+//! `type` says what it indexes: an item, a section of one of its documents, a requirement
+//! (MOD-50), or a section of a project's or a workspace's own document (MOD-147 M4). Postgres
+//! stays the source of truth (`R-STO-1`): every point can be rebuilt from an
 //! item, document or requirement row, and [`crate::vector_sync::Indexer`] is what keeps the two in
 //! step. Qdrant errors are [`StoreError::Backend`], never [`StoreError::Unreachable`], so
 //! nothing that reads the latter as "Postgres went away" can mistake a down vector store for it.
@@ -47,10 +48,11 @@ pub const SPARSE: &str = "sparse";
 pub const EMBEDDER_KEY: &str = "embedder";
 /// The collection metadata key the payload layout's version is stored under (MOD-144 Decision B).
 pub const PAYLOAD_SCHEMA_KEY: &str = "payload_schema";
-/// The payload layout this htui writes. 2: MOD-144's three-value `status`. Bump it with any change
-/// to what a point's payload means; a collection stamped with an older one (or none) is dropped,
-/// recreated and refilled by the next `Indexer::sync`; one stamped with a newer one is refused.
-pub const PAYLOAD_SCHEMA: u64 = 2;
+/// The payload layout this htui writes. 2: MOD-144's three-value `status`. 3: MOD-147 M4's
+/// owner-document points. Bump it with any change to what a point's payload means; a collection
+/// stamped with an older one (or none) is dropped, recreated and refilled by the next
+/// `Indexer::sync`; one stamped with a newer one is refused.
+pub const PAYLOAD_SCHEMA: u64 = 3;
 /// How the message of every refusal of an existing collection begins, before `: ` and what is
 /// wrong with which collection and how to rebuild it (MOD-68 D8, review L3). The one spelling
 /// [`is_embedder_mismatch`] reads.
@@ -95,7 +97,8 @@ const VERSION: &str = "version";
 pub enum PointType {
     /// An item's key, title and body.
     Item,
-    /// One section of an item's latest document of some kind.
+    /// One section of the latest document of some kind of an item, or of a project or a
+    /// workspace's scope row (MOD-147 M4 D1).
     Document,
     /// A requirement's key, body and rationale (MOD-50).
     Requirement,
@@ -150,6 +153,13 @@ pub enum Subject {
         /// `requirement.version`, what the indexer compares (MOD-50 D226).
         version: i32,
     },
+    /// A document a project or a workspace's scope row owns (`item_id IS NULL`, MOD-147 M4 D1):
+    /// no status, resolution, state or version. Its row is never updated, so its ID is all the
+    /// indexer compares.
+    OwnerDocument {
+        /// `document.id`.
+        id: DocumentId,
+    },
 }
 
 impl Subject {
@@ -159,42 +169,44 @@ impl Subject {
         match self {
             Self::Item { id, .. } => Owner::Item(*id),
             Self::Requirement { id, .. } => Owner::Requirement(*id),
+            Self::OwnerDocument { id } => Owner::Document(*id),
         }
     }
 
-    /// The item's status; `None` for a requirement.
+    /// The item's status; `None` for a requirement and an owner document.
     #[must_use]
     pub const fn status(&self) -> Option<Status> {
         match self {
             Self::Item { status, .. } => Some(*status),
-            Self::Requirement { .. } => None,
+            Self::Requirement { .. } | Self::OwnerDocument { .. } => None,
         }
     }
 
-    /// The item's resolution; `None` for an item that is not closed and for a requirement.
+    /// The item's resolution; `None` for an item that is not closed, a requirement and an owner
+    /// document.
     #[must_use]
     pub const fn resolution(&self) -> Option<Resolution> {
         match self {
             Self::Item { resolution, .. } => *resolution,
-            Self::Requirement { .. } => None,
+            Self::Requirement { .. } | Self::OwnerDocument { .. } => None,
         }
     }
 
-    /// The requirement's state; `None` for an item.
+    /// The requirement's state; `None` for an item and an owner document.
     #[must_use]
     pub const fn state(&self) -> Option<RequirementState> {
         match self {
             Self::Requirement { state, .. } => Some(*state),
-            Self::Item { .. } => None,
+            Self::Item { .. } | Self::OwnerDocument { .. } => None,
         }
     }
 
-    /// The requirement's version; `None` for an item.
+    /// The requirement's version; `None` for an item and an owner document.
     #[must_use]
     pub const fn version(&self) -> Option<i32> {
         match self {
             Self::Requirement { version, .. } => Some(*version),
-            Self::Item { .. } => None,
+            Self::Item { .. } | Self::OwnerDocument { .. } => None,
         }
     }
 }
@@ -206,6 +218,9 @@ pub enum Owner {
     Item(ItemId),
     /// A requirement.
     Requirement(RequirementId),
+    /// A project's or a workspace's own document (MOD-147 M4 D1, ANA-35 §7.5): it belongs to no
+    /// item, so the document is its own owner.
+    Document(DocumentId),
 }
 
 impl Owner {
@@ -214,7 +229,7 @@ impl Owner {
     pub const fn item(self) -> Option<ItemId> {
         match self {
             Self::Item(id) => Some(id),
-            Self::Requirement(_) => None,
+            Self::Requirement(_) | Self::Document(_) => None,
         }
     }
 
@@ -223,7 +238,16 @@ impl Owner {
     pub const fn requirement(self) -> Option<RequirementId> {
         match self {
             Self::Requirement(id) => Some(id),
-            Self::Item(_) => None,
+            Self::Item(_) | Self::Document(_) => None,
+        }
+    }
+
+    /// The owner document, when the owner is one (MOD-147 M4 D1).
+    #[must_use]
+    pub const fn document(self) -> Option<DocumentId> {
+        match self {
+            Self::Document(id) => Some(id),
+            Self::Item(_) | Self::Requirement(_) => None,
         }
     }
 }
@@ -244,39 +268,49 @@ pub struct DocumentRef {
 /// One point to write: the text to embed plus what the payload says about it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConceptPoint {
-    /// The item or requirement the point was built from.
+    /// The item, requirement or owner document the point was built from.
     pub subject: Subject,
-    /// The item's or the requirement's key, e.g. `MOD-34` or `R-STO-8`.
+    /// The item's or the requirement's key, e.g. `MOD-34` or `R-STO-8`; on an owner document,
+    /// the owning project's slug, e.g. `htui` or `@platform` (MOD-147 M4 D4).
     pub key: String,
     /// The row's project.
     pub project_id: ProjectId,
-    /// The row's `updated_at` when this point was built.
+    /// The row's `updated_at` when this point was built; an owner document's `created_at`.
     pub updated_at: DateTime<Utc>,
-    /// Set on document points, which only an item has.
+    /// Set on document points: an item's documents and every owner-document point. Never on a
+    /// requirement's.
     pub document: Option<DocumentRef>,
     /// The text embedded, dense and sparse.
     pub text: String,
 }
 
 impl ConceptPoint {
-    /// What the point indexes: a requirement, a document section, or an item.
+    /// What the point indexes: a requirement, a document section (an item's or an owner's), or an
+    /// item.
     #[must_use]
     pub const fn point_type(&self) -> PointType {
         match (&self.subject, &self.document) {
             (Subject::Requirement { .. }, _) => PointType::Requirement,
-            (Subject::Item { .. }, Some(_)) => PointType::Document,
+            (Subject::Item { .. }, Some(_)) | (Subject::OwnerDocument { .. }, _) => {
+                PointType::Document
+            }
             (Subject::Item { .. }, None) => PointType::Item,
         }
     }
 
     /// The point's ID: the item's UUID for an item point; for a document section, a UUID (version
-    /// 8) derived from SHA-256 of the document ID and section number; for a requirement, one
-    /// derived the same way from its ID. All stable forever.
+    /// 8) derived from SHA-256 of the document ID and section number, the same derivation for an
+    /// item's document and an owner document (MOD-147 M4 D1); for a requirement, one derived the
+    /// same way from its ID. All stable forever.
     #[must_use]
     pub fn id(&self) -> Uuid {
         match (&self.subject, &self.document) {
             (Subject::Requirement { id, .. }, _) => requirement_point_id(*id),
-            (Subject::Item { .. }, Some(doc)) => document_point_id(doc.id, doc.chunk),
+            (Subject::Item { .. } | Subject::OwnerDocument { .. }, Some(doc)) => {
+                document_point_id(doc.id, doc.chunk)
+            }
+            // Never built (`owner_document_points` always sets `document`): its first section.
+            (Subject::OwnerDocument { id }, None) => document_point_id(*id, 0),
             (Subject::Item { id, .. }, None) => id.0,
         }
     }
@@ -313,12 +347,13 @@ pub struct IndexedPoint {
     pub id: Uuid,
     /// Item, document section or requirement.
     pub point_type: PointType,
-    /// The item or requirement it belongs to.
+    /// The item, requirement or owner document it belongs to.
     pub owner: Owner,
     /// The row's `updated_at` when the point was built.
     pub updated_at: DateTime<Utc>,
-    /// The item's status when the point was built, on item and document points. Compared on its
-    /// own because a status move (`WriteStore::transition`) does not touch `updated_at`.
+    /// The item's status when the point was built, on item points and an item's document points;
+    /// `None` on an owner document's. Compared on its own because a status move
+    /// (`WriteStore::transition`) does not touch `updated_at`.
     pub status: Option<Status>,
     /// The requirement's version when the point was built, on requirement points.
     pub version: Option<i32>,
@@ -364,9 +399,9 @@ pub enum SearchArms {
 pub struct Hit {
     /// Item, document section or requirement.
     pub point_type: PointType,
-    /// The item or requirement.
+    /// The item, the requirement, or the owner document itself (MOD-147 M4).
     pub owner: Owner,
-    /// The item's or the requirement's key.
+    /// The item's or the requirement's key; the owning project's slug on an owner document.
     pub key: String,
     /// The document and its kind, on document hits.
     pub document: Option<(DocumentId, String)>,
@@ -592,12 +627,18 @@ fn payload(point: &ConceptPoint) -> HashMap<String, Value> {
             if let Some(r) = resolution {
                 p.insert(RESOLUTION.to_owned(), Value::from(r.as_str()));
             }
-            // Only an item has documents; a requirement point never writes these keys.
+            // An item's documents and owner documents write these keys; a requirement point never
+            // does.
             if let Some(doc) = &point.document {
-                p.insert(DOCUMENT_ID.to_owned(), Value::from(doc.id.0.to_string()));
-                p.insert(DOC_KIND.to_owned(), Value::from(doc.kind.clone()));
-                p.insert(DOC_VERSION.to_owned(), Value::from(i64::from(doc.version)));
-                p.insert(CHUNK.to_owned(), Value::from(i64::from(doc.chunk)));
+                insert_document(&mut p, doc);
+            }
+        }
+        // MOD-147 M4 D2: the document, and no item: no `item_id`, `kind_id`, `status` or
+        // `resolution`, so a status or resolution filter leaves it out as it does a requirement.
+        Subject::OwnerDocument { id } => {
+            p.insert(DOCUMENT_ID.to_owned(), Value::from(id.0.to_string()));
+            if let Some(doc) = &point.document {
+                insert_document(&mut p, doc);
             }
         }
         Subject::Requirement {
@@ -617,6 +658,14 @@ fn payload(point: &ConceptPoint) -> HashMap<String, Value> {
     p
 }
 
+/// A document point's own keys: which document, its kind and version, and the section.
+fn insert_document(p: &mut HashMap<String, Value>, doc: &DocumentRef) {
+    p.insert(DOCUMENT_ID.to_owned(), Value::from(doc.id.0.to_string()));
+    p.insert(DOC_KIND.to_owned(), Value::from(doc.kind.clone()));
+    p.insert(DOC_VERSION.to_owned(), Value::from(i64::from(doc.version)));
+    p.insert(CHUNK.to_owned(), Value::from(i64::from(doc.chunk)));
+}
+
 fn text_of<'a>(payload: &'a HashMap<String, Value>, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(Value::as_str).map(String::as_str)
 }
@@ -632,14 +681,20 @@ fn point_uuid(id: Option<&PointId>) -> Option<Uuid> {
     }
 }
 
-/// The owner a payload names, by its type: a requirement point names a requirement, every other
-/// point an item.
+/// The owner a payload names, by its type: a requirement point names a requirement, an item point
+/// an item, and a document point its item when it has an `item_id`, else the document itself
+/// (MOD-147 M4 D2: a project's or a workspace's own document).
 fn owner_of(point_type: PointType, payload: &HashMap<String, Value>) -> Option<Owner> {
     Some(match point_type {
         PointType::Requirement => {
             Owner::Requirement(RequirementId(uuid_of(payload, REQUIREMENT_ID)?))
         }
-        PointType::Item | PointType::Document => Owner::Item(ItemId(uuid_of(payload, ITEM_ID)?)),
+        PointType::Item => Owner::Item(ItemId(uuid_of(payload, ITEM_ID)?)),
+        PointType::Document => match uuid_of(payload, ITEM_ID) {
+            Some(item) => Owner::Item(ItemId(item)),
+            None if payload.contains_key(ITEM_ID) => return None,
+            None => Owner::Document(DocumentId(uuid_of(payload, DOCUMENT_ID)?)),
+        },
     })
 }
 
@@ -649,17 +704,20 @@ fn parsed<T: FromStr>(payload: &HashMap<String, Value>, key: &str) -> Option<T> 
 
 fn indexed_point(id: Option<&PointId>, payload: &HashMap<String, Value>) -> Option<IndexedPoint> {
     let point_type = PointType::parse(text_of(payload, TYPE)?)?;
-    let (status, version) = match point_type {
-        PointType::Requirement => (
+    let owner = owner_of(point_type, payload)?;
+    // An item's points carry its status; an owner document has none (MOD-147 M4 D2).
+    let (status, version) = match owner {
+        Owner::Requirement(_) => (
             None,
             Some(i32::try_from(payload.get(VERSION)?.as_integer()?).ok()?),
         ),
-        PointType::Item | PointType::Document => (Some(parsed(payload, STATUS)?), None),
+        Owner::Item(_) => (Some(parsed(payload, STATUS)?), None),
+        Owner::Document(_) => (None, None),
     };
     Some(IndexedPoint {
         id: point_uuid(id)?,
         point_type,
-        owner: owner_of(point_type, payload)?,
+        owner,
         updated_at: DateTime::parse_from_rfc3339(text_of(payload, UPDATED_AT)?)
             .ok()?
             .with_timezone(&Utc),
@@ -1810,6 +1868,147 @@ mod tests {
         };
         let hits = store.search(&closed).await.unwrap();
         assert!(hits.iter().all(|h| h.point_type != PointType::Requirement));
+    }
+
+    /// MOD-147 M4: the Platform workspace's `goals` document, owned by its scope row.
+    fn owner_doc(chunk: u32) -> ConceptPoint {
+        ConceptPoint {
+            subject: Subject::OwnerDocument {
+                id: DocumentId(Uuid::from_u128(6)),
+            },
+            key: "@platform".into(),
+            project_id: ProjectId(Uuid::from_u128(2)),
+            updated_at: at(),
+            document: Some(DocumentRef {
+                id: DocumentId(Uuid::from_u128(6)),
+                kind: "goals".into(),
+                version: 2,
+                chunk,
+            }),
+            text: "@platform Goals (goals)\n\nship qdrant search".into(),
+        }
+    }
+
+    /// MOD-147 M4 D2: an owner document's payload names the document and its owner's slug, and no
+    /// item: no `item_id`, `kind_id`, `status` or `resolution`.
+    #[test]
+    fn an_owner_document_payload_names_the_document_and_no_item() {
+        let payload = payload(&owner_doc(1));
+        assert_eq!(text_of(&payload, TYPE), Some("document"));
+        assert_eq!(text_of(&payload, KEY), Some("@platform"));
+        assert_eq!(
+            text_of(&payload, PROJECT_ID),
+            Some(Uuid::from_u128(2).to_string().as_str())
+        );
+        assert_eq!(
+            text_of(&payload, DOCUMENT_ID),
+            Some(Uuid::from_u128(6).to_string().as_str())
+        );
+        assert_eq!(text_of(&payload, DOC_KIND), Some("goals"));
+        assert_eq!(
+            payload.get(DOC_VERSION).and_then(Value::as_integer),
+            Some(2)
+        );
+        assert_eq!(payload.get(CHUNK).and_then(Value::as_integer), Some(1));
+        for absent in [ITEM_ID, KIND_ID, STATUS, RESOLUTION, REQUIREMENT_ID] {
+            assert!(!payload.contains_key(absent), "{absent} is absent");
+        }
+    }
+
+    /// MOD-147 M4 D2: the payload reads back as the document's own owner, with no status.
+    #[test]
+    fn an_owner_document_payload_round_trips_to_an_indexed_point_and_a_hit() {
+        let p = owner_doc(0);
+        let id = DocumentId(Uuid::from_u128(6));
+        let payload = payload(&p);
+        let point_id = PointId::from(p.id().to_string());
+        let indexed = indexed_point(Some(&point_id), &payload).unwrap();
+        assert_eq!(indexed.id, p.id());
+        assert_eq!(indexed.point_type, PointType::Document);
+        assert_eq!(indexed.owner, Owner::Document(id));
+        assert_eq!(indexed.updated_at, at());
+        assert_eq!(indexed.status, None);
+        assert_eq!(indexed.version, None);
+        assert_eq!(indexed.document_id, Some(id));
+        let h = hit(&payload, 0.5).unwrap();
+        assert_eq!(h.point_type, PointType::Document);
+        assert_eq!(h.owner, Owner::Document(id));
+        assert_eq!(h.key, "@platform");
+        assert_eq!(h.document, Some((id, "goals".into())));
+        assert_eq!(h.resolution, None);
+        assert_eq!(h.state, None);
+    }
+
+    /// MOD-147 M4 D1: a document point, under the ID an item's document section would get.
+    #[test]
+    fn an_owner_document_point_is_a_document_point_owned_by_the_document() {
+        let id = DocumentId(Uuid::from_u128(6));
+        let p = owner_doc(2);
+        assert_eq!(p.point_type(), PointType::Document);
+        assert_eq!(p.id(), document_point_id(id, 2));
+        let owner = p.subject.owner();
+        assert_eq!(owner, Owner::Document(id));
+        assert_eq!(owner.document(), Some(id));
+        assert_eq!(owner.item(), None);
+        assert_eq!(owner.requirement(), None);
+        assert_eq!(Owner::Item(ItemId(Uuid::from_u128(1))).document(), None);
+        assert_eq!(p.subject.status(), None);
+        assert_eq!(p.subject.resolution(), None);
+        assert_eq!(p.subject.state(), None);
+        assert_eq!(p.subject.version(), None);
+    }
+
+    /// MOD-147 M4 D2: an item's document keeps its item as owner, from the payload too.
+    #[test]
+    fn an_item_document_still_parses_as_its_item() {
+        let p = point(Some(doc(0)));
+        let payload = payload(&p);
+        let item = Owner::Item(ItemId(Uuid::from_u128(1)));
+        let point_id = PointId::from(p.id().to_string());
+        assert_eq!(
+            indexed_point(Some(&point_id), &payload).unwrap().owner,
+            item
+        );
+        assert_eq!(hit(&payload, 0.5).unwrap().owner, item);
+    }
+
+    /// MOD-147 M4 D2: a status or resolution filter leaves an owner document out, as it leaves out
+    /// a requirement; a `Document` type filter keeps it.
+    #[tokio::test]
+    async fn mem_store_filters_leave_out_an_owner_document_unless_by_type() {
+        let store = MemVectorStore::new();
+        store
+            .upsert(vec![point(None), open_item(), owner_doc(0)])
+            .await
+            .unwrap();
+        let owned = |hits: &[Hit]| {
+            hits.iter()
+                .any(|h| h.owner == Owner::Document(DocumentId(Uuid::from_u128(6))))
+        };
+        assert!(owned(&store.search(&scoped("qdrant")).await.unwrap()));
+        let statuses = SearchQuery {
+            statuses: vec![Status::Closed, Status::Open],
+            ..scoped("qdrant")
+        };
+        let hits = store.search(&statuses).await.unwrap();
+        assert_eq!(hits.len(), 2, "both items, {hits:?}");
+        assert!(!owned(&hits));
+        let resolutions = SearchQuery {
+            resolutions: vec![Resolution::Rejected],
+            ..scoped("qdrant")
+        };
+        assert!(!owned(&store.search(&resolutions).await.unwrap()));
+        let documents = SearchQuery {
+            types: vec![PointType::Document],
+            ..scoped("qdrant")
+        };
+        let hits = store.search(&documents).await.unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(owned(&hits));
+        assert_eq!(
+            hits[0].document,
+            Some((DocumentId(Uuid::from_u128(6)), "goals".into()))
+        );
     }
 
     const C: &str = "htui_concepts_v2";
