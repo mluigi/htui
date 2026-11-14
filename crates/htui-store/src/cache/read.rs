@@ -237,20 +237,28 @@ const ITEM_SELECT: &str = "i.id, i.project_id, i.kind_id, i.key_prefix, i.key_nu
 const LATEST_OF_I: &str = "(SELECT r.status FROM run r WHERE r.item_id = i.id AND r.kind = 'graph' \
      AND r.status <> 'cancelled' ORDER BY r.queued_at DESC, r.id DESC LIMIT 1)";
 
-/// [`LATEST_OF_I`] for a `blocked_by` target aliased `t`.
-const LATEST_OF_T: &str = "(SELECT tr.status FROM run tr WHERE tr.item_id = t.id \
+/// The **id** of the latest graph run of a `blocked_by` target aliased `t` ([`LATEST_OF_I`]'s
+/// order, `cancelled` skipped), `NULL` when none.
+const LATEST_ID_OF_T: &str = "(SELECT tr.id FROM run tr WHERE tr.item_id = t.id \
      AND tr.kind = 'graph' AND tr.status <> 'cancelled' \
      ORDER BY tr.queued_at DESC, tr.id DESC LIMIT 1)";
 
 /// MOD-144's readiness of the item aliased `i`, as `1`/`0`: `open`, no non-cancelled graph run,
-/// and every `blocked_by` target released (`closed`, or its latest graph run `done`). No
-/// `deleted_at`: a tombstone is already gone from the mirror; `IS NOT` is SQLite's null-safe `<>`.
+/// and every `blocked_by` target released. No `deleted_at`: a tombstone is already gone from the
+/// mirror.
+///
+/// MOD-133 D7 (`pg/read.rs`' `items(ready)`): a target is released when it is `closed`, or its
+/// latest graph run is `done` **and** no `integration` record of that run is outside `landed |
+/// pr_merged`. No record, every `local` run, counts as landed, so that is MOD-144's rule.
 fn ready_case() -> String {
     format!(
         "CASE WHEN i.status = 'open' AND {LATEST_OF_I} IS NULL AND NOT EXISTS (\
          SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id \
          WHERE l.from_item_id = i.id AND l.kind = 'blocked_by' \
-         AND t.status <> 'closed' AND {LATEST_OF_T} IS NOT 'done') THEN 1 ELSE 0 END"
+         AND t.status <> 'closed' AND NOT EXISTS (\
+         SELECT 1 FROM run lt WHERE lt.id = {LATEST_ID_OF_T} AND lt.status = 'done' \
+         AND NOT EXISTS (SELECT 1 FROM integration g WHERE g.run_id = lt.id \
+         AND g.state NOT IN ('landed', 'pr_merged')))) THEN 1 ELSE 0 END"
     )
 }
 

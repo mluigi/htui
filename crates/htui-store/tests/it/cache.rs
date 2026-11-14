@@ -3140,6 +3140,134 @@ async fn a_document_link_is_mirrored_and_a_withdrawal_deletes_it() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-133 M1 (plan D5, D7): `integration` is mirrored, and the mirror's readiness reads it. The
+/// fixture's `agy:FIX-1 --blocked_by--> agy:ANA-1` is released by `RUN_7` (`done`); a refused
+/// record of that run holds FIX-1 out of `items(ready)` offline exactly as on Postgres, and the
+/// next pass after it lands releases FIX-1 again. A `pending` record holds it too: only
+/// `landed | pr_merged` counts as landed.
+#[tokio::test]
+async fn a_refused_integration_holds_its_dependent_offline() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let scope = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: all_projects(),
+    };
+    let ready = ItemFilter {
+        ready: Some(true),
+        ..ItemFilter::default()
+    };
+    let fix_1_ready =
+        |rows: &[htui_core::model::ItemSummary]| rows.iter().any(|row| row.id == ids::AGY_FIX_1);
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("first pass");
+    let before = cache.items(&scope, &ready).await.expect("cache items");
+    assert!(
+        fix_1_ready(&before),
+        "no record: FIX-1 is ready, today's rule"
+    );
+
+    // The fixture has no `repo` row (blueprint F-P); the record keys on one.
+    let repo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO repo (project_id, name, is_primary) VALUES ($1, 'agy', true) RETURNING id",
+    )
+    .bind(ids::PROJECT_AGY.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("a repo for the record to key on");
+    sqlx::query(
+        "INSERT INTO integration (run_id, repo_id, project_id, mode, remote, target_branch, \
+                                  state, refusal) \
+         VALUES ($1, $2, $3, 'push', 'https://forge.invalid/agy.git', 'main', 'refused', \
+                 'non_fast_forward: main on the remote has moved; merge it locally, then retry')",
+    )
+    .bind(ids::RUN_7.as_uuid())
+    .bind(repo)
+    .bind(ids::PROJECT_AGY.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("a refused record of agy:ANA-1's done run");
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("second pass");
+    assert_eq!(mirror_count(cache.pool(), "integration").await, 1);
+    let row = sqlx::query(
+        "SELECT run_id, repo_id, project_id, mode, remote, target_branch, state, refusal, \
+                landed_hash FROM integration",
+    )
+    .fetch_one(cache.pool())
+    .await
+    .expect("the mirrored record");
+    let text = |column: &str| row.try_get::<Option<String>, _>(column).expect(column);
+    assert_eq!(text("run_id"), Some(ids::RUN_7.to_string()));
+    assert_eq!(text("repo_id"), Some(repo.to_string()));
+    assert_eq!(text("project_id"), Some(ids::PROJECT_AGY.to_string()));
+    assert_eq!(text("mode").as_deref(), Some("push"));
+    assert_eq!(text("target_branch").as_deref(), Some("main"));
+    assert_eq!(text("state").as_deref(), Some("refused"));
+    assert!(text("refusal").is_some_and(|r| r.starts_with("non_fast_forward: ")));
+    assert_eq!(text("landed_hash"), None);
+
+    let held = cache.items(&scope, &ready).await.expect("cache items");
+    assert!(!fix_1_ready(&held), "a refused record holds FIX-1 offline");
+    assert_eq!(
+        held,
+        db.store.items(&scope, &ready).await.expect("pg items")
+    );
+    let not_ready = ItemFilter {
+        ready: Some(false),
+        ..ItemFilter::default()
+    };
+    assert_eq!(
+        cache.items(&scope, &not_ready).await.expect("cache items"),
+        db.store.items(&scope, &not_ready).await.expect("pg items"),
+    );
+
+    sqlx::query("UPDATE integration SET state = 'pending', refusal = NULL WHERE run_id = $1")
+        .bind(ids::RUN_7.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("back to pending");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("third pass");
+    let pending = cache.items(&scope, &ready).await.expect("cache items");
+    assert!(!fix_1_ready(&pending), "a pending record holds FIX-1 too");
+    assert_eq!(
+        pending,
+        db.store.items(&scope, &ready).await.expect("pg items")
+    );
+
+    sqlx::query(
+        "UPDATE integration SET state = 'landed', landed_hash = 'd4e5f6a7' WHERE run_id = $1",
+    )
+    .bind(ids::RUN_7.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("landed");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("fourth pass");
+    let landed = cache.items(&scope, &ready).await.expect("cache items");
+    assert!(fix_1_ready(&landed), "a landed record releases FIX-1");
+    assert_eq!(
+        landed,
+        db.store.items(&scope, &ready).await.expect("pg items")
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM integration")
+        .fetch_one(cache.pool())
+        .await
+        .expect("the mirrored state");
+    assert_eq!(state, "landed");
+
+    teardown(db, &[&cache]).await;
+}
+
 /// MOD-38 T5 (blueprint §6.3): `item.resolution` reaches the mirror, and so do the four
 /// requirement tables' names.
 ///
@@ -3150,9 +3278,9 @@ async fn a_document_link_is_mirrored_and_a_withdrawal_deletes_it() {
 async fn a_closed_item_mirrors_its_resolution() {
     assert_eq!(
         htui_store::cache::MIRRORED_TABLES.len(),
-        23,
+        24,
         "MOD-38 adds requirement_spec, requirement_area, requirement and item_requirement; \
-         MOD-139 adds run_plan; MOD-150 M3 adds item_artifact_link",
+         MOD-139 adds run_plan; MOD-150 M3 adds item_artifact_link; MOD-133 adds integration",
     );
     let Some(db) = common::demo_db().await else {
         return;

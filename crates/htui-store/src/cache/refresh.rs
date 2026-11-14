@@ -192,8 +192,8 @@ impl Refresher {
     }
 }
 
-/// The seventeen cursor-driven tables of §6.2, in foreign-key order. The last four are MOD-38's
-/// (plan D12, `docs/ANA-11.md` §5.2).
+/// The eighteen cursor-driven tables of §6.2, in foreign-key order. The last four are MOD-38's
+/// (plan D12, `docs/ANA-11.md` §5.2); `integration` is MOD-133's (plan D5).
 const PROJECT: &str = "project";
 const REPO: &str = "repo";
 const ITEM_KIND: &str = "item_kind";
@@ -207,6 +207,7 @@ const RUN_STEP: &str = "run_step";
 const RUN_STEP_COMMIT: &str = "run_step_commit";
 const RUN_STEP_TREE: &str = "run_step_tree";
 const RUN_PLAN: &str = "run_plan";
+const INTEGRATION: &str = "integration";
 const REQUIREMENT_SPEC: &str = "requirement_spec";
 const REQUIREMENT_AREA: &str = "requirement_area";
 const REQUIREMENT: &str = "requirement";
@@ -268,6 +269,7 @@ pub async fn run_pass(
             RUN_STEP_COMMIT,
             RUN_STEP_TREE,
             RUN_PLAN,
+            INTEGRATION,
             REQUIREMENT_SPEC,
             REQUIREMENT_AREA,
             REQUIREMENT,
@@ -301,6 +303,7 @@ pub async fn run_pass(
                 }
                 RUN_STEP_TREE => refresh_run_step_tree(pool, sqlite, project, since, hw).await?,
                 RUN_PLAN => refresh_run_plan(pool, sqlite, project, since, hw).await?,
+                INTEGRATION => refresh_integration(pool, sqlite, project, since, hw).await?,
                 REQUIREMENT_SPEC => {
                     refresh_requirement_spec(pool, sqlite, project, since, hw).await?
                 }
@@ -1527,6 +1530,75 @@ async fn refresh_run_plan(
     }
     let high_water = rows.last().map_or(hw, |row| ts_bind(row.updated_at));
     finish(tx, project, RUN_PLAN, high_water).await?;
+    Ok(Batch {
+        rows: rows.len() as u64,
+        tombstones: 0,
+    })
+}
+
+const INTEGRATION_COLUMNS: &[&str] = &[
+    "run_id",
+    "repo_id",
+    "project_id",
+    "mode",
+    "remote",
+    "target_branch",
+    "state",
+    "refusal",
+    "landed_hash",
+    "pr_ref",
+    "pr_url",
+    "created_at",
+    "updated_at",
+];
+
+/// MOD-133 M1 (plan D5): a run's integration records on their own `updated_at` cursor, which a
+/// settle bumps (`trg_integration_updated_at`), so a landing or a refusal reaches the mirror on the
+/// next pass. Keyed `(run_id, repo_id)`; the lease columns stay on Postgres. After `run` in the
+/// list, the foreign-key order: a record names its run, its repo and its project.
+async fn refresh_integration(
+    pool: &PgPool,
+    sqlite: &SqlitePool,
+    project: ProjectId,
+    since: DateTime<Utc>,
+    hw: i64,
+) -> Result<Batch> {
+    let rows = sqlx::query!(
+        "SELECT run_id, repo_id, project_id, mode, remote, target_branch, state, refusal, \
+                landed_hash, pr_ref, pr_url, created_at, updated_at \
+           FROM integration \
+          WHERE project_id = $1 AND updated_at > $2 \
+          ORDER BY updated_at",
+        project.as_uuid(),
+        since,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(INTEGRATION, INTEGRATION_COLUMNS, 2);
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    for row in &rows {
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.run_id.to_string())
+            .bind(row.repo_id.to_string())
+            .bind(row.project_id.to_string())
+            .bind(&row.mode)
+            .bind(&row.remote)
+            .bind(&row.target_branch)
+            .bind(&row.state)
+            .bind(row.refusal.as_deref())
+            .bind(row.landed_hash.as_deref())
+            .bind(row.pr_ref.as_deref())
+            .bind(row.pr_url.as_deref())
+            .bind(ts_bind(row.created_at))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    let high_water = rows.last().map_or(hw, |row| ts_bind(row.updated_at));
+    finish(tx, project, INTEGRATION, high_water).await?;
     Ok(Batch {
         rows: rows.len() as u64,
         tombstones: 0,
