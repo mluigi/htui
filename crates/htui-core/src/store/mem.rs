@@ -11989,7 +11989,7 @@ impl WorkerLogStore for MemStore {
 }
 
 /// MOD-122 M3 plan D1: `activity_event` in memory, `PgStore`'s rules. The rows are written by
-/// [`State::record_activity`] under [`MemStore::write`]'s lock; the reads take `this_user` before
+/// `State::record_activity` under `MemStore::write`'s lock; the reads take `this_user` before
 /// the lock, as [`WorkerLogStore`]'s do.
 impl ActivityStore for MemStore {
     async fn activity(&self, after: Option<i64>, limit: u32) -> Result<ActivityPage> {
