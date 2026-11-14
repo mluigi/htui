@@ -6,6 +6,10 @@
 **Routing**: PRD path, ultracode for implement (C2, C4) (`/handoff-run`, 2026-11-14). The plan runs
 without a confirm gate (handoff-run step 3).
 
+**Blueprint**: `.claude/plans/mod-130-m1-targets-and-child-boxes.blueprint.md`: 12 architect deltas (B1-B12), all
+accepted 2026-11-14 and folded into the task briefs (`mod-130-m1-targets-and-child-boxes.briefs/T1..T5.md`), where they
+supersede the task text. T6 landed in `6ed37436`.
+
 ## Summary
 
 After M1 the store knows what an execution target is and where each level of the cascade points:
