@@ -2173,6 +2173,184 @@ mod tests {
         }
     }
 
+    /// MOD-122 M3 blueprint F1: the activity writer's run-level park rule
+    /// (`htui_core::model::park_kind`, which reads no snapshot and so can run in SQL) against
+    /// [`waiting`]'s run rules, over every fixture of `every_parked_run_owns_a_row` and one
+    /// more. A run parked with no step parked agrees on the reason and the step, or is one of the
+    /// named divergences, each pinned to both answers so any drift on either side fails here:
+    ///
+    /// - an undecodable snapshot: `waiting` lists `Interrupted` with no rest step, `park_kind`
+    ///   names the newest `failed` step (it reads no snapshot);
+    /// - a slot whose candidates all failed, with a failed noted judge: `waiting` has no
+    ///   selectable slot and says `Interrupted`, `park_kind` says `JudgeFailed`;
+    /// - the interrupted step: `waiting` takes the cursor's rest step, `park_kind` the newest
+    ///   `failed` one; they agree on `interrupted_park`;
+    /// - a run whose item already owns an `Unblock` row (`escalation`, `crashed_rejection`, a
+    ///   decided slot): `waiting` adds no run row, while the store writes `interrupted` beside
+    ///   the item's `unblock`.
+    #[test]
+    fn park_kind_agrees_with_waiting() {
+        use htui_core::model::{ActivityKind, park_kind};
+
+        /// What `waiting` and `park_kind` answer for one fixture's parked run.
+        #[derive(Debug)]
+        enum Parity {
+            /// No run parked with no step parked: neither rule applies.
+            NoRunRule,
+            /// Both name the same reason and step.
+            Agrees(ActivityKind, Option<StepId>),
+            /// A named divergence: `waiting`'s run-level row (`None`: none) and `park_kind`'s
+            /// answer.
+            Diverges {
+                waiting: Option<(WaitingReason, Option<StepId>)>,
+                park_kind: (ActivityKind, Option<StepId>),
+            },
+        }
+
+        let kind_of = |reason: WaitingReason| match reason {
+            WaitingReason::JudgeFailed => Some(ActivityKind::JudgeFailed),
+            WaitingReason::Selection => Some(ActivityKind::Selection),
+            WaitingReason::Interrupted => Some(ActivityKind::Interrupted),
+            WaitingReason::Gate | WaitingReason::Unblock | WaitingReason::Permission => None,
+        };
+        let id = |candidate: &WaitingCandidate, index: usize| Some(step_of(candidate, index).id);
+
+        let mut promoted = over_a_gate(Status::Open);
+        promoted.runs[0].1[0].promoted_at = Some(demo_at(2, 3));
+        let mut all_failed = slot(Some((Some(GateOutcome::Rejected), "judge: tie")));
+        for step in &mut all_failed.runs[0].1 {
+            step.status = StepStatus::Failed;
+        }
+        let mut fixtures: Vec<(&str, WaitingCandidate, Parity)> = Vec::new();
+        let mut add =
+            |name, candidate: WaitingCandidate, parity: &dyn Fn(&WaitingCandidate) -> Parity| {
+                let parity = parity(&candidate);
+                fixtures.push((name, candidate, parity));
+            };
+        add("escalation", escalation(), &|c| Parity::Diverges {
+            waiting: None,
+            park_kind: (ActivityKind::Interrupted, id(c, 1)),
+        });
+        add("crashed_rejection", crashed_rejection(), &|c| {
+            Parity::Diverges {
+                waiting: None,
+                park_kind: (ActivityKind::Interrupted, id(c, 0)),
+            }
+        });
+        add("reopen", reopen(), &|_| Parity::NoRunRule);
+        add(
+            "over_a_gate(blocked)",
+            over_a_gate(Status::Blocked),
+            &|_| Parity::NoRunRule,
+        );
+        add("over_a_gate(open)", over_a_gate(Status::Open), &|_| {
+            Parity::NoRunRule
+        });
+        add("slot(none)", slot(None), &|c| {
+            Parity::Agrees(ActivityKind::Selection, id(c, 0))
+        });
+        add(
+            "slot(rejected judge)",
+            slot(Some((Some(GateOutcome::Rejected), "judge: tie"))),
+            &|c| Parity::Agrees(ActivityKind::JudgeFailed, id(c, 2)),
+        );
+        add(
+            "slot(interrupted judge)",
+            slot(Some((None, "interrupted"))),
+            &|c| Parity::Agrees(ActivityKind::JudgeFailed, id(c, 2)),
+        );
+        add(
+            "resolved_selection(gate)",
+            resolved_selection(true),
+            &|_| Parity::NoRunRule,
+        );
+        add("resolved_selection", resolved_selection(false), &|_| {
+            Parity::Diverges {
+                waiting: None,
+                park_kind: (ActivityKind::Interrupted, None),
+            }
+        });
+        add(
+            "undecodable(gate)",
+            undecodable(|run| vec![step(1, run, (0, 1, 0), StepStatus::AwaitingApproval)]),
+            &|_| Parity::NoRunRule,
+        );
+        add(
+            "undecodable(failed)",
+            undecodable(|run| vec![step(1, run, (0, 1, 0), StepStatus::Failed)]),
+            &|c| Parity::Diverges {
+                waiting: Some((WaitingReason::Interrupted, None)),
+                park_kind: (ActivityKind::Interrupted, id(c, 0)),
+            },
+        );
+        add("undecodable(empty)", undecodable(|_| Vec::new()), &|_| {
+            Parity::Agrees(ActivityKind::Interrupted, None)
+        });
+        add("promoted", promoted, &|_| Parity::NoRunRule);
+        for note in [
+            Some("interrupted"),
+            Some("interrupted, tree not reset"),
+            None,
+        ] {
+            add("interrupted_park", interrupted_park(note), &|c| {
+                Parity::Agrees(ActivityKind::Interrupted, id(c, 1))
+            });
+        }
+        add("all candidates failed", all_failed, &|c| Parity::Diverges {
+            waiting: Some((WaitingReason::Interrupted, None)),
+            park_kind: (ActivityKind::JudgeFailed, id(c, 2)),
+        });
+
+        for (name, candidate, parity) in &fixtures {
+            let view = one(candidate);
+            let parked: Vec<&(Run, Vec<RunStep>)> = candidate
+                .runs
+                .iter()
+                .filter(|(run, steps)| {
+                    run.status == RunStatus::AwaitingApproval
+                        && !steps
+                            .iter()
+                            .any(|step| step.status == StepStatus::AwaitingApproval)
+                })
+                .collect();
+            let [(run, steps)] = parked.as_slice() else {
+                assert!(
+                    matches!(parity, Parity::NoRunRule) && parked.is_empty(),
+                    "{name}: {parity:?} over {} runs parked with no step parked",
+                    parked.len()
+                );
+                continue;
+            };
+            let row = view
+                .rows
+                .iter()
+                .find(|row| row.run == Some(run.id) && kind_of(row.reason).is_some())
+                .map(|row| (row.reason, row.step));
+            let written = park_kind(steps);
+            match parity {
+                Parity::NoRunRule => panic!("{name}: a run is parked with no step parked"),
+                Parity::Agrees(kind, step) => {
+                    let (reason, row_step) = row.unwrap_or_else(|| {
+                        panic!("{name}: `waiting` lists no run row: {:?}", view.rows)
+                    });
+                    assert_eq!(
+                        (kind_of(reason), row_step),
+                        (Some(*kind), *step),
+                        "{name}: `waiting`"
+                    );
+                    assert_eq!(written, (*kind, *step), "{name}: `park_kind`");
+                }
+                Parity::Diverges { waiting, park_kind } => {
+                    assert_eq!(row, *waiting, "{name}: `waiting`'s side of the divergence");
+                    assert_eq!(
+                        written, *park_kind,
+                        "{name}: `park_kind`'s side of the divergence"
+                    );
+                }
+            }
+        }
+    }
+
     /// Review H1's invariant: every active run at `AwaitingApproval` among `candidates` owns at
     /// least one row of `view`. Called by every test that builds its candidates inline as well
     /// (review R2), so no fixture escapes it.
