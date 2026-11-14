@@ -1275,6 +1275,7 @@ fn items() -> Vec<Item> {
             required_tags: strings(spec.tags),
             touched_paths: Vec::new(),
             step_graph_id: None,
+            target_id: None,
             version: 1,
             created_by: ids::USER,
             created_at: demo_at(0, i64::from(spec.n)),

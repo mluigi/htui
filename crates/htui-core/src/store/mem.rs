@@ -2463,6 +2463,7 @@ impl State {
         }
         // Before the counter moves: a §4.1 key number a refused mint consumed is never given back.
         require_author(new.created_by, "item.created_by")?;
+        item_target_refusal(&self.targets, new.target_id)?;
 
         let prefix = kind.prefix.clone();
         let counter = self
@@ -2486,6 +2487,7 @@ impl State {
             required_tags: new.required_tags,
             touched_paths: new.touched_paths,
             step_graph_id: new.step_graph_id,
+            target_id: new.target_id,
             version: 1,
             created_by: new.created_by,
             created_at: now,
@@ -2555,9 +2557,15 @@ impl State {
                     kind.prefix, kind.project_id, item.project_id
                 )));
             }
-            item.kind_id = kind_id;
+        }
+        // MOD-130 M1 D11: after the kind check, before the first write.
+        if let Some(target_id) = patch.target_id {
+            item_target_refusal(&self.targets, target_id)?;
         }
 
+        if let Some(kind_id) = patch.kind_id {
+            item.kind_id = kind_id;
+        }
         if let Some(title) = patch.title {
             item.title = title;
         }
@@ -2575,6 +2583,9 @@ impl State {
         }
         if let Some(step_graph_id) = patch.step_graph_id {
             item.step_graph_id = step_graph_id;
+        }
+        if let Some(target_id) = patch.target_id {
+            item.target_id = target_id;
         }
         item.version += 1;
         item.updated_at = now;
@@ -10364,6 +10375,29 @@ fn require_author(id: UserId, column: &str) -> Result<()> {
     Ok(())
 }
 
+/// MOD-130 M1 D11 (blueprint B3): an item's target is inherit (`None`), the built-in local target
+/// (never in `targets`, blueprint B8, and never retired), or a target that is not retired. A free
+/// function over `targets`, so `update` can call it while it holds the item.
+fn item_target_refusal(
+    targets: &BTreeMap<TargetId, Target>,
+    target_id: Option<TargetId>,
+) -> Result<()> {
+    let Some(id) = target_id.filter(|id| *id != seed::LOCAL_TARGET_ID) else {
+        return Ok(());
+    };
+    match targets.get(&id) {
+        None => Err(StoreError::Constraint(references_no_row(
+            "item.target_id",
+            id,
+            "target",
+        ))),
+        Some(row) if row.retired_at.is_some() => {
+            Err(StoreError::Constraint(target_retired(&row.name)))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 /// MOD-42 (plan D1-D5, D12-D14; blueprint §2.11): the relay's reference semantics. Every time is
 /// the handle's clock, passed in as `now` (I-4); every status move is a compare-and-set (I-3).
 impl State {
@@ -15556,6 +15590,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -16792,6 +16827,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -16868,6 +16904,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -17491,6 +17528,7 @@ mod tests {
                         touched_paths: Vec::new(),
                         priority: 0,
                         step_graph_id: None,
+                        target_id: None,
                         created_by: ids::USER,
                         box_id: Some(ids::BOX),
                     })
@@ -17588,6 +17626,7 @@ mod tests {
                     touched_paths: Vec::new(),
                     priority: 0,
                     step_graph_id: None,
+                    target_id: None,
                     created_by: ids::USER,
                     box_id: Some(ids::BOX),
                 })
@@ -17819,6 +17858,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -17945,6 +17985,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -19388,6 +19429,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -19498,6 +19540,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -19984,6 +20027,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -21463,6 +21507,7 @@ mod tests {
                     touched_paths: Vec::new(),
                     priority: 0,
                     step_graph_id: None,
+                    target_id: None,
                     created_by: ids::USER,
                     box_id: Some(ids::BOX),
                 })
@@ -21554,6 +21599,76 @@ mod tests {
                 .expect("the read answers"),
             None,
             "another box has none"
+        );
+    }
+
+    // ---- MOD-130 M1 T3: a retired target refuses an item (D11, P9) -----------------------------
+
+    /// D11, P9: `mint_item` and `update_item` refuse a retired target with `target_retired`, and
+    /// write nothing. M1 has no retire verb, so the row is planted retired.
+    #[tokio::test]
+    async fn a_retired_target_refuses_an_item() {
+        use crate::model::{ItemPatch, TargetId, TargetKind};
+        use crate::store::UpdateOutcome;
+        use crate::store::traits::target_retired;
+
+        let store = MemStore::demo();
+        let retired = TargetId::new();
+        store.write(|state| {
+            let mut row = crate::seed::local_target(chrono::DateTime::UNIX_EPOCH);
+            row.id = retired;
+            row.name = "gone".to_owned();
+            row.kind = TargetKind::Docker;
+            row.retired_at = Some(chrono::DateTime::UNIX_EPOCH);
+            state.targets.insert(retired, row);
+        });
+        let refused = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: "retired".to_owned(),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                target_id: Some(retired),
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await;
+        assert!(
+            matches!(&refused, Err(StoreError::Constraint(m)) if *m == target_retired("gone")),
+            "{refused:?}"
+        );
+        let before = store
+            .item(ids::HTUI_ANA_2)
+            .await
+            .expect("read")
+            .expect("the fixture item");
+        let edit = store
+            .update_item(
+                before.id,
+                before.version,
+                ItemPatch {
+                    title: Some("moved".to_owned()),
+                    target_id: Some(Some(retired)),
+                    author_id: ids::USER,
+                    reason: "edited".to_owned(),
+                    ..ItemPatch::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(&edit, Err(StoreError::Constraint(m)) if *m == target_retired("gone")),
+            "{:?}",
+            edit.map(|outcome| matches!(outcome, UpdateOutcome::Updated(_)))
+        );
+        assert_eq!(
+            store.item(before.id).await.expect("read"),
+            Some(before),
+            "a refused edit writes nothing"
         );
     }
 }

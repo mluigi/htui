@@ -482,6 +482,8 @@ pub const CASES: &[&str] = &[
     "create_target_refusals",
     "edit_target_is_cas_on_updated_at",
     "attach_child_box_creates_reuses_and_refuses",
+    // MOD-130 M1 T3: the item's target is a spec field (D11, blueprint B3)
+    "item_target_is_a_spec_field",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1546,6 +1548,7 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         "attach_child_box_creates_reuses_and_refuses" => {
             boxed(attach_child_box_creates_reuses_and_refuses, store).await;
         }
+        "item_target_is_a_spec_field" => boxed(item_target_is_a_spec_field, store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -3083,6 +3086,7 @@ fn new_item(project_id: ProjectId, kind_id: ItemKindId, title: &str) -> NewItem 
         touched_paths: Vec::new(),
         priority: 0,
         step_graph_id: None,
+        target_id: None,
         created_by: ids::USER,
         box_id: Some(ids::BOX),
     }
@@ -37566,6 +37570,159 @@ async fn attach_child_box_creates_reuses_and_refuses<S: WriteStore>(store: &S) {
     let mut want = vec![ids::BOX, child, remote_child];
     want.sort_unstable();
     assert_eq!(listed_ids, want, "{CASE}: the machine and its two children");
+}
+
+/// MOD-130 M1 T3 (D11, blueprint B3): the item's target is a spec field under `version`. A mint
+/// carries it; `update_item` sets it to another target and back to inherit, each a new version;
+/// a spent version diverges before any refusal; an id that names no target is
+/// `references_no_row("item.target_id", …)` at mint and at edit, and writes nothing.
+async fn item_target_is_a_spec_field<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_target_is_a_spec_field";
+    let first = store
+        .create_target(new_target("first", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let other = store
+        .create_target(new_target(
+            "other",
+            TargetKind::Ssh,
+            json!({"host": "build"}),
+        ))
+        .await
+        .expect(CASE);
+
+    let minted = store
+        .mint_item(NewItem {
+            target_id: Some(first.id),
+            ..new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "targeted")
+        })
+        .await
+        .expect(CASE);
+    assert_eq!(
+        minted.target_id,
+        Some(first.id),
+        "{CASE}: the mint carries it"
+    );
+    assert_eq!(
+        store.item(minted.id).await.expect(CASE),
+        Some(minted.clone()),
+        "{CASE}: item() reads it back"
+    );
+    let local = store
+        .mint_item(NewItem {
+            target_id: Some(seed::LOCAL_TARGET_ID),
+            ..new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "on this box")
+        })
+        .await
+        .expect(CASE);
+    assert_eq!(
+        local.target_id,
+        Some(seed::LOCAL_TARGET_ID),
+        "{CASE}: the local target is a target like any other"
+    );
+
+    let patch = |target_id: Option<TargetId>| ItemPatch {
+        target_id: Some(target_id),
+        author_id: ids::USER,
+        box_id: Some(ids::BOX),
+        reason: EditReason::Edited.as_str().to_owned(),
+        ..ItemPatch::default()
+    };
+    let UpdateOutcome::Updated(moved) = store
+        .update_item(minted.id, minted.version, patch(Some(other.id)))
+        .await
+        .expect(CASE)
+    else {
+        panic!("{CASE}: an edit at the current version lands")
+    };
+    assert_eq!(moved.target_id, Some(other.id), "{CASE}: another target");
+    assert_eq!(
+        moved.version,
+        minted.version + 1,
+        "{CASE}: the version moves"
+    );
+    assert_eq!(moved.title, minted.title, "{CASE}: nothing else moves");
+    let UpdateOutcome::Updated(inherit) = store
+        .update_item(minted.id, moved.version, patch(None))
+        .await
+        .expect(CASE)
+    else {
+        panic!("{CASE}: back to inherit lands")
+    };
+    assert_eq!(inherit.target_id, None, "{CASE}: back to inherit (D3)");
+    assert_eq!(
+        inherit.version,
+        moved.version + 1,
+        "{CASE}: the version moves"
+    );
+    assert_eq!(
+        store.item(minted.id).await.expect(CASE),
+        Some(inherit.clone()),
+        "{CASE}: item() reads the head"
+    );
+
+    // A spent version diverges first, even with a target that names no row (B3).
+    let UpdateOutcome::Diverged { head, ancestor } = store
+        .update_item(minted.id, moved.version, patch(Some(TargetId::new())))
+        .await
+        .expect(CASE)
+    else {
+        panic!("{CASE}: a spent version diverges")
+    };
+    assert_eq!(head, inherit, "{CASE}: the head is unchanged");
+    assert_eq!(ancestor.version, moved.version, "{CASE}: ancestor version");
+
+    let unknown = TargetId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .update_item(minted.id, inherit.version, patch(Some(unknown)))
+            .await,
+        &references_no_row("item.target_id", unknown, "target"),
+        "an edit to an unknown target",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .update_item(
+                minted.id,
+                inherit.version,
+                ItemPatch {
+                    title: Some("half applied".to_owned()),
+                    kind_id: Some(ids::KIND_HTUI_ANA),
+                    ..patch(Some(unknown))
+                },
+            )
+            .await,
+        &references_no_row("item.target_id", unknown, "target"),
+        "an edit to an unknown target beside a kind and a title",
+    );
+    assert_eq!(
+        store.item(minted.id).await.expect(CASE),
+        Some(inherit.clone()),
+        "{CASE}: a refused edit writes nothing"
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .mint_item(NewItem {
+                target_id: Some(unknown),
+                ..new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "nowhere")
+            })
+            .await,
+        &references_no_row("item.target_id", unknown, "target"),
+        "a mint naming an unknown target",
+    );
+    let next = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "after"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        next.key_number,
+        local.key_number + 1,
+        "{CASE}: a refused mint consumes no key number"
+    );
+    assert_eq!(next.target_id, None, "{CASE}: a plain mint inherits");
 }
 
 #[cfg(test)]

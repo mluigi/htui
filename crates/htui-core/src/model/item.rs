@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::ids::{BoxId, ItemId, ItemKindId, ProjectId, StepGraphId, UserId};
+use crate::model::ids::{BoxId, ItemId, ItemKindId, ProjectId, StepGraphId, TargetId, UserId};
 use crate::model::run::RunStatus;
 
 str_enum!(
@@ -181,6 +181,9 @@ pub struct Item {
     pub touched_paths: Vec<String>,
     /// `item.step_graph_id`; `None` means the kind's default graph.
     pub step_graph_id: Option<StepGraphId>,
+    /// `item.target_id` (MOD-130 M1 D11): the item's execution target, a spec field under
+    /// `version`; `None` inherits the workflow's, the project's, then the Settings default (D3).
+    pub target_id: Option<TargetId>,
     /// `item.version`, the divergence counter of §4.2.
     pub version: i32,
     /// `item.created_by`.
@@ -310,6 +313,8 @@ pub struct NewItem {
     pub priority: i16,
     /// `item.step_graph_id`; `None` means the kind's default graph.
     pub step_graph_id: Option<StepGraphId>,
+    /// `item.target_id` (MOD-130 M1 D11); `None` inherits (D3).
+    pub target_id: Option<TargetId>,
     /// `item.created_by`, also the author of revision 1.
     pub created_by: UserId,
     /// `item_revision.box_id` of the box that minted the item.
@@ -335,6 +340,9 @@ pub struct ItemPatch {
     /// New `item.step_graph_id`; the outer `Option` is "change it", the inner one is the value,
     /// so clearing the override back to the kind default is expressible.
     pub step_graph_id: Option<Option<StepGraphId>>,
+    /// New `item.target_id` (MOD-130 M1 D11), `step_graph_id`'s double option: `Some(None)` sets
+    /// the item back to inherit (D3).
+    pub target_id: Option<Option<TargetId>>,
     /// `item_revision.author_id` of the revision this edit writes.
     pub author_id: UserId,
     /// `item_revision.box_id` of the box the edit was made on.

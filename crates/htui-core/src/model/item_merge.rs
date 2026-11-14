@@ -1,5 +1,5 @@
-//! MOD-13 milestone 3 D2: a field-level three-way merge over the seven `version`-covered columns
-//! of an item (ANA-9 §4.2).
+//! MOD-13 milestone 3 D2: a field-level three-way merge over the eight `version`-covered columns
+//! of an item (ANA-9 §4.2; the eighth, `target_id`, is MOD-130 M1 D11).
 //!
 //! A field is [`FieldState::Same`], [`FieldState::Theirs`] or [`FieldState::Mine`] when at most
 //! one side moved it (or both moved it to the same value), and those keep both sides' changes; a
@@ -11,7 +11,8 @@
 
 use crate::model::ItemSpec;
 
-/// The seven `version`-covered columns, in the item form's `Tab` order minus its project picker.
+/// The eight `version`-covered columns, in the item form's `Tab` order minus its project picker.
+/// The form has no target widget yet (MOD-130 M1 D16), so `Target` sits after `Graph`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecField {
     /// `item.kind_id`.
@@ -24,6 +25,8 @@ pub enum SpecField {
     Tags,
     /// `item.step_graph_id`.
     Graph,
+    /// `item.target_id` (MOD-130 M1 D11).
+    Target,
     /// `item.touched_paths`.
     Paths,
     /// `item.body`.
@@ -32,17 +35,19 @@ pub enum SpecField {
 
 impl SpecField {
     /// Every field, in that order: the order the view lists its rows in.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Kind,
         Self::Title,
         Self::Priority,
         Self::Tags,
         Self::Graph,
+        Self::Target,
         Self::Paths,
         Self::Body,
     ];
 
-    /// The form's row label: `kind`, `title`, `priority`, `tags`, `graph`, `paths`, `body`.
+    /// The form's row label: `kind`, `title`, `priority`, `tags`, `graph`, `target`, `paths`,
+    /// `body`.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -51,6 +56,7 @@ impl SpecField {
             Self::Priority => "priority",
             Self::Tags => "tags",
             Self::Graph => "graph",
+            Self::Target => "target",
             Self::Paths => "paths",
             Self::Body => "body",
         }
@@ -140,6 +146,7 @@ impl SpecMerge {
             SpecField::Priority => classify(&a.priority, &t.priority, &m.priority),
             SpecField::Tags => classify(&a.required_tags, &t.required_tags, &m.required_tags),
             SpecField::Graph => classify(&a.step_graph_id, &t.step_graph_id, &m.step_graph_id),
+            SpecField::Target => classify(&a.target_id, &t.target_id, &m.target_id),
             SpecField::Paths => classify(&a.touched_paths, &t.touched_paths, &m.touched_paths),
             SpecField::Body => classify(&a.body, &t.body, &m.body),
         }
@@ -173,6 +180,7 @@ impl SpecMerge {
             required_tags: self.pick(SpecField::Tags, side, |spec| spec.required_tags.clone()),
             touched_paths: self.pick(SpecField::Paths, side, |spec| spec.touched_paths.clone()),
             step_graph_id: self.pick(SpecField::Graph, side, |spec| spec.step_graph_id),
+            target_id: self.pick(SpecField::Target, side, |spec| spec.target_id),
         }
     }
 
@@ -202,7 +210,7 @@ fn classify<T: PartialEq>(ancestor: &T, theirs: &T, mine: &T) -> FieldState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ItemKindId, StepGraphId};
+    use crate::model::{ItemKindId, StepGraphId, TargetId};
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -218,6 +226,7 @@ mod tests {
             required_tags: strings(&["rust"]),
             touched_paths: strings(&["src/**"]),
             step_graph_id: Some(StepGraphId::new()),
+            target_id: Some(TargetId::new()),
         }
     }
 
@@ -233,6 +242,10 @@ mod tests {
             SpecField::Graph => {
                 // Variant 0 clears the graph to the kind's default: `Some(g1)` -> `None`.
                 next.step_graph_id = (variant != 0).then(StepGraphId::new);
+            }
+            SpecField::Target => {
+                // As the graph: variant 0 sets the target back to inherit.
+                next.target_id = (variant != 0).then(TargetId::new);
             }
             SpecField::Paths => next.touched_paths = vec![format!("p{variant}/**")],
             SpecField::Body => next.body = format!("body {variant}"),
@@ -384,12 +397,54 @@ mod tests {
         let mine = ItemSpec {
             kind_id: ItemKindId::new(),
             required_tags: strings(&["go"]),
+            step_graph_id: None,
+            target_id: None,
             ..ancestor.clone()
         };
         assert_eq!(
             merge(&ancestor, &theirs, &mine).changed(),
-            vec![SpecField::Kind, SpecField::Tags, SpecField::Body]
+            vec![
+                SpecField::Kind,
+                SpecField::Tags,
+                SpecField::Graph,
+                SpecField::Target,
+                SpecField::Body
+            ]
         );
+    }
+
+    /// MOD-130 M1 D11: a target conflict resolves like the graph's: either side wins, and a side
+    /// that set the target back to inherit wins with `None`.
+    #[test]
+    fn a_target_conflict_resolves_like_the_graph() {
+        let ancestor = base();
+        let other = TargetId::new();
+        let theirs = ItemSpec {
+            target_id: Some(other),
+            step_graph_id: Some(StepGraphId::new()),
+            ..ancestor.clone()
+        };
+        let mine = ItemSpec {
+            target_id: None,
+            step_graph_id: None,
+            ..ancestor.clone()
+        };
+        let merged = merge(&ancestor, &theirs, &mine);
+        assert_eq!(merged.state(SpecField::Target), FieldState::Conflict);
+        assert_eq!(merged.state(SpecField::Graph), FieldState::Conflict);
+        let took_theirs = merged.resolve(Side::Theirs);
+        assert_eq!(took_theirs.target_id, Some(other));
+        assert_eq!(took_theirs.step_graph_id, theirs.step_graph_id);
+        let took_mine = merged.resolve(Side::Mine);
+        assert_eq!(took_mine.target_id, None, "inherit wins as a value");
+        assert_eq!(took_mine.step_graph_id, None);
+
+        let only_theirs = merge(&ancestor, &theirs, &ancestor);
+        assert_eq!(only_theirs.state(SpecField::Target), FieldState::Theirs);
+        assert_eq!(only_theirs.resolve(Side::Mine).target_id, Some(other));
+        let only_mine = merge(&ancestor, &ancestor, &mine);
+        assert_eq!(only_mine.state(SpecField::Target), FieldState::Mine);
+        assert_eq!(only_mine.resolve(Side::Theirs).target_id, None);
     }
 
     #[test]
@@ -397,7 +452,7 @@ mod tests {
         assert_eq!(
             SpecField::ALL.map(SpecField::label),
             [
-                "kind", "title", "priority", "tags", "graph", "paths", "body"
+                "kind", "title", "priority", "tags", "graph", "target", "paths", "body"
             ]
         );
         assert_eq!(

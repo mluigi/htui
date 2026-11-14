@@ -16,7 +16,7 @@
 use crate::model::skill_glob::{self, GlobError};
 use crate::model::{
     BoxId, Item, ItemId, ItemKind, ItemKindId, ItemPatch, NewItem, ProjectId, Repo, StepGraph,
-    StepGraphId, UserId, canonical_declared_tags, declared_tags_from_text,
+    StepGraphId, TargetId, UserId, canonical_declared_tags, declared_tags_from_text,
 };
 use crate::prompt::excerpt::split_qualifier;
 
@@ -81,10 +81,14 @@ pub struct ItemSpec {
     pub touched_paths: Vec<String>,
     /// `None` = the kind's default graph.
     pub step_graph_id: Option<StepGraphId>,
+    /// `item.target_id` (MOD-130 M1 D11); `None` = inherit (D3). No rule here: whether the
+    /// target exists and is not retired is the store's check.
+    pub target_id: Option<TargetId>,
 }
 
 /// The columns an edit changes; `None` leaves a column alone (D5, A4). The wire payload of
-/// `StoreRequest::EditItem`. `step_graph_id` is `ItemPatch`'s double option: `Some(None)` clears.
+/// `StoreRequest::EditItem`. `step_graph_id` and `target_id` are `ItemPatch`'s double option:
+/// `Some(None)` clears.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SpecChanges {
     /// New `item.kind_id`.
@@ -101,6 +105,8 @@ pub struct SpecChanges {
     pub touched_paths: Option<Vec<String>>,
     /// New `item.step_graph_id`; the inner `None` is the kind's default graph.
     pub step_graph_id: Option<Option<StepGraphId>>,
+    /// New `item.target_id` (MOD-130 M1 D11); the inner `None` is inherit (D3).
+    pub target_id: Option<Option<TargetId>>,
 }
 
 /// Lengths, not text, for `body` and `touched_paths` (E6): the rule of
@@ -115,6 +121,7 @@ impl core::fmt::Debug for ItemSpec {
             .field("required_tags", &self.required_tags)
             .field("touched_paths", &self.touched_paths.len())
             .field("step_graph_id", &self.step_graph_id)
+            .field("target_id", &self.target_id)
             .finish()
     }
 }
@@ -131,6 +138,7 @@ impl core::fmt::Debug for SpecChanges {
             .field("required_tags", &self.required_tags)
             .field("touched_paths", &self.touched_paths.as_ref().map(Vec::len))
             .field("step_graph_id", &self.step_graph_id)
+            .field("target_id", &self.target_id)
             .finish()
     }
 }
@@ -254,6 +262,7 @@ pub fn check_spec(spec: &ItemSpec, ctx: &SpecContext<'_>) -> Result<ItemSpec, Sp
         required_tags,
         touched_paths,
         step_graph_id,
+        target_id: spec.target_id,
     })
 }
 
@@ -291,6 +300,7 @@ pub fn check_changes(
         required_tags,
         touched_paths,
         step_graph_id,
+        target_id: changes.target_id,
     })
 }
 
@@ -401,6 +411,7 @@ impl ItemSpec {
             required_tags: item.required_tags.clone(),
             touched_paths: item.touched_paths.clone(),
             step_graph_id: item.step_graph_id,
+            target_id: item.target_id,
         }
     }
 
@@ -423,6 +434,7 @@ impl ItemSpec {
             touched_paths: self.touched_paths,
             priority: self.priority,
             step_graph_id: self.step_graph_id,
+            target_id: self.target_id,
             created_by,
             box_id,
         }
@@ -440,6 +452,7 @@ impl From<ItemSpec> for SpecChanges {
             required_tags: Some(spec.required_tags),
             touched_paths: Some(spec.touched_paths),
             step_graph_id: Some(spec.step_graph_id),
+            target_id: Some(spec.target_id),
         }
     }
 }
@@ -460,6 +473,7 @@ impl SpecChanges {
             required_tags: changed(&base.required_tags, &next.required_tags),
             touched_paths: changed(&base.touched_paths, &next.touched_paths),
             step_graph_id: changed(&base.step_graph_id, &next.step_graph_id),
+            target_id: changed(&base.target_id, &next.target_id),
         }
     }
 
@@ -485,6 +499,7 @@ impl SpecChanges {
             priority: self.priority,
             touched_paths: self.touched_paths,
             step_graph_id: self.step_graph_id,
+            target_id: self.target_id,
             author_id,
             box_id,
             reason: reason.as_str().to_owned(),
@@ -566,6 +581,7 @@ mod tests {
             required_tags: strings(&["rust"]),
             touched_paths: strings(&["src/**"]),
             step_graph_id: None,
+            target_id: None,
         }
     }
 
@@ -985,11 +1001,13 @@ mod tests {
     fn between_names_only_the_fields_that_differ() {
         let base = spec(&kind(ProjectId::new()));
         let graph_id = StepGraphId::new();
+        let target_id = TargetId::new();
         let next = ItemSpec {
             body: "a new body".to_owned(),
             priority: -1,
             touched_paths: strings(&["src/**", "docs/*"]),
             step_graph_id: Some(graph_id),
+            target_id: Some(target_id),
             ..base.clone()
         };
         assert_eq!(
@@ -999,6 +1017,7 @@ mod tests {
                 priority: Some(-1),
                 touched_paths: Some(strings(&["src/**", "docs/*"])),
                 step_graph_id: Some(Some(graph_id)),
+                target_id: Some(Some(target_id)),
                 ..SpecChanges::default()
             }
         );
@@ -1006,6 +1025,11 @@ mod tests {
             SpecChanges::between(&next, &base).step_graph_id,
             Some(None),
             "back to the kind default is a change"
+        );
+        assert_eq!(
+            SpecChanges::between(&next, &base).target_id,
+            Some(None),
+            "back to inherit is a change"
         );
         let other_kind = ItemSpec {
             kind_id: ItemKindId::new(),
@@ -1032,8 +1056,10 @@ mod tests {
     fn into_patch_and_into_new_item_carry_every_field() {
         let base = spec(&kind(ProjectId::new()));
         let graph_id = StepGraphId::new();
+        let target_id = TargetId::new();
         let full = ItemSpec {
             step_graph_id: Some(graph_id),
+            target_id: Some(target_id),
             ..base.clone()
         };
         let (id, project, user, box_id) = (
@@ -1054,6 +1080,7 @@ mod tests {
                 touched_paths: full.touched_paths.clone(),
                 priority: full.priority,
                 step_graph_id: Some(graph_id),
+                target_id: Some(target_id),
                 created_by: user,
                 box_id,
             }
@@ -1069,6 +1096,7 @@ mod tests {
                 priority: Some(full.priority),
                 touched_paths: Some(full.touched_paths.clone()),
                 step_graph_id: Some(Some(graph_id)),
+                target_id: Some(Some(target_id)),
                 author_id: user,
                 box_id,
                 reason: "edited".to_owned(),
@@ -1076,6 +1104,7 @@ mod tests {
         );
         let clear = SpecChanges::between(&full, &base).into_patch(user, None, EditReason::Edited);
         assert_eq!(clear.step_graph_id, Some(None), "`Some(None)` survives");
+        assert_eq!(clear.target_id, Some(None), "back to inherit survives");
         assert_eq!(clear.reason, EDITED);
         assert_eq!(clear.title, None);
         assert_eq!(
@@ -1084,6 +1113,46 @@ mod tests {
                 .reason,
             "divergence_resolution",
             "milestone 3 D6: a resolution lands with its own reason"
+        );
+    }
+
+    /// MOD-130 M1 D11: the target is a spec field. A change to it alone is a change, it passes
+    /// both checks unchanged (the store owns whether it names a live target), and it reaches the
+    /// patch, so the item's `version` moves with it.
+    #[test]
+    fn a_target_change_is_a_spec_change() {
+        let ours = kind(ProjectId::new());
+        let repos = [repo("htui", true)];
+        let context = ctx(std::slice::from_ref(&ours), &[], &repos);
+        let base = spec(&ours);
+        let target_id = TargetId::new();
+        let next = ItemSpec {
+            target_id: Some(target_id),
+            ..base.clone()
+        };
+        let changes = SpecChanges::between(&base, &next);
+        assert_eq!(
+            changes,
+            SpecChanges {
+                target_id: Some(Some(target_id)),
+                ..SpecChanges::default()
+            }
+        );
+        assert!(!changes.is_empty(), "a target alone is something to save");
+        assert_eq!(check_changes(&changes, &context), Ok(changes.clone()));
+        assert_eq!(check_spec(&next, &context), Ok(next.clone()));
+        let patch = changes.into_patch(UserId::new(), None, EditReason::Edited);
+        assert_eq!(patch.target_id, Some(Some(target_id)));
+        assert_eq!(
+            SpecChanges::between(&next, &base)
+                .into_patch(UserId::new(), None, EditReason::Edited)
+                .target_id,
+            Some(None),
+            "back to inherit reaches the patch"
+        );
+        assert!(
+            format!("{changes:?}", changes = SpecChanges::between(&base, &next))
+                .contains("target_id")
         );
     }
 
@@ -1107,6 +1176,7 @@ mod tests {
     fn of_reads_the_stored_columns() {
         let ours = kind(ProjectId::new());
         let graph_id = StepGraphId::new();
+        let target_id = TargetId::new();
         let item = Item {
             id: ItemId::new(),
             project_id: ours.project_id,
@@ -1121,6 +1191,7 @@ mod tests {
             required_tags: strings(&["Rust"]),
             touched_paths: strings(&["nope:x"]),
             step_graph_id: Some(graph_id),
+            target_id: Some(target_id),
             version: 4,
             created_by: UserId::new(),
             created_at: EPOCH,
@@ -1134,6 +1205,7 @@ mod tests {
                 required_tags: strings(&["Rust"]),
                 touched_paths: strings(&["nope:x"]),
                 step_graph_id: Some(graph_id),
+                target_id: Some(target_id),
                 ..spec(&ours)
             },
             "unchecked: legacy values come through as stored"
