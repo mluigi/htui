@@ -556,17 +556,24 @@ conflict. Their verdicts survive only where restated here.
   a subset of the box's tags, listing the missing tags, and `htui` offers to dispatch it to a box
   that has them (R-ORCH-12). Auto mode filters the queue the same way. Amended 2026-10-15.
 - **R-ORCH-11 (must).** Every run records: item, target box, executing box, graph snapshot, and per
-  step: agent, model, gate outcome, status, exit code, prompt digest, commit hashes, usage, timing.
+  step: agent, model, gate outcome, status, exit code, prompt digest, commit hashes, usage, timing;
+  and, per repo, the integration mode, target and outcome (merge commit, pushed commit or pull request
+  reference). Amended 2026-11-14 by MOD-133 (ANA-34 §10.9).
 - **R-ORCH-12 (must).** Remote dispatch: queue an item from one box to run on another. Requires a
   headless `htui` worker per box polling Postgres (R-ID-2). Promoted from later by maintainer
   decision on MOD-41, 2026-09-29; delivered by MOD-41 (worker, done) and MOD-43 (targeting, open).
 - **R-ORCH-13 (later).** Scheduling: run the queue inside a time window on a chosen box.
 - **R-ORCH-14 (must).** Coordinators: one per project and one per workspace, above item runs. A
   coordinator only manages: it follows what happens below it, talks with its children and its
-  parent, and integrates a child's work when the child's run completes — merging, pushing or
-  opening a pull request as the project configures — and runs close-out (R-TUI-9). It does no item
-  work itself. Added by maintainer decision, 2026-10-15; design in ANA-34, which also settles what it
-  changes in R-ID-6, R-ORCH-7, R-ENT-8 and R-TUI-9.
+  parent, integrates a child's work when the child's run completes, as the project configures per
+  repo: `local` (merged into the primary checkout, the default), `push` (fast-forward only, never
+  forced) or `pull_request` (through the project's forge); and prepares close-out (R-TUI-9).
+  Integration and every status transition are deterministic code; an agent part, if configured, only
+  proposes drafts a person accepts (R-ID-6). A coordinator never resolves a conflict: it parks the run
+  and may propose a follow-up item. Version one's workspace coordinator follows and relays and
+  integrates nothing of its own (ANA-41). It does no item work itself. Added by maintainer decision,
+  2026-10-15; design in ANA-34, which also settles what it changes in R-ID-6, R-ORCH-7, R-ENT-8 and
+  R-TUI-9. Amended 2026-11-14 by MOD-133 (ANA-34 §10.2).
 - **R-ORCH-15 (must).** Execution targets: each item runs on a target — this box (a worktree of the
   project), docker on this box (a fresh clone in a container with its own compose project and the
   toolchain image, as `scripts/hr` sandboxes run), a remote machine over SSH, docker on a remote
