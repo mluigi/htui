@@ -1146,6 +1146,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn workspace_live_runs(&self, workspace: WorkspaceId) -> Result<Vec<Run>> {
+        match self {
+            Self::Memory(store) => store.workspace_live_runs(workspace).await,
+            Self::Online(pg) => pg.workspace_live_runs(workspace).await,
+        }
+    }
+
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
         match self {
             Self::Memory(store) => store.stop_run(run, owner).await,

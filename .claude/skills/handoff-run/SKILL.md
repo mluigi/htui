@@ -51,7 +51,7 @@ model only after the maintainer agrees: a silent fallback would spoil the compar
 - `scripts/hr-mint` (repo root, Linux) — the leased mint; P0 mints through it whenever `scripts/hr-mint --leasing`
   exits 0 (always in a sandbox; on the host once `scripts/hr up` has been used). User guide: `docs/hr-sandbox.md`
 - `scripts/task-lane.js` — the Workflow-tool script for the implementation phase (step 4); its header documents `args`
-- `scripts/token-usage.py` — token usage per item, stage, task and model from the session transcripts (step 5)
+- `scripts/token-usage.py` — token usage per item, stage, task and model from the session transcripts (on demand; not part of close-out)
 - `scripts/validate-workflow-docs.sh` / `.ps1` — structural validator, run at close-out
 - Law: `.claude/rules/workflow-docs.md` (auto-loads when workflow docs are touched)
 
@@ -214,10 +214,7 @@ catches the defect. Review authority sits in one place, the review gate.
    as `[WARNING] ... (pre-existing ...)` and does not block an unrelated commit. Human escape hatch:
    `WORKFLOW_SKIP_HOOK=1`.
 3. Update PRD milestone row / plan artifact status where they exist.
-4. Usage table: run `python3 .claude/skills/handoff-run/scripts/token-usage.py --item <ITEM-ID>` and put its
-   output in the report as-is (stage, task, model, cost share, cache reloads, verifier findings). It reads this
-   session's transcripts, so it is a measurement, not an estimate; `--help` explains the columns.
-5. Report: what shipped, commits, validator result, the usage table, and the stage models that were in force. Push only when agreed (the repo's
+4. Report: what shipped, commits, validator result, and the stage models that were in force. Push only when agreed (the repo's
    `AGENTS.md` push policy).
 
 ## Sandbox mode (`HR_SANDBOX=1`)

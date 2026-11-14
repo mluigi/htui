@@ -1,7 +1,7 @@
 # CONCEPTS - htui
 
 **Owner:** Luigi Marrandino
-**Reviewed:** 2026-10-20
+**Reviewed:** 2026-11-14
 
 Standing architectural intent for `htui`. Governed by `.claude/rules/concept-docs.md`. Distilled
 from `docs/REQUIREMENTS.md`, which is the authority; requirement IDs in brackets.
@@ -64,8 +64,8 @@ nothing extra [R-ENT-9].
 - **Runs go where you say.** Each item runs on a target — this box, docker, a remote machine over
   SSH or its docker — chosen by a Settings → workspace → project → workflow → item cascade; `htui`
   prepares it there and the work comes back by collecting the branch [R-ORCH-15]. Stopping a run
-  saves its conversation and can always be resumed [R-ORCH-16]; leaving the TUI never stops work
-  [R-TUI-18].
+  saves its conversation; it resumes on the box that ran it or, when no box can, can only be
+  cancelled [R-ORCH-16]. Leaving the TUI never stops work [R-TUI-18].
 - **Routing.** A run needs a box whose probed tags cover the item's, or it is refused; agents are
   tried in priority order, skipping exhausted subscriptions and reached token caps [R-BOX-3,
   R-ORCH-10, R-AGT-7, 8].

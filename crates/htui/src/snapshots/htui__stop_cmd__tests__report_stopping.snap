@@ -1,0 +1,15 @@
+---
+source: crates/htui/src/stop_cmd.rs
+expression: report.to_string()
+---
+workspace graphics: stopping (graceful, requested 2026-10-01 00:00 UTC)
+  FEAT-1   [run]  stopped, no box          cannot be resumed: cancel it from the Runs pane
+  FEAT-4   [run]  stopped on DESKTOP-HTUI  resumes: implement reopens its agent session
+  FEAT-5   [run]  stopped on DESKTOP-HTUI  resumes: review starts a fresh session with the handoff
+  FEAT-6   [run]  stopped on DESKTOP-HTUI  resumes: research starts a fresh session with the handoff; research runs again from its start
+  FEAT-7   [run]  stopped on DESKTOP-HTUI  resumes: continues from where it stopped
+  FEAT-8   [run]  queued                   starts when the workspace is resumed
+  FEAT-9   [run]  awaiting approval        its gate can be answered once resumed
+  FEAT-10  [run]  running on DESKTOP-HTUI  stopping
+checks rerun after each resumed step
+once resumed, each box resumes its stopped runs at its next command poll

@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{RunId, UserId, WorkspaceId};
+use crate::model::run::RunStatus;
 
 str_enum!(
     /// `workspace_stop.mode` (MOD-125 D4, PRD gate decisions).
@@ -18,7 +19,7 @@ str_enum!(
 );
 
 /// One `workspace_stop` row (MOD-125 D4): its presence is the gate. "Stopping" vs "stopped" is
-/// derived from the workspace's runs (M4), never stored.
+/// derived from the workspace's runs (M4, [`WorkspaceStopState::of`]), never stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceStop {
     /// `workspace_stop.workspace_id`.
@@ -41,4 +42,112 @@ pub struct PendingStop {
     /// `workspace_stop.mode` of the run's workspace, as read now: a forced upsert over a graceful
     /// stop shows on the next poll.
     pub mode: StopMode,
+}
+
+/// How a workspace reads (MOD-125 M4 D4; R-TUI-14's "stopping, stopped"): derived from its stop row
+/// and its runs, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceStopState {
+    /// No `workspace_stop` row: runs claim and start as usual.
+    NotStopped,
+    /// A stop row and at least one `running` run: the executors are still applying the stop.
+    Stopping,
+    /// A stop row and no `running` run: the stop has settled.
+    Stopped,
+}
+
+impl WorkspaceStopState {
+    /// `NotStopped` without a row; with one, `Stopping` while any run is `Running`, else `Stopped`.
+    /// Queued runs are held and parked ones wait at their gate: neither keeps a workspace stopping.
+    pub fn of(stop: Option<&WorkspaceStop>, runs: impl IntoIterator<Item = RunStatus>) -> Self {
+        match stop {
+            None => Self::NotStopped,
+            Some(_) if runs.into_iter().any(|status| status == RunStatus::Running) => {
+                Self::Stopping
+            }
+            Some(_) => Self::Stopped,
+        }
+    }
+}
+
+impl core::fmt::Display for WorkspaceStopState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NotStopped => "not stopped",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row() -> WorkspaceStop {
+        WorkspaceStop {
+            workspace_id: WorkspaceId::new(),
+            mode: StopMode::Graceful,
+            requested_by: UserId::new(),
+            requested_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_workspace_without_a_stop_row_is_not_stopped() {
+        assert_eq!(
+            WorkspaceStopState::of(None, []),
+            WorkspaceStopState::NotStopped
+        );
+        assert_eq!(
+            WorkspaceStopState::of(None, RunStatus::ALL.iter().copied()),
+            WorkspaceStopState::NotStopped,
+            "whatever its runs"
+        );
+    }
+
+    #[test]
+    fn a_stopped_workspace_with_a_running_run_is_stopping() {
+        let stop = row();
+        assert_eq!(
+            WorkspaceStopState::of(Some(&stop), [RunStatus::Running]),
+            WorkspaceStopState::Stopping
+        );
+        assert_eq!(
+            WorkspaceStopState::of(
+                Some(&stop),
+                [RunStatus::Stopped, RunStatus::Running, RunStatus::Queued]
+            ),
+            WorkspaceStopState::Stopping,
+            "one running run among others"
+        );
+    }
+
+    #[test]
+    fn queued_parked_and_stopped_runs_leave_it_stopped() {
+        let stop = row();
+        assert_eq!(
+            WorkspaceStopState::of(
+                Some(&stop),
+                [
+                    RunStatus::Queued,
+                    RunStatus::AwaitingApproval,
+                    RunStatus::Stopped,
+                ]
+            ),
+            WorkspaceStopState::Stopped
+        );
+        assert_eq!(
+            WorkspaceStopState::of(Some(&stop), []),
+            WorkspaceStopState::Stopped,
+            "no runs"
+        );
+    }
+
+    #[test]
+    fn workspace_stop_states_display_their_words() {
+        assert_eq!(WorkspaceStopState::NotStopped.to_string(), "not stopped");
+        assert_eq!(WorkspaceStopState::Stopping.to_string(), "stopping");
+        assert_eq!(WorkspaceStopState::Stopped.to_string(), "stopped");
+    }
 }

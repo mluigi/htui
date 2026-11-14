@@ -984,6 +984,9 @@ impl WriteStore for SpyStore {
     async fn resume_workspace(&self, workspace: WorkspaceId) -> StoreResult<bool> {
         self.inner.resume_workspace(workspace).await
     }
+    async fn workspace_live_runs(&self, workspace: WorkspaceId) -> StoreResult<Vec<Run>> {
+        self.inner.workspace_live_runs(workspace).await
+    }
     async fn stop_run(&self, run: RunId, owner: Uuid) -> StoreResult<bool> {
         self.inner.stop_run(run, owner).await
     }

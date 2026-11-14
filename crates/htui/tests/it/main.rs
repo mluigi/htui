@@ -62,6 +62,7 @@ mod shell;
 mod skills;
 mod skills_pg;
 mod state_cli_pg;
+mod stop_cli_pg;
 mod templates;
 mod templates_pg;
 mod token_scan;

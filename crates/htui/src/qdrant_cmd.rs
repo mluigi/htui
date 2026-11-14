@@ -193,7 +193,7 @@ async fn stored(pg: &PgStore) -> Result<Option<StoredQdrantUrl>, StateExit> {
 /// headless connect: a pending schema or a build below the database's target is refused, never
 /// migrated. Every refusal is `state_cmd`'s sentence, but an unreadable keyring says so first
 /// ([`KEYRING_UNREADABLE`]).
-async fn connect() -> Result<PgStore, StateExit> {
+pub(crate) async fn connect() -> Result<PgStore, StateExit> {
     let dsn = state_cmd::read_dsn().map_err(dsn_exit)?;
     let identity = identity::config_root()
         .and_then(|root| identity::load_or_mint(&root))

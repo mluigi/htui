@@ -223,7 +223,7 @@ pub use skill::{
 };
 pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
-pub use stop::{PendingStop, StopMode, WorkspaceStop};
+pub use stop::{PendingStop, StopMode, WorkspaceStop, WorkspaceStopState};
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 pub use waiting::{WaitingCandidate, WaitingPermission};
