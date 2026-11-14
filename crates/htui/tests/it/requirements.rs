@@ -844,10 +844,12 @@ async fn click_activity(harness: &mut Harness) {
 /// opened in the tree stays on screen when a click moves the focus to the activity pane, and
 /// `Esc` still closes it there.
 ///
-/// It once opened the form with `a` while the activity pane was zoomed. That state is no longer
-/// reachable: the focused activity pane holds the keys, so the tab never sees `a`, and once the
-/// form is open it takes the zoom key too. The nearest reachable state is this one: the form
-/// open, the focus on the activity pane beside it.
+/// It once opened the form with `a` while the activity pane was zoomed. `a` no longer gets there:
+/// the focused activity pane holds the keys, so the tab never sees `a`, and once the form is open
+/// it takes the zoom key too. A form whose data comes back after the zoom does (the Backlog's item
+/// form, `backlog::an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it`);
+/// this pins the new-area form's nearest state: the form open, the focus on the activity pane
+/// beside it.
 #[tokio::test]
 async fn a_form_stays_on_screen_when_a_click_focuses_the_activity_pane() {
     let mut harness = open().await;
@@ -877,8 +879,9 @@ async fn a_form_stays_on_screen_when_a_click_focuses_the_activity_pane() {
 /// filters stays drawn and follows what is typed while the activity pane has the focus.
 ///
 /// It once pinned this with the activity pane zoomed; with the field open the zoom key is the
-/// field's, so it pins the nearest reachable state: the focus moved to the activity pane by a
-/// click.
+/// field's, so it pins the field's nearest state: the focus moved to the activity pane by a
+/// click. (A zoomed pane under a form is reachable through a form whose data returns late:
+/// `backlog::an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it`.)
 #[tokio::test]
 async fn the_tree_follows_the_filter_while_the_activity_pane_has_the_focus() {
     let mut harness = open().await;

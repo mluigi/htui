@@ -3803,6 +3803,35 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
     );
 }
 
+/// Review M3: `e` asks for the item form's data, and `tab`, `tab`, `z` zoom the activity pane
+/// before it returns; the reply then opens the form, whose modal stack holds the keys, over the
+/// zoomed pane, and the panel is not drawn over it (`App::paint_panes`).
+#[tokio::test]
+async fn an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    harness.render();
+    for key in ["e", "tab", "tab", "z"] {
+        harness.key(key);
+        harness.render();
+    }
+    let zoomed = harness.render();
+    assert!(
+        zoomed.contains("\u{2500} Activity \u{b7}") && !zoomed.contains("Edit FEAT-1"),
+        "the activity pane is zoomed before the form's data returns:\n{zoomed}"
+    );
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("Edit FEAT-1"),
+        "the form is drawn over the zoomed pane:\n{frame}"
+    );
+    assert!(
+        !frame.contains("\u{2500} Activity \u{b7}"),
+        "the panel is not drawn over the form:\n{frame}"
+    );
+}
+
 /// Presses each of `keys`, serving and drawing a frame after each as the app does, so the focus
 /// cycle reads the panes on screen.
 async fn press(harness: &mut Harness, keys: &[&str]) {
@@ -3868,10 +3897,12 @@ async fn click_activity(harness: &mut Harness) {
 /// MOD-115 M2 §7 (T7 repair), MOD-122 M3 D10: the filter form takes every key, so it stays on
 /// screen when a click moves the focus to the activity pane, and `Esc` still closes it there.
 ///
-/// It once opened the form with `f` while the activity pane was zoomed. That state is no longer
-/// reachable: the focused activity pane holds the keys, so `f` is the panel's filter (pinned
-/// below), and once the form is open it takes the zoom key too. The nearest reachable state is
-/// this one: the form open, the focus on the activity pane beside it.
+/// It once opened the form with `f` while the activity pane was zoomed. `f` no longer gets there:
+/// the focused activity pane holds the keys, so `f` is the panel's filter (pinned below), and once
+/// the form is open it takes the zoom key too. A form whose data comes back after the zoom does
+/// (the item form, pinned by
+/// `an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it`); this pins the
+/// filter's nearest state: the form open, the focus on the activity pane beside it.
 #[tokio::test]
 async fn the_filter_stays_on_screen_when_a_click_focuses_the_activity_pane() {
     let mut harness = backlog().await;
@@ -3903,8 +3934,9 @@ async fn the_filter_stays_on_screen_when_a_click_focuses_the_activity_pane() {
 /// that list is drawn above it, not a blank body, while the activity pane has the focus.
 ///
 /// It once pinned this with the activity pane zoomed; with the form open the zoom key is the
-/// form's, so it pins the nearest reachable state: the focus moved to the activity pane by a
-/// click.
+/// form's, so it pins the filter's nearest state: the focus moved to the activity pane by a
+/// click. (A zoomed pane under a form is reachable through a form whose data returns late:
+/// `an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it`.)
 #[tokio::test]
 async fn the_list_is_drawn_above_the_filter_while_the_activity_pane_has_the_focus() {
     let mut harness = backlog().await;

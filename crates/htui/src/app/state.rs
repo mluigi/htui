@@ -819,6 +819,8 @@ impl App {
         let stack = tab.key_stack().unwrap_or(Stack::BASE);
         // T7 repair: with the activity pane zoomed, a tab whose keys a modal stack holds (an
         // open form) draws what captures them over the zoomed pane; the panel does not cover it.
+        // Reachable (review M3): `e`, `tab`, `tab`, `z` before the item form's read answers
+        // opens the form under the zoom (`backlog::an_item_form_whose_data_returns_…`).
         let modal = stack.global().is_some_and(|(_, layer)| layer.is_modal());
         let zoomed = areas.list.is_none() && areas.detail.is_empty();
         let Some(activity) = areas.activity.filter(|rect| !rect.is_empty()) else {
