@@ -1289,6 +1289,58 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-130 M1 P10: name byte order (`COLLATE "C"`), then id; retired rows included.
+    async fn targets(&self) -> Result<Vec<htui_core::model::Target>> {
+        sqlx::query_as!(
+            htui_core::model::Target,
+            r#"
+            SELECT id          AS "id: htui_core::model::TargetId",
+                   name,
+                   kind        AS "kind: htui_core::model::TargetKind",
+                   locator,
+                   box_id      AS "box_id: BoxId",
+                   probed_at,
+                   probe_error,
+                   retired_at,
+                   created_at,
+                   updated_at
+              FROM target
+             ORDER BY name COLLATE "C", id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    async fn target(&self, id: htui_core::model::TargetId) -> Result<htui_core::model::Target> {
+        sqlx::query_as!(
+            htui_core::model::Target,
+            r#"
+            SELECT id          AS "id: htui_core::model::TargetId",
+                   name,
+                   kind        AS "kind: htui_core::model::TargetKind",
+                   locator,
+                   box_id      AS "box_id: BoxId",
+                   probed_at,
+                   probe_error,
+                   retired_at,
+                   created_at,
+                   updated_at
+              FROM target
+             WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "target",
+            id: id.to_string(),
+        })
+    }
+
     /// The item's live citations, each joined to the requirement as it is now, in the
     /// requirement's list order ([`requirements`](ReadStore::requirements)), then `kind`.
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
@@ -1699,6 +1751,9 @@ impl PgStore {
 
     /// This box's row, projected for the top bar.
     ///
+    /// This box is always a machine, and `chk_box_os_family` holds a machine's `os_family` non-NULL
+    /// (MOD-130 M1, D13), hence the `!` on the nullable column.
+    ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
@@ -1712,7 +1767,7 @@ impl PgStore {
             -- seeds two *different* sets and names which is which (blueprint §3.5, T1 audit A-5).
             SELECT id            AS "box_id: htui_core::model::BoxId",
                    hostname,
-                   os_family     AS "os_family: htui_core::model::OsFamily",
+                   os_family     AS "os_family!: htui_core::model::OsFamily",
                    probed_tags,
                    declared_tags,
                    settings
@@ -2042,7 +2097,9 @@ impl PgStore {
                    last_seen_at,
                    last_probed_at,
                    updated_at,
-                   edit_version
+                   edit_version,
+                   kind           AS "kind: htui_core::model::BoxKind",
+                   parent_box_id  AS "parent_box_id: BoxId"
               FROM box WHERE id = $1
             "#,
             id.as_uuid(),
@@ -2312,7 +2369,9 @@ impl PgStore {
                    last_seen_at,
                    last_probed_at,
                    updated_at,
-                   edit_version
+                   edit_version,
+                   kind           AS "kind: htui_core::model::BoxKind",
+                   parent_box_id  AS "parent_box_id: BoxId"
               FROM box WHERE id = $1
             "#,
             id.as_uuid(),

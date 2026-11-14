@@ -1470,6 +1470,23 @@ impl ReadStore for CacheStore {
         rows.iter().map(run_plan_of).collect()
     }
 
+    // MOD-130 M1 T5 replaces: the mirror has no `target` table yet, so it answers the built-in
+    // local target alone (D2), at the epoch as `MemStore` does.
+    async fn targets(&self) -> Result<Vec<htui_core::model::Target>> {
+        Ok(vec![htui_core::seed::local_target(DateTime::UNIX_EPOCH)])
+    }
+
+    // MOD-130 M1 T5 replaces.
+    async fn target(&self, id: htui_core::model::TargetId) -> Result<htui_core::model::Target> {
+        if id == htui_core::seed::LOCAL_TARGET_ID {
+            return Ok(htui_core::seed::local_target(DateTime::UNIX_EPOCH));
+        }
+        Err(StoreError::NotFound {
+            entity: "target",
+            id: id.to_string(),
+        })
+    }
+
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {REQUIREMENT_SELECT}, ir.kind, ir.requirement_version, \

@@ -690,6 +690,11 @@ pub async fn seed_mirror(cache: &CacheStore, demo: &DemoData) -> Result<()> {
         .iter()
         .filter(|row| demo.this_box.is_some_and(|id| id == row.id))
     {
+        // This box is a machine (MOD-130 M1, blueprint B12): the mirror's `box.os_family` is
+        // NOT NULL, and a box without one is a fixture bug.
+        let os_family = row.os_family.ok_or_else(|| {
+            htui_core::store::StoreError::Backend(format!("box {} has no os_family", row.id))
+        })?;
         sqlx::query(
             "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, cpu, ram_mb, \
                               gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags, \
@@ -700,7 +705,7 @@ pub async fn seed_mirror(cache: &CacheStore, demo: &DemoData) -> Result<()> {
         .bind(row.id.to_string())
         .bind(row.user_id.to_string())
         .bind(&row.hostname)
-        .bind(row.os_family.as_str())
+        .bind(os_family.as_str())
         .bind(&row.os_version)
         .bind(&row.arch)
         .bind(&row.cpu)

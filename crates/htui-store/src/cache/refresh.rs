@@ -639,7 +639,7 @@ async fn refresh_box(
         "SELECT id, user_id, hostname, os_family, os_version, arch, cpu, ram_mb, gpu_present, \
                 gpu_vendor, htui_version, probed_tags, declared_tags, quirks, settings, \
                 registered_at, last_seen_at, last_probed_at, updated_at \
-           FROM box WHERE id = $1",
+           FROM box WHERE id = $1 AND kind = 'machine'",
         this_box.as_uuid(),
     )
     .fetch_all(pool)
@@ -649,11 +649,17 @@ async fn refresh_box(
     let sql = upsert_sql("box", BOX_COLUMNS, 1);
     let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
     for row in &rows {
+        // This box is a machine, and `chk_box_os_family` holds a machine's family non-NULL
+        // (MOD-130 M1, D13): a NULL here is a store bug, not a value to invent (blueprint B12).
+        let os_family = row
+            .os_family
+            .as_deref()
+            .ok_or_else(|| StoreError::Backend(format!("box {} has no os_family", row.id)))?;
         sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
             .bind(row.id.to_string())
             .bind(row.user_id.to_string())
             .bind(&row.hostname)
-            .bind(&row.os_family)
+            .bind(os_family)
             .bind(&row.os_version)
             .bind(&row.arch)
             .bind(&row.cpu)

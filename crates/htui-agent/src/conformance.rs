@@ -779,6 +779,17 @@ impl<S: WriteStore> ReadStore for UsageSpy<'_, S> {
     async fn run_plans(&self, run: RunId) -> StoreResult<Vec<htui_core::model::RunPlan>> {
         self.inner.run_plans(run).await
     }
+
+    async fn targets(&self) -> StoreResult<Vec<htui_core::model::Target>> {
+        self.inner.targets().await
+    }
+
+    async fn target(
+        &self,
+        id: htui_core::model::TargetId,
+    ) -> StoreResult<htui_core::model::Target> {
+        self.inner.target(id).await
+    }
 }
 
 impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {

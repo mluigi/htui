@@ -379,6 +379,20 @@ impl ReadStore for Writer {
             Self::Online(pg) => pg.run_plans(run).await,
         }
     }
+
+    async fn targets(&self) -> Result<Vec<htui_core::model::Target>> {
+        match self {
+            Self::Memory(store) => store.targets().await,
+            Self::Online(pg) => pg.targets().await,
+        }
+    }
+
+    async fn target(&self, id: htui_core::model::TargetId) -> Result<htui_core::model::Target> {
+        match self {
+            Self::Memory(store) => store.target(id).await,
+            Self::Online(pg) => pg.target(id).await,
+        }
+    }
 }
 
 impl WriteStore for Writer {

@@ -33,7 +33,8 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `0031_command_log.sql` (MOD-152 plan D1).
 /// `0032_worker_log.sql` (MOD-122 M2 plan D1), then the one of `0034_item_artifact_link.sql`
 /// (MOD-150 M3 plan D1), then the one of `0035_requirement_keys.sql` (MOD-149 plan D1), then the
-/// one of `0036_activity_event.sql` (MOD-122 M3 plan D2).
+/// one of `0036_activity_event.sql` (MOD-122 M3 plan D2), then the one of
+/// `0037_execution_targets.sql` (MOD-130 M1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -108,6 +109,8 @@ const TABLES: &[&str] = &[
     "requirement_child_counter",
     // 0036_activity_event.sql (MOD-122 M3)
     "activity_event",
+    // 0037_execution_targets.sql (MOD-130 M1)
+    "target",
 ];
 
 #[tokio::test]
@@ -130,7 +133,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -147,7 +150,8 @@ async fn migrations_apply_on_a_clean_database() {
          0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql, MOD-150's \
          0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql, \
          MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql, \
-         MOD-149's 0035_requirement_keys.sql and MOD-122 M3's 0036_activity_event.sql, in ordinal order"
+         MOD-149's 0035_requirement_keys.sql, MOD-122 M3's 0036_activity_event.sql and \
+         MOD-130's 0037_execution_targets.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -165,7 +169,7 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        57,
+        58,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
@@ -177,7 +181,8 @@ async fn migrations_apply_on_a_clean_database() {
          0031_command_log.sql adds command_log and MOD-122's \
          0032_worker_log.sql adds worker_log and MOD-150 M3's 0034_item_artifact_link.sql \
          adds item_artifact_link and MOD-149's 0035_requirement_keys.sql adds \
-         requirement_child_counter and MOD-122 M3's 0036_activity_event.sql adds activity_event"
+         requirement_child_counter and MOD-122 M3's 0036_activity_event.sql adds activity_event \
+         and MOD-130 M1's 0037_execution_targets.sql adds target"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
@@ -192,7 +197,7 @@ async fn migrations_apply_on_a_clean_database() {
          0032_worker_log.sql (worker_log) and MOD-150 M3's 0034_item_artifact_link.sql \
          (item_artifact_link) and MOD-149's 0035_requirement_keys.sql \
          (requirement_child_counter) and MOD-122 M3's 0036_activity_event.sql \
-         (activity_event) and nothing else, \
+         (activity_event) and MOD-130 M1's 0037_execution_targets.sql (target) and nothing else, \
          got {present:?}"
     );
 
@@ -1022,6 +1027,93 @@ const MOD139_TABLE_COMMENT: (&str, &str) = (
      transaction (MOD-139 M2). Mirrored.",
 );
 
+/// The `COMMENT ON COLUMN` texts of `0037_execution_targets.sql` (MOD-130 M1), verbatim and in
+/// migration order, for [`ANA_COLUMN_COMMENTS`]'s reason. `box.os_family` carries none.
+const MOD130_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "target",
+        "kind",
+        "MOD-130 M1 (D1): local, docker, ssh, ssh_docker or enrolled. All five are stored; a \
+         kind this build cannot run derives the status planned.",
+    ),
+    (
+        "target",
+        "locator",
+        "MOD-130 M1 (ANA-42 7.1): a JSON object of names and addresses only, never values: \
+         an ssh Host and user, a docker context, an image, a run root. The store refuses a \
+         key or a URL that looks like a secret.",
+    ),
+    (
+        "target",
+        "box_id",
+        "MOD-130 M1 (D2, P4): the box the target runs on once bound; NULL on the local \
+         target, which means the box that starts the run, and on a target not yet bound.",
+    ),
+    (
+        "target",
+        "probe_error",
+        "MOD-130 M1 (D4): why the last probe through this target failed; NULL after a good \
+         one. Set, the status is unreachable.",
+    ),
+    (
+        "target",
+        "retired_at",
+        "MOD-130 M1 (D14): when the target was retired. A retired target is hidden from \
+         pickers and keeps its history; never set on the local target.",
+    ),
+    (
+        "box",
+        "kind",
+        "MOD-130 M1 (D12): machine, or container, a child of a machine (parent_box_id). Only \
+         a container may hold a NULL os_family, until its first probe (D13).",
+    ),
+    (
+        "box",
+        "parent_box_id",
+        "MOD-130 M1 (D12): the machine a container box runs on; NULL exactly on a machine.",
+    ),
+    (
+        "project",
+        "target_id",
+        "MOD-130 M1 (D3): the project's target; NULL = inherit; on a scope row, the \
+         workspace level (D5).",
+    ),
+    (
+        "step_graph",
+        "target_id",
+        "MOD-130 M1 (D3, D11): the workflow's target; NULL = inherit. Setting it bumps \
+         revision.",
+    ),
+    (
+        "item",
+        "target_id",
+        "MOD-130 M1 (D3, D11): the item's target, a spec field under version; NULL = \
+         inherit.",
+    ),
+    (
+        "run",
+        "target_id",
+        "MOD-130 M1 (D7): the target the run resolved at its start; NULL on a run started \
+         before targets. Set with target_source.",
+    ),
+    (
+        "run",
+        "target_source",
+        "MOD-130 M1 (D7): the level that named run.target_id: item, workflow, project, \
+         workspace, settings or default (no level and no Settings default: the local \
+         target).",
+    ),
+];
+
+/// The one `COMMENT ON TABLE` of `0037_execution_targets.sql` (MOD-130 M1), verbatim.
+const MOD130_TABLE_COMMENT: (&str, &str) = (
+    "target",
+    "MOD-130 M1 (ANA-42 7.1): where a run executes, a record that points at a box. Kind, \
+     locator and, once bound, box; the status is derived at read time and never stored (D4). \
+     One local row is seeded and built in (D2). Retired, never deleted while anything names \
+     it (D14). Mirrored.",
+);
+
 /// MOD-11 plan D14 (OQ-3): `0015_command_queue.sql` gives `command_run` its two liveness columns,
 /// both nullable (every row written before the migration, and every verify row, has neither) and
 /// both commented.
@@ -1259,6 +1351,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD163_M2_COLUMN_COMMENTS)
         .chain(MOD139_COLUMN_COMMENTS)
         .chain(MOD164_COLUMN_COMMENTS)
+        .chain(MOD130_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -1276,8 +1369,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             actual.as_deref(),
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
-             MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163, MOD-163 M2, MOD-139 or MOD-164) \
-             text byte for byte"
+             MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163, MOD-163 M2, MOD-139, MOD-164 or \
+             MOD-130) text byte for byte"
         );
     }
 
@@ -1288,6 +1381,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         MOD125_TABLE_COMMENT,
         MOD146_TABLE_COMMENT,
         MOD139_TABLE_COMMENT,
+        MOD130_TABLE_COMMENT,
     ]
     .into_iter()
     .chain(MOD137_TABLE_COMMENTS.iter().copied())
@@ -1338,6 +1432,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD163_M2_COLUMN_COMMENTS)
             .chain(MOD139_COLUMN_COMMENTS)
             .chain(MOD164_COLUMN_COMMENTS)
+            .chain(MOD130_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -1363,6 +1458,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD163_M2_COLUMN_COMMENTS)
         .chain(MOD139_COLUMN_COMMENTS)
         .chain(MOD164_COLUMN_COMMENTS)
+        .chain(MOD130_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
@@ -4267,8 +4363,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(36),
-        "thirty-six embedded migrations, none applied (through MOD-122 M3's 0036_activity_event.sql)"
+        MigrationState::Pending(37),
+        "thirty-seven embedded migrations, none applied (through MOD-130 M1's 0037_execution_targets.sql)"
     );
 
     db.drop_db().await;
@@ -4368,8 +4464,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(36),
-        "thirty-six embedded migrations, through MOD-122 M3's 0036_activity_event.sql"
+        MigrationState::Pending(37),
+        "thirty-seven embedded migrations, through MOD-130 M1's 0037_execution_targets.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4377,8 +4473,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(36),
-        "every one of the thirty-six, through MOD-122 M3's 0036_activity_event.sql, is pending"
+        HeadlessError::MigrationsPending(37),
+        "every one of the thirty-seven, through MOD-130 M1's 0037_execution_targets.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4400,8 +4496,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(36),
-        "every one of the thirty-six, through MOD-122 M3's 0036_activity_event.sql, is pending"
+        HeadlessError::MigrationsPending(37),
+        "every one of the thirty-seven, through MOD-130 M1's 0037_execution_targets.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4552,8 +4648,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        36,
-        "the later applies migrate nothing: the thirty-six embedded migrations (through MOD-122 M3's 0036_activity_event.sql) are applied once"
+        37,
+        "the later applies migrate nothing: the thirty-seven embedded migrations (through MOD-130 M1's 0037_execution_targets.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -8390,6 +8486,414 @@ async fn migration_0035_checks_tie_the_key_shape() {
         .execute(pool)
         .await
         .expect("a project holding a nested child is deleted whole");
+
+    db.drop_db().await;
+}
+
+/// The SQLSTATE and the constraint name of a refused statement, read off the driver's error.
+fn refusal_of(err: &sqlx::Error) -> (String, String) {
+    let db = err
+        .as_database_error()
+        .unwrap_or_else(|| panic!("a database refusal, got {err:?}"));
+    (
+        db.code().map(|code| code.into_owned()).unwrap_or_default(),
+        db.constraint().unwrap_or_default().to_owned(),
+    )
+}
+
+/// MOD-130 M1 (D1, D2, D7, D12, D13; plan P1-P3): `0037_execution_targets.sql` over a populated
+/// v36 schema. The old rows read as machines with every `target_id` NULL; the local row exists;
+/// the CHECKs refuse a second local, a machine without an OS family, a container without a
+/// parent, a machine with one, a non-object locator and a half or unknown `run` target pair; a
+/// container without an OS family under a machine is accepted; the constraint texts are pinned;
+/// and an update moves `target.updated_at`.
+#[tokio::test]
+async fn migration_0037_adds_targets_and_box_kinds() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(36, &db.pool)
+        .await
+        .expect("apply 0001 through 0036");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod130").await;
+    let machine = insert_box(pool, user).await;
+    let pk = plant_project_kind(pool, user, "targets").await;
+    let graph = insert_graph(pool, pk.0, "feature").await;
+    let item = plant_item(pool, pk, 1, "open", None, user).await;
+    let run = insert_run(pool, pk.0, "chat", "queued", machine, user).await;
+
+    MIGRATOR.run_to(37, pool).await.expect("apply 0037");
+
+    let (kind, parent, os): (String, Option<uuid::Uuid>, Option<String>) =
+        sqlx::query_as("SELECT kind, parent_box_id, os_family FROM box WHERE id = $1")
+            .bind(machine)
+            .fetch_one(pool)
+            .await
+            .expect("read the v36 box");
+    assert_eq!(
+        (kind.as_str(), parent, os.as_deref()),
+        ("machine", None, Some("linux")),
+        "a box registered before 0037 is a machine with no parent"
+    );
+    for (table, id) in [
+        ("project", pk.0),
+        ("step_graph", graph),
+        ("item", item),
+        ("run", run),
+    ] {
+        let target: Option<uuid::Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT target_id FROM {table} WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|err| panic!("read {table}.target_id: {err}"));
+        assert_eq!(
+            target, None,
+            "{table}.target_id is NULL (inherit) on an old row"
+        );
+    }
+    let source: Option<String> = sqlx::query_scalar("SELECT target_source FROM run WHERE id = $1")
+        .bind(run)
+        .fetch_one(pool)
+        .await
+        .expect("read run.target_source");
+    assert_eq!(source, None, "an old run has no target source");
+
+    let local: (
+        uuid::Uuid,
+        String,
+        String,
+        serde_json::Value,
+        Option<uuid::Uuid>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT id, name, kind, locator, box_id, retired_at IS NULL FROM target \
+              WHERE kind = 'local'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the local target exists");
+    assert_eq!(
+        local,
+        (
+            htui_core::seed::LOCAL_TARGET_ID.0,
+            "this box".to_owned(),
+            "local".to_owned(),
+            json!({}),
+            None,
+            true,
+        ),
+        "0037 seeds the one local target"
+    );
+
+    // Each refusal is checked by SQLSTATE and constraint name.
+    let refused = |result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+                   state: &str,
+                   constraint: &str,
+                   what: &str| {
+        let err = result.expect_err(what);
+        assert_eq!(
+            refusal_of(&err),
+            (state.to_owned(), constraint.to_owned()),
+            "{what} is refused by {constraint} ({state})"
+        );
+    };
+    refused(
+        sqlx::query("INSERT INTO target (name, kind) VALUES ('another', 'local')")
+            .execute(pool)
+            .await,
+        "23505",
+        "uq_target_one_local",
+        "a second local target",
+    );
+    let insert_box_row =
+        |kind: &'static str, os: Option<&'static str>, parent: Option<uuid::Uuid>| {
+            let id = uuid::Uuid::now_v7();
+            sqlx::query(
+            "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                              kind, parent_box_id) \
+             VALUES ($1, $2, $3, $4, '', '', '', $5, $6)",
+        )
+        .bind(id)
+        .bind(user)
+        .bind(format!("HTUI-TEST-{}", id.simple()))
+        .bind(os)
+        .bind(kind)
+        .bind(parent)
+        .execute(pool)
+        };
+    refused(
+        insert_box_row("machine", None, None).await,
+        "23514",
+        "chk_box_os_family",
+        "a machine without an os_family",
+    );
+    refused(
+        insert_box_row("container", Some("linux"), None).await,
+        "23514",
+        "chk_box_kind_parent",
+        "a container without a parent",
+    );
+    refused(
+        insert_box_row("machine", Some("linux"), Some(machine)).await,
+        "23514",
+        "chk_box_kind_parent",
+        "a machine with a parent",
+    );
+    refused(
+        insert_box_row("container", Some("solaris"), Some(machine)).await,
+        "23514",
+        "chk_box_os_family",
+        "an os_family outside the three",
+    );
+    refused(
+        sqlx::query("INSERT INTO target (name, kind, locator) VALUES ('list', 'ssh', '[]')")
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_target_locator_object",
+        "a locator that is not an object",
+    );
+    refused(
+        sqlx::query("INSERT INTO target (name, kind) VALUES ('vm', 'vm')")
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_target_kind",
+        "an unknown target kind",
+    );
+    refused(
+        sqlx::query("UPDATE target SET locator = '{\"host\": \"dev\"}' WHERE kind = 'local'")
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_target_local_shape",
+        "a local target with a locator",
+    );
+    refused(
+        sqlx::query("UPDATE run SET target_source = 'item' WHERE id = $1")
+            .bind(run)
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_run_target_pair",
+        "a target_source without a target_id",
+    );
+    refused(
+        sqlx::query("UPDATE run SET target_id = $2, target_source = 'elsewhere' WHERE id = $1")
+            .bind(run)
+            .bind(htui_core::seed::LOCAL_TARGET_ID.0)
+            .execute(pool)
+            .await,
+        "23514",
+        "chk_run_target_source",
+        "target_source = 'elsewhere'",
+    );
+    sqlx::query("UPDATE run SET target_id = $2, target_source = 'default' WHERE id = $1")
+        .bind(run)
+        .bind(htui_core::seed::LOCAL_TARGET_ID.0)
+        .execute(pool)
+        .await
+        .expect("a run names the local target with its source");
+
+    insert_box_row("container", None, Some(machine))
+        .await
+        .expect("a container under a machine may wait for its first probe without an os_family");
+
+    for (table, constraint, definition) in [
+        (
+            "target",
+            "chk_target_kind",
+            "CHECK ((kind = ANY (ARRAY['local'::text, 'docker'::text, 'ssh'::text, \
+             'ssh_docker'::text, 'enrolled'::text])))",
+        ),
+        (
+            "target",
+            "chk_target_locator_object",
+            "CHECK ((jsonb_typeof(locator) = 'object'::text))",
+        ),
+        (
+            "target",
+            "chk_target_local_shape",
+            "CHECK (((kind <> 'local'::text) OR ((box_id IS NULL) AND (locator = '{}'::jsonb) \
+             AND (retired_at IS NULL))))",
+        ),
+        (
+            "target",
+            "fk_target_box",
+            "FOREIGN KEY (box_id) REFERENCES box(id) ON DELETE RESTRICT",
+        ),
+        ("target", "uq_target_name", "UNIQUE (name)"),
+        (
+            "box",
+            "chk_box_kind",
+            "CHECK ((kind = ANY (ARRAY['machine'::text, 'container'::text])))",
+        ),
+        (
+            "box",
+            "chk_box_kind_parent",
+            "CHECK (((kind = 'container'::text) = (parent_box_id IS NOT NULL)))",
+        ),
+        (
+            "box",
+            "chk_box_parent_not_self",
+            "CHECK ((parent_box_id <> id))",
+        ),
+        (
+            "box",
+            "chk_box_os_family",
+            "CHECK (\nCASE\n    WHEN (os_family IS NULL) THEN (kind = 'container'::text)\n    \
+             ELSE (os_family = ANY (ARRAY['windows'::text, 'linux'::text, 'macos'::text]))\nEND)",
+        ),
+        (
+            "box",
+            "fk_box_parent",
+            "FOREIGN KEY (parent_box_id) REFERENCES box(id) ON DELETE RESTRICT",
+        ),
+        (
+            "run",
+            "chk_run_target_source",
+            "CHECK ((target_source = ANY (ARRAY['item'::text, 'workflow'::text, \
+             'project'::text, 'workspace'::text, 'settings'::text, 'default'::text])))",
+        ),
+        (
+            "run",
+            "chk_run_target_pair",
+            "CHECK (((target_id IS NULL) = (target_source IS NULL)))",
+        ),
+        (
+            "project",
+            "fk_project_target",
+            "FOREIGN KEY (target_id) REFERENCES target(id) ON DELETE RESTRICT",
+        ),
+        (
+            "step_graph",
+            "fk_step_graph_target",
+            "FOREIGN KEY (target_id) REFERENCES target(id) ON DELETE RESTRICT",
+        ),
+        (
+            "item",
+            "fk_item_target",
+            "FOREIGN KEY (target_id) REFERENCES target(id) ON DELETE RESTRICT",
+        ),
+        (
+            "run",
+            "fk_run_target",
+            "FOREIGN KEY (target_id) REFERENCES target(id) ON DELETE RESTRICT",
+        ),
+    ] {
+        let actual: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+              WHERE conrelid = $1::regclass AND conname = $2",
+        )
+        .bind(table)
+        .bind(constraint)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|err| panic!("read {constraint}: {err}"));
+        assert_eq!(actual, definition, "{constraint} is as 0037 writes it");
+    }
+    let old_check: Option<String> = sqlx::query_scalar(
+        "SELECT conname::text FROM pg_constraint \
+          WHERE conrelid = 'box'::regclass AND conname = 'box_os_family_check'",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("look for the 0001 os_family check");
+    assert_eq!(
+        old_check, None,
+        "chk_box_os_family replaces box_os_family_check"
+    );
+    for (index, definition) in [
+        (
+            "uq_target_one_local",
+            "CREATE UNIQUE INDEX uq_target_one_local ON public.target USING btree (kind) \
+             WHERE (kind = 'local'::text)",
+        ),
+        (
+            "idx_box_parent",
+            "CREATE INDEX idx_box_parent ON public.box USING btree (parent_box_id) \
+             WHERE (parent_box_id IS NOT NULL)",
+        ),
+        (
+            "idx_project_target",
+            "CREATE INDEX idx_project_target ON public.project USING btree (target_id) \
+             WHERE (target_id IS NOT NULL)",
+        ),
+        (
+            "idx_step_graph_target",
+            "CREATE INDEX idx_step_graph_target ON public.step_graph USING btree (target_id) \
+             WHERE (target_id IS NOT NULL)",
+        ),
+        (
+            "idx_item_target",
+            "CREATE INDEX idx_item_target ON public.item USING btree (target_id) \
+             WHERE (target_id IS NOT NULL)",
+        ),
+        (
+            "idx_run_target",
+            "CREATE INDEX idx_run_target ON public.run USING btree (target_id) \
+             WHERE (target_id IS NOT NULL)",
+        ),
+    ] {
+        let actual: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|err| panic!("read {index}: {err}"));
+        assert_eq!(actual, definition, "{index} is as 0037 writes it");
+    }
+
+    let docker: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO target (name, kind, updated_at) \
+         VALUES ('docker here', 'docker', '2000-01-01T00:00:00Z') RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("a docker target");
+    sqlx::query("UPDATE target SET probe_error = 'no daemon' WHERE id = $1")
+        .bind(docker)
+        .execute(pool)
+        .await
+        .expect("update the docker target");
+    let moved: bool = sqlx::query_scalar(
+        "SELECT updated_at > '2000-01-01T00:00:00Z'::timestamptz FROM target WHERE id = $1",
+    )
+    .bind(docker)
+    .fetch_one(pool)
+    .await
+    .expect("read target.updated_at");
+    assert!(moved, "trg_target_updated_at moves updated_at on UPDATE");
+
+    db.drop_db().await;
+}
+
+/// MOD-130 M1 P2: the row 0037 inserts is `htui_core::seed`'s local target, so `MemStore`'s
+/// synthesised row and Postgres's agree.
+#[tokio::test]
+async fn migration_0037_seeds_the_code_seed() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let rows: Vec<(uuid::Uuid, String, String)> =
+        sqlx::query_as("SELECT id, name, kind FROM target ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .expect("read target");
+    assert_eq!(
+        rows,
+        vec![(
+            htui_core::seed::LOCAL_TARGET_ID.0,
+            htui_core::seed::LOCAL_TARGET_NAME.to_owned(),
+            htui_core::model::TargetKind::Local.as_str().to_owned(),
+        )],
+        "0037's one row is seed::LOCAL_TARGET_ID and LOCAL_TARGET_NAME"
+    );
 
     db.drop_db().await;
 }

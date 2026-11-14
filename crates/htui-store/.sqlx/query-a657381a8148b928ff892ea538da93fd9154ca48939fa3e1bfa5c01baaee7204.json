@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id AS \"id: BoxId\", user_id AS \"user_id: htui_core::model::UserId\", hostname,\n                   os_family AS \"os_family: htui_core::model::OsFamily\", os_version, arch, cpu,\n                   ram_mb, gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags,\n                   quirks, settings, registered_at, last_seen_at, last_probed_at, updated_at,\n                   edit_version, probe_spec_digest\n              FROM box WHERE user_id = $1 ORDER BY id\n            ",
+  "query": "SELECT id, user_id, hostname, os_family, os_version, arch, cpu, ram_mb, gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags, quirks, settings, registered_at, last_seen_at, last_probed_at, updated_at FROM box WHERE id = $1 AND kind = 'machine'",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: BoxId",
+        "name": "id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "user_id: htui_core::model::UserId",
+        "name": "user_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "os_family: htui_core::model::OsFamily",
+        "name": "os_family",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -211,28 +211,6 @@
             "name": "updated_at"
           }
         }
-      },
-      {
-        "ordinal": 19,
-        "name": "edit_version",
-        "type_info": "Int4",
-        "origin": {
-          "Table": {
-            "table": "box",
-            "name": "edit_version"
-          }
-        }
-      },
-      {
-        "ordinal": 20,
-        "name": "probe_spec_digest",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "box",
-            "name": "probe_spec_digest"
-          }
-        }
       }
     ],
     "parameters": {
@@ -244,7 +222,7 @@
       false,
       false,
       false,
-      false,
+      true,
       false,
       false,
       false,
@@ -259,10 +237,8 @@
       false,
       false,
       true,
-      false,
-      false,
-      true
+      false
     ]
   },
-  "hash": "e3ceb595686179920532cfe1a9b9e73b29b7b8de1e5868d26243bdb64c8501b4"
+  "hash": "a657381a8148b928ff892ea538da93fd9154ca48939fa3e1bfa5c01baaee7204"
 }

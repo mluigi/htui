@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id             AS \"id: BoxId\",\n                   user_id        AS \"user_id: htui_core::model::UserId\",\n                   hostname,\n                   os_family      AS \"os_family: htui_core::model::OsFamily\",\n                   os_version,\n                   arch,\n                   cpu,\n                   ram_mb,\n                   gpu_present,\n                   gpu_vendor,\n                   htui_version,\n                   probed_tags,\n                   declared_tags,\n                   quirks,\n                   settings,\n                   registered_at,\n                   last_seen_at,\n                   last_probed_at,\n                   updated_at,\n                   edit_version\n              FROM box WHERE id = $1\n            ",
+  "query": "\n            SELECT id             AS \"id: BoxId\",\n                   user_id        AS \"user_id: htui_core::model::UserId\",\n                   hostname,\n                   os_family      AS \"os_family: htui_core::model::OsFamily\",\n                   os_version,\n                   arch,\n                   cpu,\n                   ram_mb,\n                   gpu_present,\n                   gpu_vendor,\n                   htui_version,\n                   probed_tags,\n                   declared_tags,\n                   quirks,\n                   settings,\n                   registered_at,\n                   last_seen_at,\n                   last_probed_at,\n                   updated_at,\n                   edit_version,\n                   kind           AS \"kind: htui_core::model::BoxKind\",\n                   parent_box_id  AS \"parent_box_id: BoxId\"\n              FROM box WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -222,6 +222,28 @@
             "name": "edit_version"
           }
         }
+      },
+      {
+        "ordinal": 20,
+        "name": "kind: htui_core::model::BoxKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "parent_box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "parent_box_id"
+          }
+        }
       }
     ],
     "parameters": {
@@ -233,7 +255,7 @@
       false,
       false,
       false,
-      false,
+      true,
       false,
       false,
       false,
@@ -249,8 +271,10 @@
       false,
       true,
       false,
-      false
+      false,
+      false,
+      true
     ]
   },
-  "hash": "5875c0fce5de0b4204e3c057988c7b3aae2b8f153be7b6f1b12aa96787325edb"
+  "hash": "ff5c980decbca62d833f912a3c2f1fe7a6075467954690234e7e809225ca6adc"
 }

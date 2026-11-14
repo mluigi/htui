@@ -3473,7 +3473,8 @@ impl WriteStore for PgStore {
                    os_family AS "os_family: htui_core::model::OsFamily", os_version, arch, cpu,
                    ram_mb, gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags,
                    quirks, settings, registered_at, last_seen_at, last_probed_at, updated_at,
-                   edit_version, probe_spec_digest
+                   edit_version, probe_spec_digest, kind AS "kind: htui_core::model::BoxKind",
+                   parent_box_id AS "parent_box_id: BoxId"
               FROM box WHERE user_id = $1 ORDER BY id
             "#,
             self.this_user().as_uuid(),
@@ -3535,6 +3536,8 @@ impl WriteStore for PgStore {
                         last_probed_at: row.last_probed_at,
                         updated_at: row.updated_at,
                         edit_version: row.edit_version,
+                        kind: row.kind,
+                        parent_box_id: row.parent_box_id,
                     },
                     tools: own,
                     probe_spec_digest: row.probe_spec_digest,
@@ -3607,7 +3610,9 @@ impl WriteStore for PgStore {
                       os_family      AS "os_family: htui_core::model::OsFamily",
                       os_version, arch, cpu, ram_mb, gpu_present, gpu_vendor, htui_version,
                       probed_tags, declared_tags, quirks, settings,
-                      registered_at, last_seen_at, last_probed_at, updated_at, edit_version
+                      registered_at, last_seen_at, last_probed_at, updated_at, edit_version,
+                      kind           AS "kind: htui_core::model::BoxKind",
+                      parent_box_id  AS "parent_box_id: BoxId"
             "#,
             id.as_uuid(),
             expected,
