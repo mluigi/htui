@@ -3735,9 +3735,9 @@ where
             let Some(item) = reads.item else {
                 continue;
             };
-            if !repos.contains_key(&record.project_id) {
-                let rows = self.parts.store.repos(record.project_id).await?;
-                repos.insert(record.project_id, rows);
+            if let std::collections::btree_map::Entry::Vacant(slot) = repos.entry(record.project_id)
+            {
+                slot.insert(self.parts.store.repos(record.project_id).await?);
             }
             let repo = repos
                 .get(&record.project_id)
