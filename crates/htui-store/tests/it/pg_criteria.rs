@@ -274,9 +274,9 @@ async fn concurrent_requirement_mints_produce_consecutive_numbers() {
     db.drop_db().await;
 }
 
-/// MOD-149 plan D5: two pools nesting under one parent at once take `.1` and `.2`. The first
-/// mint inserts the `requirement_child_counter` row and the second takes its `DO UPDATE` branch,
-/// so neither sees `23505` on the counter's primary key or on `uq_requirement_child`.
+/// MOD-149 plan D5: eight mints from two pools nesting under one parent at once take `.1` to
+/// `.8`. The first inserts the `requirement_child_counter` row and the rest take its `DO UPDATE`
+/// branch, so none sees `23505` on the counter's primary key or on `uq_requirement_child`.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_children_take_distinct_numbers() {
     let Some(db) = common::demo_db().await else {
@@ -292,7 +292,8 @@ async fn concurrent_children_take_distinct_numbers() {
         .expect("third pool")
         .store;
 
-    let mints = join_all([&left, &right].into_iter().enumerate().map(|(n, store)| {
+    let mints = join_all((0..8).map(|n| {
+        let store = if n % 2 == 0 { &left } else { &right };
         let new = NewRequirement {
             id: RequirementId::new(),
             body: format!("child {n}"),
@@ -306,21 +307,35 @@ async fn concurrent_children_take_distinct_numbers() {
     }))
     .await;
 
-    let mut keys: Vec<(String, Option<i32>, Option<i32>)> = mints
+    let rows: Vec<_> = mints
         .into_iter()
-        .map(|minted| {
-            let row = minted.expect("every nested mint lands, neither on 23505");
-            (row.key, row.number, row.child_number)
-        })
+        .map(|minted| minted.expect("every nested mint lands, none on 23505"))
         .collect();
+    assert!(
+        rows.iter().all(|row| row.number.is_none()),
+        "a nested child takes no top-level number"
+    );
+    let mut numbers: Vec<i32> = rows
+        .iter()
+        .map(|row| row.child_number.expect("a nested mint has a child number"))
+        .collect();
+    numbers.sort_unstable();
+    assert_eq!(
+        numbers,
+        (1..=8).collect::<Vec<i32>>(),
+        "eight concurrent children of R-ENT-1 are exactly .1 to .8: no duplicate, no gap"
+    );
+    let mut keys: Vec<String> = rows.into_iter().map(|row| row.key).collect();
     keys.sort_unstable();
+    keys.dedup();
     assert_eq!(
         keys,
-        vec![
-            ("R-ENT-1.1".to_owned(), None, Some(1)),
-            ("R-ENT-1.2".to_owned(), None, Some(2)),
-        ],
-        "two concurrent children of R-ENT-1 take .1 and .2"
+        {
+            let mut expected: Vec<String> = (1..=8).map(|n| format!("R-ENT-1.{n}")).collect();
+            expected.sort_unstable();
+            expected
+        },
+        "eight distinct keys, R-ENT-1.1 to R-ENT-1.8"
     );
 
     db.drop_db().await;
