@@ -89,8 +89,11 @@ the top level need `--search-items`; `htui --json` alone is a usage error.
     box's". Without one it is refused with `no_box`; start the TUI once so the box gets an
     identity.
 
-`--search-items` keeps its own default: **every workspace**. `--project` and `--cwd` narrow it to
-one project, with the same rules as above.
+`--search-items` keeps its own default: **every workspace**, each workspace's own items and
+documents (its `WS` items and its `goals` document) included, before its projects.
+`--project` and `--cwd` narrow it to one project, with the same rules as above, and
+`--project @<workspace>` (a workspace's slug after `@`, such as `@platform`) narrows it to that
+workspace's own items and documents alone. `--index-items` covers the same scopes.
 
 ## The envelope
 
@@ -309,8 +312,8 @@ off by the difference; an age that would be negative is reported as `0`.
 | `query` | string | The query, as given. |
 | `decisions` | boolean | Whether `--decisions` was given. |
 | `hits` | array | Present for `online` and `empty` only. The best hits first. |
-| `hits[].key` | string | The item's or requirement's key. |
-| `hits[].place` | string | What matched: `"item"`, `"document"` (one of the item's documents) or `"requirement"`. |
+| `hits[].key` | string | The item's or requirement's key, or the owning project's slug on a project or workspace document (`@platform` for the `platform` workspace's own). |
+| `hits[].place` | string | What matched: `"item"`, `"document"` (one of the item's documents, or a project's or a workspace's own document) or `"requirement"`. |
 | `hits[].document_kind` | string or `null` | The document's kind, such as `prd`, on a document hit; otherwise `null`. |
 | `hits[].resolution` | string or `null` | How the item closed (`done`, `concluded`, `rejected`, `withdrawn`, `superseded`, `duplicate`), on an item or document hit of a closed item; otherwise `null`. |
 | `hits[].requirement_state` | string or `null` | `active` or `withdrawn`, on a requirement hit; otherwise `null`. |
@@ -360,7 +363,7 @@ Every `error.code`, with the `store` it comes with and the exit code:
 | `migrations_pending` | `refused` | 2 | all | The database has migrations this build has not applied. Start the TUI once to apply them. |
 | `below_target` | `refused` | 2 | all | The database's target version is newer than this build. Update htui. |
 | `store_refused` | `refused` | 2 | all | Postgres answered and refused this htui: a newer or drifted schema, a partial migration, a wrong password, a missing database, a pooler that rejects the read-only session (see [No writes](#no-writes)). |
-| `unknown_project` | `refused` | 2 | all | `--project` names no project. |
+| `unknown_project` | `refused` | 2 | all | `--project` names no project (or, as `@<workspace>` on `--search-items`, no workspace). |
 | `cwd_unresolved` | `refused` | 2 | all | `--cwd`'s path cannot be resolved on this machine. |
 | `no_box` | `refused` | 2 | all | `--cwd` was given, but this machine has no `box.toml`. |
 | `cwd_unmatched` | `refused` | 2 | all | `--cwd`'s path is in no repository registered on this box. |

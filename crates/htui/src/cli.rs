@@ -126,7 +126,8 @@ pub struct Args {
     #[arg(long, value_name = "QUERY", conflicts_with_all = ["set_dsn", "clear_dsn", "demo", "offline"])]
     pub search_items: Option<String>,
 
-    /// With `--index-items` or `--search-items`: only the project with this slug.
+    /// With `--index-items` or `--search-items`: only the project with this slug, or with
+    /// `@<workspace>` only that workspace's own items and documents.
     #[arg(long, value_name = "SLUG", requires = "concepts")]
     pub project: Option<String>,
 

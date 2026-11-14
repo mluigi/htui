@@ -1645,7 +1645,7 @@ mod tests {
             &envelope(
                 2,
                 StoreRequest::SearchConcepts {
-                    query: query,
+                    query,
                     scope_row_of: None,
                 },
             ),
@@ -1819,7 +1819,7 @@ mod tests {
             &envelope(
                 1,
                 StoreRequest::SearchConcepts {
-                    query: query,
+                    query,
                     scope_row_of: None,
                 },
             ),
@@ -3123,7 +3123,7 @@ mod tests {
             &envelope(
                 1,
                 StoreRequest::SearchConcepts {
-                    query: query,
+                    query,
                     scope_row_of: None,
                 },
             ),
