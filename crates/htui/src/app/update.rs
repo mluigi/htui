@@ -19,6 +19,7 @@ use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayId};
 use crate::ui::shell::PaneId;
+use crate::ui::shell::activity::ActivityJump;
 use crate::ui::shell::history::Loc;
 use crate::ui::shell::layout as pane_layout;
 use crate::ui::tabs::SettingsTab;
@@ -26,6 +27,9 @@ use crate::ui::tabs::settings::ConnectionSection;
 
 /// The top bar's counts are re-read once a second, i.e. every fourth 250 ms tick.
 const TICKS_PER_REFRESH: u64 = 4;
+
+/// MOD-122 M3 D6 (blueprint F10): the retention sweep goes once an hour of 250 ms ticks.
+const SWEEP_TICKS: u64 = 3600 * 4;
 
 impl App {
     /// Applies one action, recording the move it made in the history (MOD-115 M2 §8: a reply
@@ -42,6 +46,11 @@ impl App {
 
     /// [`update`](Self::update)'s body.
     fn apply(&mut self, action: Action) {
+        // MOD-122 M3 D8: a move that may show the activity pane reads it at once, not a second on.
+        let may_show_activity = matches!(
+            action,
+            Action::Tab(_) | Action::Layout(_) | Action::Pane(_) | Action::History(_)
+        );
         match action {
             Action::Quit => self.should_quit = true,
             Action::Tab(tab) => self.update_tab(tab),
@@ -75,7 +84,80 @@ impl App {
                 return;
             }
         }
+        if may_show_activity {
+            self.poll_activity();
+        }
         self.dirty = true;
+    }
+
+    /// MOD-122 M3 D8: reads the activity feed for the panel while the active tab shows its
+    /// pane, one read in flight at most: the newest page first, then from the panel's cursor.
+    /// Sent as `Origin::App`, which is never forgotten, so every reply passes the freshness gate
+    /// to [`App::on_app_reply`] (blueprint F9).
+    fn poll_activity(&mut self) {
+        if self.activity_shown() && self.activity.begin_request() {
+            let after = self.activity.after();
+            self.dispatch(Origin::App, StoreRequest::Activity { after });
+        }
+    }
+
+    /// MOD-122 M3 D6 (blueprint F10): the retention sweep, on the first refresh tick and then
+    /// every [`SWEEP_TICKS`]; a store that was down is swept by the next one. Idempotent, so no
+    /// answer is waited on.
+    fn sweep_retention(&mut self) {
+        if self.ticks >= self.sweep_due {
+            self.sweep_due = self.ticks + SWEEP_TICKS;
+            self.dispatch(Origin::App, StoreRequest::SweepRetention);
+        }
+    }
+
+    /// MOD-122 M3 D9: `Enter` on an activity row. A chat replays; an item in this workspace is
+    /// revealed; one in another workspace enters it first, then reveals (a scope change clears a
+    /// pending reveal) and says so, unless an open in-pane edit refuses the move; a row whose
+    /// item or run went says so and moves nothing.
+    pub(super) fn activity_jump(&mut self, jump: ActivityJump) {
+        match jump {
+            ActivityJump::Replay { step } => self.update(Action::Replay { step_id: step }),
+            ActivityJump::Gone { key } => self.status = Some(format!("{key} was deleted")),
+            ActivityJump::Reveal {
+                workspace: None,
+                target,
+            } => self.reveal_from_activity(target),
+            ActivityJump::Reveal {
+                workspace: Some(workspace),
+                target,
+            } => {
+                if let Some(refusal) = self.editor_steer_refusal() {
+                    self.status = Some(refusal);
+                    return;
+                }
+                let key = match &target {
+                    RevealTarget::Item { key, .. }
+                    | RevealTarget::Step { key, .. }
+                    | RevealTarget::Requirement { key, .. } => key.clone(),
+                };
+                let said = format!("opened workspace {} for {key}", workspace.name);
+                self.update(Action::SetScope { workspace });
+                self.reveal_from_activity(target);
+                self.status = Some(said);
+            }
+        }
+    }
+
+    /// D9: reveals `target`, then focuses the detail of the tab that revealed it: the jump lands
+    /// on the step, not back on the activity pane. A refused reveal moves nothing.
+    fn reveal_from_activity(&mut self, target: RevealTarget) {
+        let kind = target.kind();
+        self.update(Action::Reveal(target));
+        if let Some(tab) = self.tabs.active_id()
+            && self.editor_tab() != Some(tab)
+            && self
+                .reveal_tabs
+                .iter()
+                .any(|(registered, id)| *registered == kind && *id == tab)
+        {
+            self.focus.insert(tab, PaneId::Detail);
+        }
     }
 
     /// MOD-122 D5, D6: applies one logging setting through the control; on success records it in
@@ -306,6 +388,8 @@ impl App {
                 let scope = self.scope.clone();
                 self.dispatch(Origin::App, StoreRequest::Waiting { scope });
             }
+            self.poll_activity();
+            self.sweep_retention();
             self.refresh_active_tab();
             self.refresh_top_overlay();
             self.dirty = true;
@@ -492,6 +576,15 @@ impl App {
                 tracing::debug!("the launch's old Qdrant URL check was refused; nothing is said");
                 true
             }
+            // MOD-122 M3 D6, D8: the panel's poll and the retention sweep go on their own, once
+            // a second and once an hour; a database that is down must not fill the line. The
+            // panel keeps its rows (`on_app_reply` lets the next read go).
+            Origin::App
+                if request == StoreRequest::Activity { after: None }.name()
+                    || request == StoreRequest::SweepRetention.name() =>
+            {
+                true
+            }
             Origin::App | Origin::Overlay(_) => false,
         }
     }
@@ -619,6 +712,20 @@ impl App {
     /// (blueprint D, "Startup"). Nothing is opened before that reply, so the first frame is
     /// always the shell itself.
     fn on_app_reply(&mut self, reply: &StoreReply) {
+        // MOD-122 M3 D8 (blueprint F9): the activity panel's read, after the freshness gate.
+        // A refusal lets the next read go and keeps the rows; a sweep's answer needs nothing.
+        match reply {
+            StoreReply::Activity { page, workspaces } => {
+                self.activity.merge(page.clone(), workspaces.clone());
+            }
+            StoreReply::Failed { request, .. }
+                if *request == StoreRequest::Activity { after: None }.name() =>
+            {
+                self.activity.failed();
+            }
+            _ => {}
+        }
+
         if let StoreReply::Workspaces(workspaces) = reply
             && !self.has_scope()
         {
@@ -1070,9 +1177,11 @@ mod tests {
             app.update(Action::Tick);
         }
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(requests.len(), 2, "one refresh per second, not per tick");
+        // MOD-122 M3 D6: the first refresh also sweeps; `activity_tests` pins its schedule.
+        assert_eq!(requests.len(), 3, "one refresh per second, not per tick");
         assert!(matches!(requests[0].request, StoreRequest::StoreState));
         assert!(matches!(requests[1].request, StoreRequest::Waiting { .. }));
+        assert!(matches!(requests[2].request, StoreRequest::SweepRetention));
     }
 
     /// An overlay that counts the refresh ticks it is handed (MOD-12 M3 D9).
@@ -1140,8 +1249,10 @@ mod tests {
             app.update(Action::Tick);
         }
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(requests.len(), 1);
+        // MOD-122 M3 D6: nor is the retention sweep, which the first refresh sends.
+        assert_eq!(requests.len(), 2);
         assert!(matches!(requests[0].request, StoreRequest::StoreState));
+        assert!(matches!(requests[1].request, StoreRequest::SweepRetention));
     }
 
     /// A `StoreState` reply addressed to the shell.
@@ -2331,5 +2442,217 @@ mod tests {
         assert_eq!(app.logging.control().state().filter, "info");
         assert_eq!(stored(&store), None, "nothing is saved");
         assert_eq!(app.ui.logging, None);
+    }
+}
+
+/// MOD-122 M3 T5 (D6, D8, blueprint F9, F10): the shell's activity poll, its replies and the
+/// retention sweep, read off the wire the store worker would read.
+#[cfg(test)]
+mod activity_tests {
+    use htui_core::fixtures::{demo_at, ids};
+    use htui_core::model::activity::{ActivityEvent, ActivityKind, ActivityPage};
+    use tokio::sync::mpsc::{self, UnboundedReceiver};
+
+    use super::{SWEEP_TICKS, TICKS_PER_REFRESH};
+    use crate::app::Action;
+    use crate::app::state::App;
+    use crate::app::state::shell_tests::{SPLIT, SPLIT_LAYOUT, SplitTab};
+    use crate::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
+    use crate::ui::shell::{Preset, TabLayout};
+
+    /// A shell whose one list + detail tab is laid out in `preset`, and the worker's inbox.
+    fn shell(preset: Preset) -> (App, UnboundedReceiver<RequestEnvelope>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.register_tab(Box::new(SplitTab::new(SPLIT, "Backlog")));
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                preset,
+                ..SPLIT_LAYOUT
+            },
+        );
+        (app, rx)
+    }
+
+    /// Everything sent since the last look.
+    fn sent(rx: &mut UnboundedReceiver<RequestEnvelope>) -> Vec<RequestEnvelope> {
+        let mut out = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            out.push(envelope);
+        }
+        out
+    }
+
+    /// The activity reads among `sent`: their `seq` and cursor.
+    fn reads(sent: &[RequestEnvelope]) -> Vec<(u64, Option<i64>)> {
+        sent.iter()
+            .filter_map(|envelope| match envelope.request {
+                StoreRequest::Activity { after } => {
+                    assert_eq!(envelope.origin, Origin::App, "the shell's own read");
+                    Some((envelope.seq, after))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many sweeps are among `sent`.
+    fn sweeps(sent: &[RequestEnvelope]) -> usize {
+        sent.iter()
+            .filter(|envelope| matches!(envelope.request, StoreRequest::SweepRetention))
+            .count()
+    }
+
+    /// One shell refresh.
+    fn refresh(app: &mut App) {
+        for _ in 0..TICKS_PER_REFRESH {
+            app.update(Action::Tick);
+        }
+    }
+
+    /// Event `id`: a gate on htui `ANA-2` in Platform.
+    fn event(id: i64) -> ActivityEvent {
+        ActivityEvent {
+            id,
+            at: demo_at(0, 0),
+            kind: ActivityKind::Gate,
+            workspace: Some(ids::WORKSPACE_PLATFORM),
+            project: Some(ids::PROJECT_HTUI),
+            project_slug: "htui".to_owned(),
+            item: Some(ids::HTUI_ANA_2),
+            item_key: Some("ANA-2".to_owned()),
+            run: Some(ids::RUN_1),
+            chat: false,
+            step: Some(ids::STEP_PLAN),
+            step_name: Some("plan".to_owned()),
+            permission: None,
+            text: String::new(),
+        }
+    }
+
+    /// The shell's reply to read `seq`.
+    fn reply(seq: u64, reply: StoreReply) -> Action {
+        Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply,
+        })
+    }
+
+    /// A page holding `events`, none pinned.
+    fn page(events: Vec<ActivityEvent>) -> StoreReply {
+        StoreReply::Activity {
+            page: ActivityPage {
+                events,
+                pinned: Vec::new(),
+            },
+            workspaces: Vec::new(),
+        }
+    }
+
+    /// D8: shown, the pane is read on the refresh tick, the newest page first, then from the
+    /// highest id held minus the overlap; never a second read while one is out.
+    #[test]
+    fn the_shown_activity_pane_is_read_on_the_refresh_tick_one_read_at_a_time() {
+        let (mut app, mut rx) = shell(Preset::IdeActivity);
+        let _ = sent(&mut rx);
+        refresh(&mut app);
+        let first = reads(&sent(&mut rx));
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0].1, None, "the first read takes the newest page");
+
+        refresh(&mut app);
+        assert!(
+            reads(&sent(&mut rx)).is_empty(),
+            "one read in flight at most"
+        );
+
+        app.update(reply(first[0].0, page(vec![event(300), event(299)])));
+        assert_eq!(app.activity.rows(&app.scope).len(), 2);
+        refresh(&mut app);
+        let next = reads(&sent(&mut rx));
+        assert_eq!(next.len(), 1, "{next:?}");
+        assert_eq!(next[0].1, Some(100), "max id minus the overlap");
+    }
+
+    /// D8, F9: a refused read says nothing on the status line, keeps the rows, and lets the next
+    /// read go.
+    #[test]
+    fn a_refused_read_says_nothing_and_keeps_the_rows() {
+        let (mut app, mut rx) = shell(Preset::IdeActivity);
+        refresh(&mut app);
+        let (seq, _) = reads(&sent(&mut rx))[0];
+        app.update(reply(seq, page(vec![event(7)])));
+
+        refresh(&mut app);
+        let (seq, _) = reads(&sent(&mut rx))[0];
+        app.update(reply(
+            seq,
+            StoreReply::Failed {
+                request: "activity",
+                message: "the database is down".to_owned(),
+            },
+        ));
+        assert_eq!(app.status, None, "absorbed");
+        assert_eq!(app.activity.rows(&app.scope).len(), 1, "the rows stay");
+
+        refresh(&mut app);
+        assert_eq!(reads(&sent(&mut rx)).len(), 1, "the next read goes");
+    }
+
+    /// D8: a hidden pane is not read; a layout that shows it reads at once, before any tick.
+    #[test]
+    fn a_hidden_pane_is_not_read_and_showing_it_reads_at_once() {
+        let (mut app, mut rx) = shell(Preset::Ide);
+        refresh(&mut app);
+        assert!(reads(&sent(&mut rx)).is_empty(), "hidden: no read");
+
+        app.update(Action::Layout(crate::app::LayoutAction::NextPreset));
+        let layout = app.layout_of(app.tabs.active().expect("a tab"));
+        assert_eq!(layout.map(|l| l.preset), Some(Preset::IdeActivity));
+        assert_eq!(reads(&sent(&mut rx)).len(), 1, "read at once");
+    }
+
+    /// D6, F10: the retention sweep goes on the first refresh tick, shown pane or not, then not
+    /// again before `SWEEP_TICKS` more ticks; its answer and its refusal say nothing.
+    #[test]
+    fn the_sweep_goes_on_the_first_refresh_and_then_hourly() {
+        let (mut app, mut rx) = shell(Preset::Ide);
+        for _ in 1..TICKS_PER_REFRESH {
+            app.update(Action::Tick);
+        }
+        assert_eq!(sweeps(&sent(&mut rx)), 0, "not before the first refresh");
+        app.update(Action::Tick);
+        let first = sent(&mut rx);
+        assert_eq!(sweeps(&first), 1, "the first refresh sweeps");
+        let seq = first
+            .iter()
+            .find(|envelope| matches!(envelope.request, StoreRequest::SweepRetention))
+            .map(|envelope| envelope.seq)
+            .expect("the sweep");
+        app.update(reply(seq, StoreReply::RetentionSwept(3)));
+        assert_eq!(app.status, None);
+
+        for _ in 1..SWEEP_TICKS {
+            app.update(Action::Tick);
+        }
+        assert_eq!(sweeps(&sent(&mut rx)), 0, "not again within the hour");
+        app.update(Action::Tick);
+        let again = sent(&mut rx);
+        assert_eq!(sweeps(&again), 1, "an hour on, again");
+        let seq = again
+            .iter()
+            .find(|envelope| matches!(envelope.request, StoreRequest::SweepRetention))
+            .map(|envelope| envelope.seq)
+            .expect("the sweep");
+        app.update(reply(
+            seq,
+            StoreReply::Failed {
+                request: "sweep_retention",
+                message: "the database is down".to_owned(),
+            },
+        ));
+        assert_eq!(app.status, None, "a refused sweep is absorbed");
     }
 }

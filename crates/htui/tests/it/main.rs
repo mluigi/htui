@@ -1,3 +1,4 @@
+mod activity;
 mod agent_settings;
 mod agent_settings_pg;
 mod auth;
