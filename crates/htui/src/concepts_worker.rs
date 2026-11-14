@@ -834,7 +834,7 @@ impl QdrantIndex {
         &self.source
     }
 
-    /// The model, loading it on first use (F9, blueprint D245). `concepts::spawn_index_job` takes
+    /// The model, loading it on first use (F9, blueprint D245). `concepts::IndexJob::spawn` takes
     /// the worker's from here too, so its index job and `search_concepts` share one (H-26).
     pub(crate) async fn embedder(&self) -> Result<RtenEmbedder, String> {
         self.load().await
@@ -1042,7 +1042,7 @@ pub fn shared_index() -> Arc<dyn ConceptIndex> {
     shared_qdrant()
 }
 
-/// [`shared_index`] as itself: `concepts::spawn_index_job` takes the worker's model from it, so
+/// [`shared_index`] as itself: `concepts::IndexJob::spawn` takes the worker's model from it, so
 /// `htui worker`'s index job and its `search_concepts` load the model once (H-26).
 #[must_use]
 pub fn shared_qdrant() -> Arc<QdrantIndex> {
@@ -1405,6 +1405,17 @@ pub struct ConceptsRuntime {
     /// This process's indexer-lease token (MOD-159 M1 plan D5): `Ctrl+R` takes a workspace's
     /// lease with it, so a lease this process's own index job holds is `Ours`.
     owner: Uuid,
+    /// The TUI's index job ([`Self::with_index_job`]), `None` when this runtime runs none.
+    job: Option<JobSlot>,
+}
+
+/// The TUI's index job (MOD-159 M1 plan D8): the index it runs over, and the job over the
+/// writable store last published, if any.
+struct JobSlot {
+    /// The process's shared index, so the job and the overlay's search load one model.
+    index: Arc<QdrantIndex>,
+    /// The job running now.
+    running: Option<crate::concepts::IndexJob<PgStore>>,
 }
 
 /// What [`ConceptsRuntime::publish`] last handed the index, so an unchanged backend is not handed
@@ -1461,6 +1472,24 @@ impl ConceptsRuntime {
             tasks: HashMap::new(),
             published: Published::Never,
             owner: Uuid::now_v7(),
+            job: None,
+        }
+    }
+
+    /// The same runtime, also running the TUI's index job (MOD-159 M1 plan D8) over the process's
+    /// shared index: [`Self::publish`] starts it over each writable store it is handed, with this
+    /// runtime's token (so `Ctrl+R` finds its leases `Ours`), and stops it, letting go of its
+    /// leases, when the store goes; [`Self::stop_index_job`] stops it at exit. Only
+    /// `store_worker::spawn_hosted` asks for it: `--demo` and the memory backend have no writable
+    /// store, so no job runs there, and the test harness builds runtimes without one.
+    #[must_use]
+    pub fn with_index_job(self) -> Self {
+        Self {
+            job: Some(JobSlot {
+                index: shared_qdrant(),
+                running: None,
+            }),
+            ..self
         }
     }
 
@@ -1495,6 +1524,28 @@ impl ConceptsRuntime {
         self.published = now;
         self.index
             .publish(store.map(|pg| Arc::new(pg.clone()) as Arc<dyn UrlRow>));
+        // MOD-159 M1 plan D8: the job follows the writable store. The old one stops on a task of
+        // its own (this awaits nothing); the new one's first beat waits for that stop, so the old
+        // release cannot free a lease the new job has just taken under the same token.
+        if let Some(job) = &mut self.job {
+            let stopping = job.running.take().map(|old| tokio::spawn(old.stop()));
+            job.running = store.map(|pg| {
+                crate::concepts::IndexJob::spawn_over(
+                    pg.clone(),
+                    Arc::clone(&job.index),
+                    self.owner,
+                    stopping,
+                )
+            });
+        }
+    }
+
+    /// MOD-159 M1 plan D8: stops the TUI's index job, if one runs, and lets go of its leases
+    /// (waited for at most a few seconds). The store loop calls it once, when the UI is gone.
+    pub async fn stop_index_job(&mut self) {
+        if let Some(running) = self.job.as_mut().and_then(|job| job.running.take()) {
+            running.stop().await;
+        }
     }
 
     /// MOD-160 D5: the loop wrote or cleared the `qdrant_url` row (or tried): the index reads its

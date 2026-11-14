@@ -3207,7 +3207,8 @@ pub fn spawn_hosted(
         tx,
         runtime,
         runs,
-        ConceptsRuntime::production(),
+        // MOD-159 M1 plan D8: the TUI indexes each collection whose lease it holds while online.
+        ConceptsRuntime::production().with_index_job(),
         tools,
     )
 }
@@ -3900,6 +3901,7 @@ pub(crate) fn spawn_with_concepts(
         if let Some(host) = &tools {
             htui_orch::tools::ToolHost::close(host.as_ref());
         }
+        concepts.stop_index_job().await;
         concepts.shutdown();
 
         if let Some(refresher) = refresher {
