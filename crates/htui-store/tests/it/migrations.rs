@@ -7799,6 +7799,145 @@ async fn cache_0011_applies_over_a_populated_0010_mirror() {
     pool.close().await;
 }
 
+/// MOD-130 M1 T5 (D15, plan P7): cache 0013 applies over a populated 0012 mirror, since
+/// `CACHE_MIGRATOR` runs before the `schema_version` check. The planted project, item and run
+/// survive with the new level columns `NULL` (inherit); `target` exists with the Postgres columns,
+/// timestamps as INTEGER microseconds, keyed on `id`. Needs no server and therefore never skips.
+#[tokio::test]
+async fn cache_0013_applies_over_a_populated_0012_mirror() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let dir = tempfile::tempdir().expect("a temp cache dir");
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("cache.sqlite"))
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open the cache file");
+    htui_store::CACHE_MIGRATOR
+        .run_to(12, &pool)
+        .await
+        .expect("apply cache 0001 through 0012");
+    for plant in [
+        "INSERT INTO project (id, slug, name, created_by, created_at, updated_at) \
+         VALUES ('p1', 'htui', 'htui', 'u1', 1, 1)",
+        "INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, key, title, \
+         created_by, created_at, updated_at) \
+         VALUES ('i1', 'p1', 'k1', 'FEAT', 1, 'FEAT-1', 'planted', 'u1', 1, 1)",
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+         started_by, queued_at, updated_at) \
+         VALUES ('r1', 'p1', 'i1', 'graph', 'auto', 'done', 'b1', 'u1', 1, 1)",
+    ] {
+        sqlx::query(plant)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("plant a 0012 row ({plant}): {e}"));
+    }
+    htui_store::CACHE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("cache 0013 applies over a populated 0012 file");
+
+    let columns = |table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            )))
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("list {table}'s columns: {e}"))
+        }
+    };
+    assert_eq!(
+        columns("project").await.last().map(String::as_str),
+        Some("target_id"),
+        "project gains target_id last"
+    );
+    assert_eq!(
+        columns("item").await.last().map(String::as_str),
+        Some("target_id"),
+        "item gains target_id last"
+    );
+    assert!(
+        columns("run")
+            .await
+            .ends_with(&["target_id".to_owned(), "target_source".to_owned()]),
+        "run gains target_id and target_source last"
+    );
+
+    for (table, id) in [("project", "p1"), ("item", "i1")] {
+        let target: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT target_id FROM {table} WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("read the planted {table}: {e}"));
+        assert_eq!(target, None, "the planted {table} survives and inherits");
+    }
+    let run: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT target_id, target_source FROM run WHERE id = 'r1'")
+            .fetch_one(&pool)
+            .await
+            .expect("read the planted run");
+    assert_eq!(
+        run,
+        (None, None),
+        "the planted run survives without a target"
+    );
+
+    let target: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT name, type, \"notnull\" FROM pragma_table_info('target') ORDER BY cid",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("list target's columns");
+    let target: Vec<(&str, &str, i64)> = target
+        .iter()
+        .map(|(name, kind, notnull)| (name.as_str(), kind.as_str(), *notnull))
+        .collect();
+    assert_eq!(
+        target,
+        [
+            ("id", "TEXT", 0),
+            ("name", "TEXT", 1),
+            ("kind", "TEXT", 1),
+            ("locator", "TEXT", 1),
+            ("box_id", "TEXT", 0),
+            ("probed_at", "INTEGER", 0),
+            ("probe_error", "TEXT", 0),
+            ("retired_at", "INTEGER", 0),
+            ("created_at", "INTEGER", 1),
+            ("updated_at", "INTEGER", 1),
+        ],
+        "the Postgres columns, UUID and JSONB as TEXT, TIMESTAMPTZ as INTEGER microseconds"
+    );
+    sqlx::query(
+        "INSERT INTO target (id, name, kind, created_at, updated_at) \
+         VALUES ('t1', 'this box', 'local', 1, 2)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert a target row");
+    let locator: String = sqlx::query_scalar("SELECT locator FROM target WHERE id = 't1'")
+        .fetch_one(&pool)
+        .await
+        .expect("read the locator");
+    assert_eq!(locator, "{}", "the locator defaults to the empty object");
+    let duplicate = sqlx::query(
+        "INSERT INTO target (id, name, kind, created_at, updated_at) \
+         VALUES ('t1', 'other', 'docker', 1, 1)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(duplicate.is_err(), "id is the primary key");
+
+    pool.close().await;
+}
+
 /// Inserts `from --kind--> to` straight into `item_link`, live.
 async fn insert_link(
     pool: &sqlx::PgPool,

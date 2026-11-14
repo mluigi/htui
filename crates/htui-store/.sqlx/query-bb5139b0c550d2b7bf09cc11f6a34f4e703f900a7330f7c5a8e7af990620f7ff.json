@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, project_id, kind_id, key_prefix, key_number, key as \"key!\", title, body,\n                  status, priority, required_tags, touched_paths, step_graph_id, version,\n                  created_by, created_at, updated_at, closed_at, resolution\n             FROM item WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
+  "query": "SELECT id, project_id, kind_id, key_prefix, key_number, key as \"key!\", title, body,\n                  status, priority, required_tags, touched_paths, step_graph_id, version,\n                  created_by, created_at, updated_at, closed_at, resolution, target_id\n             FROM item WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
@@ -211,6 +211,17 @@
             "name": "resolution"
           }
         }
+      },
+      {
+        "ordinal": 19,
+        "name": "target_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "target_id"
+          }
+        }
       }
     ],
     "parameters": {
@@ -238,8 +249,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "9d9d867f785f72a84b380188dbceaee5e9e4c1b88780a08f7cfeabc66930894a"
+  "hash": "bb5139b0c550d2b7bf09cc11f6a34f4e703f900a7330f7c5a8e7af990620f7ff"
 }

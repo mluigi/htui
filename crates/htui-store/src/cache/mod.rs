@@ -48,10 +48,15 @@ pub const CACHE_FILE: &str = "cache.sqlite";
 /// `item_artifact_link` joined in MOD-150 M3 (plan D9): an offline `links` answers the reached
 /// items' document links off it. It holds live rows only; a tombstone is a delete, as for
 /// `item_link`.
-pub const MIRRORED_TABLES: [&str; 23] = [
+///
+/// `target` joined in MOD-130 M1 (D15, plan P7): an offline reader answers `targets` and `target`
+/// off it, retired rows included. Like `workspace` it is a full replace on every pass, so a target
+/// deleted on Postgres leaves the mirror; `project`, `item` and `run` carry its level columns.
+pub const MIRRORED_TABLES: [&str; 24] = [
     "app_user",
     "agent",
     "box",
+    "target",
     "workspace",
     "workspace_project",
     "project",

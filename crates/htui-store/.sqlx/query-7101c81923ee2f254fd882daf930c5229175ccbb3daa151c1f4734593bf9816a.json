@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
+  "query": "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id, target_id, target_source FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
@@ -211,6 +211,28 @@
             "name": "workspace_id"
           }
         }
+      },
+      {
+        "ordinal": 19,
+        "name": "target_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "target_id"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "target_source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "target_source"
+          }
+        }
       }
     ],
     "parameters": {
@@ -238,8 +260,10 @@
       true,
       true,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "ffcc6ecd62820b20236345c30467b02a2cae5845443560fc7ad31bc1220dfd4a"
+  "hash": "7101c81923ee2f254fd882daf930c5229175ccbb3daa151c1f4734593bf9816a"
 }
