@@ -22,7 +22,7 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 55 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 56 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
@@ -30,7 +30,7 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// then the two of `0020_step_graph_v2.sql` (MOD-137 plan D6, D8), then the one of
 /// `0021_project_type.sql` (MOD-146 plan D1), then the two of `0022_memory.sql` (MOD-163 plan D1),
 /// then the one of `0029_divided_fanout.sql` (MOD-139 plan D1), then the one of
-/// `0031_command_log.sql` (MOD-152 plan D1).
+/// `0031_command_log.sql` (MOD-152 plan D1), then the one of
 /// `0032_worker_log.sql` (MOD-122 M2 plan D1), then the one of `0034_item_artifact_link.sql`
 /// (MOD-150 M3 plan D1), then the one of `0035_requirement_keys.sql` (MOD-149 plan D1).
 const TABLES: &[&str] = &[
@@ -127,7 +127,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -143,8 +143,9 @@ async fn migrations_apply_on_a_clean_database() {
          0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql, MOD-97's \
          0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql, MOD-150's \
          0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql, \
-         MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql and \
-         MOD-149's 0035_requirement_keys.sql, in ordinal order"
+         MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql, \
+         MOD-149's 0035_requirement_keys.sql and MOD-125 M4's 0036_stopped_run_index.sql, in \
+         ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -180,7 +181,7 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 55 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 56 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
          0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
          and MOD-146's 0021_project_type.sql (project_type) and MOD-163's 0022_memory.sql \
@@ -1219,6 +1220,33 @@ async fn the_persona_phase_index_exists() {
              (persona_id)"
         ),
         "0013 indexes step_graph_phase.persona_id"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 M4 plan D9: `0036_stopped_run_index.sql` indexes the stopped runs by the box that ran
+/// them, the column and predicate of `pending_resumes`, which every box reads at each command
+/// poll. `pg_indexes` prints the definition Postgres normalised.
+#[tokio::test]
+async fn the_stopped_run_index_exists() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let definition: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' \
+         AND indexname = 'idx_run_stopped_box'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .expect("read pg_indexes");
+    assert_eq!(
+        definition.as_deref(),
+        Some(
+            "CREATE INDEX idx_run_stopped_box ON public.run USING btree (executing_box_id) \
+             WHERE (status = 'stopped'::text)"
+        ),
+        "0036 indexes run.executing_box_id over the stopped runs only"
     );
 
     db.drop_db().await;
@@ -4263,8 +4291,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(35),
-        "thirty-five embedded migrations, none applied (through MOD-149's 0035_requirement_keys.sql)"
+        MigrationState::Pending(36),
+        "thirty-six embedded migrations, none applied (through MOD-125 M4's 0036_stopped_run_index.sql)"
     );
 
     db.drop_db().await;
@@ -4364,8 +4392,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(35),
-        "thirty-five embedded migrations, through MOD-149's 0035_requirement_keys.sql"
+        MigrationState::Pending(36),
+        "thirty-six embedded migrations, through MOD-125 M4's 0036_stopped_run_index.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4373,8 +4401,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(35),
-        "every one of the thirty-five, through MOD-149's 0035_requirement_keys.sql, is pending"
+        HeadlessError::MigrationsPending(36),
+        "every one of the thirty-six, through MOD-125 M4's 0036_stopped_run_index.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4396,8 +4424,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(35),
-        "every one of the thirty-five, through MOD-149's 0035_requirement_keys.sql, is pending"
+        HeadlessError::MigrationsPending(36),
+        "every one of the thirty-six, through MOD-125 M4's 0036_stopped_run_index.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4548,10 +4576,84 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        35,
-        "the later applies migrate nothing: the thirty-five embedded migrations (through MOD-149's 0035_requirement_keys.sql) are applied once"
+        36,
+        "the later applies migrate nothing: the thirty-six embedded migrations (through MOD-125 M4's 0036_stopped_run_index.sql) are applied once"
     );
 
+    db.drop_db().await;
+}
+
+/// MOD-125 M4 plan D9 (M2 review H1): applying `0036` raises a `0.1.0` target to this build, so a
+/// `0.1.0` worker meets `BelowTarget` from then on.
+///
+/// The target rises only in `apply_migrations`, which the TUI runs only over a pending schema, so
+/// a database is raised to `0.2.0` only by applying a migration with a `0.2.0` build: `0033` to
+/// `0035` did on `main`, `0036` does on any database still below. The version bump alone refused
+/// no `0.1.0` worker.
+#[tokio::test]
+async fn migration_0036_raises_a_0_1_0_target_so_an_old_worker_is_refused() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    // A database a `0.1.0` build migrated through `0035`: its target, and `0036` not applied.
+    plant_target(&db.pool, json!("0.1.0")).await;
+    sqlx::query("DROP INDEX idx_run_stopped_box")
+        .execute(&db.pool)
+        .await
+        .expect("roll 0036's index back by hand");
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 36")
+        .execute(&db.pool)
+        .await
+        .expect("roll 0036's bookkeeping row back by hand");
+
+    let mut connected = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("a TUI connect over the rolled-back schema");
+    assert_eq!(
+        connected.migrations,
+        MigrationState::Pending(1),
+        "0036_stopped_run_index.sql alone is pending"
+    );
+    assert_eq!(
+        connected.store.below_target(),
+        None,
+        "this build is above a 0.1.0 target"
+    );
+    assert_eq!(
+        target(&db.pool).await,
+        Some(json!("0.1.0")),
+        "a connect raises nothing"
+    );
+
+    connected
+        .store
+        .apply_migrations()
+        .await
+        .expect("apply 0036");
+    assert_eq!(
+        target(&db.pool).await,
+        Some(json!(HTUI_VERSION)),
+        "applying 0036 raises the target to this build"
+    );
+    let version = |text: &str| -> Vec<u64> {
+        text.split('.')
+            .map(|part| part.parse().expect("a numeric version part"))
+            .collect()
+    };
+    assert!(
+        version(HTUI_VERSION) > version("0.1.0"),
+        "this build ({HTUI_VERSION}) is above 0.1.0, so a 0.1.0 headless process now meets \
+         BelowTarget (headless_checks refuses below the target)"
+    );
+
+    let headless = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
+        .await
+        .expect("a headless connect at this build still connects");
+    assert_eq!(headless.below_target(), None);
+
+    headless.pool().close().await;
+    connected.store.pool().close().await;
     db.drop_db().await;
 }
 
