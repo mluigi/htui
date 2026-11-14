@@ -21876,73 +21876,72 @@ mod tests {
         );
     }
 
-    // ---- MOD-130 M1 T3: a retired target refuses an item (D11, P9) -----------------------------
+    // ---- MOD-130 M1 R1: a container under another machine (refusal 6) -------------------------
 
-    /// D11, P9: `mint_item` and `update_item` refuse a retired target with `target_retired`, and
-    /// write nothing. M1 has no retire verb, so the row is planted retired.
+    /// MOD-130 M1 R1 (blueprint B3, refusal 6): a stored container attached again under a second
+    /// machine is `box_not_a_child_of`, and writes nothing. The conformance case cannot reach this
+    /// arm: no `WriteStore` verb creates a machine, so the second one is planted.
     #[tokio::test]
-    async fn a_retired_target_refuses_an_item() {
-        use crate::model::{ItemPatch, TargetId, TargetKind};
-        use crate::store::UpdateOutcome;
-        use crate::store::traits::target_retired;
+    async fn a_container_attached_under_another_machine_is_refused() {
+        use crate::model::{NewChildBox, NewTarget, TargetId, TargetKind};
+        use crate::store::traits::box_not_a_child_of;
 
         let store = MemStore::demo();
-        let retired = TargetId::new();
-        store.write(|state| {
-            let mut row = crate::seed::local_target(chrono::DateTime::UNIX_EPOCH);
-            row.id = retired;
-            row.name = "gone".to_owned();
-            row.kind = TargetKind::Docker;
-            row.retired_at = Some(chrono::DateTime::UNIX_EPOCH);
-            state.targets.insert(retired, row);
-        });
-        let refused = store
-            .mint_item(NewItem {
-                id: ItemId::new(),
-                project_id: ids::PROJECT_HTUI,
-                kind_id: ids::KIND_HTUI_FEAT,
-                title: "retired".to_owned(),
-                body: String::new(),
-                required_tags: Vec::new(),
-                touched_paths: Vec::new(),
-                priority: 0,
-                step_graph_id: None,
-                target_id: Some(retired),
-                created_by: ids::USER,
-                box_id: Some(ids::BOX),
-            })
-            .await;
-        assert!(
-            matches!(&refused, Err(StoreError::Constraint(m)) if *m == target_retired("gone")),
-            "{refused:?}"
-        );
-        let before = store
-            .item(ids::HTUI_ANA_2)
+        let second = BoxId::new();
+        let mut machine = store
+            .box_row(ids::BOX)
             .await
-            .expect("read")
-            .expect("the fixture item");
-        let edit = store
-            .update_item(
-                before.id,
-                before.version,
-                ItemPatch {
-                    title: Some("moved".to_owned()),
-                    target_id: Some(Some(retired)),
-                    author_id: ids::USER,
-                    reason: "edited".to_owned(),
-                    ..ItemPatch::default()
-                },
-            )
-            .await;
-        assert!(
-            matches!(&edit, Err(StoreError::Constraint(m)) if *m == target_retired("gone")),
-            "{:?}",
-            edit.map(|outcome| matches!(outcome, UpdateOutcome::Updated(_)))
+            .expect("MemStore never fails a read")
+            .expect("the fixture box");
+        machine.id = second;
+        machine.hostname = "second".to_owned();
+        store.write(|state| {
+            state.boxes.insert(second, machine);
+        });
+        let target = |name: &str| NewTarget {
+            id: TargetId::new(),
+            name: name.to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        };
+        let docker = store
+            .create_target(target("dev docker"))
+            .await
+            .expect("create");
+        let spare = store
+            .create_target(target("spare docker"))
+            .await
+            .expect("create");
+        let child = BoxId::new();
+        let attach = |parent: BoxId, target: TargetId| NewChildBox {
+            id: child,
+            parent,
+            hostname: "dev-rust".to_owned(),
+            target,
+        };
+        store
+            .attach_child_box(attach(ids::BOX, docker.id))
+            .await
+            .expect("attach under the fixture machine");
+        let before = store.boxes().await.expect("boxes");
+
+        for target in [docker.id, spare.id] {
+            let refused = store.attach_child_box(attach(second, target)).await;
+            assert!(
+                matches!(&refused, Err(StoreError::Constraint(m))
+                    if *m == box_not_a_child_of(child, second)),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            store.boxes().await.expect("boxes"),
+            before,
+            "nothing written"
         );
         assert_eq!(
-            store.item(before.id).await.expect("read"),
-            Some(before),
-            "a refused edit writes nothing"
+            store.target(spare.id).await.expect("read"),
+            spare,
+            "the spare target stays unbound"
         );
     }
 }

@@ -38426,7 +38426,7 @@ async fn retire_and_delete_refuse_a_target_in_use<S: WriteStore>(store: &S) {
 
 /// MOD-130 M1 T4 (D14, P9): after a retire, every writer that names a target as a value refuses
 /// it with `target_retired` and writes nothing: both level setters, the Settings default, an
-/// item edit and `attach_child_box`.
+/// item mint (spending no key number) and edit, and `attach_child_box`.
 async fn a_retired_target_is_refused_everywhere<S: WriteStore>(store: &S) {
     const CASE: &str = "a_retired_target_is_refused_everywhere";
     let machine = fixture_box_row(store, CASE).await;
@@ -38496,6 +38496,26 @@ async fn a_retired_target_is_refused_everywhere<S: WriteStore>(store: &S) {
         .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "stays"))
         .await
         .expect(CASE);
+    let pinned = NewItem {
+        target_id: Some(retired.id),
+        ..new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "pinned")
+    };
+    let pinned_id = pinned.id;
+    constraint_exactly(CASE, store.mint_item(pinned).await, &refusal, "mint_item");
+    assert_eq!(
+        store.item(pinned_id).await.expect(CASE),
+        None,
+        "{CASE}: mint_item wrote nothing"
+    );
+    let next = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "next"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        next.key_number,
+        item.key_number + 1,
+        "{CASE}: the refused mint spent no key number"
+    );
     constraint_exactly(
         CASE,
         store

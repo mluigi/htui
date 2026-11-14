@@ -31,12 +31,12 @@ use htui_core::model::{
     SnapshotSettings, Status, StepId, StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS,
     Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
-use htui_core::model::{NewTarget, TargetId, TargetKind};
+use htui_core::model::{NewChildBox, NewTarget, TargetId, TargetKind};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::conformance::assert_leased_for;
-use htui_core::store::traits::{target_has_runs, target_retired};
+use htui_core::store::traits::{box_not_a_child_of, target_has_runs, target_retired};
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken, workspace_gone,
@@ -15585,6 +15585,74 @@ async fn an_item_write_behind_a_retire_is_refused() {
         counter(&db.pool, ids::PROJECT_HTUI, RACE_PREFIX).await,
         None,
         "the refused mint spent no key number"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-130 M1 R1 (blueprint B3, refusal 6): a stored container attached again under a second
+/// machine is `box_not_a_child_of`, and writes nothing. The conformance case cannot reach this
+/// arm: no `WriteStore` verb creates a machine, so the second one is planted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_container_attached_under_another_machine_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let second = BoxId::new();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, $2, 'second', 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(second.as_uuid())
+    .bind(db.store.this_user().as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant a second machine");
+    let target = |name: &str| NewTarget {
+        id: TargetId::new(),
+        name: name.to_owned(),
+        kind: TargetKind::Docker,
+        locator: serde_json::json!({}),
+    };
+    let docker = db
+        .store
+        .create_target(target("dev docker"))
+        .await
+        .expect("create");
+    let spare = db
+        .store
+        .create_target(target("spare docker"))
+        .await
+        .expect("create");
+    let child = BoxId::new();
+    let attach = |parent: BoxId, target: TargetId| NewChildBox {
+        id: child,
+        parent,
+        hostname: "dev-rust".to_owned(),
+        target,
+    };
+    db.store
+        .attach_child_box(attach(ids::BOX, docker.id))
+        .await
+        .expect("attach under the fixture machine");
+    let before = db.store.boxes().await.expect("boxes");
+
+    for target in [docker.id, spare.id] {
+        match db.store.attach_child_box(attach(second, target)).await {
+            Err(htui_core::store::StoreError::Constraint(sentence)) => {
+                assert_eq!(sentence, box_not_a_child_of(child, second));
+            }
+            other => panic!("a container under another machine is refused, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        db.store.boxes().await.expect("boxes"),
+        before,
+        "nothing written"
+    );
+    assert_eq!(
+        db.store.target(spare.id).await.expect("read"),
+        spare,
+        "the spare target stays unbound"
     );
     db.drop_db().await;
 }
