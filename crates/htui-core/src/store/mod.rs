@@ -6,6 +6,7 @@
 mod activity;
 pub mod error;
 pub mod graph_rules;
+mod index_changes;
 mod indexer_lease;
 pub mod mem;
 pub mod traits;
@@ -22,6 +23,7 @@ pub use graph_rules::{
     forward_mask, graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_usable_by, phase_row_refusal, walk_refusal,
 };
+pub use index_changes::IndexChangesStore;
 pub use indexer_lease::IndexerLeaseStore;
 pub use mem::MemStore;
 pub use traits::{

@@ -55,6 +55,7 @@ use crate::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     PredicateError, SkillBinding, Split, StepGraphEdge,
 };
+use crate::model::{IndexChanges, ProjectChanges};
 use crate::model::{IndexedCollection, IndexerLease, LeaseTake};
 use crate::model::{ItemState, latest_graph_run};
 use crate::model::{
@@ -69,6 +70,7 @@ use crate::secret::{INFISICAL, SecretScope, project_scope};
 use crate::seed::{self, DEFAULT_PROJECT_TYPE, PROJECT_TYPES};
 use crate::store::activity::ActivityStore;
 use crate::store::error::StoreError;
+use crate::store::index_changes::IndexChangesStore;
 use crate::store::indexer_lease::IndexerLeaseStore;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
@@ -3808,6 +3810,428 @@ async fn an_out_of_range_indexer_lease_ttl_is_refused<S: WriteStore + IndexerLea
             .await
             .expect(CASE),
         "{CASE}: a zero TTL is accepted"
+    );
+}
+
+/// The index change read half of the suite (MOD-159 M2 plan D3), in run order. A name never
+/// changes.
+///
+/// A sixth list beside [`CASES`], [`READ_CASES`], [`WORKER_LOG_CASES`], [`ACTIVITY_CASES`] and
+/// [`INDEXER_LEASE_CASES`], for the reason the indexer lease list is one: these cases need
+/// [`IndexChangesStore`], a narrow trait only `MemStore` and `PgStore` implement. Each case writes,
+/// so [`run_all_index_changes`] builds a fresh store per case. Every `since` is the store's own
+/// [`IndexChangesStore::index_clock`], never the test's clock; a document's `created_at` is its
+/// writer's on both stores, so a document to be listed is stamped a second after `since` and one
+/// to be left out a second before it.
+pub const INDEX_CHANGES_CASES: &[&str] = &[
+    "index_changes_list_an_item_minted_or_edited_after_since",
+    "index_changes_list_an_item_whose_status_moved",
+    "index_changes_list_an_item_that_gained_a_document_version",
+    "index_changes_list_a_requirement_minted_or_amended_after_since",
+    "index_changes_list_an_owner_document_of_a_project_or_a_scope_row",
+    "index_changes_leave_out_rows_before_since_and_projects_not_asked",
+    "the_index_clock_brackets_a_write",
+];
+
+/// Runs one [`INDEX_CHANGES_CASES`] case by name against an already-loaded store. Every arm is
+/// boxed, as [`run_case`]'s are (MOD-137).
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case, and on an unknown `name`.
+pub async fn run_index_changes_case<S: WriteStore + IndexChangesStore>(name: &str, store: &S) {
+    Box::pin(run_index_changes_case_inline(name, store)).await;
+}
+
+async fn run_index_changes_case_inline<S: WriteStore + IndexChangesStore>(name: &str, store: &S) {
+    match name {
+        "index_changes_list_an_item_minted_or_edited_after_since" => {
+            Box::pin(index_changes_list_an_item_minted_or_edited_after_since(
+                store,
+            ))
+            .await;
+        }
+        "index_changes_list_an_item_whose_status_moved" => {
+            Box::pin(index_changes_list_an_item_whose_status_moved(store)).await;
+        }
+        "index_changes_list_an_item_that_gained_a_document_version" => {
+            Box::pin(index_changes_list_an_item_that_gained_a_document_version(
+                store,
+            ))
+            .await;
+        }
+        "index_changes_list_a_requirement_minted_or_amended_after_since" => {
+            Box::pin(index_changes_list_a_requirement_minted_or_amended_after_since(store)).await;
+        }
+        "index_changes_list_an_owner_document_of_a_project_or_a_scope_row" => {
+            Box::pin(index_changes_list_an_owner_document_of_a_project_or_a_scope_row(store)).await;
+        }
+        "index_changes_leave_out_rows_before_since_and_projects_not_asked" => {
+            Box::pin(index_changes_leave_out_rows_before_since_and_projects_not_asked(store)).await;
+        }
+        "the_index_clock_brackets_a_write" => {
+            Box::pin(the_index_clock_brackets_a_write(store)).await;
+        }
+        other => panic!(
+            "unknown index changes case `{other}`; INDEX_CHANGES_CASES and run_index_changes_case \
+             disagree"
+        ),
+    }
+}
+
+/// Runs every case in [`INDEX_CHANGES_CASES`], each against a store `make` produced fresh.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case.
+pub async fn run_all_index_changes<S, F, Fut>(make: F)
+where
+    S: WriteStore + IndexChangesStore,
+    F: Fn() -> Fut,
+    Fut: Future<Output = S>,
+{
+    for name in INDEX_CHANGES_CASES {
+        run_index_changes_case(name, &make().await).await;
+    }
+}
+
+/// The store's clock now, or a panic naming the case.
+async fn index_since<S: IndexChangesStore>(case: &str, store: &S) -> DateTime<Utc> {
+    store.index_clock().await.expect(case)
+}
+
+/// `projects`' changes since `since`, or a panic naming the case.
+async fn index_changes_of<S: IndexChangesStore>(
+    case: &str,
+    store: &S,
+    projects: &[ProjectId],
+    since: DateTime<Utc>,
+) -> IndexChanges {
+    store.index_changes(projects, since).await.expect(case)
+}
+
+/// [`IndexChanges`] with one entry per `(project, changes)` pair.
+fn index_changes_with(
+    entries: impl IntoIterator<Item = (ProjectId, ProjectChanges)>,
+) -> IndexChanges {
+    IndexChanges {
+        projects: entries.into_iter().collect(),
+    }
+}
+
+/// A project's changes that name only `items`.
+fn changed_items(items: impl IntoIterator<Item = ItemId>) -> ProjectChanges {
+    ProjectChanges {
+        items: items.into_iter().collect(),
+        ..ProjectChanges::default()
+    }
+}
+
+/// A writer's stamp `seconds` from `since`, at the precision both stores keep.
+fn stamp_from(since: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
+    (since + TimeDelta::seconds(seconds)).trunc_subsecs(TIMESTAMPTZ_DIGITS)
+}
+
+/// MOD-159 M2 plan D3: an item minted after `since` is listed under its project, and so is one
+/// edited after a later `since`; a `since` read after the edit lists nothing.
+async fn index_changes_list_an_item_minted_or_edited_after_since<
+    S: WriteStore + IndexChangesStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "index_changes_list_an_item_minted_or_edited_after_since";
+    let since = index_since(CASE, store).await;
+    let item = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "indexed"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since).await,
+        index_changes_with([(ids::PROJECT_HTUI, changed_items([item.id]))]),
+        "{CASE}: the minted item"
+    );
+
+    let since = index_since(CASE, store).await;
+    let UpdateOutcome::Updated(_) = store
+        .update_item(item.id, item.version, title_patch("re-indexed", "edited"))
+        .await
+        .expect(CASE)
+    else {
+        panic!("{CASE}: the edit lands");
+    };
+    assert_eq!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since).await,
+        index_changes_with([(ids::PROJECT_HTUI, changed_items([item.id]))]),
+        "{CASE}: the edited item"
+    );
+
+    let since = index_since(CASE, store).await;
+    assert!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since)
+            .await
+            .is_empty(),
+        "{CASE}: nothing was written after the edit"
+    );
+}
+
+/// MOD-159 M2 plan D3: a status move stamps `updated_at`, so the item is listed.
+async fn index_changes_list_an_item_whose_status_moved<S: WriteStore + IndexChangesStore>(
+    store: &S,
+) {
+    const CASE: &str = "index_changes_list_an_item_whose_status_moved";
+    let item = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "to block"))
+        .await
+        .expect(CASE);
+    let since = index_since(CASE, store).await;
+    assert!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since)
+            .await
+            .is_empty(),
+        "{CASE}: the mint is before `since`"
+    );
+    assert!(
+        store
+            .transition(item.id, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: the move lands"
+    );
+    assert_eq!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since).await,
+        index_changes_with([(ids::PROJECT_HTUI, changed_items([item.id]))]),
+        "{CASE}: the moved item"
+    );
+}
+
+/// MOD-159 M2 plan D3 (C35): a new document version does not touch its item's `updated_at`, so
+/// the document arm lists the item, under `items`, never under `owner_documents`. A version
+/// created before `since` lists nothing.
+async fn index_changes_list_an_item_that_gained_a_document_version<
+    S: WriteStore + IndexChangesStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "index_changes_list_an_item_that_gained_a_document_version";
+    let gained = store
+        .mint_item(new_item(
+            ids::PROJECT_HTUI,
+            ids::KIND_HTUI_FEAT,
+            "gains a plan",
+        ))
+        .await
+        .expect(CASE);
+    let earlier = store
+        .mint_item(new_item(
+            ids::PROJECT_HTUI,
+            ids::KIND_HTUI_FEAT,
+            "had a plan",
+        ))
+        .await
+        .expect(CASE);
+    let since = index_since(CASE, store).await;
+    store
+        .write_document(NewDocument {
+            created_at: stamp_from(since, 1),
+            ..new_document(gained.id, "plan", None)
+        })
+        .await
+        .expect(CASE);
+    store
+        .write_document(NewDocument {
+            created_at: stamp_from(since, -1),
+            ..new_document(earlier.id, "plan", None)
+        })
+        .await
+        .expect(CASE);
+    assert_eq!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since).await,
+        index_changes_with([(ids::PROJECT_HTUI, changed_items([gained.id]))]),
+        "{CASE}: the item whose version is after `since`, listed as an item"
+    );
+}
+
+/// MOD-159 M2 plan D3: a requirement minted after `since` is listed, and so is one amended after
+/// a later `since`.
+async fn index_changes_list_a_requirement_minted_or_amended_after_since<
+    S: WriteStore + IndexChangesStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "index_changes_list_a_requirement_minted_or_amended_after_since";
+    let area = area_in(store, ids::PROJECT_HTUI, "IDX", CASE).await;
+    let since = index_since(CASE, store).await;
+    let minted = store
+        .mint_requirement(area, new_requirement("The index reads what changed."))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since).await,
+        index_changes_with([(
+            ids::PROJECT_HTUI,
+            ProjectChanges {
+                requirements: [minted.id].into(),
+                ..ProjectChanges::default()
+            }
+        )]),
+        "{CASE}: the minted requirement"
+    );
+
+    let since = index_since(CASE, store).await;
+    requirement_updated(
+        CASE,
+        store
+            .amend_requirement(
+                minted.id,
+                minted.version,
+                body_patch("The index reads only what changed."),
+                ids::HTUI_FEAT_3,
+            )
+            .await
+            .expect(CASE),
+    );
+    // Only the requirements are pinned: the amend's citation is the item's business, not this
+    // case's.
+    let changes = index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since).await;
+    assert_eq!(
+        changes
+            .projects
+            .get(&ids::PROJECT_HTUI)
+            .map(|project| project.requirements.clone()),
+        Some([minted.id].into()),
+        "{CASE}: the amended requirement: {changes:?}"
+    );
+}
+
+/// MOD-159 M2 plan D3 (MOD-147): an owner document is listed under its owner, a project or a
+/// workspace's scope row alike; one created before `since` is not.
+async fn index_changes_list_an_owner_document_of_a_project_or_a_scope_row<
+    S: WriteStore + IndexChangesStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "index_changes_list_an_owner_document_of_a_project_or_a_scope_row";
+    let since = index_since(CASE, store).await;
+    let project_doc = store
+        .write_owner_document(NewOwnerDocument {
+            created_at: stamp_from(since, 1),
+            ..new_owner_document(ids::PROJECT_HTUI, "goals")
+        })
+        .await
+        .expect(CASE);
+    let scope_doc = store
+        .write_owner_document(NewOwnerDocument {
+            created_at: stamp_from(since, 1),
+            ..new_owner_document(ids::PROJECT_SCOPE_PLATFORM, "goals")
+        })
+        .await
+        .expect(CASE);
+    store
+        .write_owner_document(NewOwnerDocument {
+            created_at: stamp_from(since, -1),
+            ..new_owner_document(ids::PROJECT_HTUI, "notes")
+        })
+        .await
+        .expect(CASE);
+    let owner_documents = |id: DocumentId| ProjectChanges {
+        owner_documents: [id].into(),
+        ..ProjectChanges::default()
+    };
+    assert_eq!(
+        index_changes_of(
+            CASE,
+            store,
+            &[ids::PROJECT_HTUI, ids::PROJECT_SCOPE_PLATFORM],
+            since
+        )
+        .await,
+        index_changes_with([
+            (ids::PROJECT_HTUI, owner_documents(project_doc.id)),
+            (ids::PROJECT_SCOPE_PLATFORM, owner_documents(scope_doc.id)),
+        ]),
+        "{CASE}: each owner's document after `since`"
+    );
+}
+
+/// MOD-159 M2 plan D3: a project not asked about is not answered, whatever it wrote, and rows
+/// written before `since` (an item, its document, an owner document) are out; an empty project
+/// list answers empty.
+async fn index_changes_leave_out_rows_before_since_and_projects_not_asked<
+    S: WriteStore + IndexChangesStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "index_changes_leave_out_rows_before_since_and_projects_not_asked";
+    let before = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "before"))
+        .await
+        .expect(CASE);
+    let since = index_since(CASE, store).await;
+    store
+        .write_document(NewDocument {
+            created_at: stamp_from(since, -1),
+            ..new_document(before.id, "plan", None)
+        })
+        .await
+        .expect(CASE);
+    store
+        .write_owner_document(NewOwnerDocument {
+            created_at: stamp_from(since, -1),
+            ..new_owner_document(ids::PROJECT_HTUI, "goals")
+        })
+        .await
+        .expect(CASE);
+    let elsewhere = store
+        .mint_item(new_item(ids::PROJECT_AGY, ids::KIND_AGY_FEAT, "elsewhere"))
+        .await
+        .expect(CASE);
+    let elsewhere_doc = store
+        .write_owner_document(NewOwnerDocument {
+            created_at: stamp_from(since, 1),
+            ..new_owner_document(ids::PROJECT_AGY, "goals")
+        })
+        .await
+        .expect(CASE);
+
+    assert!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI], since)
+            .await
+            .is_empty(),
+        "{CASE}: htui wrote nothing after `since`; agy is not asked"
+    );
+    assert!(
+        index_changes_of(CASE, store, &[], since).await.is_empty(),
+        "{CASE}: no project asked, none answered"
+    );
+    assert_eq!(
+        index_changes_of(CASE, store, &[ids::PROJECT_HTUI, ids::PROJECT_AGY], since).await,
+        index_changes_with([(
+            ids::PROJECT_AGY,
+            ProjectChanges {
+                items: [elsewhere.id].into(),
+                owner_documents: [elsewhere_doc.id].into(),
+                ..ProjectChanges::default()
+            }
+        )]),
+        "{CASE}: asked, agy answers; htui still has no entry"
+    );
+}
+
+/// MOD-159 M2 plan D3, D5: the index clock is the clock the store stamps rows with, so a write
+/// between two reads of it is stamped between them.
+async fn the_index_clock_brackets_a_write<S: WriteStore + IndexChangesStore>(store: &S) {
+    const CASE: &str = "the_index_clock_brackets_a_write";
+    let before = index_since(CASE, store).await;
+    let minted = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "stamped"))
+        .await
+        .expect(CASE);
+    let after = index_since(CASE, store).await;
+    let row = item_row(CASE, store, minted.id).await;
+    assert!(
+        before <= row.updated_at && row.updated_at <= after,
+        "{CASE}: {before} <= {} <= {after}",
+        row.updated_at
     );
 }
 
@@ -37732,8 +38156,9 @@ async fn document_links_are_leaves_of_the_walk<S: WriteStore>(store: &S) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVITY_CASES, CASES, INDEXER_LEASE_CASES, READ_CASES, WORKER_LOG_CASES,
-        run_activity_case, run_case, run_indexer_lease_case, run_read_case, run_worker_log_case,
+        ACTIVITY_CASES, CASES, INDEX_CHANGES_CASES, INDEXER_LEASE_CASES, READ_CASES,
+        WORKER_LOG_CASES, run_activity_case, run_case, run_index_changes_case,
+        run_indexer_lease_case, run_read_case, run_worker_log_case,
     };
     use crate::store::MemStore;
 
@@ -37744,7 +38169,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
 
-        // The four lists are reported separately by MOD-6's binding, so a name may not be in two
+        // The six lists are reported separately by MOD-6's binding, so a name may not be in two
         // either: a duplicate across them would be run twice and reported once.
         let mut all: Vec<&str> = CASES
             .iter()
@@ -37752,6 +38177,7 @@ mod tests {
             .chain(WORKER_LOG_CASES)
             .chain(ACTIVITY_CASES)
             .chain(INDEXER_LEASE_CASES)
+            .chain(INDEX_CHANGES_CASES)
             .copied()
             .collect();
         all.sort_unstable();
@@ -37762,8 +38188,9 @@ mod tests {
                 + READ_CASES.len()
                 + WORKER_LOG_CASES.len()
                 + ACTIVITY_CASES.len()
-                + INDEXER_LEASE_CASES.len(),
-            "a case name is unique across the four lists"
+                + INDEXER_LEASE_CASES.len()
+                + INDEX_CHANGES_CASES.len(),
+            "a case name is unique across the six lists"
         );
     }
 
@@ -37943,6 +38370,15 @@ mod tests {
     async fn run_indexer_lease_case_accepts_every_name() {
         for name in INDEXER_LEASE_CASES {
             run_indexer_lease_case(name, &MemStore::demo()).await;
+        }
+    }
+
+    /// The same guard for the index change read (MOD-159 M2 plan D3): each case writes, so each
+    /// gets a fresh store.
+    #[tokio::test]
+    async fn run_index_changes_case_accepts_every_name() {
+        for name in INDEX_CHANGES_CASES {
+            run_index_changes_case(name, &MemStore::demo()).await;
         }
     }
 }
