@@ -1608,6 +1608,7 @@ fn demo_graph_snapshot() -> Value {
         personas: Vec::new(),
         memory: None,
         capture: None,
+        integrate: std::collections::BTreeMap::new(),
     })
     .expect("a literal this module owns serialises")
 }

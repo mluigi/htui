@@ -515,6 +515,7 @@ mod tests {
             is_primary: primary,
             created_at: EPOCH,
             updated_at: EPOCH,
+            integrate: None,
         }
     }
 

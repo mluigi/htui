@@ -1,5 +1,7 @@
 //! Runs, steps and their commits (`docs/ANA-9.md` §5.8).
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, SubsecRound as _, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,6 +10,7 @@ use crate::model::ids::{
     AgentId, BatchId, BoxId, CommandRunId, ItemId, PersonaId, ProjectId, RepoId, RunId, RunPlanId,
     StepGraphId, StepId, UserId, WorkspaceId,
 };
+use crate::model::integration::IntegrateMode;
 use crate::model::kind::{
     CommandQueue, EdgeKind, EdgePredicate, Gate, GraphScope, Isolation, PlanScope, Split,
 };
@@ -737,6 +740,24 @@ pub struct GraphSnapshot {
     /// hashed by `topology` and [`GraphSnapshot::V`] not bumped; absent from the JSON when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<SnapshotCapture>,
+    /// MOD-133 D3: how each repo of the run's scope integrates, frozen at `StartRun` by
+    /// `graph::resolve`. Only non-`local` repos are entries, so a `local` run's JSON is unchanged:
+    /// absent when empty, **not** hashed by `topology`, and [`GraphSnapshot::V`] not bumped.
+    /// `finish_run(Done)` writes one `integration` record per entry whose repo the run changed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub integrate: BTreeMap<RepoId, IntegrateSnapshot>,
+}
+
+/// MOD-133 D3: [`GraphSnapshot::integrate`], one non-`local` repo's landing as frozen at
+/// `StartRun`: the mode, and the repo's `remote_url` and `default_branch` at that instant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrateSnapshot {
+    /// `repo.integrate`, else the project's default; never [`IntegrateMode::Local`].
+    pub mode: IntegrateMode,
+    /// `repo.remote_url`.
+    pub remote: String,
+    /// `repo.default_branch`.
+    pub target_branch: String,
 }
 
 /// MOD-164 D8: [`GraphSnapshot::capture`], what the run's capture step runs on.
@@ -2309,7 +2330,50 @@ mod tests {
             personas,
             memory: None,
             capture: None,
+            integrate: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// MOD-133 D3: an empty `integrate` is absent from the JSON (a `local` run's snapshot keeps
+    /// its bytes, `V` unbumped), and a blob without the key decodes to an empty map; an entry
+    /// round-trips keyed by the repo id.
+    #[test]
+    fn snapshot_integrate_is_absent_when_empty_and_round_trips() {
+        use crate::model::RepoId;
+        use crate::model::integration::IntegrateMode;
+
+        let mut snapshot = graph_snapshot(Vec::new(), Vec::new());
+        let value = serde_json::to_value(&snapshot).expect("a snapshot serialises");
+        assert!(value.get("integrate").is_none(), "{value}");
+        assert_eq!(
+            serde_json::from_value::<super::GraphSnapshot>(value).expect("it decodes"),
+            snapshot
+        );
+
+        let repo = RepoId(Uuid::from_u128(7));
+        snapshot.integrate.insert(
+            repo,
+            super::IntegrateSnapshot {
+                mode: IntegrateMode::Push,
+                remote: "git@example.invalid:core.git".to_owned(),
+                target_branch: "main".to_owned(),
+            },
+        );
+        let value = serde_json::to_value(&snapshot).expect("a snapshot serialises");
+        assert_eq!(
+            value.get("integrate"),
+            Some(&json!({
+                "00000000-0000-0000-0000-000000000007": {
+                    "mode": "push",
+                    "remote": "git@example.invalid:core.git",
+                    "target_branch": "main",
+                }
+            }))
+        );
+        assert_eq!(
+            serde_json::from_value::<super::GraphSnapshot>(value).expect("it decodes"),
+            snapshot
+        );
     }
 
     fn frozen(name: &str) -> crate::model::persona::SnapshotPersona {

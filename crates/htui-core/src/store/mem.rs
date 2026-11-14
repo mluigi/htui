@@ -69,6 +69,7 @@ use crate::model::{
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{IndexedCollection, IndexerLease, LeaseTake};
+use crate::model::{IntegrateMode, IntegrateSnapshot, Integration, IntegrationState, LandOutcome};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{LogShipLevel, NewWorkerLog, WorkerLogLine};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
@@ -243,6 +244,20 @@ struct CommandClaim {
     heartbeat_at: DateTime<Utc>,
 }
 
+/// An `integration` row (MOD-133 D5) with its lease columns, which [`Integration`] deliberately
+/// omits, as [`State::lease_owners`] sits beside a [`Run`].
+#[derive(Debug, Clone)]
+struct IntegrationRow {
+    /// The row as readers see it.
+    row: Integration,
+    /// `integration.lease_box_id`.
+    lease_box_id: Option<BoxId>,
+    /// `integration.lease_owner`.
+    lease_owner: Option<Uuid>,
+    /// `integration.lease_expires_at`, the store's clock plus the taker's TTL.
+    lease_expires_at: Option<DateTime<Utc>>,
+}
+
 /// Every §5 table the TUI reads, keyed the way the queries of §7 look rows up.
 #[derive(Debug, Default)]
 struct State {
@@ -349,6 +364,9 @@ struct State {
     /// `run_step_commit`, keyed the same way. `MemStore` held no such rows before MOD-4, which is
     /// why [`DeleteReach::run_step_commits`] used to be a hard-coded `0`.
     step_commits: BTreeMap<(StepId, RepoId), RunStepCommit>,
+    /// `integration` (MOD-133 D4, D5), keyed as its primary key is, so a run's records come out in
+    /// `repo_id` order. Written by [`State::finish_run`] only; no fixture loads one.
+    integrations: BTreeMap<(RunId, RepoId), IntegrationRow>,
     /// `command_run` (`0001_init.sql:537`), keyed by its own id so a duplicate write is a lookup
     /// rather than a scan, and read back sorted by `(queued_at, id)`.
     ///
@@ -593,6 +611,7 @@ impl MemStore {
             activity: Vec::new(),
             activity_last_id: 0,
             indexer_leases: HashMap::new(),
+            integrations: BTreeMap::new(),
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -3683,6 +3702,8 @@ impl State {
             remote_url: new.remote_url,
             default_branch: new.default_branch,
             is_primary: new.is_primary,
+            // MOD-133 D2: a repo is created on its project's default.
+            integrate: None,
             created_at: now,
             updated_at: now,
         };
@@ -3738,6 +3759,9 @@ impl State {
         }
         if let Some(is_primary) = patch.is_primary {
             row.is_primary = is_primary;
+        }
+        if let Some(integrate) = patch.integrate {
+            row.integrate = integrate;
         }
         row.updated_at = now;
         Ok(CasOutcome::Applied(row.clone()))
@@ -6238,6 +6262,9 @@ impl State {
         // MOD-139 plan D5: a plan goes with its run (and its planner step), `ON DELETE CASCADE`.
         self.run_plans
             .retain(|row| !gone.runs.contains(&row.run_id));
+        // MOD-133 D5: a record goes with its run and with its project (`ON DELETE CASCADE`).
+        self.integrations
+            .retain(|(run, _), record| !gone.runs.contains(run) && record.row.project_id != id);
         self.lease_owners.retain(|id, _| !gone.runs.contains(id));
         // MOD-42 plan D1: both relay tables go with their run (`ON DELETE CASCADE`, F-18).
         self.permissions
@@ -6498,11 +6525,21 @@ impl State {
         Ok(true)
     }
 
-    /// Released (ANA-35 §7.1): `closed`, or latest graph run `done`. A `blocked_by` edge to a
-    /// released target no longer holds its source.
+    /// Released (ANA-35 §7.1, MOD-133 D7): `closed`, or latest graph run `done` with no
+    /// `integration` record outside `landed | pr_merged` (none at all, every `local` run, counts
+    /// as landed). A `blocked_by` edge to a released target no longer holds its source.
     fn is_released(&self, target: &Item) -> bool {
         target.status == Status::Closed
-            || self.latest_run_status(target.id) == Some(RunStatus::Done)
+            || self
+                .latest_graph_run_of(target.id)
+                .is_some_and(|run| run.status == RunStatus::Done && self.run_has_landed(run.id))
+    }
+
+    /// MOD-133 D7: whether every `integration` record of `run` is landed; `true` for none.
+    fn run_has_landed(&self, run: RunId) -> bool {
+        self.integrations
+            .range((run, RepoId(Uuid::nil()))..=(run, RepoId(Uuid::max())))
+            .all(|(_, record)| record.row.state.is_landed())
     }
 
     /// The list projection of `item` with its latest graph run's status filled (MOD-144).
@@ -8614,9 +8651,152 @@ impl State {
             row.finished_at = row.finished_at.or(Some(at));
             row.updated_at = now;
         }
+        // MOD-133 D4: a `done` run's integration records, in the same write.
+        if to == RunStatus::Done {
+            self.write_integrations(run, now);
+        }
         // MOD-144: no item write. A chat run never had one (§5.8: `item_id` is nullable for
         // `kind = 'chat'`), and a graph run's item reads its state from this run.
         Ok(())
+    }
+
+    /// MOD-133 D6: `run`'s `integration` records in `repo_id` order (the map's key order).
+    fn integration_rows(&self, run: RunId) -> Vec<Integration> {
+        self.integrations
+            .range((run, RepoId(Uuid::nil()))..=(run, RepoId(Uuid::max())))
+            .map(|(_, record)| record.row.clone())
+            .collect()
+    }
+
+    /// MOD-133 D4: `finish_run(Done)`'s records, under the same lock as the run's move: one
+    /// `pending` row per `graph_snapshot.integrate` entry (never `local`) whose repo has a
+    /// `run_step_commit` with an `after_hash` in this run. A snapshot whose `integrate` does not
+    /// decode holds no entry, as the column's own decode would fail on every reader; an existing
+    /// row is left (`ON CONFLICT DO NOTHING`).
+    fn write_integrations(&mut self, run: RunId, now: DateTime<Utc>) {
+        let Some(row) = self.runs.get(&run) else {
+            return;
+        };
+        let project = row.project_id;
+        let entries: BTreeMap<RepoId, IntegrateSnapshot> = row
+            .graph_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("integrate"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        if entries.is_empty() {
+            return;
+        }
+        let changed: BTreeSet<RepoId> = self
+            .step_commits
+            .values()
+            .filter(|commit| {
+                commit.after_hash.is_some()
+                    && self
+                        .steps
+                        .get(&commit.run_step_id)
+                        .is_some_and(|step| step.run_id == run)
+            })
+            .map(|commit| commit.repo_id)
+            .collect();
+        for (repo, entry) in entries {
+            if entry.mode == IntegrateMode::Local || !changed.contains(&repo) {
+                continue;
+            }
+            self.integrations
+                .entry((run, repo))
+                .or_insert_with(|| IntegrationRow {
+                    row: Integration {
+                        run_id: run,
+                        repo_id: repo,
+                        project_id: project,
+                        mode: entry.mode,
+                        remote: entry.remote,
+                        target_branch: entry.target_branch,
+                        state: IntegrationState::Pending,
+                        refusal: None,
+                        landed_hash: None,
+                        pr_ref: None,
+                        pr_url: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    lease_box_id: None,
+                    lease_owner: None,
+                    lease_expires_at: None,
+                });
+        }
+    }
+
+    /// MOD-133 D6: leases every takeable `pending` record of a run executing on `box_id`.
+    fn take_integrations(
+        &mut self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+        now: DateTime<Utc>,
+    ) -> Vec<Integration> {
+        let executing = |id: RunId| {
+            self.runs
+                .get(&id)
+                .is_some_and(|row| row.executing_box_id == Some(box_id))
+        };
+        let takeable: Vec<(RunId, RepoId)> = self
+            .integrations
+            .iter()
+            .filter(|((id, _), record)| {
+                record.row.state == IntegrationState::Pending
+                    && run.is_none_or(|wanted| wanted == *id)
+                    && (record.lease_owner.is_none_or(|held| held == owner)
+                        || record.lease_expires_at.is_none_or(|until| until <= now))
+                    && executing(*id)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        takeable
+            .into_iter()
+            .filter_map(|key| {
+                let record = self.integrations.get_mut(&key)?;
+                record.lease_box_id = Some(box_id);
+                record.lease_owner = Some(owner);
+                record.lease_expires_at = Some(now + ttl);
+                record.row.updated_at = now;
+                Some(record.row.clone())
+            })
+            .collect()
+    }
+
+    /// MOD-133 D6: settles `owner`'s `pending` record; `false` writes nothing.
+    fn settle_integration(
+        &mut self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let Some(record) = self.integrations.get_mut(&(run, repo)) else {
+            return false;
+        };
+        if record.row.state != IntegrationState::Pending || record.lease_owner != Some(owner) {
+            return false;
+        }
+        match outcome {
+            LandOutcome::Landed { hash } => {
+                record.row.state = IntegrationState::Landed;
+                record.row.landed_hash = Some(hash.clone());
+            }
+            LandOutcome::Refused { reason } => {
+                record.row.state = IntegrationState::Refused;
+                record.row.refusal = Some(reason.clone());
+            }
+        }
+        record.lease_box_id = None;
+        record.lease_owner = None;
+        record.lease_expires_at = None;
+        record.row.updated_at = now;
+        true
     }
 
     /// `R-TUI-9`'s three effects, one closure: everything refusable is decided first.
@@ -12041,6 +12221,33 @@ impl WriteStore for MemStore {
     ) -> Result<()> {
         let now = self.now();
         self.write(|state| state.finish_run(run, to, failure, at, now))
+    }
+
+    async fn integrations(&self, run: RunId) -> Result<Vec<Integration>> {
+        Ok(self.read(|state| state.integration_rows(run)))
+    }
+
+    async fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> Result<Vec<Integration>> {
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        Ok(self.write(|state| state.take_integrations(box_id, owner, ttl, run, now)))
+    }
+
+    async fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+    ) -> Result<bool> {
+        let now = self.now();
+        Ok(self.write(|state| state.settle_integration(run, repo, owner, outcome, now)))
     }
 
     async fn close_out(
@@ -16813,6 +17020,7 @@ mod tests {
             capture: None,
             source: None,
             edges: Vec::new(),
+            integrate: std::collections::BTreeMap::new(),
         }
     }
 
