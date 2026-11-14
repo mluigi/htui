@@ -192,3 +192,28 @@ async fn pg_store_worker_log_conformance() {
         db.drop_db().await;
     }
 }
+
+/// MOD-159 M1's indexer lease suite (`INDEXER_LEASE_CASES`, plan D2, D3) run against `PgStore`.
+///
+/// A fourth loop for `pg_store_worker_log_conformance`'s reason: `run_indexer_lease_case` is bound
+/// to `WriteStore + IndexerLeaseStore`, a narrow trait only the two stores implement. Every case
+/// writes, so each gets its own database, boxed as `pg_store_conformance`'s are (MOD-137).
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_indexer_lease_conformance() {
+    use htui_core::store::conformance;
+
+    assert_eq!(
+        conformance::INDEXER_LEASE_CASES.len(),
+        8,
+        "MOD-159 M1's eight indexer lease cases, as `mem_store.rs` pins them"
+    );
+    for name in conformance::INDEXER_LEASE_CASES {
+        let Some(db) = Box::pin(common::demo_db()).await else {
+            return; // `common` printed the skip line already (plan D13).
+        };
+        println!("indexer lease case {name}");
+        conformance::run_indexer_lease_case(name, &db.store).await;
+        db.drop_db().await;
+    }
+}

@@ -6,6 +6,7 @@
 
 #[cfg(feature = "demo")]
 mod demo;
+mod indexer_lease;
 mod read;
 mod relay;
 mod rows;

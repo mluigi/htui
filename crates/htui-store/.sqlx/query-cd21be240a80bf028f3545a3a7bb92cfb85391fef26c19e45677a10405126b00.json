@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT l.collection,\n                   l.lease_box_id,\n                   b.hostname AS \"box_name?\",\n                   l.lease_expires_at,\n                   COALESCE(l.lease_owner IS NOT NULL\n                            AND l.lease_expires_at > clock_timestamp(), false) AS \"live!\"\n              FROM indexer_lease l\n              LEFT JOIN box b ON b.id = l.lease_box_id\n             WHERE l.collection = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "collection",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "indexer_lease",
+            "name": "collection"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "lease_box_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "indexer_lease",
+            "name": "lease_box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "box_name?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "hostname"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "indexer_lease",
+            "name": "lease_expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "cd21be240a80bf028f3545a3a7bb92cfb85391fef26c19e45677a10405126b00"
+}

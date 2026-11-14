@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                WITH prior AS (\n                    SELECT lease_owner FROM indexer_lease WHERE collection = $1\n                ), taken AS (\n                    INSERT INTO indexer_lease (collection, lease_owner, lease_box_id,\n                                               lease_expires_at)\n                    VALUES ($1, $3, $2, clock_timestamp() + $4::bigint * interval '1 microsecond')\n                    ON CONFLICT (collection) DO UPDATE\n                       SET lease_owner      = EXCLUDED.lease_owner,\n                           lease_box_id     = EXCLUDED.lease_box_id,\n                           lease_expires_at = EXCLUDED.lease_expires_at\n                     WHERE indexer_lease.lease_owner IS NULL\n                        OR indexer_lease.lease_owner = EXCLUDED.lease_owner\n                        OR indexer_lease.lease_expires_at IS NULL\n                        OR indexer_lease.lease_expires_at <= clock_timestamp()\n                    RETURNING collection\n                )\n                SELECT EXISTS (SELECT 1 FROM taken) AS \"taken!\",\n                       EXISTS (SELECT 1 FROM prior WHERE lease_owner = $3) AS \"ours!\"\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "taken!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "ours!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "762684212e1274b2412077f095409b978ce2ea71e63c4ceb2dfd28bf1d32a131"
+}

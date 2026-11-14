@@ -22,7 +22,7 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 55 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 57 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
@@ -30,9 +30,10 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// then the two of `0020_step_graph_v2.sql` (MOD-137 plan D6, D8), then the one of
 /// `0021_project_type.sql` (MOD-146 plan D1), then the two of `0022_memory.sql` (MOD-163 plan D1),
 /// then the one of `0029_divided_fanout.sql` (MOD-139 plan D1), then the one of
-/// `0031_command_log.sql` (MOD-152 plan D1).
+/// `0031_command_log.sql` (MOD-152 plan D1), then the one of
 /// `0032_worker_log.sql` (MOD-122 M2 plan D1), then the one of `0034_item_artifact_link.sql`
-/// (MOD-150 M3 plan D1), then the one of `0035_requirement_keys.sql` (MOD-149 plan D1).
+/// (MOD-150 M3 plan D1), then the one of `0035_requirement_keys.sql` (MOD-149 plan D1), then the
+/// one of `0036_indexer_lease.sql` (MOD-159 M1 plan D2).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -105,6 +106,8 @@ const TABLES: &[&str] = &[
     "item_artifact_link",
     // 0035_requirement_keys.sql (MOD-149)
     "requirement_child_counter",
+    // 0036_indexer_lease.sql (MOD-159 M1)
+    "indexer_lease",
 ];
 
 #[tokio::test]
@@ -127,7 +130,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -143,8 +146,9 @@ async fn migrations_apply_on_a_clean_database() {
          0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql, MOD-97's \
          0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql, MOD-150's \
          0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql, \
-         MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql and \
-         MOD-149's 0035_requirement_keys.sql, in ordinal order"
+         MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql, \
+         MOD-149's 0035_requirement_keys.sql and MOD-159 M1's 0036_indexer_lease.sql, in ordinal \
+         order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -162,7 +166,7 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        56,
+        57,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
@@ -174,13 +178,13 @@ async fn migrations_apply_on_a_clean_database() {
          0031_command_log.sql adds command_log and MOD-122's \
          0032_worker_log.sql adds worker_log and MOD-150 M3's 0034_item_artifact_link.sql \
          adds item_artifact_link and MOD-149's 0035_requirement_keys.sql adds \
-         requirement_child_counter"
+         requirement_child_counter and MOD-159 M1's 0036_indexer_lease.sql adds indexer_lease"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 55 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 57 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
          0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
          and MOD-146's 0021_project_type.sql (project_type) and MOD-163's 0022_memory.sql \
@@ -188,7 +192,8 @@ async fn migrations_apply_on_a_clean_database() {
          (run_plan) and MOD-152's 0031_command_log.sql (command_log) and MOD-122's \
          0032_worker_log.sql (worker_log) and MOD-150 M3's 0034_item_artifact_link.sql \
          (item_artifact_link) and MOD-149's 0035_requirement_keys.sql \
-         (requirement_child_counter) and nothing else, \
+         (requirement_child_counter) and MOD-159 M1's 0036_indexer_lease.sql (indexer_lease) \
+         and nothing else, \
          got {present:?}"
     );
 
@@ -4263,8 +4268,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(35),
-        "thirty-five embedded migrations, none applied (through MOD-149's 0035_requirement_keys.sql)"
+        MigrationState::Pending(36),
+        "thirty-six embedded migrations, none applied (through MOD-159 M1's 0036_indexer_lease.sql)"
     );
 
     db.drop_db().await;
@@ -4364,8 +4369,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(35),
-        "thirty-five embedded migrations, through MOD-149's 0035_requirement_keys.sql"
+        MigrationState::Pending(36),
+        "thirty-six embedded migrations, through MOD-159 M1's 0036_indexer_lease.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4373,8 +4378,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(35),
-        "every one of the thirty-five, through MOD-149's 0035_requirement_keys.sql, is pending"
+        HeadlessError::MigrationsPending(36),
+        "every one of the thirty-six, through MOD-159 M1's 0036_indexer_lease.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4396,8 +4401,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(35),
-        "every one of the thirty-five, through MOD-149's 0035_requirement_keys.sql, is pending"
+        HeadlessError::MigrationsPending(36),
+        "every one of the thirty-six, through MOD-159 M1's 0036_indexer_lease.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4548,8 +4553,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        35,
-        "the later applies migrate nothing: the thirty-five embedded migrations (through MOD-149's 0035_requirement_keys.sql) are applied once"
+        36,
+        "the later applies migrate nothing: the thirty-six embedded migrations (through MOD-159 M1's 0036_indexer_lease.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -8386,6 +8391,103 @@ async fn migration_0035_checks_tie_the_key_shape() {
         .execute(pool)
         .await
         .expect("a project holding a nested child is deleted whole");
+
+    db.drop_db().await;
+}
+
+/// MOD-159 M1 (plan D2): 0036 creates `indexer_lease`, one row per Qdrant collection, keyed by an
+/// `IndexedCollection::name`. The `CHECK` takes `htui_global` and `htui_ws_` followed by a simple
+/// (32 lowercase hex) workspace UUID, and refuses the legacy `htui_concepts_v2` and every other
+/// spelling of a workspace UUID. No foreign key: a lease names a box that need not exist.
+#[tokio::test]
+async fn migration_0036_creates_indexer_lease() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name::text, data_type::text, is_nullable::text \
+           FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'indexer_lease' \
+          ORDER BY ordinal_position",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read indexer_lease's columns");
+    let expected: Vec<(String, String, String)> = [
+        ("collection", "text", "NO"),
+        ("lease_owner", "uuid", "YES"),
+        ("lease_box_id", "uuid", "YES"),
+        ("lease_expires_at", "timestamp with time zone", "YES"),
+        ("pass_requested_at", "timestamp with time zone", "YES"),
+    ]
+    .into_iter()
+    .map(|(name, kind, nullable)| (name.to_owned(), kind.to_owned(), nullable.to_owned()))
+    .collect();
+    assert_eq!(columns, expected, "indexer_lease is as plan D2 writes it");
+    let foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'indexer_lease'::regclass AND contype = 'f'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count indexer_lease's foreign keys");
+    assert_eq!(
+        foreign_keys, 0,
+        "no FK to workspace or box: a deleted one leaves the row inert"
+    );
+
+    let workspace = format!("htui_ws_{}", uuid::Uuid::now_v7().simple());
+    for accepted in ["htui_global", workspace.as_str()] {
+        sqlx::query(
+            "INSERT INTO indexer_lease (collection, lease_owner, lease_box_id, lease_expires_at) \
+             VALUES ($1, $2, $3, clock_timestamp())",
+        )
+        .bind(accepted)
+        .bind(uuid::Uuid::now_v7())
+        .bind(uuid::Uuid::now_v7())
+        .execute(pool)
+        .await
+        .unwrap_or_else(|err| panic!("`{accepted}` names a collection: {err}"));
+    }
+    let hyphenated = format!("htui_ws_{}", uuid::Uuid::now_v7().hyphenated());
+    let upper = format!(
+        "htui_ws_{}",
+        uuid::Uuid::now_v7().simple().to_string().to_uppercase()
+    );
+    for refused in [
+        "htui_concepts_v2",
+        "htui_ws_",
+        "htui_global_",
+        "xhtui_global",
+        hyphenated.as_str(),
+        upper.as_str(),
+    ] {
+        let err = sqlx::query("INSERT INTO indexer_lease (collection) VALUES ($1)")
+            .bind(refused)
+            .execute(pool)
+            .await
+            .expect_err("only an IndexedCollection name is a key");
+        assert_eq!(
+            err.as_database_error()
+                .and_then(|e| e.code())
+                .map(|c| c.into_owned())
+                .as_deref(),
+            Some("23514"),
+            "`{refused}` is refused by the CHECK: {err}"
+        );
+    }
+
+    let comment: Option<String> =
+        sqlx::query_scalar("SELECT obj_description('indexer_lease'::regclass, 'pg_class')")
+            .fetch_one(pool)
+            .await
+            .expect("read indexer_lease's comment");
+    assert!(
+        comment.is_some_and(|text| text.contains("MOD-159") && text.contains("Not mirrored")),
+        "the table says what it is and that the cache has no copy"
+    );
 
     db.drop_db().await;
 }
