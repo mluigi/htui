@@ -103,9 +103,12 @@ impl App {
 
     /// MOD-122 M3 D6 (blueprint F10): the retention sweep, on the first refresh tick and then
     /// every [`SWEEP_TICKS`]; a store that was down is swept by the next one. Idempotent, so no
-    /// answer is waited on.
+    /// answer is waited on. Review M2: only to a store that is up (`top_bar.store` online or
+    /// memory): one still connecting would answer nothing and put the next sweep an hour off,
+    /// so the first goes on the first refresh after the store is up.
     fn sweep_retention(&mut self) {
-        if self.ticks >= self.sweep_due {
+        let up = matches!(self.top_bar.store.as_str(), "online" | "memory");
+        if up && self.ticks >= self.sweep_due {
             self.sweep_due = self.ticks + SWEEP_TICKS;
             self.dispatch(Origin::App, StoreRequest::SweepRetention);
         }
@@ -532,7 +535,7 @@ impl App {
         }
         let ReplyEnvelope { origin, reply, .. } = envelope;
         match origin {
-            Origin::App => self.on_app_reply(&reply),
+            Origin::App => self.on_app_reply(reply),
             Origin::Tab(id) => {
                 let _ = self.call_tab(id, |tab, ctx| tab.on_reply(&reply, ctx));
             }
@@ -711,17 +714,29 @@ impl App {
     /// (the switcher, once registered) over the bare shell instead of leaving it blank
     /// (blueprint D, "Startup"). Nothing is opened before that reply, so the first frame is
     /// always the shell itself.
-    fn on_app_reply(&mut self, reply: &StoreReply) {
-        // MOD-122 M3 D8 (blueprint F9): the activity panel's read, after the freshness gate.
-        // A refusal lets the next read go and keeps the rows; a sweep's answer needs nothing.
-        match reply {
+    fn on_app_reply(&mut self, reply: StoreReply) {
+        // MOD-122 M3 D8 (blueprint F9): the activity panel's read, after the freshness gate,
+        // taken by value (review L2: it comes once a second). A refusal lets the next read go
+        // and keeps the rows; a sweep's answer needs nothing, and its refusal, kept off the line
+        // (`absorbed`), is logged (review L3).
+        let reply = match reply {
             StoreReply::Activity { page, workspaces } => {
-                self.activity.merge(page.clone(), workspaces.clone());
+                self.activity.merge(page, workspaces);
+                return;
             }
+            reply => reply,
+        };
+        let reply = &reply;
+        match reply {
             StoreReply::Failed { request, .. }
                 if *request == StoreRequest::Activity { after: None }.name() =>
             {
                 self.activity.failed();
+            }
+            StoreReply::Failed { request, message }
+                if *request == StoreRequest::SweepRetention.name() =>
+            {
+                tracing::warn!(%message, "the retention sweep failed; the next goes in an hour");
             }
             _ => {}
         }
@@ -1172,12 +1187,14 @@ mod tests {
         app.update(Action::SetScope {
             workspace: workspace("Platform"),
         });
+        app.top_bar.store = "online".to_owned();
         while rx.try_recv().is_ok() {}
         for _ in 0..TICKS_PER_REFRESH {
             app.update(Action::Tick);
         }
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        // MOD-122 M3 D6: the first refresh also sweeps; `activity_tests` pins its schedule.
+        // MOD-122 M3 D6: the first refresh also sweeps a store that is up; `activity_tests`
+        // pins its schedule.
         assert_eq!(requests.len(), 3, "one refresh per second, not per tick");
         assert!(matches!(requests[0].request, StoreRequest::StoreState));
         assert!(matches!(requests[1].request, StoreRequest::Waiting { .. }));
@@ -1244,12 +1261,14 @@ mod tests {
     fn the_store_state_refresh_is_not_gated_on_a_scope() {
         // A first launch never enters a workspace, and `offline · 3m` still has to keep ticking.
         let (mut app, mut rx, _seen) = shell();
+        app.top_bar.store = "online".to_owned();
         while rx.try_recv().is_ok() {}
         for _ in 0..TICKS_PER_REFRESH {
             app.update(Action::Tick);
         }
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        // MOD-122 M3 D6: nor is the retention sweep, which the first refresh sends.
+        // MOD-122 M3 D6: nor is the retention sweep, which the first refresh sends a store
+        // that is up.
         assert_eq!(requests.len(), 2);
         assert!(matches!(requests[0].request, StoreRequest::StoreState));
         assert!(matches!(requests[1].request, StoreRequest::SweepRetention));
@@ -2615,17 +2634,27 @@ mod activity_tests {
     }
 
     /// D6, F10: the retention sweep goes on the first refresh tick, shown pane or not, then not
-    /// again before `SWEEP_TICKS` more ticks; its answer and its refusal say nothing.
+    /// again before `SWEEP_TICKS` more ticks; its answer and its refusal say nothing. Review M2:
+    /// not while the store is still connecting (or down): the first sweep goes on the first
+    /// refresh after it is up.
     #[test]
-    fn the_sweep_goes_on_the_first_refresh_and_then_hourly() {
+    fn the_sweep_goes_on_the_first_refresh_once_up_and_then_hourly() {
         let (mut app, mut rx) = shell(Preset::Ide);
+        app.top_bar.store = "connecting".to_owned();
+        refresh(&mut app);
+        assert_eq!(sweeps(&sent(&mut rx)), 0, "not to a store still connecting");
+        app.top_bar.store = "offline \u{b7} 3m".to_owned();
+        refresh(&mut app);
+        assert_eq!(sweeps(&sent(&mut rx)), 0, "nor to one that is down");
+
+        app.top_bar.store = "online".to_owned();
         for _ in 1..TICKS_PER_REFRESH {
             app.update(Action::Tick);
         }
-        assert_eq!(sweeps(&sent(&mut rx)), 0, "not before the first refresh");
+        assert_eq!(sweeps(&sent(&mut rx)), 0, "not before the next refresh");
         app.update(Action::Tick);
         let first = sent(&mut rx);
-        assert_eq!(sweeps(&first), 1, "the first refresh sweeps");
+        assert_eq!(sweeps(&first), 1, "the first refresh once up sweeps");
         let seq = first
             .iter()
             .find(|envelope| matches!(envelope.request, StoreRequest::SweepRetention))
@@ -2654,5 +2683,71 @@ mod activity_tests {
             },
         ));
         assert_eq!(app.status, None, "a refused sweep is absorbed");
+    }
+
+    /// Review M2: the in-memory store is up from the start, so it is swept on the first refresh.
+    #[test]
+    fn a_memory_store_is_swept_on_the_first_refresh() {
+        let (mut app, mut rx) = shell(Preset::Ide);
+        app.top_bar.store = "memory".to_owned();
+        refresh(&mut app);
+        assert_eq!(sweeps(&sent(&mut rx)), 1);
+    }
+
+    /// Review L3: a refused sweep stays off the status line, but leaves a `warn` line.
+    #[test]
+    fn a_refused_sweep_is_a_warning_in_the_log() {
+        use std::sync::{Arc, Mutex, PoisonError};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut app, mut rx) = shell(Preset::Ide);
+        app.top_bar.store = "online".to_owned();
+        refresh(&mut app);
+        let seq = sent(&mut rx)
+            .iter()
+            .find(|envelope| matches!(envelope.request, StoreRequest::SweepRetention))
+            .map(|envelope| envelope.seq)
+            .expect("the sweep");
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buffer = buffer.clone();
+                move || buffer.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            app.update(reply(
+                seq,
+                StoreReply::Failed {
+                    request: "sweep_retention",
+                    message: "the database is down".to_owned(),
+                },
+            ));
+        });
+        assert_eq!(app.status, None, "absorbed");
+        let logged = String::from_utf8(
+            buffer
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("utf-8 logs");
+        assert!(logged.contains(" WARN "), "{logged}");
+        assert!(logged.contains("the database is down"), "{logged}");
     }
 }
