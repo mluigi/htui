@@ -101,6 +101,9 @@ R-TUI-10 amended in place (every key bound to a named action and rebindable, onl
 character typed into a text field excepted; `ctrl-c` a rebindable default of leaving, with a way out
 of htui always kept; `Esc` never configurable; the fixed field, choice and numbered-choice keys
 withdrawn).
+amended 2026-11-14 by maintainer decision on ANA-42 (`docs/ANA-42.md` §8 Q4,
+`docs/decisions/ana/ana-42.md`) — R-NF-2 amended in place (`dockerd` and `sshd` opt-in per execution
+target, merged into ANA-37's text; written by MOD-130).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -896,12 +899,14 @@ and R-LATER-7 were promoted to must on 2026-10-15 and keep their IDs.
   prompt or close-out waits on it. While no Qdrant is configured, agents are not offered the search tool
   (R-MCP-2). Every box and process uses that one Qdrant; none runs or names a Qdrant of its own, except
   a development or CI override (R-STO-1). Beyond Postgres, Qdrant and the agents, no required
-  dependency on any external daemon, except the code-context tools in coding sessions (R-LATER-7). An
-  error-reporting endpoint the user configures in Settings stays optional: it is off unless set,
+  dependency on any external daemon, except the code-context tools in coding sessions (R-LATER-7).
+  `dockerd` and `sshd` are opt-in per execution target (R-ORCH-15): only a docker or ssh target needs
+  them, gated by the box probe's `docker` tag and a successful target probe; a project that never adds
+  such a target needs neither. An error-reporting endpoint the user configures in Settings stays optional: it is off unless set,
   receives only scrubbed events (R-ID-7, MOD-99), and fails open with nothing else affected. Amended by
   maintainer decision, 2026-10-14, 2026-10-15 (context tools; Qdrant to ANA-37), on ANA-37,
-  2026-10-19 (one shared Qdrant per workspace, required, failing open), and on 2026-10-20 (one Qdrant
-  for the whole database).
+  2026-10-19 (one shared Qdrant per workspace, required, failing open), on 2026-10-20 (one Qdrant
+  for the whole database), and on 2026-11-14 (ANA-42, §8 Q4: `dockerd` and `sshd` opt-in per target).
 - **R-NF-3 (must).** All long operations (probe, cache refresh, sessions) run off the UI thread;
   the TUI never blocks on network or subprocess I/O, and reflects a key press on screen within a
   bound set by ANA-32's measurement (order of 50 ms) under load. Amended 2026-10-15.
