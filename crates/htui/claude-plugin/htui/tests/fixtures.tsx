@@ -43,17 +43,35 @@ export const waitingCalls = (calls: Call[]) => calls.filter(c => c.argv[1] === '
 /** Raises `session.start` the way a session does, with `env` as the process environment. */
 export const start = async ($: Engine, on: On, env: Record<string, string> = {}) => {
   mock.env(on, env)
-  on('command.register', async () => ({ value: undefined }))
+  on('command.register', async (_$, e) => registered(e.name))
   on('session.start', async ($, e) => e)
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
 }
 
-/** The engine's own drawing beneath `component` (A-3): the kit has none, so a passing hook needs this. */
+/**
+ * The engine's answer to `$.command.register({ name })`. Its value is `{ command }` on Claude Code
+ * 2.1.323 and was nothing on earlier releases; the mod never reads it, so the mock is typed to fit
+ * either.
+ */
+export const registered = (name: string) => ({ value: { command: name } }) as never
+
+/**
+ * The engine's own drawing beneath `component` (A-3): the kit has none, so a passing hook needs this.
+ * One literal matcher per component: on 2.1.323 a matcher's type follows its component, and a union
+ * of two does not type-check.
+ */
 export const engineBottom = (on: On, component: 'AbovePrompt' | 'Pane') => {
-  on('ui.render', { component }, async ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box key="engine" />
-  })
+  if (component === 'Pane') {
+    on('ui.render', { component: 'Pane' }, async ($, e) => {
+      const { Box } = $.ui.resolve(e)
+      return <Box key="engine" />
+    })
+  } else {
+    on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
+      const { Box } = $.ui.resolve(e)
+      return <Box key="engine" />
+    })
+  }
 }
 
 export const BAND = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 80 } as never

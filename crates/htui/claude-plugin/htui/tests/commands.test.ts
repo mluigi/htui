@@ -122,7 +122,7 @@ test('a query that starts with a dash stays one argument', async ($, on) => {
   htui(on, { search: ok(SEARCH) }, calls)
   await begin($, on, clock, calls)
   await run($, 'search --json')
-  expect(calls[0].argv).toEqual(['htui', '--search-items=--json', '--json'])
+  expect(calls[0]?.argv).toEqual(['htui', '--search-items=--json', '--json'])
 })
 
 test('search with no hits says so', async ($, on) => {
