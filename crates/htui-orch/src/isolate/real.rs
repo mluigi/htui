@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use htui_core::model::{
-    BoxId, Isolation, PartMerge, PartPremerge, PremergeReport, RepoId, RepoPremerge, RunId,
-    RunStepCommit, RunStepTree, StepId,
+    BoxId, Isolation, LandOutcome, PartMerge, PartPremerge, PremergeReport, RepoId, RepoPremerge,
+    RunId, RunStepCommit, RunStepTree, StepId,
 };
 use htui_core::prompt::DiffBlock;
 use tokio::sync::OwnedMutexGuard;
@@ -25,9 +25,10 @@ use super::copy;
 use super::env_files::{self, EnvFiles};
 use super::git::{self, Cli, MergeAttempt, blocking};
 use super::{
-    ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, PartTip, Prepared,
-    PreparedTree, ResetReport,
+    ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, LandRequest, PartTip,
+    Prepared, PreparedTree, ResetReport,
 };
+use crate::{infer, land};
 
 // One named free function per refusal sentence, the house style of `htui_core`'s store refusals
 // (`crates/htui-core/src/store/traits.rs:1053-1160`). The two `copy` refusals and the unborn-HEAD
@@ -2151,6 +2152,78 @@ impl Isolator for GixIsolator {
             }
             checked
         })
+    }
+
+    /// MOD-133 D8: the trait's contract over this box's checkout ([`GixIsolator::landing_tip`],
+    /// then the two network verbs with no lock held).
+    fn land<'a>(&'a self, request: &'a LandRequest) -> IsolatorFuture<'a, LandOutcome> {
+        Box::pin(async move {
+            let Some(checkout) = self.config.repos.get(&request.repo) else {
+                return Ok(refused(land::repo_unavailable(&no_checkout_for_repo())));
+            };
+            let git = self.cli()?.clone();
+            let tip = match self.landing_tip(request, checkout).await? {
+                Ok(tip) => tip,
+                Err(reason) => return Ok(refused(reason)),
+            };
+            let cwd = &checkout.local_path;
+            let remote = request.remote.as_str();
+            let target = request.target_branch.as_str();
+            if git.ls_remote(cwd, remote, target).await?.as_deref() == Some(tip.as_str()) {
+                return Ok(LandOutcome::Landed { hash: tip });
+            }
+            Ok(match git.push(cwd, remote, &tip, target).await? {
+                git::Pushed::Done => LandOutcome::Landed { hash: tip },
+                git::Pushed::NonFastForward => refused(land::non_fast_forward(target)),
+                git::Pushed::Failed(line) => {
+                    refused(land::push_failed(&scrub_remote(&line, remote)))
+                }
+            })
+        })
+    }
+}
+
+/// A [`LandOutcome::Refused`] with `reason`.
+fn refused(reason: String) -> LandOutcome {
+    LandOutcome::Refused { reason }
+}
+
+/// MOD-133 D8: a `git` line shown in a reason, with `remote` and every other URL in it carrying
+/// no userinfo ([`infer::redact_remote`], [`infer::redact_urls`]).
+fn scrub_remote(line: &str, remote: &str) -> String {
+    let line = if remote.is_empty() {
+        line.to_owned()
+    } else {
+        line.replace(remote, &infer::redact_remote(remote))
+    };
+    infer::redact_urls(&line)
+}
+
+impl GixIsolator {
+    /// MOD-133 D8's local half: the target branch's tip, or the refusal, read under the repo's
+    /// admin lock (D70's "one child and nothing else": the guard is dropped on return, before any
+    /// network verb). The `gix` reads run through `blocking`, as [`GixIsolator::head_of`]'s.
+    async fn landing_tip(
+        &self,
+        request: &LandRequest,
+        checkout: &RepoCheckout,
+    ) -> Result<Result<String, String>, IsolateError> {
+        let _admin = self.admin_guard(request.repo).await;
+        let path = checkout.local_path.clone();
+        let target = request.target_branch.clone();
+        let commits = request.commits.clone();
+        blocking(move || {
+            let Some(tip) = git::branch_target(&path, &target)? else {
+                return Ok(Err(land::no_target_branch(&target)));
+            };
+            for commit in &commits {
+                if !git::is_ancestor(&path, commit, &tip)? {
+                    return Ok(Err(land::not_on_target(commit, &target)));
+                }
+            }
+            Ok(Ok(tip))
+        })
+        .await
     }
 }
 

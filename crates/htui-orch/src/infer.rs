@@ -169,6 +169,60 @@ fn host_path(host: &str, path: &str) -> Option<String> {
     Some(format!("{}/{path}", host.to_ascii_lowercase()))
 }
 
+/// MOD-133 D8: `url` as a reason may show it: the userinfo dropped, by
+/// [`normalise_remote`]'s "last `@`" rule, and nothing else touched. A scheme URL loses
+/// everything up to the last `@` of its authority; an scp-like `user@host:path` loses `user@`;
+/// a path, a `file:` URL or anything else is returned as it is. `normalise_remote` is a
+/// comparison key and not a URL, so it cannot be shown in its place.
+#[must_use]
+pub fn redact_remote(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let end = rest.find('/').unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(end);
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        return format!("{scheme}://{host}{path}");
+    }
+    if url.starts_with('/') || has_drive(url) {
+        return url.to_owned();
+    }
+    match url.split_once(':') {
+        Some((before, path)) if !before.contains('/') && !before.contains('\\') => {
+            match before.rsplit_once('@') {
+                Some((_, host)) => format!("{host}:{path}"),
+                None => url.to_owned(),
+            }
+        }
+        _ => url.to_owned(),
+    }
+}
+
+/// MOD-133 D8: `text` (a `git` message) with every `scheme://userinfo@` spelling inside it
+/// reduced to `scheme://`, as [`redact_remote`] does to one URL. The authority ends at the first
+/// `/`, whitespace or quote after `://`.
+#[must_use]
+pub fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|ch: char| ch == '/' || ch.is_whitespace() || matches!(ch, '\'' | '"' | '`'))
+            .unwrap_or(tail.len());
+        let (authority, after) = tail.split_at(end);
+        out.push_str(
+            authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host),
+        );
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `file:` and the collapsed path. A `/` in front of a drive (`file:///C:/…`) is dropped so the
 /// URL and the bare drive path share a key.
 fn file_key(path: &str) -> Option<String> {
@@ -391,10 +445,50 @@ mod tests {
     use htui_core::model::{Repo, RepoId};
     use uuid::Uuid;
 
-    use super::{Checkout, Choice, MatchedBy, choose, normalise_remote};
+    use super::{
+        Checkout, Choice, MatchedBy, choose, normalise_remote, redact_remote, redact_urls,
+    };
 
     /// The key every spelling of `o/r` on GitHub folds to.
     const KEY: &str = "github.com/o/r";
+
+    /// MOD-133 D8: a remote is shown without its userinfo, cut at the last `@` of the authority,
+    /// and every other spelling is left byte for byte.
+    #[test]
+    fn redact_remote_drops_userinfo_and_keeps_the_rest() {
+        for (url, shown) in [
+            (
+                "https://user:tok@GitHub.com/o/r.git",
+                "https://GitHub.com/o/r.git",
+            ),
+            ("https://a@b:c@host/o/r", "https://host/o/r"),
+            ("ssh://git@host:22/o/r", "ssh://host:22/o/r"),
+            ("https://host/o/r.git", "https://host/o/r.git"),
+            ("git@github.com:o/r.git", "github.com:o/r.git"),
+            ("github.com:o/r", "github.com:o/r"),
+            ("/srv/git/r.git", "/srv/git/r.git"),
+            ("file:///srv/git/r.git", "file:///srv/git/r.git"),
+            ("C:\\repos\\r", "C:\\repos\\r"),
+            ("../r@2.git", "../r@2.git"),
+            ("https://host/o/r@v2", "https://host/o/r@v2"),
+        ] {
+            assert_eq!(redact_remote(url), shown, "{url}");
+        }
+    }
+
+    /// MOD-133 D8: a `git` message that quotes a URL keeps its words, without the userinfo.
+    #[test]
+    fn redact_urls_scrubs_every_url_in_a_message() {
+        assert_eq!(
+            redact_urls(
+                "fatal: unable to access 'https://u:secret@host/o/r.git/': 403; \
+                 also ssh://git@other/x and https://plain/y"
+            ),
+            "fatal: unable to access 'https://host/o/r.git/': 403; also ssh://other/x and \
+             https://plain/y"
+        );
+        assert_eq!(redact_urls("no url here"), "no url here");
+    }
 
     /// A repo named `name` with `remote_url`.
     fn repo(name: &str, remote_url: Option<&str>) -> Repo {

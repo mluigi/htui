@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex};
 
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePart, PremergeReport,
-    RepoBoxPath, RepoId, RunId, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    SnapshotCandidate, SnapshotPhase, Split, StepGraphId, StepGraphPhase, StepId, StepRole,
-    StepStatus, VerifyOutcome,
+    Gate, Isolation, ItemId, ItemPatch, LandOutcome, NewRepo, NewStepGraph, PhaseId, PhasePart,
+    PremergeReport, RepoBoxPath, RepoId, RunId, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, SnapshotCandidate, SnapshotPhase, Split, StepGraphId, StepGraphPhase, StepId,
+    StepRole, StepStatus, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::scrub::MinimalScrubber;
@@ -49,7 +49,7 @@ use htui_orch::isolate::git::{Cli, IDENTITY_ENV, premerge_message};
 use htui_orch::isolate::real::{dirty_tree_not_reset, local_moved};
 use htui_orch::isolate::{
     ChangedPaths, EnvFiles, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture,
-    PartTip, Prepared, RepoCheckout, ResetReport,
+    LandRequest, PartTip, Prepared, RepoCheckout, ResetReport,
 };
 use htui_orch::secrets::RunSecrets;
 use htui_orch::skip_without_git;
@@ -2128,6 +2128,10 @@ impl Isolator for StallAfterReconcile<'_> {
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, ()> {
         self.inner.reacquire(run, step, trees)
+    }
+
+    fn land<'a>(&'a self, request: &'a LandRequest) -> IsolatorFuture<'a, LandOutcome> {
+        self.inner.land(request)
     }
 }
 

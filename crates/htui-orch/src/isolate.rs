@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use htui_core::model::{
-    Isolation, PremergeReport, RepoId, RunId, RunStepCommit, RunStepTree, StepId,
+    Isolation, LandOutcome, PremergeReport, RepoId, RunId, RunStepCommit, RunStepTree, StepId,
 };
 use htui_core::prompt::DiffBlock;
 
@@ -150,10 +150,24 @@ pub struct PartTip {
     pub commits: Vec<RunStepCommit>,
 }
 
+/// MOD-133 D8: one `integration` record as [`Isolator::land`] lands it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandRequest {
+    /// `integration.repo_id`: the checkout on this box to land from.
+    pub repo: RepoId,
+    /// `integration.remote`: the URL `git ls-remote` and `git push` are handed.
+    pub remote: String,
+    /// `integration.target_branch`: `refs/heads/<target>` locally and on the remote.
+    pub target_branch: String,
+    /// The run's landed commits in the repo ([`crate::land::landed_commits`]), each of which must
+    /// be an ancestor of the local target branch; empty pushes the target branch as it is.
+    pub commits: Vec<String>,
+}
+
 /// ANA-2 §4.6's four verbs plus four reads (milestone 4's two, `changed_paths`, MOD-9 D119, and
 /// `env_files`, MOD-89), milestone 5's two recovery verbs, MOD-139 M3's pre-merge verb and
-/// post-check read, and MOD-125 M3's `reacquire`; the four are named there verbatim
-/// (`docs/ANA-2.md:1769`), and all thirteen sit behind plan D6's seam.
+/// post-check read, MOD-125 M3's `reacquire` and MOD-133's `land`; the four are named there
+/// verbatim (`docs/ANA-2.md:1769`), and all fourteen sit behind plan D6's seam.
 ///
 /// **An isolator touches no store.** The engine persists what these return —
 /// `upsert_step_tree` after [`prepare`](Isolator::prepare), `record_commits` after
@@ -338,4 +352,21 @@ pub trait Isolator: Send + Sync + fmt::Debug {
         step: StepId,
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, ()>;
+
+    /// MOD-133 D8: lands one `push` record from this box's checkout of `request.repo`, with the
+    /// box's own credentials, and never with `--force`.
+    ///
+    /// Local reads first, under the repo's admin lock (released before any network verb): no
+    /// checkout here is `Refused("repo_unavailable: …")`, no local `refs/heads/<target>` is
+    /// `Refused("no_target_branch: <target>")`, and a commit of `request.commits` that is not an
+    /// ancestor of it is `Refused("not_on_target: …")`. Then the remote: a target branch already
+    /// at the local tip is `Landed` with nothing pushed (a crash after a push re-lands nothing);
+    /// otherwise `git push --porcelain <remote> <tip>:refs/heads/<target>` is `Landed { tip }` on
+    /// exit 0, `Refused("non_fast_forward: …")` when the remote moved, and
+    /// `Refused("push_failed: …")` for any other failure. Remote URLs in a reason carry no
+    /// userinfo.
+    ///
+    /// An `Err` (no usable `git`, a verb past its budget) is not a refusal: the engine leaves the
+    /// record `pending` for the next sweep.
+    fn land<'a>(&'a self, request: &'a LandRequest) -> IsolatorFuture<'a, LandOutcome>;
 }

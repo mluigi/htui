@@ -1002,6 +1002,154 @@ fn parse_name_only(bytes: &[u8], overflowed: bool) -> NameOnly {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// MOD-133 D8: landing's two network verbs, `ls-remote` and `push`.
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-133 D8 (PRD Q2): the `GIT_SSH_COMMAND` both network verbs run under: `inherited` (the
+/// process's own, which [`SCRUBBED_ENV`] keeps, as it keeps `SSH_AUTH_SOCK`), else `ssh`, with
+/// ` -o BatchMode=yes` appended. An ssh remote then authenticates with the box's own agent and
+/// keys and fails rather than prompting; `GIT_TERMINAL_PROMPT=0` does the same for https.
+#[must_use]
+pub fn ssh_command(inherited: Option<&str>) -> String {
+    let base = inherited
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .unwrap_or("ssh");
+    format!("{base} -o BatchMode=yes")
+}
+
+/// [`ssh_command`] over this process's `GIT_SSH_COMMAND`.
+fn batch_ssh() -> String {
+    ssh_command(std::env::var("GIT_SSH_COMMAND").ok().as_deref())
+}
+
+/// MOD-133 D8: `git push`'s argv: `push --porcelain -- <remote> <tip>:refs/heads/<target>`.
+/// **Never** `--force` and never a `+` refspec: a remote that moved refuses the push, and landing
+/// reads that as `non_fast_forward`. `--` keeps a remote spelled like an option a remote.
+#[must_use]
+pub fn push_args(remote: &str, tip: &str, target: &str) -> Vec<String> {
+    vec![
+        "push".to_owned(),
+        "--porcelain".to_owned(),
+        "--".to_owned(),
+        remote.to_owned(),
+        format!("{tip}:refs/heads/{target}"),
+    ]
+}
+
+/// What one [`Cli::push`] answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pushed {
+    /// Exit 0: the remote's target branch is at the pushed tip.
+    Done,
+    /// A `[rejected]` line for `non-fast-forward` or `fetch first`: the remote moved.
+    NonFastForward,
+    /// Any other non-zero exit, with the line a human should read (not yet redacted).
+    Failed(String),
+}
+
+/// The line of a failed network verb a human should read: its first `fatal:` line, else its
+/// first `error:` line, else [`Exited::message`]'s, else the exit status.
+fn network_failure(exited: &Exited) -> String {
+    let lines = || exited.stderr.lines().map(str::trim_end);
+    lines()
+        .find(|line| line.starts_with("fatal:"))
+        .or_else(|| lines().find(|line| line.starts_with("error:")))
+        .or_else(|| exited.message())
+        .map_or_else(
+            || match exited.code {
+                Some(code) => format!("exit status {code} with no stderr"),
+                None => "killed by signal".to_owned(),
+            },
+            str::to_owned,
+        )
+}
+
+/// Whether a `git push` exit carries a rejection for a moved remote: `[rejected]` with
+/// `non-fast-forward` or `fetch first`, in the porcelain stdout or in stderr.
+fn rejected_as_moved(exited: &Exited) -> bool {
+    exited
+        .stdout
+        .lines()
+        .chain(exited.stderr.lines())
+        .any(|line| {
+            line.contains("[rejected]")
+                && (line.contains("non-fast-forward") || line.contains("fetch first"))
+        })
+}
+
+/// The hash `git ls-remote` printed for exactly `reference`, if any.
+fn parse_ls_remote(stdout: &str, reference: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let (hash, name) = line.split_once('\t')?;
+        (name.trim_end() == reference).then(|| hash.trim().to_owned())
+    })
+}
+
+impl Cli {
+    /// MOD-133 D8: `git ls-remote -- <remote> refs/heads/<target>` in `cwd`, under
+    /// [`ssh_command`]: the remote's target tip. `None` when the remote has no such branch **and**
+    /// when the verb failed (an unreachable remote, a refused credential): landing then pushes,
+    /// and the push's own failure is the one reported.
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] when the verb cannot be spawned or outlives its budget.
+    pub async fn ls_remote(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        target: &str,
+    ) -> Result<Option<String>, IsolateError> {
+        let reference = format!("refs/heads/{target}");
+        let ssh = batch_ssh();
+        let exited = self
+            .run(
+                "ls-remote",
+                cwd,
+                &[
+                    OsStr::new("ls-remote"),
+                    OsStr::new("--"),
+                    OsStr::new(remote),
+                    OsStr::new(&reference),
+                ],
+                &[("GIT_SSH_COMMAND", &ssh)],
+            )
+            .await?;
+        if !exited.ok() {
+            return Ok(None);
+        }
+        Ok(parse_ls_remote(&exited.stdout, &reference))
+    }
+
+    /// MOD-133 D8: [`push_args`] in `cwd`, under [`ssh_command`]: the fast-forward of the
+    /// remote's `target` to `tip`, classified.
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] when the verb cannot be spawned or outlives its budget.
+    pub async fn push(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        tip: &str,
+        target: &str,
+    ) -> Result<Pushed, IsolateError> {
+        let args = push_args(remote, tip, target);
+        let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+        let ssh = batch_ssh();
+        let exited = self
+            .run("push", cwd, &args, &[("GIT_SSH_COMMAND", &ssh)])
+            .await?;
+        Ok(if exited.ok() {
+            Pushed::Done
+        } else if rejected_as_moved(&exited) {
+            Pushed::NonFastForward
+        } else {
+            Pushed::Failed(network_failure(&exited))
+        })
+    }
+}
+
 /// The sleeps between retries (plan D39): 200, 400 and 800 ms, so four attempts in all.
 ///
 /// Entirely ours. `gix::lock` offers `Fail::AfterDurationWithBackoff`, whose backoff is quadratic
@@ -4514,6 +4662,89 @@ mod tests {
             b"htui: reconcile X",
             "the subject's surrounding whitespace and CR are trimmed"
         );
+    }
+
+    /// MOD-133 D8 (PRD Q2): the network verbs' ssh command is the inherited one, else `ssh`,
+    /// always in batch mode.
+    #[test]
+    fn the_ssh_command_is_batch_mode_over_the_inherited_one() {
+        assert_eq!(super::ssh_command(None), "ssh -o BatchMode=yes");
+        assert_eq!(super::ssh_command(Some("  ")), "ssh -o BatchMode=yes");
+        assert_eq!(
+            super::ssh_command(Some("ssh -i /k/id")),
+            "ssh -i /k/id -o BatchMode=yes"
+        );
+    }
+
+    /// MOD-133 D8: the push is a fast-forward refspec, never `--force` and never `+`.
+    #[test]
+    fn the_push_argv_never_forces() {
+        let args = super::push_args("-oops", "abc", "main");
+        assert_eq!(
+            args,
+            ["push", "--porcelain", "--", "-oops", "abc:refs/heads/main"]
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--force") || arg == "-f" || arg.starts_with('+')),
+            "{args:?}"
+        );
+    }
+
+    /// MOD-133 D8: a moved remote (both of git 2.43's wordings) is told from any other failure,
+    /// whose first `fatal:` line is the one kept.
+    #[test]
+    fn a_push_exit_is_classified() {
+        let fetch_first = Exited {
+            code: Some(1),
+            stdout: "To ../remote.git\n!\tHEAD:refs/heads/main\t[rejected] (fetch first)\nDone\n"
+                .to_owned(),
+            stderr: "error: failed to push some refs to '../remote.git'\nhint: …\n".to_owned(),
+        };
+        assert!(super::rejected_as_moved(&fetch_first));
+        let non_ff = Exited {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: " ! [rejected]        main -> main (non-fast-forward)\n".to_owned(),
+        };
+        assert!(super::rejected_as_moved(&non_ff));
+        let missing = Exited {
+            code: Some(128),
+            stdout: String::new(),
+            stderr: "fatal: '../nonexist.git' does not appear to be a git repository\n\
+                     fatal: Could not read from remote repository.\n\n\
+                     Please make sure you have the correct access rights\n\
+                     and the repository exists.\n"
+                .to_owned(),
+        };
+        assert!(!super::rejected_as_moved(&missing));
+        assert_eq!(
+            super::network_failure(&missing),
+            "fatal: '../nonexist.git' does not appear to be a git repository"
+        );
+        let silent = Exited {
+            code: Some(2),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            super::network_failure(&silent),
+            "exit status 2 with no stderr"
+        );
+    }
+
+    /// MOD-133 D8: `ls-remote`'s hash for exactly the asked reference.
+    #[test]
+    fn ls_remote_output_is_read_for_the_one_reference() {
+        let out = "1111111111111111111111111111111111111111\trefs/heads/main-old\n\
+                   2222222222222222222222222222222222222222\trefs/heads/main\n";
+        assert_eq!(
+            super::parse_ls_remote(out, "refs/heads/main").as_deref(),
+            Some("2222222222222222222222222222222222222222")
+        );
+        assert_eq!(super::parse_ls_remote(out, "refs/heads/dev"), None);
+        assert_eq!(super::parse_ls_remote("", "refs/heads/main"), None);
     }
 
     /// A `sh` script that answers `--version` like `git` does, marked executable.

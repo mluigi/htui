@@ -7,9 +7,13 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    DocumentHead, DocumentId, Item, ItemId, LinkGraph, LinkKind, NewDocument, Repo, RepoId,
-    Resolution, RunId, RunStepCommit, RunSummary, Status, StepId, UserId,
+    DocumentHead, DocumentId, Integration, IntegrationState, Item, ItemId, LinkGraph, LinkKind,
+    NewDocument, Repo, RepoId, Resolution, RunId, RunStepCommit, RunSummary, Status, StepId,
+    UserId,
 };
+
+use crate::infer::redact_remote;
+use crate::land::short_hash;
 
 /// `document.kind` of the close-out summary (ANA-2 §4.10).
 const KIND: &str = "summary";
@@ -115,7 +119,19 @@ fn label(item: &Item, links: &LinkGraph, id: ItemId) -> String {
 /// `(position, attempt, fanout_index)`, then the repo name. A repo missing from `repos` renders
 /// its id; a step no listed run carries renders its id as the phase and `-` as its position and
 /// attempt, and sorts last.
+///
+/// MOD-133 D11: `integrations`, the `integration` records of the item's runs, append an
+/// `## Integration` table after the run lines, one row per record: the repo's name, the run, the
+/// mode, the remote (without userinfo) and target, and the outcome (`landed <short hash>`,
+/// `refused: <reason>`, `pending`, or a PR state's wire name). Rows follow the run lines' order,
+/// then the repo name. No record writes no section, so the body is byte-identical to a `local`
+/// item's.
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MOD-133 D11: the integration records are the eighth input of one pure formatter, \
+              each a separate read of the engine's"
+)]
 pub fn summary(
     item: &Item,
     runs: &[RunSummary],
@@ -124,6 +140,7 @@ pub fn summary(
     id: DocumentId,
     user: UserId,
     at: DateTime<Utc>,
+    integrations: &[Integration],
 ) -> NewDocument {
     let mut body = format!("# Close-out {} — {}\n\n", item.key, item.title);
     body.push_str("| repo | position | phase | attempt | commits |\n|---|---|---|---|---|\n");
@@ -142,7 +159,7 @@ pub fn summary(
     if !oldest_first.is_empty() {
         body.push('\n');
     }
-    for run in oldest_first {
+    for run in &oldest_first {
         body.push_str(&format!("- {} run {}: {}", run.kind, run.id, run.status));
         if let Some(finished) = run.finished_at {
             body.push_str(&format!(
@@ -152,6 +169,7 @@ pub fn summary(
         }
         body.push('\n');
     }
+    integration_section(&mut body, &oldest_first, repos, integrations);
     NewDocument {
         id,
         item_id: item.id,
@@ -161,6 +179,62 @@ pub fn summary(
         produced_by_step_id: None,
         created_by: user,
         created_at: at,
+    }
+}
+
+/// MOD-133 D11: the `## Integration` table, appended to `body` when `integrations` is not empty.
+fn integration_section(
+    body: &mut String,
+    oldest_first: &[&RunSummary],
+    repos: &[Repo],
+    integrations: &[Integration],
+) {
+    if integrations.is_empty() {
+        return;
+    }
+    let repo_name = |record: &Integration| {
+        repos
+            .iter()
+            .find(|repo| repo.id == record.repo_id)
+            .map_or_else(|| record.repo_id.to_string(), |repo| repo.name.clone())
+    };
+    let mut rows: Vec<(usize, String, RepoId, &Integration)> = integrations
+        .iter()
+        .map(|record| {
+            let run = oldest_first
+                .iter()
+                .position(|run| run.id == record.run_id)
+                .unwrap_or(usize::MAX);
+            (run, repo_name(record), record.repo_id, record)
+        })
+        .collect();
+    rows.sort_by(|a, b| (a.0, a.3.run_id, &a.1, a.2).cmp(&(b.0, b.3.run_id, &b.1, b.2)));
+    body.push_str(
+        "\n## Integration\n\n| repo | run | mode | target | outcome |\n|---|---|---|---|---|\n",
+    );
+    for (_, repo, _, record) in rows {
+        let outcome = match record.state {
+            IntegrationState::Landed => format!(
+                "landed {}",
+                record.landed_hash.as_deref().map_or("?", short_hash)
+            ),
+            IntegrationState::Refused => {
+                format!("refused: {}", record.refusal.as_deref().unwrap_or_default())
+            }
+            other => other.as_str().to_owned(),
+        };
+        body.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            cell(&repo),
+            record.run_id,
+            record.mode,
+            cell(&format!(
+                "{} {}",
+                redact_remote(&record.remote),
+                record.target_branch
+            )),
+            cell(&outcome),
+        ));
     }
 }
 
@@ -251,8 +325,8 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
     use htui_core::model::{
-        BoxId, ItemKindId, LinkEdge, LinkNode, ProjectId, RunKind, RunMode, RunStatus,
-        RunStepSummary, StepStatus,
+        BoxId, IntegrateMode, IntegrationState, ItemKindId, LinkEdge, LinkNode, ProjectId, RunKind,
+        RunMode, RunStatus, RunStepSummary, StepStatus,
     };
     use uuid::Uuid;
 
@@ -404,6 +478,15 @@ mod tests {
         commits: &[(StepId, Vec<RunStepCommit>)],
         repos: &[Repo],
     ) -> NewDocument {
+        write_with(runs, commits, repos, &[])
+    }
+
+    fn write_with(
+        runs: &[RunSummary],
+        commits: &[(StepId, Vec<RunStepCommit>)],
+        repos: &[Repo],
+        integrations: &[Integration],
+    ) -> NewDocument {
         summary(
             &item(),
             runs,
@@ -412,7 +495,115 @@ mod tests {
             DocumentId::from_uuid(Uuid::from_u128(0x600)),
             user(),
             at(3, 8),
+            integrations,
         )
+    }
+
+    /// One `integration` record of run `run` in repo `repo`, in `state`.
+    fn record(run: u128, repo: u128, state: IntegrationState) -> Integration {
+        Integration {
+            run_id: run_id(run),
+            repo_id: repo_id(repo),
+            project_id: project(),
+            mode: IntegrateMode::Push,
+            remote: "https://bot:secret@forge.example/o/htui.git".to_owned(),
+            target_branch: "main".to_owned(),
+            state,
+            refusal: (state == IntegrationState::Refused)
+                .then(|| "non_fast_forward: main on the remote has moved".to_owned()),
+            landed_hash: (state == IntegrationState::Landed)
+                .then(|| "0123456789abcdef0123456789abcdef01234567".to_owned()),
+            pr_ref: None,
+            pr_url: None,
+            created_at: at(2, 12),
+            updated_at: at(2, 12),
+        }
+    }
+
+    /// MOD-133 D11: the integration section follows the run lines, one row per record, oldest
+    /// run first and by repo name; the remote is shown without its userinfo.
+    #[test]
+    fn the_summary_lists_each_integration_record_after_the_runs() {
+        let runs = [
+            run(
+                2,
+                at(2, 14),
+                RunStatus::Done,
+                Some(at(2, 16)),
+                vec![step(2, 1, 1, 0, "implement")],
+            ),
+            run(
+                1,
+                at(2, 10),
+                RunStatus::Done,
+                Some(at(2, 12)),
+                vec![step(1, 1, 1, 0, "implement")],
+            ),
+        ];
+        let commits = [(step_id(1), vec![commit(1, 1, "0a1b2c3", Some("9f8e7d6"))])];
+        let repos = [repo(1, "htui"), repo(2, "docs")];
+        let integrations = [
+            record(2, 1, IntegrationState::Pending),
+            record(1, 1, IntegrationState::Landed),
+            record(1, 2, IntegrationState::Refused),
+            record(2, 2, IntegrationState::PrOpen),
+        ];
+
+        let doc = write_with(&runs, &commits, &repos, &integrations);
+
+        assert_eq!(
+            doc.body,
+            format!(
+                "# Close-out FEAT-1 — Close me\n\
+                 \n\
+                 | repo | position | phase | attempt | commits |\n\
+                 |---|---|---|---|---|\n\
+                 | htui | 1 | implement | 1 | 0a1b2c3..9f8e7d6 |\n\
+                 \n\
+                 - graph run {r1}: done, finished 2026-09-02 12:00 UTC\n\
+                 - graph run {r2}: done, finished 2026-09-02 16:00 UTC\n\
+                 \n\
+                 ## Integration\n\
+                 \n\
+                 | repo | run | mode | target | outcome |\n\
+                 |---|---|---|---|---|\n\
+                 | docs | {r1} | push | https://forge.example/o/htui.git main | refused: \
+                 non_fast_forward: main on the remote has moved |\n\
+                 | htui | {r1} | push | https://forge.example/o/htui.git main | landed 0123456 |\n\
+                 | docs | {r2} | push | https://forge.example/o/htui.git main | pr_open |\n\
+                 | htui | {r2} | push | https://forge.example/o/htui.git main | pending |\n",
+                r1 = run_id(1),
+                r2 = run_id(2),
+            ),
+        );
+        assert!(!doc.body.contains("secret"), "no userinfo is written");
+    }
+
+    /// MOD-133 D11: no record, today's bytes exactly.
+    #[test]
+    fn no_integration_record_keeps_the_summary_byte_identical() {
+        let runs = [run(
+            1,
+            at(2, 10),
+            RunStatus::Done,
+            Some(at(2, 12)),
+            vec![step(1, 1, 1, 0, "implement")],
+        )];
+        let commits = [(step_id(1), vec![commit(1, 1, "0a1b2c3", Some("9f8e7d6"))])];
+        let repos = [repo(1, "htui")];
+        assert_eq!(
+            write_with(&runs, &commits, &repos, &[]).body,
+            format!(
+                "# Close-out FEAT-1 — Close me\n\
+                 \n\
+                 | repo | position | phase | attempt | commits |\n\
+                 |---|---|---|---|---|\n\
+                 | htui | 1 | implement | 1 | 0a1b2c3..9f8e7d6 |\n\
+                 \n\
+                 - graph run {}: done, finished 2026-09-02 12:00 UTC\n",
+                run_id(1)
+            )
+        );
     }
 
     /// The commit table's body rows: every `| …` line but the header and the separator.

@@ -27,7 +27,8 @@
 //! [`walk`], the readiness walker: joins, derived skips, `if` and `asks_you` edges and loop
 //! regions over the snapshot's nodes and edges (plan D2). MOD-139 M2 adds [`divide`], divided
 //! fan-out's pure rules: names, base positions, the admission refusal, part widths and live
-//! siblings.
+//! siblings. MOD-133 adds [`land`], landing's pure half: a finished run's landed commits and the
+//! sentences a landing is refused or noted with.
 //!
 //! [`walk`]: mod@walk
 #![warn(missing_docs)]
@@ -46,6 +47,7 @@ pub mod graph;
 pub mod infer;
 pub mod isolate;
 pub mod kill_point;
+pub mod land;
 pub mod overlap;
 pub mod promote;
 pub mod recover;
@@ -68,7 +70,7 @@ pub use engine::{
     live_step_at, never_cancelled,
 };
 #[cfg(feature = "test-support")]
-pub use engine::{claim_fake, dispatch_fake, enqueue_fake, resume_fake, sweep_fake};
+pub use engine::{claim_fake, dispatch_fake, enqueue_fake, land_fake, resume_fake, sweep_fake};
 pub use fanout::{JudgeFailure, Route};
 pub use gate::{
     Landing, LoopOutcome, LoopStop, Settle, SettleInput, StepFailure, Verdict, parse_verdict,
@@ -79,7 +81,8 @@ pub use graph::{
 };
 pub use isolate::{
     ChangedPaths, Clock, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig,
-    IsolatorFuture, PartTip, Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
+    IsolatorFuture, LandRequest, PartTip, Prepared, PreparedTree, RepoCheckout, ResetReport,
+    SystemClock,
 };
 pub use recover::{Heartbeat, LeaseTimes};
 pub use secrets::RunSecrets;
