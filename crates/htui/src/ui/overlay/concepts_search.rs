@@ -21,7 +21,7 @@
 //! in this box and nothing else.
 
 use crossterm::event::KeyEvent;
-use htui_core::model::{ProjectId, ProjectRef, RequirementState, Scope, WorkspaceId};
+use htui_core::model::{IndexerLease, ProjectId, ProjectRef, RequirementState, Scope, WorkspaceId};
 use htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE;
 use htui_store::vector::{Hit, Owner, PointType, QUERY_EMBED_FAILED, SearchQuery};
 use htui_store::vector_sync::SyncReport;
@@ -33,7 +33,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
 use crate::concepts;
-use crate::concepts_worker::ConceptsReply;
+use crate::concepts_worker::{ConceptsReply, IndexOutcome};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
@@ -302,6 +302,7 @@ impl ConceptsSearch {
                 ctx.request(StoreRequest::SearchConcepts {
                     query,
                     scope_row_of,
+                    workspace: ctx.scope.workspace_id,
                 });
             }
             return;
@@ -483,8 +484,17 @@ impl Overlay for ConceptsSearch {
                     }
                 }
             }
-            ConceptsReply::Indexed(Ok(report)) => {
+            // MOD-159 M1 R2: another box took the lease over mid-sync, so the run stopped there:
+            // said dim, in the CLI's words, never as a finished report.
+            ConceptsReply::Indexed(Ok(IndexOutcome::Synced(report))) if report.abandoned => {
+                self.index = IndexLine::Done(concepts::TAKEN_OVER.to_owned());
+            }
+            ConceptsReply::Indexed(Ok(IndexOutcome::Synced(report))) => {
                 self.index = IndexLine::Done(index_report(report));
+            }
+            // MOD-159 M1 D12: another box indexes this workspace; said dim, as a report is.
+            ConceptsReply::Indexed(Ok(IndexOutcome::HeldBy(lease))) => {
+                self.index = IndexLine::Done(held_line(lease));
             }
             ConceptsReply::Indexed(Err(message)) => {
                 self.index = IndexLine::Failed(message.clone());
@@ -670,6 +680,22 @@ pub fn index_report(report: &SyncReport) -> String {
     )
 }
 
+/// MOD-159 M1 D12: a `Ctrl+R` that found another box holding the workspace's indexer lease:
+/// `indexing runs on <box> (lease until HH:MM)`, the box by its hostname, or the last eight hex
+/// digits of its id when its row is gone; the expiry in UTC, as the queue overlay's times are.
+#[must_use]
+pub fn held_line(lease: &IndexerLease) -> String {
+    // The hostname is stored text: stripped of control characters like a hit's key.
+    let holder = concepts::holder_name(lease);
+    match lease.expires_at {
+        Some(at) => format!(
+            "indexing runs on {holder} (lease until {})",
+            at.format("%H:%M")
+        ),
+        None => format!("indexing runs on {holder}"),
+    }
+}
+
 /// `error` with where it is fixed (MOD-115 M4 E6, MOD-83), `place`'s, unless it already names a
 /// Settings place (`set one in Settings > Qdrant`) or no place fixes it.
 #[must_use]
@@ -745,6 +771,7 @@ mod tests {
     use crate::ui::kit::list::GUTTER;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
+    use htui_core::model::{BoxId, IndexedCollection};
     use htui_core::model::{ProjectRef, WorkspaceId};
     use htui_store::vector::{Owner, PointType};
     use ratatui::Terminal;
@@ -914,6 +941,7 @@ mod tests {
                 Action::Store(StoreRequest::SearchConcepts {
                     query,
                     scope_row_of,
+                    ..
                 }) => Some((query.projects, scope_row_of)),
                 Action::Store(StoreRequest::IndexConcepts {
                     scope,
@@ -935,6 +963,7 @@ mod tests {
                 Action::Store(StoreRequest::SearchConcepts {
                     query,
                     scope_row_of,
+                    ..
                 }) => Some((query, scope_row_of)),
                 _ => None,
             })
@@ -1064,6 +1093,7 @@ mod tests {
                 Action::Store(StoreRequest::SearchConcepts {
                     query,
                     scope_row_of,
+                    ..
                 }) => Some((query.projects, scope_row_of)),
                 _ => None,
             })
@@ -1694,7 +1724,10 @@ mod tests {
             items_rebuilt: 3,
             ..Default::default()
         };
-        bench.reply(&mut search, ConceptsReply::Indexed(Ok(report)));
+        bench.reply(
+            &mut search,
+            ConceptsReply::Indexed(Ok(IndexOutcome::Synced(report))),
+        );
         // Wider than the box, which cuts it like every other row.
         let line: String = index_report(&report).chars().take(92).collect();
         assert!(bench.render(&search).contains(&line), "{line}");
@@ -1704,6 +1737,110 @@ mod tests {
             ConceptsReply::Indexed(Err("qdrant: upsert: refused".to_owned())),
         );
         assert!(bench.render(&search).contains("qdrant: upsert: refused"));
+    }
+
+    /// MOD-159 M1 R2: a press whose lease another box took over mid-sync stopped there; the row
+    /// says so, in the CLI's words, dim, and never as a report.
+    #[test]
+    fn a_ctrl_r_another_box_took_over_says_it_stopped() {
+        let bench = Bench::platform().in_platform();
+        let mut search = ConceptsSearch::new();
+        bench.ctrl(&mut search, 'r');
+        let _ = bench.emit.take();
+        let report = SyncReport {
+            items_rebuilt: 2,
+            abandoned: true,
+            ..Default::default()
+        };
+        bench.reply(
+            &mut search,
+            ConceptsReply::Indexed(Ok(IndexOutcome::Synced(report))),
+        );
+        let frame = bench.render(&search);
+        assert!(!frame.contains(INDEXING), "{frame}");
+        assert!(
+            frame.contains("another box took the indexing over; stopped here"),
+            "{frame}"
+        );
+        assert!(!frame.contains("indexed:"), "no report: {frame}");
+    }
+
+    /// MOD-159 M1 D12: a lease another box holds is said on the index row, in the dim style (it
+    /// is no error): the holder's name, or its id's tail when its row is gone, and the expiry.
+    #[test]
+    fn a_ctrl_r_another_box_indexes_says_which_box_and_until_when() {
+        let bench = Bench::platform().in_platform();
+        let mut search = ConceptsSearch::new();
+        bench.ctrl(&mut search, 'r');
+        let _ = bench.emit.take();
+        let expires_at = chrono::DateTime::parse_from_rfc3339("2026-11-14T09:41:00Z")
+            .expect("a timestamp")
+            .with_timezone(&chrono::Utc);
+        let lease = IndexerLease {
+            collection: IndexedCollection::Workspace(bench.scope.workspace_id).name(),
+            box_id: Some(BoxId::from_uuid(uuid::Uuid::from_u128(
+                0x0123_4567_89ab_cdef,
+            ))),
+            box_name: Some("hal".to_owned()),
+            expires_at: Some(expires_at),
+            live: true,
+        };
+        assert_eq!(
+            held_line(&lease),
+            "indexing runs on hal (lease until 09:41)"
+        );
+        let unnamed = IndexerLease {
+            box_name: None,
+            ..lease.clone()
+        };
+        assert_eq!(
+            held_line(&unnamed),
+            "indexing runs on 89abcdef (lease until 09:41)"
+        );
+
+        bench.reply(
+            &mut search,
+            ConceptsReply::Indexed(Ok(IndexOutcome::HeldBy(lease))),
+        );
+        let frame = bench.render(&search);
+        assert!(!frame.contains(INDEXING), "{frame}");
+        let buffer = bench.buffer(&search, 100, 30);
+        let line = "indexing runs on hal (lease until 09:41)";
+        let y = (0..buffer.area.height)
+            .find(|&y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains(line)
+            })
+            .unwrap_or_else(|| panic!("the held line is drawn:\n{frame}"));
+        let x = (0..buffer.area.width)
+            .find(|&x| buffer[(x, y)].symbol() == "i")
+            .expect("its first cell");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            bench.theme.dim.fg.expect("dim has a colour")
+        );
+        insta::assert_snapshot!("held_by_another_box", frame);
+    }
+
+    /// MOD-159 M1 D9: a search names the workspace whose collection it reads.
+    #[test]
+    fn a_search_names_its_workspace() {
+        let bench = Bench::platform().in_platform();
+        let mut search = ConceptsSearch::new();
+        bench.typed(&mut search, "tui");
+        bench.code(&mut search, KeyCode::Enter);
+        let workspaces: Vec<WorkspaceId> = bench
+            .emit
+            .take()
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Store(StoreRequest::SearchConcepts { workspace, .. }) => Some(workspace),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(workspaces, [ids::WORKSPACE_PLATFORM]);
     }
 
     #[test]
@@ -1955,6 +2092,7 @@ mod tests {
             requirements_unchanged: 4,
             points_upserted: 5,
             points_deleted: 6,
+            abandoned: false,
         };
         assert_eq!(
             index_report(&report),

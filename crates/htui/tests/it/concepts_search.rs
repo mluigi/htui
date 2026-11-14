@@ -25,7 +25,7 @@ use htui::ui::tabs::{BacklogTab, ChatTab, RequirementsTab};
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::document::GOALS_KIND;
-use htui_core::model::{DocumentId, NewOwnerDocument, Scope};
+use htui_core::model::{DocumentId, IndexedCollection, NewOwnerDocument, Scope};
 use htui_core::store::{MemStore, WriteStore as _};
 use htui_store::Backend;
 use htui_store::vector::{Hit, Owner, PointType};
@@ -53,6 +53,9 @@ const MIXED: &str = "postgres store cache";
 /// Only `htui` FIX-1 matches it among closed items: the decisions search.
 const PANIC: &str = "terminal raw panic";
 
+/// Platform's knowledge collection (MOD-159 M1 D9): what its searches read and `Ctrl+R` writes.
+const PLATFORM: IndexedCollection = IndexedCollection::Workspace(ids::WORKSPACE_PLATFORM);
+
 /// The demo store and its Platform scope.
 async fn platform_scope() -> (Backend, Scope) {
     let backend = Backend::memory(MemStore::demo());
@@ -73,7 +76,7 @@ async fn platform_scope() -> (Backend, Scope) {
 async fn seeded() -> Arc<MemIndex> {
     let index = MemIndex::new();
     let (backend, scope) = platform_scope().await;
-    index.seed(&backend, &scope).await;
+    index.seed(&PLATFORM, &backend, &scope).await;
     Arc::new(index)
 }
 
@@ -128,7 +131,7 @@ async fn expected(
 ) -> Vec<Hit> {
     use htui_store::vector::VectorStore as _;
     index
-        .store()
+        .store(&PLATFORM)
         .search(&concepts::query(
             text,
             projects,
@@ -456,7 +459,7 @@ async fn ctrl_r_reindexes_and_prints_the_report_line() {
     harness.drive_to_end().await;
 
     let (backend, scope) = platform_scope().await;
-    let report = MemIndex::new().seed(&backend, &scope).await;
+    let report = MemIndex::new().seed(&PLATFORM, &backend, &scope).await;
     let frame = harness.render();
     // The line is wider than the box, which clips it like every other row.
     assert!(
@@ -496,7 +499,7 @@ async fn a_reply_to_a_closed_search_is_not_shown_by_a_reopened_one() {
     harness.drive_to_end().await;
 
     let (backend, scope) = platform_scope().await;
-    let report = MemIndex::new().seed(&backend, &scope).await;
+    let report = MemIndex::new().seed(&PLATFORM, &backend, &scope).await;
     let frame = harness.render();
     assert!(search_is_open(&mut harness));
     assert!(frame.contains(&idle(Some("Enter"))), "{frame}");
@@ -584,7 +587,7 @@ async fn a_rebound_reindex_acts_and_the_old_chord_is_inert() {
 
     let (backend, scope) = platform_scope().await;
     let report = clip(
-        &index_report(&MemIndex::new().seed(&backend, &scope).await),
+        &index_report(&MemIndex::new().seed(&PLATFORM, &backend, &scope).await),
         INNER_CELLS,
     );
 
@@ -668,7 +671,7 @@ async fn a_workspace_goals_document_is_indexed_found_and_opened_from_settings() 
     harness.drive_to_end().await;
     assert!(
         index
-            .store()
+            .store(&PLATFORM)
             .points()
             .iter()
             .any(|p| p.subject.owner() == Owner::Document(goals.id)),

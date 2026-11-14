@@ -38,6 +38,13 @@ async fn mem_store_activity_conformance() {
     conformance::run_all_activity(|| async { MemStore::demo() }).await;
 }
 
+/// The indexer lease half of the suite (MOD-159 M1 plan D3), bound to the same fixture: a fourth
+/// binding, because `run_all_indexer_leases` is generic over `WriteStore + IndexerLeaseStore`.
+#[tokio::test]
+async fn mem_store_indexer_lease_conformance() {
+    conformance::run_all_indexer_leases(|| async { MemStore::demo() }).await;
+}
+
 #[tokio::test]
 async fn demo_store_loads_the_fixture() {
     let store = MemStore::demo();
@@ -125,5 +132,11 @@ async fn demo_store_loads_the_fixture() {
         conformance::ACTIVITY_CASES.len(),
         12,
         "MOD-122 M3's twelve activity cases (plan D1-D4, D7; blueprint F1)"
+    );
+    assert_eq!(
+        conformance::INDEXER_LEASE_CASES.len(),
+        10,
+        "MOD-159 M1's eight indexer lease cases (plan D2, D3) and review R1's lapsed-`Ours` and \
+         single-release cases"
     );
 }

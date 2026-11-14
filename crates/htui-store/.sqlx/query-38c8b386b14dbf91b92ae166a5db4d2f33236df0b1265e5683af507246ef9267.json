@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE indexer_lease SET lease_owner = NULL, lease_expires_at = clock_timestamp() WHERE lease_owner = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38c8b386b14dbf91b92ae166a5db4d2f33236df0b1265e5683af507246ef9267"
+}

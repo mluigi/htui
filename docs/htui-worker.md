@@ -444,28 +444,65 @@ running `htui` process below your server's `max_connections`.
 
 ## The concepts index
 
-The worker keeps the concepts index in step with every project: once at start, then every
-`concepts_sync_minutes` minutes. That is an `app_setting` key holding a positive whole number,
-read again after every sync; without it, or with any other value, the interval is 15 minutes.
+The worker keeps the concepts index in step with every project. Each workspace has its own Qdrant
+collection (`htui_ws_<workspace id>`), and there is one global collection (`htui_global`, empty
+for now).
+
+- **One process indexes each collection: the holder of its lease.** Each collection has one row
+  in the database's `indexer_lease` table. Every `htui worker` and every TUI connected to the
+  database (not `--demo`, not offline) competes for every collection, so on a team the collections
+  are spread over whichever processes are running. Only the lease holder deletes points; a process
+  that loses the lease stops at its next delete batch.
+- **Every beat** (the run lease's refresh: `lease_refresh_seconds`, at most a third of
+  `lease_ttl_seconds`, so 40 seconds by default, both read again every beat) the worker takes or
+  renews the lease of every collection. A collection whose lease another process holds is left
+  to it. A beat reads the Qdrant URL only; the API key is read when a collection is due for a
+  reconcile, so a beat with nothing to reconcile never touches the keyring. A key that cannot be
+  read is one `warn` line until its error changes; the worker then lets go of every lease it holds,
+  so a process with a key takes the indexing over, and takes none, nor reads the key, until the
+  interval below has passed.
+- **A collection it holds is reconciled once when it is taken, then every
+  `concepts_sync_minutes` minutes.** That is an `app_setting` key holding a positive whole number,
+  read again every beat; without it, or with any other value, the interval is 15 minutes. The
+  reconcile renews the lease before it deletes anything from a project's points. While one
+  collection reconciles (the first build of a large workspace takes minutes), every lease the
+  process holds, that collection's included, is still renewed every beat interval, so none lapses
+  behind it. If another process has taken a lease meanwhile (this one stalled past the lease's
+  time-to-live), it stops there, deletes nothing, and leaves the collection to the new holder.
+- **On shutdown the worker lets go of its leases**, so another process takes its collections over
+  on its next beat rather than after the lease lapses (it waits at most 5 seconds for that; the
+  TUI, whose whole shutdown has 5 seconds, waits at most 1). A worker that dies without letting go
+  holds them until the lease's time-to-live (`lease_ttl_seconds`, 120 seconds by default) runs out.
+- **The global collection's holder** creates that collection and drops `htui_concepts_v2`, the one
+  shared collection earlier versions wrote, once per process (one `info` line when it was there).
+- `Ctrl+R` in the TUI's knowledge search and `htui --index-items` index a workspace only when its
+  lease is free or their own process's; otherwise they say which box indexes it. A `Ctrl+R` on a
+  free lease takes it for that one press and lets it go after; one the TUI's own index job holds
+  stays the job's. A `Ctrl+R` stopped half-way (a second press, or quitting) leaves its lease to
+  lapse within the time-to-live.
+- **MCP `search_concepts`** reads every workspace's collection; one that fails (a stale
+  collection, or one another embedder wrote) is skipped and logged while the others answer. The
+  search fails only when no workspace collection answered.
 
 - **The Qdrant URL is one setting for the whole database**, the `app_setting` `qdrant_url` that
   **Settings › Qdrant** and `htui --set-qdrant-url` write, so every box indexes into the same
   Qdrant. `HTUI_QDRANT_URL`, when set and not blank, overrides it for this process (development and
   CI); a value that is not a Qdrant URL is an error, never a fall-back to the setting. The API key
   comes from [these sources](#where-the-qdrant-api-key-comes-from).
-- **The URL is read again at every sync.** Without one, the worker logs one `info` line ("no Qdrant
-  URL is set; …") and tries again after the interval; a URL set later is indexed into at the next
-  sync, with no restart, and a changed URL or key reconnects. A setting that is not a usable URL is
-  a `warn` line naming it, every interval.
+- **The URL is read again every beat.** Without one, the worker takes no lease, loads no model and
+  logs one `info` line ("no Qdrant URL is set; …") until a URL is set; a URL set later is indexed
+  into from the next beat, with no restart, and a changed URL or key reconnects at the next
+  reconcile. A setting that is not a usable URL is a `warn` line naming it, every beat.
 - **An old Qdrant URL in this box's keyring is no longer read.** Earlier versions kept the URL
   there; if the worker finds one at start it says so once, at `info`, so you can make it the setting
   for every box in **Settings › Qdrant** or with `htui --set-qdrant-url`.
-- The embedding model loads in the background, only once a URL is set, downloaded on first use
-  exactly as for `--index-items`; runs never wait for it.
+- The embedding model loads in the background, only once a URL is set and the worker holds a
+  collection to reconcile, downloaded on first use exactly as for `--index-items`; runs never wait
+  for it.
 - A Qdrant that does not answer, a model that does not load or a sync that fails is a `warn` line,
   and the next interval tries again. None of it touches runs.
-- **At start the worker looks at Qdrant once**, without the model and without creating anything,
-  and says what it found in one line (see [Logs](#logs)).
+- **At start the worker looks at Qdrant once**, at the global collection, without the model and
+  without creating anything, and says what it found in one line (see [Logs](#logs)).
 - The sync shares the worker's pool, one query at a time, and is stopped on shutdown.
 
 ## Logs

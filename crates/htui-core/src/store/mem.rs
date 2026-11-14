@@ -68,6 +68,7 @@ use crate::model::{
 };
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
+use crate::model::{IndexedCollection, IndexerLease, LeaseTake};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{LogShipLevel, NewWorkerLog, WorkerLogLine};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
@@ -83,6 +84,7 @@ use crate::store::graph_rules::{
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_usable_by, phase_row_refusal,
 };
+use crate::store::indexer_lease::IndexerLeaseStore;
 use crate::store::traits::command_log_too_large;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -420,6 +422,9 @@ struct State {
     activity: Vec<ActivityRow>,
     /// The last `activity_event.id` handed out, the identity column's counter.
     activity_last_id: i64,
+    /// MOD-159 M1 plan D2: `indexer_lease`, keyed by `collection` (an
+    /// [`IndexedCollection::name`]). No fixture loads one.
+    indexer_leases: HashMap<String, MemIndexerLease>,
 }
 
 /// One `activity_event` row: the event the panel reads, and the user it belongs to (plan D5:
@@ -430,6 +435,24 @@ struct ActivityRow {
     user_id: UserId,
     /// Every other column.
     event: ActivityEvent,
+}
+
+/// One `indexer_lease` row (MOD-159 M1 plan D2) without its key.
+#[derive(Debug, Clone)]
+struct MemIndexerLease {
+    /// `indexer_lease.lease_owner`: the holder's per-process token; `None` = free.
+    owner: Option<Uuid>,
+    /// `indexer_lease.lease_box_id`: the holder's box, kept after a release for display.
+    box_id: Option<BoxId>,
+    /// `indexer_lease.lease_expires_at`.
+    expires_at: Option<DateTime<Utc>>,
+}
+
+impl MemIndexerLease {
+    /// Someone holds it at `now`: an owner is set and the expiry is after `now`.
+    fn live(&self, now: DateTime<Utc>) -> bool {
+        self.owner.is_some() && self.expires_at.is_some_and(|expiry| expiry > now)
+    }
 }
 
 /// One `worker_log` row: the line the TUI reads, and the user it belongs to.
@@ -569,6 +592,7 @@ impl MemStore {
             worker_log_last_id: 0,
             activity: Vec::new(),
             activity_last_id: 0,
+            indexer_leases: HashMap::new(),
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -12425,6 +12449,137 @@ impl WriteStore for MemStore {
     async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
         let now = self.now();
         Ok(self.write(|state| state.close_dropped_follow_ups(run, owner, reason, now)))
+    }
+}
+
+/// MOD-159 M1 plan D3: `indexer_lease` in memory, `PgStore`'s rules. Expiry is judged, and
+/// stamped, by this handle's clock plus the TTL (MOD-40 plan D10), and a TTL out of range is
+/// refused before the lock is taken.
+impl IndexerLeaseStore for MemStore {
+    async fn take_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<LeaseTake> {
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        Ok(self.write(|state| state.take_indexer_lease(collection, box_id, owner, now + ttl, now)))
+    }
+
+    async fn renew_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        Ok(self.write(
+            |state| match state.indexer_leases.get_mut(&collection.name()) {
+                Some(row) if row.owner == Some(owner) => {
+                    row.expires_at = Some(now + ttl);
+                    true
+                }
+                _ => false,
+            },
+        ))
+    }
+
+    async fn release_indexer_leases(&self, owner: Uuid) -> Result<u64> {
+        let now = self.now();
+        Ok(self.write(|state| {
+            let mut freed = 0_u64;
+            for row in state.indexer_leases.values_mut() {
+                if row.owner == Some(owner) {
+                    row.owner = None;
+                    row.expires_at = Some(now);
+                    freed += 1;
+                }
+            }
+            freed
+        }))
+    }
+
+    async fn release_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> Result<bool> {
+        let now = self.now();
+        Ok(self.write(
+            |state| match state.indexer_leases.get_mut(&collection.name()) {
+                Some(row) if row.owner == Some(owner) => {
+                    row.owner = None;
+                    row.expires_at = Some(now);
+                    true
+                }
+                _ => false,
+            },
+        ))
+    }
+
+    async fn indexer_lease(&self, collection: &IndexedCollection) -> Result<Option<IndexerLease>> {
+        let now = self.now();
+        Ok(self.read(|state| state.indexer_lease_view(&collection.name(), now)))
+    }
+}
+
+impl State {
+    /// [`MemStore::take_indexer_lease`]'s body: takes a free, expired or `owner`'s own lease,
+    /// creating the row on the first take; otherwise answers the live holder and writes nothing.
+    fn take_indexer_lease(
+        &mut self,
+        collection: &IndexedCollection,
+        box_id: BoxId,
+        owner: Uuid,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> LeaseTake {
+        let name = collection.name();
+        let answer = match self.indexer_leases.get(&name) {
+            Some(row) if row.owner == Some(owner) => LeaseTake::Ours,
+            Some(row) if row.live(now) => {
+                return LeaseTake::Held(self.indexer_lease_of(&name, row, now));
+            }
+            _ => LeaseTake::Taken,
+        };
+        self.indexer_leases.insert(
+            name,
+            MemIndexerLease {
+                owner: Some(owner),
+                box_id: Some(box_id),
+                expires_at: Some(expires_at),
+            },
+        );
+        answer
+    }
+
+    /// One `indexer_lease` row as people see it at `now`: `box_name` is the hostname of the box
+    /// row `lease_box_id` names, when there is one (`PgStore`'s `LEFT JOIN box`).
+    fn indexer_lease_view(&self, name: &str, now: DateTime<Utc>) -> Option<IndexerLease> {
+        let row = self.indexer_leases.get(name)?;
+        Some(self.indexer_lease_of(name, row, now))
+    }
+
+    /// [`State::indexer_lease_view`] of a row already in hand.
+    fn indexer_lease_of(
+        &self,
+        name: &str,
+        row: &MemIndexerLease,
+        now: DateTime<Utc>,
+    ) -> IndexerLease {
+        IndexerLease {
+            collection: name.to_owned(),
+            box_id: row.box_id,
+            box_name: row
+                .box_id
+                .and_then(|id| self.boxes.get(&id))
+                .map(|found| found.hostname.clone()),
+            expires_at: row.expires_at,
+            live: row.live(now),
+        }
     }
 }
 

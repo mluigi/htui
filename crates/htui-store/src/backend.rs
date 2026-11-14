@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
     AgentBox, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CoverageRow, Document, DocumentHead, DocumentId, Item, ItemCitation, ItemFilter, ItemId,
@@ -35,8 +35,10 @@ use htui_core::model::{
     RunSummary, Scope, SessionEvent, StepGraph, StepGraphId, StepId, ToolCallCount, UpstreamEntry,
     UserId, WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, ReadStore, Result, StoreError, WriteStore};
+use htui_core::model::{IndexedCollection, IndexerLease, LeaseTake};
+use htui_core::store::{IndexerLeaseStore, MemStore, ReadStore, Result, StoreError, WriteStore};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::cache::CacheStore;
 use crate::pg::PgStore;
@@ -1020,6 +1022,71 @@ fn orchestration_offline() -> StoreError {
     StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned())
 }
 
+/// MOD-159 M1 plan D12: the indexer lease goes to the arm's store, `MemStore` for `--demo` and
+/// the overlay tests, Postgres online. Offline every verb is refused with
+/// [`DATABASE_UNREACHABLE`]: the lease is live coordination state the mirror does not hold
+/// (`0038_indexer_lease.sql`), so there is nothing to take, renew, release or read.
+impl IndexerLeaseStore for Backend {
+    async fn take_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<LeaseTake> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .take_indexer_lease(collection, box_id, owner, ttl)
+                    .await
+            }
+            Self::Online { pg, .. } => pg.take_indexer_lease(collection, box_id, owner, ttl).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    async fn renew_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+        ttl: TimeDelta,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.renew_indexer_lease(collection, owner, ttl).await,
+            Self::Online { pg, .. } => pg.renew_indexer_lease(collection, owner, ttl).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    async fn release_indexer_leases(&self, owner: Uuid) -> Result<u64> {
+        match self {
+            Self::Memory(store) => store.release_indexer_leases(owner).await,
+            Self::Online { pg, .. } => pg.release_indexer_leases(owner).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    async fn release_indexer_lease(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.release_indexer_lease(collection, owner).await,
+            Self::Online { pg, .. } => pg.release_indexer_lease(collection, owner).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    async fn indexer_lease(&self, collection: &IndexedCollection) -> Result<Option<IndexerLease>> {
+        match self {
+            Self::Memory(store) => store.indexer_lease(collection).await,
+            Self::Online { pg, .. } => pg.indexer_lease(collection).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+}
+
 /// The dispatch rule of plan D12: [`Backend::Online`] reads go to **Postgres**, never to the
 /// mirror — live reads come from the source of truth while it is reachable (ANA-9 §4.4's last
 /// paragraph) — and [`Backend::Offline`] reads come from the mirror.
@@ -1441,6 +1508,106 @@ mod tests {
         ));
         assert!(matches!(
             offline.last_closed_batch(ids::BOX).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        cache.close().await;
+    }
+
+    /// MOD-159 M1 plan D12: the memory backend forwards the indexer lease to its `MemStore`, so
+    /// the overlay tests run over it; offline there is no lease to take or read, so every verb is
+    /// refused rather than answered from the mirror (which has no `indexer_lease`).
+    #[tokio::test]
+    async fn the_indexer_lease_forwards_in_memory_and_is_refused_offline() {
+        use htui_core::model::{BoxId, IndexedCollection, LeaseTake};
+        use htui_core::store::{IndexerLeaseStore, StoreError};
+        use uuid::Uuid;
+
+        let ttl = TimeDelta::minutes(2);
+        let (box_id, owner) = (BoxId::new(), Uuid::now_v7());
+        let memory = Backend::memory(MemStore::new());
+        let global = IndexedCollection::Global;
+        assert_eq!(
+            memory
+                .take_indexer_lease(&global, box_id, owner, ttl)
+                .await
+                .expect("take in memory"),
+            LeaseTake::Taken
+        );
+        assert_eq!(
+            memory
+                .take_indexer_lease(&global, box_id, owner, ttl)
+                .await
+                .expect("take again in memory"),
+            LeaseTake::Ours
+        );
+        assert!(
+            memory
+                .renew_indexer_lease(&global, owner, ttl)
+                .await
+                .expect("renew in memory")
+        );
+        let lease = memory
+            .indexer_lease(&global)
+            .await
+            .expect("read in memory")
+            .expect("the take wrote a row");
+        assert_eq!(lease.box_id, Some(box_id));
+        assert!(lease.live);
+        assert!(
+            memory
+                .release_indexer_lease(&global, owner)
+                .await
+                .expect("release one in memory")
+        );
+        assert!(
+            !memory
+                .indexer_lease(&global)
+                .await
+                .expect("read in memory")
+                .expect("a release keeps the row")
+                .live
+        );
+        assert_eq!(
+            memory
+                .take_indexer_lease(&global, box_id, owner, ttl)
+                .await
+                .expect("take after the release"),
+            LeaseTake::Taken
+        );
+        assert_eq!(
+            memory
+                .release_indexer_leases(owner)
+                .await
+                .expect("release in memory"),
+            1
+        );
+
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = cache(root.path()).await;
+        let offline = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+        assert!(matches!(
+            offline
+                .take_indexer_lease(&global, box_id, owner, ttl)
+                .await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.renew_indexer_lease(&global, owner, ttl).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.release_indexer_leases(owner).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.release_indexer_lease(&global, owner).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.indexer_lease(&global).await,
             Err(StoreError::Unreachable(_))
         ));
         cache.close().await;

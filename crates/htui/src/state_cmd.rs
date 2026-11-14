@@ -360,8 +360,8 @@ pub fn emit(out: &mut dyn Write, answer: &Answer, json: bool) -> Result<(), Stat
         text.push('\n');
         text
     } else {
-        let (text, note) = human_text(answer);
-        if let Some(note) = note {
+        let (text, notes) = human_text(answer);
+        for note in notes {
             eprintln!("{note}");
         }
         text
@@ -411,33 +411,74 @@ fn envelope_text(answer: &Answer, pretty: bool) -> String {
     }
 }
 
-/// `answer` as a person reads it: the text for stdout, and the note for stderr, if any (review R1
-/// L10: printing is [`emit`]'s).
-fn human_text(answer: &Answer) -> (String, Option<&'static str>) {
+/// `answer` as a person reads it: the text for stdout, and the notes for stderr, if any (review R1
+/// L10: printing is [`emit`]'s). A search that could not read some workspace's collection says
+/// which (MOD-159 M1 plan D9) after its other note.
+fn human_text(answer: &Answer) -> (String, Vec<String>) {
     match &answer.outcome {
-        Outcome::Status(body) => (format!("{}\n", human_status(body)), None),
-        Outcome::Waiting(body) => (human_waiting(body), None),
-        Outcome::Search(search) => match &search.index {
-            IndexAnswer::Hits(hits) if hits.is_empty() => (
-                String::new(),
-                Some("no matches (run `htui --index-items` if the index is empty)"),
-            ),
-            IndexAnswer::Hits(hits) => (
-                hits.iter()
-                    .map(|hit| format!("{}\n", concepts::format_hit(hit)))
-                    .collect(),
-                None,
-            ),
-            IndexAnswer::Empty => (
-                String::new(),
-                Some("the index is empty; run `htui --index-items`"),
-            ),
-            IndexAnswer::Offline(_)
-            | IndexAnswer::Refused(_)
-            | IndexAnswer::AccessRefused(_)
-            | IndexAnswer::Failed(_) => (String::new(), None),
-        },
-        Outcome::Failed(_) => (String::new(), None),
+        Outcome::Status(body) => (format!("{}\n", human_status(body)), Vec::new()),
+        Outcome::Waiting(body) => (human_waiting(body), Vec::new()),
+        Outcome::Search(search) => {
+            let (text, note) = match &search.index {
+                IndexAnswer::Hits(hits) if hits.is_empty() => (
+                    String::new(),
+                    Some("no matches (run `htui --index-items` if the index is empty)"),
+                ),
+                IndexAnswer::Hits(hits) => (
+                    hits.iter()
+                        .map(|hit| format!("{}\n", concepts::format_hit(hit)))
+                        .collect(),
+                    None,
+                ),
+                IndexAnswer::Empty => (
+                    String::new(),
+                    Some("the index is empty; run `htui --index-items`"),
+                ),
+                IndexAnswer::Offline(_)
+                | IndexAnswer::Refused(_)
+                | IndexAnswer::AccessRefused(_)
+                | IndexAnswer::Failed(_) => (String::new(), None),
+            };
+            let mut notes: Vec<String> = note.map(str::to_owned).into_iter().collect();
+            if !search.unavailable.is_empty() {
+                notes.push(unavailable_note(
+                    &search.unavailable,
+                    search.cause.as_deref(),
+                ));
+            } else if let Some(cause) = &search.cause {
+                // The global collection failed while workspaces answered: its sentence alone.
+                notes.push(cause.chars().filter(|c| !c.is_control()).collect());
+            }
+            (text, notes)
+        }
+        Outcome::Failed(_) => (String::new(), Vec::new()),
+    }
+}
+
+/// D9's stderr note: the workspaces whose collection a search could not read, by slug, and
+/// (MOD-159 M1 R2) why the first failed one failed, its sentence's own "knowledge search
+/// unavailable: " left out.
+fn unavailable_note(slugs: &[String], cause: Option<&str>) -> String {
+    let slugs: Vec<String> = slugs
+        .iter()
+        .map(|slug| slug.chars().filter(|c| !c.is_control()).collect())
+        .collect();
+    let note = format!(
+        "knowledge search unavailable for workspace(s): {}",
+        slugs.join(", ")
+    );
+    match cause {
+        Some(cause) => {
+            let prefix = format!("{}: ", htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE);
+            let cause: String = cause
+                .strip_prefix(&prefix)
+                .unwrap_or(cause)
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            format!("{note} ({cause})")
+        }
+        None => note,
     }
 }
 
@@ -583,6 +624,12 @@ pub struct SearchAnswer {
     pub decisions: bool,
     /// What the index answered.
     pub index: IndexAnswer,
+    /// MOD-159 M1 plan D9: the slugs of the workspaces whose collection is missing or refused,
+    /// when the others answered; empty otherwise.
+    pub unavailable: Vec<String>,
+    /// MOD-159 M1 R2: the first failed collection's sentence when the others answered, for the
+    /// stderr note only (the document names the workspaces, not why).
+    pub cause: Option<String>,
 }
 
 /// The index's answer to a search whose Postgres answered (A-2).
@@ -859,6 +906,10 @@ pub struct SearchDoc {
     /// `Some` for `offline`, `refused` and `error`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorDoc>,
+    /// MOD-159 M1 plan D9: the workspaces whose collection is missing or refused, by slug, when
+    /// the others answered; absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<String>,
 }
 
 /// One search hit.
@@ -963,6 +1014,7 @@ fn search_doc(search: &SearchAnswer) -> SearchDoc {
         decisions: search.decisions,
         hits,
         error,
+        unavailable: search.unavailable.clone(),
     }
 }
 
@@ -1399,6 +1451,8 @@ mod tests {
                 query: "closed items".into(),
                 decisions: false,
                 index,
+                unavailable: Vec::new(),
+                cause: None,
             }),
         }
     }
@@ -1663,15 +1717,102 @@ mod tests {
         assert_eq!(text, "");
         assert_eq!(
             note,
-            Some("no matches (run `htui --index-items` if the index is empty)")
+            ["no matches (run `htui --index-items` if the index is empty)"]
         );
         let (text, note) = human_text(&search(IndexAnswer::Empty));
         assert_eq!(text, "");
-        assert_eq!(note, Some("the index is empty; run `htui --index-items`"));
+        assert_eq!(note, ["the index is empty; run `htui --index-items`"]);
         let (text, note) = human_text(&search(IndexAnswer::Hits(two_hits())));
         assert_eq!(text.lines().count(), 2, "{text}");
-        assert_eq!(note, None);
-        assert_eq!(human_text(&status_answer()).1, None);
+        assert!(note.is_empty(), "{note:?}");
+        assert!(human_text(&status_answer()).1.is_empty());
+    }
+
+    /// `search(index)` with `unavailable` naming workspaces whose collection was not read.
+    fn search_missing(index: IndexAnswer, unavailable: &[&str]) -> Answer {
+        let mut answer = search(index);
+        if let Outcome::Search(search) = &mut answer.outcome {
+            search.unavailable = unavailable.iter().map(|&slug| slug.to_owned()).collect();
+        }
+        answer
+    }
+
+    /// MOD-159 M1 plan D9: a search that read some workspaces' collections and not others names
+    /// the others in `unavailable`; with none to name the field is absent, so a document is what
+    /// it was before.
+    #[test]
+    fn a_search_document_names_unavailable_workspaces_and_omits_an_empty_list() {
+        let partial = document(&search_missing(
+            IndexAnswer::Hits(two_hits()),
+            &["platform", "lone"],
+        ));
+        assert_eq!(partial["index"], "online");
+        assert_eq!(
+            partial["unavailable"],
+            serde_json::json!(["platform", "lone"])
+        );
+        assert_eq!(
+            search_missing(IndexAnswer::Hits(two_hits()), &["platform"]).exit_code(),
+            0,
+            "a workspace not read is no failure"
+        );
+        let whole = document(&search(IndexAnswer::Hits(two_hits())));
+        assert!(whole.get("unavailable").is_none(), "{whole}");
+        let empty = document(&search(IndexAnswer::Empty));
+        assert!(empty.get("unavailable").is_none(), "{empty}");
+    }
+
+    /// D9: the human output says the same on stderr, after the search's own note, the slugs
+    /// stripped of control characters like every stored text printed.
+    #[test]
+    fn human_text_names_unavailable_workspaces_on_stderr() {
+        let (text, notes) = human_text(&search_missing(
+            IndexAnswer::Hits(two_hits()),
+            &["platform", "lo\u{1b}ne"],
+        ));
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert_eq!(
+            notes,
+            ["knowledge search unavailable for workspace(s): platform, lone"]
+        );
+        let (_, notes) = human_text(&search_missing(
+            IndexAnswer::Hits(Vec::new()),
+            &["platform"],
+        ));
+        assert_eq!(
+            notes,
+            [
+                "no matches (run `htui --index-items` if the index is empty)",
+                "knowledge search unavailable for workspace(s): platform",
+            ]
+        );
+    }
+
+    /// MOD-159 M1 R2: a workspace that failed while others answered is named with why, its
+    /// sentence's lead-in left out; the document keeps the slugs alone.
+    #[test]
+    fn the_unavailable_note_says_why_the_first_failure_failed() {
+        let mut answer = search_missing(IndexAnswer::Hits(two_hits()), &["lone"]);
+        if let Outcome::Search(search) = &mut answer.outcome {
+            search.cause = Some(htui_core::qdrant::unavailable(
+                "embedder mismatch: collection `htui_ws_1` holds vectors from hash/384",
+            ));
+        }
+        let (_, notes) = human_text(&answer);
+        assert_eq!(
+            notes,
+            [
+                "knowledge search unavailable for workspace(s): lone (embedder mismatch: collection \
+              `htui_ws_1` holds vectors from hash/384)"
+            ]
+        );
+        let doc = document(&answer);
+        assert_eq!(doc["unavailable"], serde_json::json!(["lone"]));
+        assert!(
+            !doc.to_string().contains("embedder mismatch"),
+            "the document keeps the slugs alone: {doc}"
+        );
+        assert_eq!(answer.exit_code(), 0);
     }
 
     #[test]

@@ -12,7 +12,9 @@
 //! `--search-items` runs through its own seam, `concepts::search_answer_with` (review R1 M4), with
 //! `HashEmbedder` behind a counting loader, so no model is downloaded and the cases can say when
 //! the model is loaded at all. The cases that need an index are gated on `HTUI_TEST_QDRANT_URL`
-//! too and own a throwaway collection.
+//! too and own throwaway collections: every collection name a case searches carries its own
+//! prefix (`SearchContext::prefix`), so the per-workspace names (MOD-159 M1 plan D9) never meet a
+//! real index or another case's.
 #![cfg(feature = "testkit")]
 
 use std::path::PathBuf;
@@ -27,8 +29,8 @@ use htui::concepts::{self, SearchContext, SearchOptions};
 use htui::state_cmd::{self, Answer, Context, Outcome, StateExit, Verb};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    BoxId, GraphSnapshot, ItemFilter, ItemId, KeyQualifier, NewItem, NewRepo, NewRun, NewRunStep,
-    RepoBoxPath, RepoId, RunId, RunMode, Scope, StepId,
+    BoxId, GraphSnapshot, IndexedCollection, ItemFilter, ItemId, KeyQualifier, NewItem, NewRepo,
+    NewRun, NewRunStep, RepoBoxPath, RepoId, RunId, RunMode, Scope, StepId,
 };
 use htui_core::qdrant::QdrantUrl;
 use htui_core::store::{ReadStore as _, WriteStore as _};
@@ -36,6 +38,7 @@ use htui_store::embed::{DENSE_DIM, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::secret::QdrantEnv;
 use htui_store::vector::QdrantStore;
+use htui_store::vector_sync::{Indexer, Unguarded, workspace_search_scope};
 use htui_store::{Identity, testkit};
 use serde_json::Value;
 
@@ -682,7 +685,7 @@ impl Loads {
 /// The keyring holds no Qdrant API key.
 async fn searched(
     env: &QdrantEnv,
-    collection: &str,
+    prefix: &str,
     dsn: &str,
     identity: Option<&Identity>,
     options: &SearchOptions,
@@ -691,7 +694,7 @@ async fn searched(
     let ctx = SearchContext {
         env,
         keyring_key: || Ok(None),
-        collection,
+        prefix,
         dsn,
         identity,
         connect_timeout: WAIT,
@@ -736,8 +739,9 @@ async fn test_qdrant() -> Option<(testkit::QdrantTurn, String)> {
     Some((testkit::qdrant_turn().await, url))
 }
 
-fn fresh_collection() -> String {
-    format!("htui_test_{}", uuid::Uuid::now_v7().simple())
+/// A prefix no other case's collections carry.
+fn fresh_prefix() -> String {
+    format!("htui_test_{}_", uuid::Uuid::now_v7().simple())
 }
 
 /// MOD-158 D8: no override and no `qdrant_url` row is `no_qdrant_url`, a refusal (exit 2), read
@@ -800,7 +804,7 @@ async fn a_search_reads_the_url_row() {
     let loads = Loads::default();
     let run = searched(
         &QdrantEnv::default(),
-        "htui_concepts_v2",
+        "c",
         &db.url,
         None,
         &search_options("closed items"),
@@ -835,7 +839,7 @@ async fn live_qdrant_the_env_url_wins_over_the_row() {
     let loads = Loads::default();
     let run = searched(
         &qdrant(&url),
-        &fresh_collection(),
+        &fresh_prefix(),
         &db.url,
         None,
         &search_options("closed items"),
@@ -905,7 +909,7 @@ async fn a_search_with_qdrant_down_is_offline_and_loads_no_model() {
     let loads = Loads::default();
     let run = searched(
         &qdrant(QDRANT_DOWN),
-        "htui_concepts_v2",
+        "c",
         &db.url,
         None,
         &search_options("closed items"),
@@ -982,10 +986,10 @@ async fn live_qdrant_a_search_without_a_collection_is_empty_and_loads_no_model()
         return;
     };
     let loads = Loads::default();
-    let name = fresh_collection();
+    let prefix = fresh_prefix();
     let run = searched(
         &qdrant(&url),
-        &name,
+        &prefix,
         &db.url,
         None,
         &search_options("closed items"),
@@ -997,12 +1001,25 @@ async fn live_qdrant_a_search_without_a_collection_is_empty_and_loads_no_model()
     assert_eq!(run.document["hits"], serde_json::json!([]));
     assert_eq!(run.message(), "", "empty is no failure: {}", run.pretty());
     assert_eq!(loads.count(), 0, "no model for a missing index");
-    let exists =
-        QdrantStore::open_existing_to(&settings(&url), HashEmbedder::new(DENSE_DIM), &name)
-            .await
-            .expect("Qdrant answers")
-            .is_some();
-    assert!(!exists, "the search created no collection");
+    assert!(
+        run.document.get("unavailable").is_none(),
+        "every collection missing is the empty index, naming nobody: {}",
+        run.pretty()
+    );
+    for collection in [
+        IndexedCollection::Global,
+        IndexedCollection::Workspace(ids::WORKSPACE_PLATFORM),
+    ] {
+        let exists = QdrantStore::open_existing_to(
+            &settings(&url),
+            HashEmbedder::new(DENSE_DIM),
+            &format!("{prefix}{collection}"),
+        )
+        .await
+        .expect("Qdrant answers")
+        .is_some();
+        assert!(!exists, "the search created no collection: {collection}");
+    }
     db.drop_db().await;
 }
 
@@ -1016,12 +1033,22 @@ async fn live_qdrant_a_search_over_an_index_answers_in_scope() {
     let Some(db) = testkit::demo_db().await else {
         return;
     };
-    let name = fresh_collection();
-    let index = testkit::qdrant_connect_to(&settings(&url), HashEmbedder::new(DENSE_DIM), &name)
-        .await
-        .expect("Qdrant answers");
-    concepts::index_cycle(&db.store, &index).await;
+    let prefix = fresh_prefix();
     let workspaces = db.store.workspaces().await.expect("workspaces");
+    // MOD-159 M1 D1: each workspace's scope in its own collection, as the index job writes them.
+    let mut collections = Vec::new();
+    for ws in &workspaces {
+        let scope = workspace_search_scope(&db.store, &Scope::from_workspace(ws)).await;
+        let name = format!("{prefix}{}", IndexedCollection::Workspace(ws.workspace_id));
+        let index =
+            testkit::qdrant_connect_to(&settings(&url), HashEmbedder::new(DENSE_DIM), &name)
+                .await
+                .expect("Qdrant answers");
+        Indexer::sync(&db.store, &scope, &index, &Unguarded)
+            .await
+            .expect("index the workspace");
+        collections.push((ws.slug.clone(), ws.workspace_id, index));
+    }
     let keys_of = |project| {
         let workspace_id = workspaces
             .iter()
@@ -1065,23 +1092,32 @@ async fn live_qdrant_a_search_over_an_index_answers_in_scope() {
     let env = qdrant(&url);
     let loads = Loads::default();
 
-    let everywhere = searched(&env, &name, &db.url, None, &search_options(&key), &loads).await;
+    let everywhere = searched(&env, &prefix, &db.url, None, &search_options(&key), &loads).await;
     assert_eq!(everywhere.code(), 0, "{}", everywhere.pretty());
     assert_eq!(everywhere.document["index"], "online");
     assert!(keys(&everywhere).contains(&key), "{}", everywhere.pretty());
-    assert_eq!(loads.count(), 1, "one load per search");
+    assert!(
+        everywhere.document.get("unavailable").is_none(),
+        "every workspace's collection answered: {}",
+        everywhere.pretty()
+    );
+    assert_eq!(
+        loads.count(),
+        1,
+        "one load per search, however many collections"
+    );
 
     let htui = SearchOptions {
         project: Some("htui".into()),
         ..search_options(&key)
     };
-    let run = searched(&env, &name, &db.url, None, &htui, &loads).await;
+    let run = searched(&env, &prefix, &db.url, None, &htui, &loads).await;
     assert!(keys(&run).contains(&key), "{}", run.pretty());
     let agy = SearchOptions {
         project: Some("agy".into()),
         ..search_options(&key)
     };
-    let run = searched(&env, &name, &db.url, None, &agy, &loads).await;
+    let run = searched(&env, &prefix, &db.url, None, &agy, &loads).await;
     assert_eq!(run.code(), 0, "{}", run.pretty());
     assert!(!keys(&run).contains(&key), "agy's scope: {}", run.pretty());
 
@@ -1116,15 +1152,43 @@ async fn live_qdrant_a_search_over_an_index_answers_in_scope() {
         cwd: Some(checkout.path().to_path_buf()),
         ..search_options(&key)
     };
-    let run = searched(&env, &name, &db.url, Some(&identity), &in_checkout, &loads).await;
+    let run = searched(
+        &env,
+        &prefix,
+        &db.url,
+        Some(&identity),
+        &in_checkout,
+        &loads,
+    )
+    .await;
     assert_eq!(run.code(), 0, "{}", run.pretty());
     assert!(keys(&run).contains(&key), "{}", run.pretty());
+
+    // D9: a workspace whose collection is gone is named; the others still answer.
+    let (gone, _, dropped) = collections
+        .iter()
+        .find(|(_, workspace, _)| *workspace != ids::WORKSPACE_PLATFORM)
+        .expect("the demo has a second workspace");
+    dropped
+        .drop_collection()
+        .await
+        .expect("drop one workspace's");
+    let run = searched(&env, &prefix, &db.url, None, &search_options(&key), &loads).await;
+    assert_eq!(run.code(), 0, "{}", run.pretty());
+    assert_eq!(run.document["index"], "online");
+    assert!(keys(&run).contains(&key), "{}", run.pretty());
+    assert_eq!(
+        run.document["unavailable"],
+        serde_json::json!([gone]),
+        "{}",
+        run.pretty()
+    );
 
     // A model that cannot load, and one that fails on the query: the model's failure, not Qdrant's.
     let ctx = SearchContext {
         env: &env,
         keyring_key: || Ok(None),
-        collection: &name,
+        prefix: &prefix,
         dsn: &db.url,
         identity: None,
         connect_timeout: WAIT,
@@ -1137,7 +1201,11 @@ async fn live_qdrant_a_search_over_an_index_answers_in_scope() {
         std::future::ready(Ok(Broken))
     })
     .await;
-    index.drop_collection().await.expect("drop");
+    for (slug, _, index) in &collections {
+        if slug != gone {
+            index.drop_collection().await.expect("drop");
+        }
+    }
     for answer in [no_model, broken] {
         assert_eq!(answer.exit_code(), 1, "{answer:?}");
         let document = state_cmd::document(&answer);

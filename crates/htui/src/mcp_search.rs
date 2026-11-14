@@ -15,7 +15,7 @@ use std::sync::Arc;
 use htui_mcp::search::{ConceptHit, ConceptQuery, ConceptSearch, ConceptType, OwnerKind};
 use htui_store::vector::{Hit, Owner, PointType, SearchQuery};
 
-use crate::concepts_worker::{ConceptIndex, shared_index};
+use crate::concepts_worker::{ConceptIndex, SearchIn, shared_index};
 
 /// `search_concepts`' index: a [`ConceptIndex`] seen as a `ConceptSearch`.
 pub struct McpSearch(Arc<dyn ConceptIndex>);
@@ -47,8 +47,10 @@ impl ConceptSearch for McpSearch {
             resolutions: Vec::new(),
             limit: query.limit,
         };
+        // MOD-159 M1 D9: a session knows no workspace (MOD-112 (4)), so every collection is
+        // searched; the session's project filter alone decides what it sees.
         Box::pin(async move {
-            let hits = self.0.search(query).await?;
+            let hits = self.0.search(SearchIn::Everywhere, query).await?;
             Ok(hits.into_iter().map(concept_hit).collect())
         })
     }
@@ -106,8 +108,8 @@ mod tests {
 
     use chrono::{DateTime, Utc};
     use htui_core::model::{
-        DocumentId, ItemId, ItemKindId, Priority, ProjectId, RequirementId, RequirementState,
-        Resolution, Status,
+        DocumentId, IndexedCollection, ItemId, ItemKindId, Priority, ProjectId, RequirementId,
+        RequirementState, Resolution, Status, WorkspaceId,
     };
     use htui_mcp::search::{ConceptHit, ConceptQuery, ConceptSearch, ConceptType, OwnerKind};
     use htui_store::vector::{ConceptPoint, DocumentRef, Subject, VectorStore as _};
@@ -197,7 +199,7 @@ mod tests {
     async fn seeded(points: Vec<ConceptPoint>) -> McpSearch {
         let index = MemIndex::new();
         index
-            .store()
+            .store(&IndexedCollection::Workspace(WorkspaceId::new()))
             .upsert(points)
             .await
             .expect("the fake upserts");
@@ -341,6 +343,37 @@ mod tests {
         assert_eq!(one.len(), 1);
     }
 
+    /// MOD-159 M1 D9: a session knows no workspace, so its search reads every workspace's
+    /// collection and the global one, and the session's project filter alone decides.
+    #[tokio::test]
+    async fn a_session_search_reads_every_collection_through_its_project_filter() {
+        let (ours, theirs) = (ProjectId::new(), ProjectId::new());
+        let index = MemIndex::new();
+        for (collection, points) in [
+            (
+                IndexedCollection::Workspace(WorkspaceId::new()),
+                vec![item(ours, "OURS-1", None), item(theirs, "THEIRS-1", None)],
+            ),
+            (
+                IndexedCollection::Workspace(WorkspaceId::new()),
+                vec![requirement(ours, "R-OURS-1")],
+            ),
+            (IndexedCollection::Global, vec![item(ours, "OURS-2", None)]),
+        ] {
+            index
+                .store(&collection)
+                .upsert(points)
+                .await
+                .expect("the fake upserts");
+        }
+        let search = McpSearch::new(Arc::new(index));
+
+        let hits = search.search(query(ours)).await.expect("the fake answers");
+        let mut keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["OURS-1", "OURS-2", "R-OURS-1"]);
+    }
+
     #[tokio::test]
     async fn an_index_failure_is_its_cause() {
         let search = McpSearch::new(Arc::new(MemIndex::new().failing("qdrant: query: refused")));
@@ -356,6 +389,7 @@ mod tests {
     impl crate::concepts_worker::ConceptIndex for Unoffered {
         fn search(
             &self,
+            _: crate::concepts_worker::SearchIn,
             _: htui_store::vector::SearchQuery,
         ) -> futures::future::BoxFuture<'_, Result<Vec<htui_store::vector::Hit>, String>> {
             Box::pin(async { Ok(Vec::new()) })
@@ -363,7 +397,9 @@ mod tests {
         fn sync(
             &self,
             _: htui_store::Backend,
+            _: IndexedCollection,
             _: htui_core::model::Scope,
+            _: Box<dyn crate::concepts_worker::DeleteGuardDyn>,
         ) -> futures::future::BoxFuture<'_, Result<htui_store::vector_sync::SyncReport, String>>
         {
             Box::pin(async { Ok(htui_store::vector_sync::SyncReport::default()) })

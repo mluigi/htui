@@ -219,3 +219,116 @@ async fn pg_store_activity_conformance() {
         db.drop_db().await;
     }
 }
+
+/// MOD-159 M1's indexer lease suite (`INDEXER_LEASE_CASES`, plan D2, D3) run against `PgStore`.
+///
+/// A fourth loop for `pg_store_worker_log_conformance`'s reason: `run_indexer_lease_case` is bound
+/// to `WriteStore + IndexerLeaseStore`, a narrow trait only the two stores implement. Every case
+/// writes, so each gets its own database, boxed as `pg_store_conformance`'s are (MOD-137).
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_indexer_lease_conformance() {
+    use htui_core::store::conformance;
+
+    assert_eq!(
+        conformance::INDEXER_LEASE_CASES.len(),
+        10,
+        "MOD-159 M1's ten indexer lease cases, as `mem_store.rs` pins them"
+    );
+    for name in conformance::INDEXER_LEASE_CASES {
+        let Some(db) = Box::pin(common::demo_db()).await else {
+            return; // `common` printed the skip line already (plan D13).
+        };
+        println!("indexer lease case {name}");
+        conformance::run_indexer_lease_case(name, &db.store).await;
+        db.drop_db().await;
+    }
+}
+
+/// MOD-159 M1 plan D3 (review R1): eight takes of one collection at once, by distinct owners on
+/// one shared box or boxes of their own, have exactly one winner, on a collection with no row
+/// (the `INSERT ... ON CONFLICT` race) and on one lapsed under another owner (the `UPDATE` race,
+/// where `TAKE_ATTEMPTS` re-reads). The seven others are `Held`, naming the winner's box as live,
+/// and only the winner's renewal holds. Postgres only: `MemStore` takes under one lock, so there
+/// is no race to lose, and it is not a conformance case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn pg_store_indexer_lease_concurrent_takes_have_one_winner() {
+    use chrono::TimeDelta;
+    use futures::future::join_all;
+    use htui_core::model::{BoxId, IndexedCollection, LeaseTake, WorkspaceId};
+    use htui_core::store::IndexerLeaseStore;
+    use uuid::Uuid;
+
+    const TAKERS: usize = 8;
+    const ROUNDS: usize = 5;
+    let Some(db) = Box::pin(common::fresh_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let store = &db.store;
+    let ttl = TimeDelta::minutes(5);
+    let shared = BoxId::new();
+    for round in 0..ROUNDS {
+        for lapsed in [false, true] {
+            let collection = IndexedCollection::Workspace(WorkspaceId::new());
+            let case = format!("round {round}, lapsed: {lapsed}");
+            if lapsed {
+                assert_eq!(
+                    store
+                        .take_indexer_lease(
+                            &collection,
+                            BoxId::new(),
+                            Uuid::now_v7(),
+                            TimeDelta::zero()
+                        )
+                        .await
+                        .expect("the earlier owner's take"),
+                    LeaseTake::Taken,
+                    "{case}"
+                );
+            }
+            let takers: Vec<(BoxId, Uuid)> = (0..TAKERS)
+                .map(|i| {
+                    let box_id = if i % 2 == 0 { shared } else { BoxId::new() };
+                    (box_id, Uuid::now_v7())
+                })
+                .collect();
+            let answers =
+                join_all(takers.iter().map(|&(box_id, owner)| {
+                    store.take_indexer_lease(&collection, box_id, owner, ttl)
+                }))
+                .await;
+            let answers: Vec<LeaseTake> = answers
+                .into_iter()
+                .map(|answer| answer.expect("a concurrent take"))
+                .collect();
+            let winners: Vec<usize> = (0..TAKERS)
+                .filter(|&i| answers[i] == LeaseTake::Taken)
+                .collect();
+            assert_eq!(winners.len(), 1, "{case}: one winner: {answers:?}");
+            let winner = winners[0];
+            for (i, answer) in answers.iter().enumerate().filter(|&(i, _)| i != winner) {
+                let LeaseTake::Held(held) = answer else {
+                    panic!("{case}: taker {i} lost and is Held, got {answer:?}");
+                };
+                assert_eq!(
+                    held.box_id,
+                    Some(takers[winner].0),
+                    "{case}: taker {i}'s Held names the winner's box"
+                );
+                assert!(held.live, "{case}: the winner holds it live: {held:?}");
+                assert_eq!(held.collection, collection.name(), "{case}");
+            }
+            for (i, &(_, owner)) in takers.iter().enumerate() {
+                assert_eq!(
+                    store
+                        .renew_indexer_lease(&collection, owner, ttl)
+                        .await
+                        .expect("a renewal"),
+                    i == winner,
+                    "{case}: only the winner's renewal holds (taker {i})"
+                );
+            }
+        }
+    }
+    db.drop_db().await;
+}

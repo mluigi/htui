@@ -125,9 +125,10 @@ async fn serve(args: WorkerArgs, ship: ShipHandle) -> Result<(), WorkerExit> {
         () = &mut shutdown => return stopped_before_ready(),
         _ = qdrant.source().url() => {}
     }
-    // MOD-158 D7: the job starts whatever the setting says and resolves it every cycle; it shares
-    // the pool, never the runtime.
-    let index_job = concepts::spawn_index_job(pg.clone());
+    // MOD-158 D7: the job starts whatever the setting says and resolves it every beat; it shares
+    // the pool, never the runtime. MOD-159 M1 plan D7, D8: it indexes each collection whose
+    // `indexer_lease` it holds, and competes for every one each beat.
+    let index_job = concepts::IndexJob::spawn(pg.clone());
     // MOD-122 M2 plan D2, D4: this box's log lines to `worker_log`, and the retention sweep. Dropped
     // on an early return below, it is aborted (R1 L7).
     let log_flusher = worker_log::spawn_flusher(pg.clone(), ship);
@@ -151,7 +152,9 @@ async fn serve(args: WorkerArgs, ship: ShipHandle) -> Result<(), WorkerExit> {
         .with_secret_source(Arc::new(crate::secrets::KeyringInfisical::new()));
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
-    index_job.abort();
+    // MOD-159 M1 plan D7: the job ends and lets go of its leases, so another process indexes on
+    // its next beat rather than after the TTL.
+    index_job.stop(concepts::WORKER_RELEASE_WAIT).await;
     start_check_task.abort();
     // R1 M2: the last lines ship, waiting at most `worker_log::FINAL_FLUSH_MAX`.
     log_flusher.shutdown().await;
@@ -161,7 +164,10 @@ async fn serve(args: WorkerArgs, ship: ShipHandle) -> Result<(), WorkerExit> {
 
 /// MOD-160 D9: the worker's start check of `source`'s Qdrant, logged once by [`start_line`].
 async fn start_check(source: Arc<QdrantSource>) {
-    let check = concepts_worker::check_qdrant(&source, htui_store::vector::COLLECTION).await;
+    // MOD-159 M1 plan D11: the global collection, the one every box shares.
+    let check =
+        concepts_worker::check_qdrant(&source, &htui_core::model::IndexedCollection::Global.name())
+            .await;
     match start_line(check.as_ref()) {
         Some((tracing::Level::WARN, line)) => tracing::warn!("{line}"),
         Some((_, line)) => tracing::info!("{line}"),

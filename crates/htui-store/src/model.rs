@@ -1175,8 +1175,8 @@ mod tests {
         assert!(text.contains("cannot create"), "{text}");
     }
 
-    /// `concepts_worker` boxes the load into a `BoxFuture` and `spawn_index_job` `tokio::spawn`s
-    /// it: both need `Send` (H-4).
+    /// `concepts_worker` boxes the load into a `BoxFuture` and `concepts::IndexJob::spawn`
+    /// `tokio::spawn`s it: both need `Send` (H-4).
     #[test]
     fn ensure_model_futures_are_send() {
         fn send<T: Send>(_: T) {}

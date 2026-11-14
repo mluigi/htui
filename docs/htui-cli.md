@@ -100,6 +100,21 @@ documents (its `WS` items and its `goals` document) included, before its project
 `--project @<workspace>` (a workspace's slug after `@`, such as `@platform`) narrows it to that
 workspace's own items and documents alone. `--index-items` covers the same scopes.
 
+Each workspace has its own Qdrant collection, named after the workspace's id (`htui_ws_<id>`),
+and there is one global collection (`htui_global`). A search reads each workspace's collection for
+that workspace's projects, plus the global one, and merges the hits by score; a project in two
+workspaces is found once. `--cwd` searches its project in every workspace that holds it.
+
+`--index-items` indexes a workspace's collection only when no other htui process is indexing it.
+Every TUI and `htui worker` connected to the database competes to index every collection, and the
+one holding a collection's lease indexes it (see `htui-worker.md`, "The concepts index"). For a
+workspace whose lease another box holds, `--index-items` prints
+`workspace <slug>: indexing runs on <box>; not indexed here` on standard error, where `<box>` is
+that box's hostname (or the last eight hex digits of its id when its row is gone), skips that
+workspace and goes on; the run still exits 0. It lets go of the leases it took when it ends. When
+it can take the global collection's lease it creates that collection, and drops the single shared
+collection earlier versions wrote (`htui_concepts_v2`).
+
 ## The envelope
 
 Every document starts with the same three fields, in this order:
@@ -325,6 +340,13 @@ off by the difference; an age that would be negative is reported as `0`.
 | `hits[].score` | number | The fused rank score. Compare scores within one search only. |
 | `hits[].snippet` | string | The start of the indexed text, whitespace folded and control characters removed. |
 | `error` | object | Present for `offline`, `refused` and `error` only: `code` and `message`, as in [Failure documents](#failure-documents). |
+| `unavailable` | array of strings | Present only when some collections answered and others did not: the slugs of the workspaces whose collection is missing (never indexed) or refused the search. Their projects are not in `hits`. Absent otherwise. |
+
+When every collection is missing, `index` is `empty` (exit 0), as before. When no workspace's
+collection answered and one failed, `index` is that failure (`offline`, `refused` or `error`) with
+its exit, and there is no `unavailable`. The global collection answering does not count here: it
+is empty on most boxes, so a workspace whose collection refuses the search (another embedder's
+vectors, say) is still a failure when it is the only workspace searched.
 
 A failure before the index is asked (no DSN, Postgres unreachable, no Qdrant URL, an unknown
 project) is a [failure document](#failure-documents) with `"kind": "search"`, and has no `index`,
@@ -639,7 +661,10 @@ nothing there, and its sentence goes to standard error as `htui: <sentence>`.
   kind with the same prefix, and bare otherwise, as in the overlay. The key column is as wide as
   the longest key.
 - **`htui --search-items`** prints one line per hit, as before. No hits, or no index yet, prints a
-  note on standard error and exits 0.
+  note on standard error and exits 0. When some workspaces' collections could not be read, it
+  also prints `knowledge search unavailable for workspace(s): <slug>, …` on standard error,
+  followed, when one of them failed rather than being missing, by why the first one failed in
+  parentheses (`(embedder mismatch: …)`). The `--json` document names the slugs only.
 
 Control characters are removed from stored text before it is printed, so a note cannot drive your
 terminal. Text output is for people; scripts should use `--json`.
