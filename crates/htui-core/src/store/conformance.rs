@@ -467,6 +467,8 @@ pub const CASES: &[&str] = &[
     "requirement_refinements_list_every_owner",
     "requirement_coverage_derives_from_splits",
     "workspace_delete_detaches_refining_requirements",
+    // MOD-130 M1: execution targets (D1-D4, P2, P10)
+    "the_local_target_is_seeded",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1520,6 +1522,7 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         "workspace_delete_detaches_refining_requirements" => {
             boxed(workspace_delete_detaches_refining_requirements, store).await;
         }
+        "the_local_target_is_seeded" => boxed(the_local_target_is_seeded, store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -36830,6 +36833,57 @@ async fn document_links_are_leaves_of_the_walk<S: WriteStore>(store: &S) {
         vec![on_x.document],
         "{CASE}: an item outside the hops brings no document"
     );
+}
+
+// ---- MOD-130 M1: execution targets ---------------------------------------------------------------
+
+/// MOD-130 M1 (D2, P2, P10, blueprint B8): every store answers exactly one built-in target, the
+/// `local` one of [`seed::LOCAL_TARGET_ID`], with no box, an empty locator and no retirement; it
+/// is `ready` with no box at all. Postgres stamps its row with the migration's `now()` and
+/// `MemStore` with the epoch, so the timestamps are the one thing not compared. An unknown id is
+/// `NotFound` on `target`.
+async fn the_local_target_is_seeded<S: WriteStore>(store: &S) {
+    const CASE: &str = "the_local_target_is_seeded";
+    let targets = store.targets().await.expect(CASE);
+    assert_eq!(
+        targets.len(),
+        1,
+        "{CASE}: one built-in target, got {targets:?}"
+    );
+    let local = &targets[0];
+    let untimed = |row: &crate::model::Target| crate::model::Target {
+        created_at: DateTime::UNIX_EPOCH,
+        updated_at: DateTime::UNIX_EPOCH,
+        ..row.clone()
+    };
+    assert_eq!(
+        untimed(local),
+        seed::local_target(DateTime::UNIX_EPOCH),
+        "{CASE}: the seeded row is seed::local_target's"
+    );
+    assert_eq!(local.id, seed::LOCAL_TARGET_ID, "{CASE}");
+    assert_eq!(local.name, seed::LOCAL_TARGET_NAME, "{CASE}");
+    assert_eq!(local.kind, crate::model::TargetKind::Local, "{CASE}");
+    assert_eq!(local.locator, json!({}), "{CASE}");
+    assert_eq!(local.box_id, None, "{CASE}");
+    assert_eq!(local.retired_at, None, "{CASE}");
+    assert_eq!(
+        local.status(None, None),
+        crate::model::TargetStatus::Ready,
+        "{CASE}: local is ready with no box"
+    );
+    assert_eq!(
+        &store.target(seed::LOCAL_TARGET_ID).await.expect(CASE),
+        local,
+        "{CASE}: target() answers the row targets() lists"
+    );
+    let unknown = crate::model::TargetId::new();
+    match store.target(unknown).await {
+        Err(StoreError::NotFound { entity, id }) => {
+            assert_eq!((entity, id), ("target", unknown.to_string()), "{CASE}");
+        }
+        other => panic!("{CASE}: an unknown target is NotFound, got {other:?}"),
+    }
 }
 
 #[cfg(test)]

@@ -411,12 +411,16 @@ pub fn box_profile(profile: &BoxProfile, hostname: HostnameLine) -> Rendered {
             lines.push(format!("hostname: {}", single_line(&profile.hostname)));
         }
     }
-    lines.push(format!(
-        "os: {} {} ({})",
-        profile.os_family.as_str(),
-        profile.os_version,
-        profile.arch,
-    ));
+    // MOD-130 M1 P5: a container box not yet probed has no OS family, and no line rather than a
+    // guessed one.
+    if let Some(os_family) = profile.os_family {
+        lines.push(format!(
+            "os: {} {} ({})",
+            os_family.as_str(),
+            profile.os_version,
+            profile.arch,
+        ));
+    }
     if !profile.cpu.is_empty() {
         lines.push(format!("cpu: {}", profile.cpu));
     }
@@ -1574,7 +1578,7 @@ mod tests {
     fn the_box_profile_omits_what_the_row_does_not_have_and_never_a_path() {
         let full = BoxProfile {
             hostname: "dev-win-01".to_owned(),
-            os_family: OsFamily::Windows,
+            os_family: Some(OsFamily::Windows),
             os_version: "10.0.26200".to_owned(),
             arch: "x86_64".to_owned(),
             cpu: "AMD Ryzen 9 7950X, 32 threads".to_owned(),
@@ -1622,10 +1626,30 @@ mod tests {
         );
     }
 
+    /// MOD-130 M1 P5: a container box not yet probed has no OS family; the `os` line goes and
+    /// every other line stays.
+    #[test]
+    fn a_box_without_an_os_family_omits_the_os_line() {
+        let full = a_full_box();
+        let unprobed = BoxProfile {
+            os_family: None,
+            ..a_full_box()
+        };
+        let with_os = box_profile(&full, HostnameLine::Shown).content;
+        let without = box_profile(&unprobed, HostnameLine::Shown).content;
+        let kept: Vec<&str> = with_os
+            .lines()
+            .filter(|line| !line.starts_with("os: "))
+            .collect();
+        assert_eq!(without, kept.join("\n"));
+        assert!(!without.contains("os: "), "{without}");
+        assert_eq!(without.lines().count() + 1, with_os.lines().count());
+    }
+
     fn a_full_box() -> BoxProfile {
         BoxProfile {
             hostname: "dev-win-01".to_owned(),
-            os_family: OsFamily::Windows,
+            os_family: Some(OsFamily::Windows),
             os_version: "10.0.26200".to_owned(),
             arch: "x86_64".to_owned(),
             cpu: "AMD Ryzen 9 7950X, 32 threads".to_owned(),

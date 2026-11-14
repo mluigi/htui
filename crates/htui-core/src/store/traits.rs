@@ -404,6 +404,22 @@ pub trait ReadStore: Send + Sync {
     /// # Errors
     /// The backend's own failures only.
     async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>>;
+
+    // ---- MOD-130 M1: execution targets (D1-D4, D15, P10) ----------------------------------------
+
+    /// Every target, the built-in `local` one included and retired ones too, ordered by `name`
+    /// byte order, then `id` (MOD-130 M1, P10). Pickers filter retired targets themselves.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn targets(&self) -> Result<Vec<crate::model::Target>>;
+
+    /// One target (MOD-130 M1).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with entity `"target"` when
+    /// no row has that id.
+    async fn target(&self, id: crate::model::TargetId) -> Result<crate::model::Target>;
 }
 
 /// Everything a write path needs.
@@ -3178,7 +3194,7 @@ pub fn run_plan_refusal(plan: &NewRunPlan) -> Option<String> {
 }
 
 /// Whether any string or object key inside `value` holds U+0000.
-fn json_has_nul(value: &Value) -> bool {
+pub(crate) fn json_has_nul(value: &Value) -> bool {
     match value {
         Value::String(text) => text.contains('\0'),
         Value::Array(items) => items.iter().any(json_has_nul),
@@ -4236,6 +4252,23 @@ pub fn self_link(item: ItemId) -> String {
 #[must_use]
 pub fn link_outside_reach(to: ItemId) -> String {
     format!("item {to} is not in this project or its workspaces")
+}
+
+/// MOD-130 M1 P9 (blueprint B4): a target name both stores refuse, stored as given and never
+/// trimmed. [`crate::model::target_name_refusal`] decides it.
+#[must_use]
+pub fn target_name_refused(name: &str) -> String {
+    format!(
+        "target.name is 1-64 characters with no control character and no leading or trailing \
+         space; {name:?} is not"
+    )
+}
+
+/// MOD-130 M1 P9 (blueprint B6): a locator that is not an object or looks like it holds a
+/// secret. `why` names the key path or the value. [`crate::model::locator_refusal`] decides it.
+#[must_use]
+pub fn target_locator_refused(why: &str) -> String {
+    format!("a target locator holds names and addresses, never secrets: {why}")
 }
 
 /// MOD-150 M3 D3: how a [`DocumentRef`] is named in a refusal: `"{owner} {kind}"`, plus

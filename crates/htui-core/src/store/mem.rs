@@ -72,6 +72,7 @@ use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{LogShipLevel, NewWorkerLog, WorkerLogLine};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
 use crate::model::{PlanAdmission, PlanToAdmit};
+use crate::model::{Target, TargetId};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -248,6 +249,9 @@ struct State {
     users: HashMap<UserId, AppUser>,
     /// `box`.
     boxes: HashMap<BoxId, BoxRow>,
+    /// `target` (MOD-130 M1), created targets only: the built-in `local` row is answered by the
+    /// readers (blueprint B8).
+    targets: BTreeMap<TargetId, Target>,
     /// The box this process runs on (`box.toml`), for the top bar.
     this_box: Option<BoxId>,
     /// `workspace`.
@@ -484,6 +488,7 @@ impl MemStore {
         let state = State {
             users: data.users.into_iter().map(|row| (row.id, row)).collect(),
             boxes: data.boxes.into_iter().map(|row| (row.id, row)).collect(),
+            targets: BTreeMap::new(),
             this_box: data.this_box,
             workspaces: data
                 .workspaces
@@ -594,19 +599,26 @@ impl MemStore {
     }
 
     /// This box's row, projected for the top bar.
+    ///
+    /// This box is always a machine, so a row without an OS family is a store bug (MOD-130 M1,
+    /// blueprint B12), answered as a backend error rather than an invented family.
     pub async fn box_info(&self) -> Result<Option<BoxInfo>> {
-        Ok(self.read(|state| {
-            let id = state.this_box?;
-            let row = state.boxes.get(&id)?;
-            Some(BoxInfo {
+        self.read(|state| {
+            let Some(row) = state.this_box.and_then(|id| state.boxes.get(&id)) else {
+                return Ok(None);
+            };
+            let os_family = row
+                .os_family
+                .ok_or_else(|| StoreError::Backend(format!("box {} has no os_family", row.id)))?;
+            Ok(Some(BoxInfo {
                 box_id: row.id,
                 hostname: row.hostname.clone(),
-                os_family: row.os_family,
+                os_family,
                 probed_tags: row.probed_tags.clone(),
                 declared_tags: row.declared_tags.clone(),
                 settings: row.settings.clone(),
-            })
-        }))
+            }))
+        })
     }
 
     /// How many runs of the scope are on the top bar (`RunStatus::on_top_bar`, MOD-125 D2).
@@ -11215,6 +11227,39 @@ impl ReadStore for MemStore {
 
     async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
         Ok(self.read(|state| state.run_plan_rows(run)))
+    }
+
+    async fn targets(&self) -> Result<Vec<Target>> {
+        // MOD-130 M1 blueprint B8: the built-in row is answered here, at the epoch, rather than
+        // stored in `State`, so no constructor can lose it.
+        Ok(self.read(|state| {
+            let mut rows: Vec<Target> = std::iter::once(seed::local_target(DateTime::UNIX_EPOCH))
+                .chain(state.targets.values().cloned())
+                .collect();
+            rows.sort_by(|a, b| {
+                a.name
+                    .as_bytes()
+                    .cmp(b.name.as_bytes())
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            rows
+        }))
+    }
+
+    async fn target(&self, id: TargetId) -> Result<Target> {
+        if id == seed::LOCAL_TARGET_ID {
+            return Ok(seed::local_target(DateTime::UNIX_EPOCH));
+        }
+        self.read(|state| {
+            state
+                .targets
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "target",
+                    id: id.to_string(),
+                })
+        })
     }
 }
 

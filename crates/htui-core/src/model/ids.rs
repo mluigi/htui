@@ -135,4 +135,6 @@ id_newtype!(
     RunPlanId,
     /// `item_artifact_link.id` (MOD-150 M3).
     ArtifactLinkId,
+    /// `target.id` (MOD-130 M1).
+    TargetId,
 );

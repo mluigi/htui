@@ -19,11 +19,12 @@
 //! [`TemplateRole::of_name`]: crate::prompt::TemplateRole::of_name
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use crate::model::{
     CommandQueue, EdgeId, EdgeKind, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId,
     ProjectType, PromptTemplate, PromptTemplateId, Split, StepGraph, StepGraphEdge, StepGraphId,
-    StepGraphPhase, UserId,
+    StepGraphPhase, Target, TargetId, TargetKind, UserId,
 };
 
 /// One phase of a default graph: the three columns the table varies, in position order within
@@ -534,6 +535,32 @@ pub fn project_type_row(builtin: &BuiltinProjectType, at: DateTime<Utc>) -> Proj
         seed: None,
         seed_version: 1,
         created_by: None,
+        created_at: at,
+        updated_at: at,
+    }
+}
+
+/// `target.id` of the one built-in `local` target (MOD-130 M1, D2, P2): the box that starts the
+/// run. `0037_execution_targets.sql` inserts this row; `MemStore` answers it from its readers.
+pub const LOCAL_TARGET_ID: TargetId =
+    TargetId::from_uuid(Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001));
+
+/// `target.name` of the built-in `local` target (MOD-130 M1, D2, P2).
+pub const LOCAL_TARGET_NAME: &str = "this box";
+
+/// The built-in `local` target's row, `at` in both stamps (MOD-130 M1, D2, P2). Only `MemStore`
+/// calls it, with the epoch; Postgres's row is the migration's own, stamped by its `now()`.
+#[must_use]
+pub fn local_target(at: DateTime<Utc>) -> Target {
+    Target {
+        id: LOCAL_TARGET_ID,
+        name: LOCAL_TARGET_NAME.to_owned(),
+        kind: TargetKind::Local,
+        locator: serde_json::Value::Object(serde_json::Map::new()),
+        box_id: None,
+        probed_at: None,
+        probe_error: None,
+        retired_at: None,
         created_at: at,
         updated_at: at,
     }
