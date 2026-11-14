@@ -2671,9 +2671,14 @@ async fn finish_run_on(
 /// MOD-133 D4: `finish_run(Done)`'s records, on the caller's transaction with the run held
 /// `FOR UPDATE`: one `pending` row per `graph_snapshot.integrate` entry whose mode is not `local`
 /// and whose repo has a `run_step_commit` with an `after_hash` in this run, carrying the entry's
-/// mode, remote and target and the run's project. An `integrate` that is not an object, or an entry
-/// whose fields are not the snapshot's strings, writes nothing, as `MemStore`'s decode of the same
-/// value would find no entry; an existing row is left (`ON CONFLICT DO NOTHING`).
+/// mode, remote and target and the run's project; an existing row is left (`ON CONFLICT DO
+/// NOTHING`). A malformed snapshot is not a path production reaches (the snapshot is serialised
+/// from a typed map), and the two stores differ on one: here an `integrate` that is not an object
+/// writes nothing, the entries are filtered one by one (one whose `mode` is not `push` or
+/// `pull_request`, or whose `remote` or `target_branch` is not a string, is skipped while the
+/// others are written), and an otherwise well-formed entry whose key is not a UUID fails the cast
+/// `e.key::uuid` and with it `finish_run(Done)`. `MemStore` decodes the whole map at once, so one
+/// bad entry, key or field, leaves the run with no records at all.
 async fn write_integrations(conn: &mut PgConnection, run: RunId) -> Result<()> {
     sqlx::query!(
         r#"
@@ -9960,11 +9965,16 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    /// MOD-133 D6: one compare-and-set `UPDATE` over every takeable record, the run joined for its
-    /// `executing_box_id`. Expiry is judged, and the new one stamped, by `clock_timestamp()`, as
-    /// [`take_lease`](WriteStore::take_lease) does: a take that waits on another's row lock
-    /// re-evaluates its `WHERE` against the committed row after the wait, so two sweeps of one box
-    /// never lease one record to two owners.
+    /// MOD-133 D6: one statement. Its first CTE locks every takeable record, the run joined for its
+    /// `executing_box_id`, in `(run_id, repo_id)` order `FOR UPDATE OF g SKIP LOCKED`; the `UPDATE`
+    /// then stamps the lease on exactly the rows it holds. Expiry is judged, and the new one
+    /// stamped, by `clock_timestamp()`, as [`take_lease`](WriteStore::take_lease) does.
+    ///
+    /// A take never waits on a row lock (the sweep rule of blueprint A-5): a record another take
+    /// holds is not this take's, so the walk's take of one run and the sweep's take of the whole box
+    /// cannot deadlock (`40P01`) over records of one run. A lock taken on a row a concurrent take
+    /// has just committed re-checks the `WHERE` against that committed row, so a record freshly
+    /// leased to another owner is not leased again: no record goes to two owners.
     ///
     /// # Errors
     ///
@@ -9980,18 +9990,26 @@ impl WriteStore for PgStore {
         sqlx::query_as!(
             Integration,
             r#"
-            WITH taken AS (
-                UPDATE integration g
-                   SET lease_box_id     = $1,
-                       lease_owner      = $2,
-                       lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'
-                  FROM run r
-                 WHERE r.id = g.run_id
-                   AND r.executing_box_id = $1
+            WITH c AS (
+                SELECT g.run_id, g.repo_id
+                  FROM integration g
+                  JOIN run r ON r.id = g.run_id
+                 WHERE r.executing_box_id = $1
                    AND g.state = 'pending'
                    AND ($4::uuid IS NULL OR g.run_id = $4)
                    AND (g.lease_owner = $2 OR g.lease_owner IS NULL
                         OR g.lease_expires_at IS NULL OR g.lease_expires_at <= clock_timestamp())
+                 ORDER BY g.run_id, g.repo_id
+                   FOR UPDATE OF g SKIP LOCKED
+            ),
+            taken AS (
+                UPDATE integration g
+                   SET lease_box_id     = $1,
+                       lease_owner      = $2,
+                       lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'
+                  FROM c
+                 WHERE g.run_id = c.run_id
+                   AND g.repo_id = c.repo_id
              RETURNING g.*
             )
             SELECT run_id        AS "run_id: RunId",

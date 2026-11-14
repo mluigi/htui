@@ -549,3 +549,164 @@ async fn pg_concurrent_integration_takes_lease_each_record_once() {
 
     db.drop_db().await;
 }
+
+/// MOD-133 fix round F1: plants `count` `pending` push records of `RUN_7`, which it marks as
+/// executed on the fixture box, each on a repo of its own, and returns their keys in order.
+#[cfg(feature = "demo")]
+async fn plant_box_integrations(
+    db: &common::TestDb,
+    tag: &str,
+    count: usize,
+) -> Vec<(htui_core::model::RunId, htui_core::model::RepoId)> {
+    use htui_core::fixtures::ids;
+    use htui_core::model::RepoId;
+    use uuid::Uuid;
+
+    sqlx::query("UPDATE run SET executing_box_id = $2 WHERE id = $1")
+        .bind(ids::RUN_7.as_uuid())
+        .bind(ids::BOX.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("RUN_7 executed on the fixture box");
+    let mut planted = Vec::new();
+    for index in 0..count {
+        let repo: Uuid = sqlx::query_scalar(
+            "INSERT INTO repo (project_id, name, remote_url) \
+             VALUES ($1, $2, 'git@example.invalid:raced.git') RETURNING id",
+        )
+        .bind(ids::PROJECT_AGY.as_uuid())
+        .bind(format!("{tag}-{index}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("plant a repo");
+        sqlx::query(
+            "INSERT INTO integration (run_id, repo_id, project_id, mode, remote, target_branch) \
+             VALUES ($1, $2, $3, 'push', 'git@example.invalid:raced.git', 'main')",
+        )
+        .bind(ids::RUN_7.as_uuid())
+        .bind(repo)
+        .bind(ids::PROJECT_AGY.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("plant a pending record");
+        planted.push((ids::RUN_7, RepoId(repo)));
+    }
+    planted.sort_unstable();
+    planted
+}
+
+/// MOD-133 fix round F1 (review L1), Postgres only: the walk's take (filtered to its run) and the
+/// sweep's take (every run on the box), by different owners at once over two records of one run,
+/// both answer `Ok` - neither is killed as a deadlock victim (`40P01`) - and together lease each
+/// record exactly once. Repeated, because a deadlock needs the two scans to interleave.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_walk_and_sweep_takes_of_one_run_never_deadlock() {
+    use chrono::TimeDelta;
+    use htui_core::fixtures::ids;
+    use htui_core::store::WriteStore as _;
+    use uuid::Uuid;
+
+    const ROUNDS: usize = 40;
+    let Some(db) = Box::pin(common::demo_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let pg = &db.store;
+    let planted = plant_box_integrations(&db, "walked", 2).await;
+    for round in 0..ROUNDS {
+        sqlx::query(
+            "UPDATE integration \
+                SET lease_box_id = NULL, lease_owner = NULL, lease_expires_at = NULL \
+              WHERE run_id = $1",
+        )
+        .bind(ids::RUN_7.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("free every lease");
+        let (walk_owner, sweep_owner) = (Uuid::now_v7(), Uuid::now_v7());
+        let (walk, sweep) = tokio::join!(
+            pg.take_integrations(
+                ids::BOX,
+                walk_owner,
+                TimeDelta::minutes(5),
+                Some(ids::RUN_7)
+            ),
+            pg.take_integrations(ids::BOX, sweep_owner, TimeDelta::minutes(5), None),
+        );
+        let walk = walk.unwrap_or_else(|err| panic!("round {round}: the walk's take: {err}"));
+        let sweep = sweep.unwrap_or_else(|err| panic!("round {round}: the sweep's take: {err}"));
+        let mut taken: Vec<_> = walk
+            .iter()
+            .chain(&sweep)
+            .map(|row| (row.run_id, row.repo_id))
+            .collect();
+        taken.sort_unstable();
+        assert_eq!(
+            taken, planted,
+            "round {round}: every record is leased, to one owner only"
+        );
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-133 fix round F1 (review L1), Postgres only: a take never waits on a row lock. With one
+/// record held `FOR UPDATE` by another transaction, a take answers at once with the other record
+/// only; once the lock is gone, the next take leases the held one.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_integration_take_skips_a_record_another_transaction_holds() {
+    use chrono::TimeDelta;
+    use htui_core::fixtures::ids;
+    use htui_core::store::WriteStore as _;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    let Some(db) = Box::pin(common::demo_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let pg = &db.store;
+    let planted = plant_box_integrations(&db, "held", 2).await;
+    let (held, free) = (planted[0], planted[1]);
+    let mut tx = db.pool.begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM integration WHERE run_id = $1 AND repo_id = $2 FOR UPDATE")
+        .bind(held.0.as_uuid())
+        .bind(held.1.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("hold one record");
+
+    let first = Uuid::now_v7();
+    let taken = tokio::time::timeout(
+        Duration::from_secs(10),
+        pg.take_integrations(ids::BOX, first, TimeDelta::minutes(5), None),
+    )
+    .await
+    .expect("the take does not wait on the held row")
+    .expect("a take");
+    assert_eq!(
+        taken
+            .iter()
+            .map(|row| (row.run_id, row.repo_id))
+            .collect::<Vec<_>>(),
+        vec![free],
+        "the held record is skipped, the free one leased"
+    );
+
+    tx.rollback().await.expect("release the lock");
+    let second = Uuid::now_v7();
+    let taken = pg
+        .take_integrations(ids::BOX, second, TimeDelta::minutes(5), None)
+        .await
+        .expect("a take");
+    assert_eq!(
+        taken
+            .iter()
+            .map(|row| (row.run_id, row.repo_id))
+            .collect::<Vec<_>>(),
+        vec![held],
+        "the released record is leased; the other stays with its first owner"
+    );
+
+    db.drop_db().await;
+}
