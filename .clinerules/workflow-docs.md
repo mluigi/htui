@@ -124,6 +124,8 @@ is now a file title: `# PREFIX-N - Title (status, YYYY-MM-DD)`.
    status line. The status line is a recap, not an archive - cap it at the most recent handful of
    completions (roughly 2-3); when a new one lands, drop the oldest mention rather than appending.
    The index and the write-up files stay uncapped - together they are the full permanent record.
+   Also refresh HANDOFF's "Parallel runs" section: drop the closed ID, and promote any item whose
+   blockers are now all done to the earliest wave it fits (IDs only, dependencies only).
 4. Multi-phase work (e.g. MOD-16) stays as a single open HANDOFF.md checklist line, appending a
    `**Phase N landed (commit)**` note per phase, until every phase is done - then it archives as
    **one** write-up file and **one** index line covering all phases.

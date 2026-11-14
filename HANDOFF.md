@@ -12,6 +12,7 @@
   prepend the index line to `DECISIONS.md`, update the summary table (per
   `.claude/rules/workflow-docs.md`, with its Cline copy in `.clinerules/`; this repo is the source of
   truth for its workflow skills and rules, `AGENTS.md` "Rules").
+  Also refresh "Parallel runs" below: drop the closed ID and promote what it unblocked.
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
 **Current status (2026-11-13):** **TOOL-17 is done** (`docs/decisions/tool/tool-17.md`; merged, `48db70dc`): the
@@ -87,6 +88,18 @@ migration's SQL is never edited to follow a rename. Items that still owe one inc
 MOD-159 and MOD-171. Pins: store conformance `CASES` 308 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
 `htui-orch` `CASES` 264 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 54
 (`htui-store/tests/migrations.rs` `TABLES`).
+---
+
+## Parallel runs (2026-11-14)
+
+The next ten items by `next-item.sh` ranking, then what each wave unlocks, by dependencies only (file and
+migration overlap is not checked; trigger-gated and "wanted later" items are left out). IDs only; a later wave
+starts once the items it follows are done.
+
+- **Wave 1 (together):** MOD-147, MOD-150, MOD-122, MOD-125, MOD-159, MOD-130, MOD-133, MOD-116, MOD-127, ANA-39
+- **Wave 2:** MOD-149, MOD-132, MOD-135, MOD-143, MOD-117, MOD-128, MOD-161, MOD-167, MOD-8
+- **Wave 3:** MOD-118, MOD-136, MOD-154, MOD-155, MOD-129
+
 ---
 
 ## Open items
