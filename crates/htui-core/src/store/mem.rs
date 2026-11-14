@@ -63,6 +63,10 @@ use crate::model::{
     moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::model::{
+    AttachedBox, BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind,
+    locator_refusal, target_name_refusal,
+};
+use crate::model::{
     CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemorySource, MemoryUsage, NewRunMemory, RunMemoryWrite,
     RunProvenance,
 };
@@ -72,7 +76,6 @@ use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{LogShipLevel, NewWorkerLog, WorkerLogLine};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
 use crate::model::{PlanAdmission, PlanToAdmit};
-use crate::model::{Target, TargetId};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -110,6 +113,11 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, run_memory_held_by_a_person,
+};
+use crate::store::traits::{
+    box_bound_to_other_target, box_hostname_is_blank, box_not_a_child_of,
+    child_box_needs_a_machine, has_nul, target_bound_elsewhere, target_built_in, target_name_taken,
+    target_retired, target_takes_no_container,
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
@@ -11066,6 +11074,204 @@ impl State {
     }
 }
 
+/// MOD-130 M1 T2: the target writers (P4-P6, P9, blueprint B2-B4, B10). The built-in `local`
+/// row is not in `targets` (blueprint B8), so each writer names it by id or name itself.
+impl State {
+    /// A stored target, the built-in one included, or `NotFound`.
+    fn target_row(&self, id: TargetId) -> Result<Target> {
+        if id == seed::LOCAL_TARGET_ID {
+            return Ok(seed::local_target(DateTime::UNIX_EPOCH));
+        }
+        self.targets
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "target",
+                id: id.to_string(),
+            })
+    }
+
+    /// Whether a target other than `except` holds `name`, the local target's name included.
+    fn target_name_held(&self, name: &str, except: Option<TargetId>) -> bool {
+        name == seed::LOCAL_TARGET_NAME
+            || self
+                .targets
+                .values()
+                .any(|row| Some(row.id) != except && row.name == name)
+    }
+
+    /// [`WriteStore::create_target`]'s order: local kind, name, locator, taken id, taken name.
+    fn create_target(&mut self, new: NewTarget, now: DateTime<Utc>) -> Result<Target> {
+        if new.kind == TargetKind::Local {
+            return Err(StoreError::Constraint(target_built_in()));
+        }
+        if let Some(refusal) =
+            target_name_refusal(&new.name).or_else(|| locator_refusal(&new.locator))
+        {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if new.id == seed::LOCAL_TARGET_ID || self.targets.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("target", new.id)));
+        }
+        if self.target_name_held(&new.name, None) {
+            return Err(StoreError::Constraint(target_name_taken(&new.name)));
+        }
+        let row = Target {
+            id: new.id,
+            name: new.name,
+            kind: new.kind,
+            locator: new.locator,
+            box_id: None,
+            probed_at: None,
+            probe_error: None,
+            retired_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.targets.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// [`WriteStore::edit_target`]'s order: unknown, local, name and locator, `Stale`, taken name.
+    fn edit_target(
+        &mut self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+        edit: TargetEdit,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Target>> {
+        let current = self.target_row(id)?;
+        if current.kind == TargetKind::Local {
+            return Err(StoreError::Constraint(target_built_in()));
+        }
+        if let Some(refusal) = edit
+            .name
+            .as_deref()
+            .and_then(target_name_refusal)
+            .or_else(|| edit.locator.as_ref().and_then(locator_refusal))
+        {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(name) = &edit.name
+            && self.target_name_held(name, Some(id))
+        {
+            return Err(StoreError::Constraint(target_name_taken(name)));
+        }
+        let row = self
+            .targets
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(name) = edit.name {
+            row.name = name;
+        }
+        if let Some(locator) = edit.locator {
+            row.locator = locator;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// [`WriteStore::attach_child_box`]'s order, then the insert and the binding, each only when
+    /// it is not already so: a repeat writes nothing.
+    fn attach_child_box(&mut self, new: NewChildBox, now: DateTime<Utc>) -> Result<AttachedBox> {
+        if new.hostname.trim().is_empty() {
+            return Err(StoreError::Constraint(box_hostname_is_blank()));
+        }
+        if new.hostname.contains('\0') {
+            return Err(StoreError::Constraint(has_nul("box.hostname")));
+        }
+        let target = self.target_row(new.target)?;
+        if target.retired_at.is_some() {
+            return Err(StoreError::Constraint(target_retired(&target.name)));
+        }
+        if !matches!(target.kind, TargetKind::Docker | TargetKind::SshDocker) {
+            return Err(StoreError::Constraint(target_takes_no_container(
+                &target.name,
+                target.kind,
+            )));
+        }
+        let Some(parent) = self.boxes.get(&new.parent) else {
+            return Err(StoreError::Constraint(references_no_row(
+                "box.parent_box_id",
+                new.parent,
+                "box",
+            )));
+        };
+        if parent.kind == BoxKind::Container {
+            return Err(StoreError::Constraint(child_box_needs_a_machine(
+                new.parent,
+            )));
+        }
+        let user_id = parent.user_id;
+        if let Some(child) = self.boxes.get(&new.id)
+            && (child.kind != BoxKind::Container || child.parent_box_id != Some(new.parent))
+        {
+            return Err(StoreError::Constraint(box_not_a_child_of(
+                new.id, new.parent,
+            )));
+        }
+        if let Some(other) = self
+            .targets
+            .values()
+            .find(|row| row.id != target.id && row.box_id == Some(new.id))
+        {
+            return Err(StoreError::Constraint(box_bound_to_other_target(
+                new.id,
+                &other.name,
+            )));
+        }
+        if let Some(other) = target.box_id.filter(|other| *other != new.id) {
+            return Err(StoreError::Constraint(target_bound_elsewhere(
+                &target.name,
+                other,
+            )));
+        }
+        let child = self
+            .boxes
+            .entry(new.id)
+            .or_insert_with(|| BoxRow {
+                id: new.id,
+                user_id,
+                hostname: new.hostname,
+                os_family: None,
+                os_version: String::new(),
+                arch: String::new(),
+                cpu: String::new(),
+                ram_mb: None,
+                gpu_present: false,
+                gpu_vendor: None,
+                htui_version: String::new(),
+                probed_tags: Vec::new(),
+                declared_tags: Vec::new(),
+                quirks: String::new(),
+                settings: Value::Object(serde_json::Map::new()),
+                registered_at: now,
+                last_seen_at: now,
+                last_probed_at: None,
+                updated_at: now,
+                edit_version: 0,
+                kind: BoxKind::Container,
+                parent_box_id: Some(new.parent),
+            })
+            .clone();
+        let target = if target.box_id == Some(new.id) {
+            target
+        } else {
+            let row = self
+                .targets
+                .get_mut(&target.id)
+                .expect("a docker target is a stored one, read under the same lock");
+            row.box_id = Some(new.id);
+            row.updated_at = now;
+            row.clone()
+        };
+        Ok(AttachedBox { child, target })
+    }
+}
+
 impl ReadStore for MemStore {
     async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
         Ok(self.read(|state| state.item_summaries(scope, filter)))
@@ -12457,6 +12663,26 @@ impl WriteStore for MemStore {
     async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
         let now = self.now();
         Ok(self.write(|state| state.close_dropped_follow_ups(run, owner, reason, now)))
+    }
+
+    async fn create_target(&self, new: NewTarget) -> Result<Target> {
+        let now = self.now();
+        self.write(|state| state.create_target(new, now))
+    }
+
+    async fn edit_target(
+        &self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+        edit: TargetEdit,
+    ) -> Result<CasOutcome<Target>> {
+        let now = self.now();
+        self.write(|state| state.edit_target(id, expected, edit, now))
+    }
+
+    async fn attach_child_box(&self, new: NewChildBox) -> Result<AttachedBox> {
+        let now = self.now();
+        self.write(|state| state.attach_child_box(new, now))
     }
 }
 

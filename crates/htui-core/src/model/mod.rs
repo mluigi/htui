@@ -226,8 +226,8 @@ pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
 pub use stop::{PendingStop, StopMode, WorkspaceStop};
 pub use target::{
-    DEFAULT_TARGET_KEY, RUNNABLE_KINDS, Target, TargetKind, TargetStatus, locator_refusal,
-    target_name_refusal,
+    AttachedBox, DEFAULT_TARGET_KEY, NewChildBox, NewTarget, RUNNABLE_KINDS, Target, TargetEdit,
+    TargetKind, TargetStatus, locator_refusal, target_name_refusal,
 };
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};

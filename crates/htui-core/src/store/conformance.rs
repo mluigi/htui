@@ -49,6 +49,9 @@ use crate::model::{
     WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
     executor_scrub_refusal, missing_tags_failure,
 };
+use crate::model::{
+    BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind, TargetStatus,
+};
 use crate::model::{CAPTURE_KEY, CAPTURE_POSITION, NewOwnerDocument, Project, StepRole};
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog};
 use crate::model::{
@@ -90,6 +93,11 @@ use crate::store::traits::{
     back_asks_you_beside_another_asks_you, branch_is_not_an_object_of_booleans,
     forward_edges_form_a_cycle, graph_not_usable, if_predicate_outside_the_closed_set,
     loop_edge_runs_forward, workspace_graph_is_held,
+};
+use crate::store::traits::{
+    box_bound_to_other_target, box_hostname_is_blank, box_not_a_child_of,
+    child_box_needs_a_machine, target_bound_elsewhere, target_built_in, target_locator_refused,
+    target_name_refused, target_name_taken, target_takes_no_container,
 };
 use crate::store::traits::{close_out_names_no_link, close_out_needs_a_link};
 use crate::store::traits::{deadline_below_one, judge_model_without_agent};
@@ -469,6 +477,11 @@ pub const CASES: &[&str] = &[
     "workspace_delete_detaches_refining_requirements",
     // MOD-130 M1: execution targets (D1-D4, P2, P10)
     "the_local_target_is_seeded",
+    // MOD-130 M1 T2: create, edit and bind targets (P4-P6, P9, blueprint B2-B4, B10)
+    "create_target_round_trips_every_kind_but_local",
+    "create_target_refusals",
+    "edit_target_is_cas_on_updated_at",
+    "attach_child_box_creates_reuses_and_refuses",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1523,6 +1536,16 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             boxed(workspace_delete_detaches_refining_requirements, store).await;
         }
         "the_local_target_is_seeded" => boxed(the_local_target_is_seeded, store).await,
+        "create_target_round_trips_every_kind_but_local" => {
+            boxed(create_target_round_trips_every_kind_but_local, store).await;
+        }
+        "create_target_refusals" => boxed(create_target_refusals, store).await,
+        "edit_target_is_cas_on_updated_at" => {
+            boxed(edit_target_is_cas_on_updated_at, store).await;
+        }
+        "attach_child_box_creates_reuses_and_refuses" => {
+            boxed(attach_child_box_creates_reuses_and_refuses, store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -36851,7 +36874,7 @@ async fn the_local_target_is_seeded<S: WriteStore>(store: &S) {
         "{CASE}: one built-in target, got {targets:?}"
     );
     let local = &targets[0];
-    let untimed = |row: &crate::model::Target| crate::model::Target {
+    let untimed = |row: &Target| Target {
         created_at: DateTime::UNIX_EPOCH,
         updated_at: DateTime::UNIX_EPOCH,
         ..row.clone()
@@ -36863,13 +36886,13 @@ async fn the_local_target_is_seeded<S: WriteStore>(store: &S) {
     );
     assert_eq!(local.id, seed::LOCAL_TARGET_ID, "{CASE}");
     assert_eq!(local.name, seed::LOCAL_TARGET_NAME, "{CASE}");
-    assert_eq!(local.kind, crate::model::TargetKind::Local, "{CASE}");
+    assert_eq!(local.kind, TargetKind::Local, "{CASE}");
     assert_eq!(local.locator, json!({}), "{CASE}");
     assert_eq!(local.box_id, None, "{CASE}");
     assert_eq!(local.retired_at, None, "{CASE}");
     assert_eq!(
         local.status(None, None),
-        crate::model::TargetStatus::Ready,
+        TargetStatus::Ready,
         "{CASE}: local is ready with no box"
     );
     assert_eq!(
@@ -36877,13 +36900,672 @@ async fn the_local_target_is_seeded<S: WriteStore>(store: &S) {
         local,
         "{CASE}: target() answers the row targets() lists"
     );
-    let unknown = crate::model::TargetId::new();
+    let unknown = TargetId::new();
     match store.target(unknown).await {
         Err(StoreError::NotFound { entity, id }) => {
             assert_eq!((entity, id), ("target", unknown.to_string()), "{CASE}");
         }
         other => panic!("{CASE}: an unknown target is NotFound, got {other:?}"),
     }
+}
+
+/// A `NewTarget` under a fresh id (MOD-130 M1 T2).
+fn new_target(name: &str, kind: TargetKind, locator: Value) -> NewTarget {
+    NewTarget {
+        id: TargetId::new(),
+        name: name.to_owned(),
+        kind,
+        locator,
+    }
+}
+
+/// MOD-130 M1 T2 (D1, P4, P10, blueprint B2): a target of each kind but `local` is created
+/// unbound, with both stamps equal, and reads back as written; `targets()` lists it among the
+/// rest in name byte order (an upper-case name first), and every one of them is `planned` in this
+/// build. A taken id, the local target's included, is `already_exists` and writes nothing.
+async fn create_target_round_trips_every_kind_but_local<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_target_round_trips_every_kind_but_local";
+    let news = [
+        new_target(
+            "alpha docker",
+            TargetKind::Docker,
+            json!({"context": "default", "image": "rust:1.95"}),
+        ),
+        new_target(
+            "build ssh",
+            TargetKind::Ssh,
+            json!({"host": "build", "user": "me"}),
+        ),
+        new_target(
+            "this box remote",
+            TargetKind::SshDocker,
+            json!({"host": "build", "docker": {"context": "remote"}}),
+        ),
+        new_target("Upper enrolled", TargetKind::Enrolled, json!({})),
+    ];
+    let mut created = Vec::new();
+    for new in &news {
+        let row = store.create_target(new.clone()).await.expect(CASE);
+        assert_eq!(
+            (row.id, &row.name, row.kind, &row.locator),
+            (new.id, &new.name, new.kind, &new.locator),
+            "{CASE}: the row is the input"
+        );
+        assert_eq!(row.box_id, None, "{CASE}: a created target is unbound (P4)");
+        assert_eq!(
+            (row.probed_at, &row.probe_error, row.retired_at),
+            (None, &None, None),
+            "{CASE}: never probed, never retired"
+        );
+        assert_eq!(
+            row.created_at, row.updated_at,
+            "{CASE}: both stamps are the insert's"
+        );
+        assert_eq!(
+            store.target(row.id).await.expect(CASE),
+            row,
+            "{CASE}: target() reads the row create_target answered"
+        );
+        assert_eq!(
+            row.status(None, None),
+            TargetStatus::Planned,
+            "{CASE}: {} does not run in this build (D1)",
+            row.kind
+        );
+        created.push(row);
+    }
+
+    let listed = store.targets().await.expect(CASE);
+    let names: Vec<&str> = listed.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "Upper enrolled",
+            "alpha docker",
+            "build ssh",
+            seed::LOCAL_TARGET_NAME,
+            "this box remote",
+        ],
+        "{CASE}: name byte order, the local target among the rest (P10)"
+    );
+    for row in &created {
+        assert!(
+            listed.contains(row),
+            "{CASE}: targets() lists {} as written",
+            row.name
+        );
+    }
+
+    let mut again = news[0].clone();
+    again.name = "another name".to_owned();
+    constraint_exactly(
+        CASE,
+        store.create_target(news[0].clone()).await,
+        &already_exists("target", news[0].id),
+        "a repeat create",
+    );
+    constraint_exactly(
+        CASE,
+        store.create_target(again).await,
+        &already_exists("target", news[0].id),
+        "a taken id under another name",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_target(NewTarget {
+                id: seed::LOCAL_TARGET_ID,
+                ..new_target("not local", TargetKind::Docker, json!({}))
+            })
+            .await,
+        &already_exists("target", seed::LOCAL_TARGET_ID),
+        "the local target's id with another kind",
+    );
+    assert_eq!(
+        store.targets().await.expect(CASE),
+        listed,
+        "{CASE}: a refused create writes nothing"
+    );
+}
+
+/// MOD-130 M1 T2 (P9, blueprint B2, B4): `create_target`'s refusals in their order, each in
+/// the sentence both stores give it, each writing nothing: a `local` kind, then the name, then
+/// the locator, then a taken id, then a taken name (the local target's name included).
+async fn create_target_refusals<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_target_refusals";
+    let before = store.targets().await.expect(CASE);
+    let kept = store
+        .create_target(new_target("kept", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let after_kept = store.targets().await.expect(CASE);
+    assert_eq!(after_kept.len(), before.len() + 1, "{CASE}");
+
+    // 1. A local kind, whatever else is wrong.
+    constraint_exactly(
+        CASE,
+        store
+            .create_target(new_target(" bad", TargetKind::Local, json!([])))
+            .await,
+        &target_built_in(),
+        "a local kind with a bad name and locator",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_target(new_target("second local", TargetKind::Local, json!({})))
+            .await,
+        &target_built_in(),
+        "a second local target",
+    );
+    // 2. The name, before the locator.
+    for bad in ["", " dev", "dev ", "de\nv", "de\u{0}v", &"x".repeat(65)] {
+        constraint_exactly(
+            CASE,
+            store
+                .create_target(new_target(bad, TargetKind::Docker, json!({"token": "x"})))
+                .await,
+            &target_name_refused(bad),
+            &format!("the name {bad:?}"),
+        );
+    }
+    // 3. The locator, before the id.
+    for (locator, sentence) in [
+        (
+            json!({"password": "x"}),
+            target_locator_refused("key `password` looks like a secret"),
+        ),
+        (
+            json!({"docker": {"host": "tcp://u:p@h:2375"}}),
+            target_locator_refused("the value at `docker.host` holds a password in a URL"),
+        ),
+        (
+            json!(["dev"]),
+            target_locator_refused("it is not a JSON object"),
+        ),
+        (json!({"host": "de\u{0}v"}), has_nul("target.locator")),
+    ] {
+        constraint_exactly(
+            CASE,
+            store
+                .create_target(NewTarget {
+                    id: kept.id,
+                    ..new_target("fresh", TargetKind::Ssh, locator.clone())
+                })
+                .await,
+            &sentence,
+            &format!("the locator {locator}"),
+        );
+    }
+    // 4. A taken id, before a taken name.
+    constraint_exactly(
+        CASE,
+        store
+            .create_target(NewTarget {
+                id: kept.id,
+                ..new_target(seed::LOCAL_TARGET_NAME, TargetKind::Ssh, json!({}))
+            })
+            .await,
+        &already_exists("target", kept.id),
+        "a taken id with a taken name",
+    );
+    // 5. A taken name: a created target's, then the local target's.
+    constraint_exactly(
+        CASE,
+        store
+            .create_target(new_target("kept", TargetKind::Ssh, json!({})))
+            .await,
+        &target_name_taken("kept"),
+        "a created target's name",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_target(new_target(
+                seed::LOCAL_TARGET_NAME,
+                TargetKind::Docker,
+                json!({}),
+            ))
+            .await,
+        &target_name_taken(seed::LOCAL_TARGET_NAME),
+        "the local target's name",
+    );
+    assert_eq!(
+        store.targets().await.expect(CASE),
+        after_kept,
+        "{CASE}: no refusal wrote anything"
+    );
+}
+
+/// MOD-130 M1 T2 (P6, P9): `edit_target` is a compare-and-set on `updated_at`. A rename and a
+/// new locator apply and move the token; a spent token is `Stale` with the row as it is; the
+/// local target is built in; an unknown id is `NotFound`; and the refusals keep their order: the
+/// name and locator before `Stale`, `Stale` before a taken name.
+async fn edit_target_is_cas_on_updated_at<S: WriteStore>(store: &S) {
+    const CASE: &str = "edit_target_is_cas_on_updated_at";
+    let created = store
+        .create_target(new_target(
+            "dev docker",
+            TargetKind::Docker,
+            json!({"context": "default"}),
+        ))
+        .await
+        .expect(CASE);
+    let other = store
+        .create_target(new_target("other docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+
+    let edit = TargetEdit {
+        name: Some("build docker".to_owned()),
+        locator: Some(json!({"context": "remote", "image": "rust:1.95"})),
+    };
+    let edited = applied(
+        CASE,
+        store
+            .edit_target(created.id, created.updated_at, edit.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(edited.name, "build docker", "{CASE}: renamed");
+    assert_eq!(
+        edited.locator,
+        json!({"context": "remote", "image": "rust:1.95"}),
+        "{CASE}: the locator replaced"
+    );
+    assert!(
+        edited.updated_at > created.updated_at,
+        "{CASE}: updated_at moves, as the BEFORE UPDATE trigger moves it"
+    );
+    assert_eq!(
+        Target {
+            name: created.name.clone(),
+            locator: created.locator.clone(),
+            updated_at: created.updated_at,
+            ..edited.clone()
+        },
+        created,
+        "{CASE}: no column but the edited ones and updated_at moves"
+    );
+    assert_eq!(
+        store.target(created.id).await.expect(CASE),
+        edited,
+        "{CASE}: target() reads the edit"
+    );
+
+    // A spent token is Stale with the row as it is now, and writes nothing.
+    let current = stale(
+        CASE,
+        store
+            .edit_target(created.id, created.updated_at, edit.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(current, edited, "{CASE}: Stale carries the current row");
+    // A `None` field keeps its column.
+    let renamed = applied(
+        CASE,
+        store
+            .edit_target(
+                created.id,
+                edited.updated_at,
+                TargetEdit {
+                    name: Some("dev docker".to_owned()),
+                    locator: None,
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (renamed.name.as_str(), &renamed.locator),
+        ("dev docker", &edited.locator),
+        "{CASE}: a None locator keeps the column"
+    );
+
+    // The local target is built in, whatever the token.
+    for token in [DateTime::UNIX_EPOCH, renamed.updated_at] {
+        constraint_exactly(
+            CASE,
+            store
+                .edit_target(seed::LOCAL_TARGET_ID, token, TargetEdit::default())
+                .await,
+            &target_built_in(),
+            "an edit of the local target",
+        );
+    }
+    let unknown = TargetId::new();
+    match store
+        .edit_target(unknown, renamed.updated_at, TargetEdit::default())
+        .await
+    {
+        Err(StoreError::NotFound { entity, id }) => {
+            assert_eq!((entity, id), ("target", unknown.to_string()), "{CASE}");
+        }
+        other => panic!("{CASE}: an unknown target is NotFound, got {other:?}"),
+    }
+    // The name and locator refusals come before Stale.
+    constraint_exactly(
+        CASE,
+        store
+            .edit_target(
+                created.id,
+                created.updated_at,
+                TargetEdit {
+                    name: Some(" dev".to_owned()),
+                    locator: None,
+                },
+            )
+            .await,
+        &target_name_refused(" dev"),
+        "a bad name under a spent token",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .edit_target(
+                created.id,
+                created.updated_at,
+                TargetEdit {
+                    name: None,
+                    locator: Some(json!({"secret": "x"})),
+                },
+            )
+            .await,
+        &target_locator_refused("key `secret` looks like a secret"),
+        "a secret locator under a spent token",
+    );
+    // Stale comes before a taken name.
+    let still = stale(
+        CASE,
+        store
+            .edit_target(
+                created.id,
+                created.updated_at,
+                TargetEdit {
+                    name: Some("other docker".to_owned()),
+                    locator: None,
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(still, renamed, "{CASE}");
+    // A name another target holds, the local target's included.
+    for taken in [other.name.as_str(), seed::LOCAL_TARGET_NAME] {
+        constraint_exactly(
+            CASE,
+            store
+                .edit_target(
+                    created.id,
+                    renamed.updated_at,
+                    TargetEdit {
+                        name: Some(taken.to_owned()),
+                        locator: None,
+                    },
+                )
+                .await,
+            &target_name_taken(taken),
+            &format!("a rename to {taken:?}"),
+        );
+    }
+    assert_eq!(
+        store.target(created.id).await.expect(CASE),
+        renamed,
+        "{CASE}: no refusal wrote anything"
+    );
+    assert_eq!(
+        store.target(other.id).await.expect(CASE),
+        other,
+        "{CASE}: the other target is untouched"
+    );
+}
+
+/// MOD-130 M1 T2 (P4, P5, P9, blueprint B3, B4, B10): `attach_child_box` registers a container
+/// under the fixture machine with the parent's user and nothing probed, and binds the target; a
+/// repeat answers the same pair and writes nothing. Each refusal fires in its order and writes
+/// nothing; an `ssh_docker` target takes a container too. The retired refusal waits for retire.
+async fn attach_child_box_creates_reuses_and_refuses<S: WriteStore>(store: &S) {
+    const CASE: &str = "attach_child_box_creates_reuses_and_refuses";
+    let machine = fixture_box_row(store, CASE).await;
+    let docker = store
+        .create_target(new_target("dev docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let spare = store
+        .create_target(new_target("spare docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let ssh = store
+        .create_target(new_target("build ssh", TargetKind::Ssh, json!({})))
+        .await
+        .expect(CASE);
+    let child = BoxId::new();
+    let attach = |id: BoxId, parent: BoxId, target: TargetId| NewChildBox {
+        id,
+        parent,
+        hostname: "dev-rust".to_owned(),
+        target,
+    };
+
+    let first = store
+        .attach_child_box(attach(child, ids::BOX, docker.id))
+        .await
+        .expect(CASE);
+    let row = &first.child;
+    assert_eq!(row.id, child, "{CASE}");
+    assert_eq!(
+        row.kind,
+        BoxKind::Container,
+        "{CASE}: a child is a container"
+    );
+    assert_eq!(
+        row.parent_box_id,
+        Some(ids::BOX),
+        "{CASE}: under its parent"
+    );
+    assert_eq!(
+        row.user_id, machine.user_id,
+        "{CASE}: the parent's user (P5)"
+    );
+    assert_eq!(row.hostname, "dev-rust", "{CASE}: the caller's hostname");
+    assert_eq!(
+        row.os_family, None,
+        "{CASE}: no OS until the first probe (P5)"
+    );
+    assert_eq!(
+        (
+            row.os_version.as_str(),
+            row.arch.as_str(),
+            row.htui_version.as_str()
+        ),
+        ("", "", ""),
+        "{CASE}: nothing probed (P5)"
+    );
+    assert!(
+        row.probed_tags.is_empty() && row.declared_tags.is_empty(),
+        "{CASE}: no tags (P5)"
+    );
+    assert_eq!(row.edit_version, 0, "{CASE}: never edited");
+    assert_eq!(row.last_probed_at, None, "{CASE}: never probed");
+    assert_eq!(
+        first.target.box_id,
+        Some(child),
+        "{CASE}: the target is bound to the child"
+    );
+    assert_eq!(
+        Target {
+            box_id: None,
+            updated_at: docker.updated_at,
+            ..first.target.clone()
+        },
+        docker,
+        "{CASE}: binding moves box_id and updated_at only"
+    );
+    assert_eq!(
+        store.target(docker.id).await.expect(CASE),
+        first.target,
+        "{CASE}: target() reads the binding"
+    );
+    let listed = store.boxes().await.expect(CASE);
+    assert_eq!(
+        listed
+            .iter()
+            .find(|record| record.row.id == child)
+            .map(|record| &record.row),
+        Some(&first.child),
+        "{CASE}: boxes() lists the child as written"
+    );
+
+    // A repeat answers the same pair and writes nothing.
+    let again = store
+        .attach_child_box(attach(child, ids::BOX, docker.id))
+        .await
+        .expect(CASE);
+    assert_eq!(again, first, "{CASE}: a repeat answers the same pair");
+    assert_eq!(
+        store.target(docker.id).await.expect(CASE).updated_at,
+        first.target.updated_at,
+        "{CASE}: a repeat does not move updated_at"
+    );
+
+    // 0. A blank hostname or a NUL in it, before the target is read.
+    let unknown_target = TargetId::new();
+    for (hostname, sentence) in [
+        ("", box_hostname_is_blank()),
+        ("  ", box_hostname_is_blank()),
+        ("dev\u{0}", has_nul("box.hostname")),
+    ] {
+        constraint_exactly(
+            CASE,
+            store
+                .attach_child_box(NewChildBox {
+                    hostname: hostname.to_owned(),
+                    ..attach(BoxId::new(), ids::BOX, unknown_target)
+                })
+                .await,
+            &sentence,
+            &format!("the hostname {hostname:?}"),
+        );
+    }
+    // 1. An unknown target.
+    match store
+        .attach_child_box(attach(BoxId::new(), BoxId::new(), unknown_target))
+        .await
+    {
+        Err(StoreError::NotFound { entity, id }) => {
+            assert_eq!(
+                (entity, id),
+                ("target", unknown_target.to_string()),
+                "{CASE}"
+            );
+        }
+        other => panic!("{CASE}: an unknown target is NotFound, got {other:?}"),
+    }
+    // 3. A kind that takes no container, before the parent is read.
+    constraint_exactly(
+        CASE,
+        store
+            .attach_child_box(attach(BoxId::new(), BoxId::new(), ssh.id))
+            .await,
+        &target_takes_no_container(&ssh.name, TargetKind::Ssh),
+        "an ssh target",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .attach_child_box(attach(BoxId::new(), ids::BOX, seed::LOCAL_TARGET_ID))
+            .await,
+        &target_takes_no_container(seed::LOCAL_TARGET_NAME, TargetKind::Local),
+        "the local target",
+    );
+    // 4. An unknown parent.
+    let nowhere = BoxId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .attach_child_box(attach(BoxId::new(), nowhere, spare.id))
+            .await,
+        &references_no_row("box.parent_box_id", nowhere, "box"),
+        "an unknown parent",
+    );
+    // 5. A container parent.
+    constraint_exactly(
+        CASE,
+        store
+            .attach_child_box(attach(BoxId::new(), child, spare.id))
+            .await,
+        &child_box_needs_a_machine(child),
+        "a container parent",
+    );
+    // 6. A stored id that is not a container of the parent: here the machine itself.
+    constraint_exactly(
+        CASE,
+        store
+            .attach_child_box(attach(ids::BOX, ids::BOX, spare.id))
+            .await,
+        &box_not_a_child_of(ids::BOX, ids::BOX),
+        "the machine as its own child",
+    );
+    // 7. A child another target is bound to.
+    constraint_exactly(
+        CASE,
+        store
+            .attach_child_box(attach(child, ids::BOX, spare.id))
+            .await,
+        &box_bound_to_other_target(child, &docker.name),
+        "a child bound to another target",
+    );
+    // 8. A target bound to another box.
+    constraint_exactly(
+        CASE,
+        store
+            .attach_child_box(attach(BoxId::new(), ids::BOX, docker.id))
+            .await,
+        &target_bound_elsewhere(&docker.name, child),
+        "a target bound to another child",
+    );
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        listed,
+        "{CASE}: no refusal wrote a box"
+    );
+    for row in [&first.target, &spare, &ssh] {
+        assert_eq!(
+            &store.target(row.id).await.expect(CASE),
+            row,
+            "{CASE}: no refusal wrote {}",
+            row.name
+        );
+    }
+
+    // An ssh_docker target takes a container on a machine too (blueprint B10).
+    let remote = store
+        .create_target(new_target(
+            "remote docker",
+            TargetKind::SshDocker,
+            json!({"host": "build"}),
+        ))
+        .await
+        .expect(CASE);
+    let remote_child = BoxId::new();
+    let bound = store
+        .attach_child_box(attach(remote_child, ids::BOX, remote.id))
+        .await
+        .expect(CASE);
+    assert_eq!(bound.child.kind, BoxKind::Container, "{CASE}");
+    assert_eq!(bound.target.box_id, Some(remote_child), "{CASE}");
+    let mut listed_ids: Vec<BoxId> = store
+        .boxes()
+        .await
+        .expect(CASE)
+        .into_iter()
+        .map(|record| record.row.id)
+        .collect();
+    listed_ids.sort_unstable();
+    let mut want = vec![ids::BOX, child, remote_child];
+    want.sort_unstable();
+    assert_eq!(listed_ids, want, "{CASE}: the machine and its two children");
 }
 
 #[cfg(test)]

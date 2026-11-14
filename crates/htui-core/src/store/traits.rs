@@ -2923,6 +2923,66 @@ pub trait WriteStore: ReadStore {
         step: StepId,
         new: NewRunMemory,
     ) -> Result<RunMemoryWrite>;
+
+    // ---- MOD-130 M1: execution targets (P4, P6, P9, blueprint B2, B10) -------------------------
+
+    /// Creates a target, unbound (MOD-130 M1, P4), with both stamps equal. Decided in this order,
+    /// before anything is written:
+    ///
+    /// 1. a `local` kind is [`target_built_in`] (D2);
+    /// 2. [`target_name_refusal`](crate::model::target_name_refusal);
+    /// 3. [`locator_refusal`](crate::model::locator_refusal);
+    /// 4. a stored `id`, the local target's included, is [`already_exists`] (blueprint B2);
+    /// 5. a stored name is [`target_name_taken`].
+    ///
+    /// # Errors
+    /// The refusals above as [`StoreError::Constraint`](crate::store::StoreError::Constraint),
+    /// and the backend's own failures.
+    async fn create_target(&self, new: crate::model::NewTarget) -> Result<crate::model::Target>;
+
+    /// Renames a target or replaces its locator under compare-and-set on `updated_at` (MOD-130
+    /// M1, P6). A retired target can be edited. Decided in this order:
+    ///
+    /// 1. an unknown id is `NotFound { entity: "target" }`;
+    /// 2. the local target is [`target_built_in`] (D2);
+    /// 3. the name and locator refusals of [`create_target`](Self::create_target);
+    /// 4. `expected` other than the row's `updated_at` is `Stale(current)`;
+    /// 5. a name another target holds is [`target_name_taken`].
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn edit_target(
+        &self,
+        id: crate::model::TargetId,
+        expected: DateTime<Utc>,
+        edit: crate::model::TargetEdit,
+    ) -> Result<CasOutcome<crate::model::Target>>;
+
+    /// Registers a container box under a machine and binds it to a `docker` or `ssh_docker`
+    /// target (MOD-130 M1, P4, P5, blueprint B10). The child is inserted with the parent's user,
+    /// `new.hostname`, no `os_family`, empty `os_version`, `arch` and `htui_version`, no tags and
+    /// `edit_version` 0, unless it exists; the target's `box_id` is set unless it already is the
+    /// child. A repeat answers the same pair and writes nothing. Decided in this order:
+    ///
+    /// 0. a blank hostname is [`box_hostname_is_blank`], a NUL in it [`has_nul`]`("box.hostname")`;
+    /// 1. an unknown target is `NotFound { entity: "target" }`;
+    /// 2. a retired target is [`target_retired`];
+    /// 3. a kind other than `docker` and `ssh_docker` is [`target_takes_no_container`];
+    /// 4. an unknown parent is [`references_no_row`]`("box.parent_box_id", parent, "box")`;
+    /// 5. a container parent is [`child_box_needs_a_machine`];
+    /// 6. a stored `id` that is not a container of `parent` is [`box_not_a_child_of`];
+    /// 7. a child another target is bound to is [`box_bound_to_other_target`];
+    /// 8. a target bound to another box is [`target_bound_elsewhere`].
+    ///
+    /// Postgres runs it in one transaction that locks the target row `FOR UPDATE` before step 2
+    /// and the child row before step 7.
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn attach_child_box(
+        &self,
+        new: crate::model::NewChildBox,
+    ) -> Result<crate::model::AttachedBox>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -4269,6 +4329,64 @@ pub fn target_name_refused(name: &str) -> String {
 #[must_use]
 pub fn target_locator_refused(why: &str) -> String {
     format!("a target locator holds names and addresses, never secrets: {why}")
+}
+
+/// MOD-130 M1 P9 (D2): the seeded `local` target, or a `local` kind, refused by every writer.
+#[must_use]
+pub fn target_built_in() -> String {
+    "the local target is built in; it cannot be created, edited, retired or deleted".to_owned()
+}
+
+/// MOD-130 M1 P9 (blueprint B4): `uq_target_name`, in the house form of a unique name, decided
+/// in code before the statement on both stores.
+#[must_use]
+pub fn target_name_taken(name: &str) -> String {
+    format!("target.name `{name}` is taken")
+}
+
+/// MOD-130 M1 P9 (D14): a retired target takes no new binding or level.
+#[must_use]
+pub fn target_retired(name: &str) -> String {
+    format!("target {name} is retired")
+}
+
+/// MOD-130 M1 P9 (blueprint B10): only a `docker` or `ssh_docker` target runs in a container,
+/// so only one of them takes a child box.
+#[must_use]
+pub fn target_takes_no_container(name: &str, kind: crate::model::TargetKind) -> String {
+    format!("only a docker or ssh_docker target takes a container box; {name} is {kind}")
+}
+
+/// MOD-130 M1 P9: a target is bound to one box; a second box is refused, never swapped in.
+#[must_use]
+pub fn target_bound_elsewhere(name: &str, other: BoxId) -> String {
+    format!("target {name} is bound to box {other}")
+}
+
+/// MOD-130 M1 (blueprint B10): one target per container box, so two targets never share and
+/// overwrite one probe.
+#[must_use]
+pub fn box_bound_to_other_target(child: BoxId, other_name: &str) -> String {
+    format!("box {child} is bound to target {other_name}")
+}
+
+/// MOD-130 M1 P9 (D12): a container is a child of a machine, never of another container.
+#[must_use]
+pub fn child_box_needs_a_machine(parent: BoxId) -> String {
+    format!("box {parent} is a container; a child box needs a machine parent")
+}
+
+/// MOD-130 M1 P9 (D12): a child box id that is stored as something else than a container of
+/// this parent.
+#[must_use]
+pub fn box_not_a_child_of(child: BoxId, parent: BoxId) -> String {
+    format!("box {child} exists and is not a container of box {parent}")
+}
+
+/// MOD-130 M1 (blueprint B4): a child box needs a hostname, decided before any read.
+#[must_use]
+pub fn box_hostname_is_blank() -> String {
+    "box.hostname must not be blank".to_owned()
 }
 
 /// MOD-150 M3 D3: how a [`DocumentRef`] is named in a refusal: `"{owner} {kind}"`, plus

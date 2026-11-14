@@ -156,6 +156,54 @@ impl Target {
     }
 }
 
+/// A target to create (MOD-130 M1, P4): never `local`, and never bound to a box here, since only
+/// [`attach_child_box`](crate::store::WriteStore::attach_child_box) binds one in M1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewTarget {
+    /// `target.id`, minted by the caller.
+    pub id: TargetId,
+    /// `target.name`: 1-64 characters, unique, stored as given (blueprint B4).
+    pub name: String,
+    /// `target.kind`: any but `local` (D2).
+    pub kind: TargetKind,
+    /// `target.locator`: a JSON object of names and addresses, never secrets.
+    pub locator: Value,
+}
+
+/// An edit of a target (MOD-130 M1, P6): `None` keeps the column. The kind and the box are
+/// never edited.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TargetEdit {
+    /// A new `target.name`.
+    pub name: Option<String>,
+    /// A new `target.locator`.
+    pub locator: Option<Value>,
+}
+
+/// A container box to register under a machine and bind to a `docker` or `ssh_docker` target
+/// (MOD-130 M1, P4, P5, blueprint B10).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewChildBox {
+    /// The child's `box.id`, minted by the caller.
+    pub id: BoxId,
+    /// `box.parent_box_id`: the machine the container runs on.
+    pub parent: BoxId,
+    /// The child's `box.hostname`.
+    pub hostname: String,
+    /// The target the child is bound to.
+    pub target: TargetId,
+}
+
+/// What [`attach_child_box`](crate::store::WriteStore::attach_child_box) answers (MOD-130 M1):
+/// the child box as stored and the target as bound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachedBox {
+    /// The child `box` row.
+    pub child: BoxRow,
+    /// The `target` row, its `box_id` the child's.
+    pub target: Target,
+}
+
 /// Why `name` cannot be a target name (MOD-130 M1, P9, blueprint B4), or `None`: 1-64 chars, no
 /// control character, and no leading or trailing whitespace. The name is stored as given.
 #[must_use]
