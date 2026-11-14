@@ -654,8 +654,8 @@ fn rows(count: i64) -> u64 {
     u64::try_from(count).unwrap_or(0)
 }
 
-/// How many times the two delete paths re-run their whole transaction after a `40001` before they
-/// give up and refuse (review M1).
+/// How many times the two delete paths re-run their whole transaction after a `40001` (or, since
+/// MOD-122 M3 R1 L1, a `40P01`) before they give up and refuse (review M1).
 ///
 /// Three rather than one because a retry is cheap — the transaction holds no lock it has not just
 /// taken — and rather than unbounded because a project under a steady stream of writes would
@@ -690,14 +690,66 @@ async fn begin_repeatable_read(
     Ok(tx)
 }
 
-/// Whether a driver error is `40001`, *serialization failure*: the one outcome [`DELETE_ATTEMPTS`]
-/// retries.
+/// Whether a driver error is `40001`, *serialization failure*, or `40P01`, *deadlock detected*:
+/// the outcomes [`DELETE_ATTEMPTS`] retries. A deadlock aborts the whole transaction, and the
+/// delete paths count and delete in one, so a repeat is as safe as after a `40001` (MOD-122 M3
+/// review R1 L1: [`lock_activity_sources`] takes its rows in one order, but a transition that
+/// locks two rows of one table in another order can still close a cycle with it).
 ///
 /// Not folded into [`map_sqlx`], which would turn a retryable answer into the same
 /// [`StoreError::Backend`] every other class-`40` failure gets: only the two delete paths open a
 /// transaction that can raise it, and only they know the work is safe to repeat.
 fn is_serialization_failure(err: &sqlx::Error) -> bool {
-    matches!(err, sqlx::Error::Database(db) if db.code().is_some_and(|code| code == "40001"))
+    matches!(
+        err,
+        sqlx::Error::Database(db) if db.code().is_some_and(|code| code == "40001" || code == "40P01")
+    )
+}
+
+/// MOD-122 M3 review R1 L1: locks, `FOR UPDATE`, every row whose status move writes an activity
+/// event that names a project of `projects` or the workspace `workspace`, before the delete
+/// path's `DELETE` takes the parent row.
+///
+/// The activity triggers are deferred: a transition holds its `run_step`, `run` or `item` row
+/// until commit, and only then does the trigger's `INSERT INTO activity_event` take
+/// `FOR KEY SHARE` on the event's `project` and `workspace`. A delete that took the parent first
+/// would hold it while its cascade (or `run.workspace_id`'s `SET NULL`) waited on that child: a
+/// cycle. Locked first, the delete waits for the transition instead; at `REPEATABLE READ` a row
+/// the transition moved then raises `40001`, which [`DELETE_ATTEMPTS`] retries, and the next
+/// attempt counts the event too. A `step_permission` insert holds `FOR KEY SHARE` on its step,
+/// which the step's lock waits for.
+///
+/// The order is `park_step`'s, step, then run, then item (MOD-77 plan D1), so a transition that
+/// takes them in that order cannot close a cycle with this one.
+async fn lock_activity_sources(
+    conn: &mut PgConnection,
+    projects: &[Uuid],
+    workspace: Option<Uuid>,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query!(
+        "SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+          WHERE r.project_id = ANY($1) OR r.workspace_id = $2 \
+          ORDER BY s.id FOR UPDATE OF s",
+        projects,
+        workspace,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    sqlx::query!(
+        "SELECT id FROM run WHERE project_id = ANY($1) OR workspace_id = $2 \
+          ORDER BY id FOR UPDATE",
+        projects,
+        workspace,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    sqlx::query!(
+        "SELECT id FROM item WHERE project_id = ANY($1) ORDER BY id FOR UPDATE",
+        projects,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// What a workspace delete reaches: its links and its box paths, and no project
@@ -11725,6 +11777,25 @@ impl PgStore {
                 rows(held),
             )));
         }
+        // MOD-122 M3 review R1 L1: the event sources of every project whose events can name
+        // this workspace (its members, its scope row) and of every run that recorded it, locked
+        // before either `DELETE` takes a parent row.
+        let members = sqlx::query_scalar!(
+            r#"
+            SELECT project_id AS "project_id!" FROM workspace_project WHERE workspace_id = $1
+            UNION
+            SELECT id FROM project WHERE owner_workspace_id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        match lock_activity_sources(&mut tx, &members, Some(id.as_uuid())).await {
+            Ok(()) => {}
+            Err(err) if is_serialization_failure(&err) => return Ok(None),
+            Err(err) => return Err(map_sqlx(err)),
+        }
         if let Some(scope) = scope_row_id(&mut *tx, id).await? {
             release_repo_references(&mut tx, scope).await?;
             // MOD-147 D7: the scope row goes first. Its kinds and items may hold the workspace's
@@ -11785,6 +11856,13 @@ impl PgStore {
             });
         };
         release_repo_references(&mut tx, id).await?;
+        // MOD-122 M3 review R1 L1: the event sources first, so the delete waits for a transition
+        // rather than holding the project its deferred trigger needs at commit.
+        match lock_activity_sources(&mut tx, &[id.as_uuid()], None).await {
+            Ok(()) => {}
+            Err(err) if is_serialization_failure(&err) => return Ok(None),
+            Err(err) => return Err(map_sqlx(err)),
+        }
         match sqlx::query!("DELETE FROM project WHERE id = $1", id.as_uuid())
             .execute(&mut *tx)
             .await

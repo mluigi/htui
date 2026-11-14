@@ -3,7 +3,8 @@
 //! generic case cannot plant is here, with raw SQL: explicit transactions that move a row more
 //! than once before commit (the deferred triggers), raw deletes of an item and of a free chat,
 //! the workspace attribution, the kind `CHECK`, another user's rows, a run that finishes over a
-//! `closed` item, and a workspace delete.
+//! `closed` item, a workspace delete, and (review R1 L1) a project or workspace delete beside a
+//! transition still open on a second connection.
 //!
 //! Every case creates and drops its own database; with `HTUI_TEST_DATABASE_URL` unset each one
 //! prints `common::SKIP` and passes.
@@ -863,6 +864,165 @@ async fn the_pinned_query_can_use_the_partial_index() {
         "the pinned read names the partial index: {plan}"
     );
     drop(conn);
+
+    db.drop_db().await;
+}
+
+/// The server's `deadlock_timeout` plus half a second: a transition that waits this long before
+/// its commit lets the delete's own deadlock check pass first, so a cycle closed at the commit is
+/// the transition's to detect, and the transition (not the retrying delete) is the one aborted.
+async fn past_the_deadlock_check(pool: &PgPool) -> std::time::Duration {
+    let millis: i32 =
+        sqlx::query_scalar("SELECT setting::int FROM pg_settings WHERE name = 'deadlock_timeout'")
+            .fetch_one(pool)
+            .await
+            .expect("read deadlock_timeout");
+    let millis = u64::try_from(millis).expect("a positive timeout");
+    std::time::Duration::from_millis(millis + 500)
+}
+
+/// Review R1 L1: `sql` (one status move of row `id`, whose deferred trigger writes an event about
+/// a row `delete` removes) runs in an open transaction; `delete` starts beside it, and the
+/// transition commits after [`past_the_deadlock_check`]. Both must succeed: the delete locks the
+/// event sources before the parent, waits for the commit, and retries the `40001` it then meets.
+async fn commit_beside<T>(
+    pool: &PgPool,
+    sql: &'static str,
+    id: Uuid,
+    delete: impl Future<Output = htui_core::store::Result<T>>,
+) -> T {
+    let pause = past_the_deadlock_check(pool).await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(sql)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"));
+    let (deleted, committed) = tokio::join!(delete, async {
+        tokio::time::sleep(pause).await;
+        tx.commit().await
+    });
+    committed.expect("the transition commits: its trigger never deadlocks against the delete");
+    deleted.expect("the delete waits for the transition, then retries")
+}
+
+/// Review R1 L1: an item blocked in an open transaction while its project is deleted. Before the
+/// fix the delete held the project row, its cascade waited on the item, and the item's deferred
+/// trigger needed `FOR KEY SHARE` on the project at commit: a deadlock.
+#[tokio::test]
+async fn a_project_delete_beside_an_item_transition_does_not_deadlock() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let me = db.store.this_user();
+    let item = plant_item(
+        &db.pool,
+        me,
+        (ids::PROJECT_HTUI, ids::KIND_HTUI_ANA, "ANA"),
+        10,
+    )
+    .await;
+
+    commit_beside(
+        &db.pool,
+        "UPDATE item SET status = 'blocked' WHERE id = $1",
+        item.as_uuid(),
+        db.store.delete_project(ids::PROJECT_HTUI),
+    )
+    .await;
+
+    assert_eq!(
+        kinds(&db.pool).await,
+        Vec::<String>::new(),
+        "the unblock went with its item"
+    );
+
+    db.drop_db().await;
+}
+
+/// Review R1 L1, the step's half: a step parked in an open transaction while its project is
+/// deleted. The cascade reaches the step through the run, so the step is locked too.
+#[tokio::test]
+async fn a_project_delete_beside_a_step_transition_does_not_deadlock() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let me = db.store.this_user();
+    let item = plant_item(
+        &db.pool,
+        me,
+        (ids::PROJECT_HTUI, ids::KIND_HTUI_ANA, "ANA"),
+        11,
+    )
+    .await;
+    let run = plant_run(&db.pool, &RunSpec::graph(item, me), "running").await;
+    let step = plant_step(&db.pool, run, 0, "implement", "running").await;
+
+    commit_beside(
+        &db.pool,
+        "UPDATE run_step SET status = 'awaiting_approval' WHERE id = $1",
+        step.as_uuid(),
+        db.store.delete_project(ids::PROJECT_HTUI),
+    )
+    .await;
+
+    assert_eq!(
+        kinds(&db.pool).await,
+        Vec::<String>::new(),
+        "the gate went with its run"
+    );
+
+    db.drop_db().await;
+}
+
+/// Review R1 L1, the workspace's half: a run that recorded a workspace fails in an open
+/// transaction while that workspace is deleted. The delete's `SET NULL` on `run.workspace_id`
+/// waited on the run, and the run's trigger needed `FOR KEY SHARE` on the workspace at commit.
+#[tokio::test]
+async fn a_workspace_delete_beside_a_run_transition_does_not_deadlock() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let me = db.store.this_user();
+    let item = plant_item(
+        &db.pool,
+        me,
+        (ids::PROJECT_HTUI, ids::KIND_HTUI_ANA, "ANA"),
+        12,
+    )
+    .await;
+    let scratch = WorkspaceId::new();
+    sqlx::query(
+        "INSERT INTO workspace (id, slug, name, created_by) VALUES ($1, 'scratch', 'Scratch', $2)",
+    )
+    .bind(scratch.as_uuid())
+    .bind(me.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant a workspace");
+    let recorded = RunSpec {
+        workspace: Some(scratch),
+        ..RunSpec::graph(item, me)
+    };
+    let run = plant_run(&db.pool, &recorded, "running").await;
+
+    commit_beside(
+        &db.pool,
+        "UPDATE run SET status = 'failed' WHERE id = $1",
+        run.as_uuid(),
+        db.store.delete_workspace(scratch),
+    )
+    .await;
+
+    assert_eq!(
+        every_row(&db.pool)
+            .await
+            .iter()
+            .map(|row| (row.kind.as_str(), row.workspace, row.run))
+            .collect::<Vec<_>>(),
+        [("run_failed", None, Some(run.as_uuid()))],
+        "the failure stays, its workspace gone with the workspace"
+    );
 
     db.drop_db().await;
 }
