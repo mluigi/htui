@@ -1,7 +1,9 @@
-# htui from scripts: `status`, `waiting` and `--search-items --json`
+# htui from scripts: `status`, `waiting`, `--search-items --json`, `stop` and `resume`
 
 Three commands let a script, a status bar or another tool read htui's state without starting the
-TUI. Each one reads, prints one answer and exits:
+TUI, and two more stop and resume a workspace's runs from a shell (see
+[Stopping and resuming a workspace](#stopping-and-resuming-a-workspace)). Each of the three
+reading commands reads, prints one answer and exits:
 
 - `htui status` prints the top bar's facts: the store's state, the workspace, this box, and how
   many runs are working and how many rows wait on you.
@@ -29,6 +31,7 @@ machine. See [No writes](#no-writes).
 - [Versioning](#versioning)
 - [No writes](#no-writes)
 - [Setting the Qdrant URL and API key](#setting-the-qdrant-url-and-api-key)
+- [Stopping and resuming a workspace](#stopping-and-resuming-a-workspace)
 - [Credentials and crash reports](#credentials-and-crash-reports)
 - [Text output](#text-output)
 
@@ -42,6 +45,8 @@ Claude Code session.
 | `htui status` | `--json`, `--project <SLUG>` or `--cwd <PATH>`, `--log <PATH>` |
 | `htui waiting` | `--json`, `--project <SLUG>` or `--cwd <PATH>`, `--log <PATH>` |
 | `htui --search-items <QUERY>` | `--json`, `--project <SLUG>` or `--cwd <PATH>`, `--decisions`, `--limit <N>`, `--log <PATH>` |
+| `htui stop <WORKSPACE>` | `--force`, `--yes` (`-y`), `--log <PATH>`. Writes: see [Stopping and resuming a workspace](#stopping-and-resuming-a-workspace) |
+| `htui resume <WORKSPACE>` | `--yes` (`-y`), `--log <PATH>`. Writes: see [Stopping and resuming a workspace](#stopping-and-resuming-a-workspace) |
 
 - **`--json`** prints one versioned JSON document instead of text. Without it, the same answer is
   printed as text (see [Text output](#text-output)) and the exit codes are the same.
@@ -514,6 +519,92 @@ database, the next time each searches or indexes. The API key stays in each box'
 
 Each line on standard error starts with `htui: ` when the flag fails. Exits 2 and 3 are never sent
 to htui's crash reporter.
+
+## Stopping and resuming a workspace
+
+`htui stop <WORKSPACE>` stops every run in a workspace, and `htui resume <WORKSPACE>` lets them go
+on (`R-ORCH-16`). `<WORKSPACE>` is the workspace's slug, matched exactly; an unknown slug is
+refused and the refusal lists the slugs there are. Unlike the three reading commands, these two
+write: they connect to Postgres as the Qdrant URL flags do (the DSN in the OS keyring, `box.toml`
+created on a first run, a pending migration or a database newer than this build refused, never
+migrated).
+
+**What a stop does.** A stop is one record on the workspace; each box running one of its runs
+applies it at its next command poll, and no run of the workspace starts while it stands.
+
+- **Graceful** (the default): each agent step stops at its turn boundary and keeps its session;
+  checks and htui's own steps stop at once.
+- **Forced** (`--force`): every step is killed mid-turn and redoes that turn when it resumes.
+  `--force` on a workspace already stopped gracefully escalates the stop. A graceful request never
+  downgrades a forced stop.
+
+Asking again for a stop that is already in force (graceful over graceful, anything over forced)
+writes nothing and asks nothing: it prints `workspace <slug> is already stopped (<mode>)` and the
+report, plus `a graceful stop does not downgrade a forced one` for a graceful request over a forced
+stop. That is also how you look at a stop again later.
+
+**What a resume does.** It removes the record. Each stopped run resumes on the box that ran it, at
+that box's next command poll; a box that is down resumes its runs when it comes back. Queued runs
+can start again. A resume of a workspace that is not stopped writes nothing and asks nothing: it
+prints `workspace <slug> is not stopped` and the report, which still lists any stopped run.
+
+**The question.** Before it writes, each command prints the report as it stands on standard
+output and asks one question on standard error, such as:
+
+```
+Stop workspace `graphics` gracefully? Each agent step stops at its turn boundary, checks stop at once; nothing new starts until `htui resume graphics`. [y/N]
+```
+
+`y` or `yes` (any case) confirms; anything else, an empty line or the end of input declines, and
+nothing is written. `--yes` (`-y`) answers it without asking. Without a terminal on standard input,
+a command that would write needs `--yes`: it is refused before anything is printed or written.
+
+**The wait.** After writing a stop, `htui stop` waits up to 20 seconds for the workspace's running
+runs to stop, saying `waiting for <n> running runs to stop…` once on standard error. A graceful
+stop settles within a few seconds and one command poll. If the wait runs out, it prints the report
+as it stands and `still stopping; run htui stop <slug> again to see it settle`, and exits 0. Ctrl-C
+during the wait is harmless: the stop is already recorded. `htui resume` does not wait.
+
+**The report** goes to standard output, a header and one line per run that is not finished, oldest
+first:
+
+```
+workspace graphics: stopped (graceful, requested 2026-11-14 10:02 UTC)
+  GFX-3  0193a1b2  stopped on DESKTOP-HTUI  resumes: implement reopens its agent session
+  GFX-4  0193a1c4  stopped on build-box     resumes: review starts a fresh session with the handoff
+  GFX-5  0193a1d0  stopped, no box          cannot be resumed: cancel it from the Runs pane
+  GFX-6  0193a1e9  running on build-box     stopping
+  GFX-7  0193a1f3  queued                   starts when the workspace is resumed
+  GFX-8  0193a201  awaiting approval        its gate can be answered once resumed
+checks rerun after each resumed step
+once resumed, each box resumes its stopped runs at its next command poll
+```
+
+- The header's state is `not stopped`, `stopping` (stopped, and a run is still running) or
+  `stopped`, with the stop's mode and when it was requested.
+- Each line names the item's key (`-` for a run without an item), the run id's first 8 hex digits,
+  the run's state and its box (the box's hostname as your boxes list it, else its id).
+- A stopped run says how each of its stopped steps resumes: `<phase> reopens its agent session`
+  (the step's own session, when its agent can resume one), `<phase> starts a fresh session with the
+  handoff` (a summary of what it did so far), or `<phase> runs again from its start` (a step that
+  had not started a session, and a judge). A stopped run with no stopped step `continues from where
+  it stopped`. Checks always rerun after a resumed step.
+- A stopped run with no box can never be resumed: cancel it from the Runs pane.
+- Whether a box is online is not checked: a line names the box, and that box resumes the run at
+  its next command poll.
+- A workspace with no unfinished run prints `no runs in this workspace`.
+- After a resume the report follows
+  `resume requested: each box resumes its stopped runs at its next command poll`.
+
+| Ending | Exit |
+|---|---|
+| Stopped, resumed, or nothing to write and the state printed (the wait running out included) | 0 |
+| Refused: no DSN, the keyring, `box.toml`, the schema, an unknown slug, `not confirmed; nothing was stopped` (`… resumed`), `needs confirmation: pass --yes, or run it in a terminal; nothing was stopped` (`… resumed`), or `workspace <slug> no longer exists` | 2 |
+| Postgres did not answer: `cannot reach Postgres: ...` | 3 |
+| Anything else: `the workspace could not be stopped: ...` (`resumed`, `read`) | 1 |
+
+The question and the wait line go to standard error; a refusal is printed there after `htui: `.
+Exits 2 and 3 are never sent to htui's crash reporter.
 
 ## Credentials and crash reports
 
