@@ -245,6 +245,31 @@ async fn pg_store_indexer_lease_conformance() {
     }
 }
 
+/// MOD-159 M2's change read suite (`INDEX_CHANGES_CASES`, plan D3, D4) run against `PgStore`.
+///
+/// A fifth loop for `pg_store_indexer_lease_conformance`'s reason: `run_index_changes_case` is
+/// bound to `WriteStore + IndexChangesStore`, a narrow trait only the two stores implement. Every
+/// case writes, so each gets its own database, boxed as `pg_store_conformance`'s are (MOD-137).
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_index_changes_conformance() {
+    use htui_core::store::conformance;
+
+    assert_eq!(
+        conformance::INDEX_CHANGES_CASES.len(),
+        7,
+        "MOD-159 M2's seven change-read cases, as `mem_store.rs` pins them"
+    );
+    for name in conformance::INDEX_CHANGES_CASES {
+        let Some(db) = Box::pin(common::demo_db()).await else {
+            return; // `common` printed the skip line already (plan D13).
+        };
+        println!("index changes case {name}");
+        conformance::run_index_changes_case(name, &db.store).await;
+        db.drop_db().await;
+    }
+}
+
 /// MOD-159 M1 plan D3 (review R1): eight takes of one collection at once, by distinct owners on
 /// one shared box or boxes of their own, have exactly one winner, on a collection with no row
 /// (the `INSERT ... ON CONFLICT` race) and on one lapsed under another owner (the `UPDATE` race,
