@@ -239,6 +239,7 @@ async fn concurrent_requirement_mints_produce_consecutive_numbers() {
             priority: Priority::Must,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
+            refines_id: None,
         };
         async move { store.mint_requirement(ids::AREA_ENT, new).await }
     }))
@@ -246,7 +247,12 @@ async fn concurrent_requirement_mints_produce_consecutive_numbers() {
 
     let mut numbers: Vec<i32> = mints
         .into_iter()
-        .map(|minted| minted.expect("every mint lands").number)
+        .map(|minted| {
+            minted
+                .expect("every mint lands")
+                .number
+                .expect("a top-level mint has a number")
+        })
         .collect();
     numbers.sort_unstable();
     assert_eq!(
@@ -264,6 +270,58 @@ async fn concurrent_requirement_mints_produce_consecutive_numbers() {
     .await
     .expect("read requirement_key_counter");
     assert_eq!(last, 102, "the counter ends at the highest number minted");
+
+    db.drop_db().await;
+}
+
+/// MOD-149 plan D5: two pools nesting under one parent at once take `.1` and `.2`. The first
+/// mint inserts the `requirement_child_counter` row and the second takes its `DO UPDATE` branch,
+/// so neither sees `23505` on the counter's primary key or on `uq_requirement_child`.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_children_take_distinct_numbers() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let left = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let right = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("third pool")
+        .store;
+
+    let mints = join_all([&left, &right].into_iter().enumerate().map(|(n, store)| {
+        let new = NewRequirement {
+            id: RequirementId::new(),
+            body: format!("child {n}"),
+            rationale: String::new(),
+            priority: Priority::Must,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+            refines_id: Some(ids::REQ_ENT_1),
+        };
+        async move { store.mint_requirement(ids::AREA_ENT, new).await }
+    }))
+    .await;
+
+    let mut keys: Vec<(String, Option<i32>, Option<i32>)> = mints
+        .into_iter()
+        .map(|minted| {
+            let row = minted.expect("every nested mint lands, neither on 23505");
+            (row.key, row.number, row.child_number)
+        })
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            ("R-ENT-1.1".to_owned(), None, Some(1)),
+            ("R-ENT-1.2".to_owned(), None, Some(2)),
+        ],
+        "two concurrent children of R-ENT-1 take .1 and .2"
+    );
 
     db.drop_db().await;
 }
@@ -3330,19 +3388,36 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
     .execute(&db.pool)
     .await
     .expect("seed a run_plan");
+    // MOD-149 plan D5: one nested child of `R-ENT-1`, so `requirement_child_counters` below is 1
+    // rather than `0 == 0`.
+    db.store
+        .mint_requirement(
+            ids::AREA_ENT,
+            NewRequirement {
+                id: RequirementId::new(),
+                body: "A nested child goes with its parent.".to_owned(),
+                rationale: String::new(),
+                priority: Priority::Must,
+                created_by: ids::USER,
+                box_id: None,
+                refines_id: Some(ids::REQ_ENT_1),
+            },
+        )
+        .await
+        .expect("seed a nested requirement");
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Thirty-one entries for thirty-one fields: a field added without an entry leaves the struct
+    /// Thirty-two entries for thirty-two fields: a field added without an entry leaves the struct
     /// literal below incomplete and the crate does not compile. MOD-38's six requirement tables
-    /// follow, in `DeleteReach` field order, then MOD-163's two memory tables (plan D8), and
-    /// MOD-139's `run_plan` closes it.
+    /// follow, in `DeleteReach` field order with MOD-149's `requirement_child_counter` after the
+    /// key counter, then MOD-163's two memory tables (plan D8), and MOD-139's `run_plan` closes it.
     ///
     /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
     /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
     /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
     /// comparing every later field against the wrong table (T1 audit A-3).
-    const TABLES: [&str; 31] = [
+    const TABLES: [&str; 32] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -3368,6 +3443,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "requirement_spec",
         "requirement_area",
         "requirement_key_counter",
+        "requirement_child_counter",
         "requirement",
         "requirement_revision",
         "item_requirement",
@@ -3416,6 +3492,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         requirement_specs,
         requirement_areas,
         requirement_key_counters,
+        requirement_child_counters,
         requirements,
         requirement_revisions,
         item_requirements,
@@ -3423,7 +3500,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         memory_revisions,
         run_plans,
     } = report;
-    let claimed: [u64; 31] = [
+    let claimed: [u64; 32] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -3449,6 +3526,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         requirement_specs,
         requirement_areas,
         requirement_key_counters,
+        requirement_child_counters,
         requirements,
         requirement_revisions,
         item_requirements,
@@ -3479,9 +3557,10 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
             repo_box_paths,
             memory_entries,
             memory_revisions,
-            run_plans
-        ) == (1, 1, 1, 1, 1, 1, 2, 1),
-        "the nine seeded tables are non-zero, so none of them passed on `0 == 0`"
+            run_plans,
+            requirement_child_counters
+        ) == (1, 1, 1, 1, 1, 1, 2, 1, 1),
+        "the ten seeded tables are non-zero, so none of them passed on `0 == 0`"
     );
 
     db.drop_db().await;

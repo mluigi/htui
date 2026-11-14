@@ -22,7 +22,7 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 54 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 55 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
@@ -31,7 +31,8 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `0021_project_type.sql` (MOD-146 plan D1), then the two of `0022_memory.sql` (MOD-163 plan D1),
 /// then the one of `0029_divided_fanout.sql` (MOD-139 plan D1), then the one of
 /// `0031_command_log.sql` (MOD-152 plan D1).
-/// `0032_worker_log.sql` (MOD-122 M2 plan D1).
+/// `0032_worker_log.sql` (MOD-122 M2 plan D1), then the one of `0034_requirement_keys.sql`
+/// (MOD-149 plan D1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -100,6 +101,8 @@ const TABLES: &[&str] = &[
     "command_log",
     // 0032_worker_log.sql (MOD-122)
     "worker_log",
+    // 0034_requirement_keys.sql (MOD-149)
+    "requirement_child_counter",
 ];
 
 #[tokio::test]
@@ -122,7 +125,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -137,8 +140,9 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-144's 0024_item_status.sql, MOD-138 M2's 0025_run_step_branch.sql, MOD-147's \
          0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql, MOD-97's \
          0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql, MOD-150's \
-         0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql
-         and MOD-164's 0033_memory_capture.sql, in ordinal order"
+         0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql, \
+         MOD-164's 0033_memory_capture.sql and MOD-149's 0034_requirement_keys.sql, in ordinal \
+         order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -156,7 +160,7 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        54,
+        55,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
@@ -166,19 +170,21 @@ async fn migrations_apply_on_a_clean_database() {
          project_type and MOD-163's 0022_memory.sql adds memory_entry and \
          memory_entry_revision and MOD-139's 0029_divided_fanout.sql adds run_plan and MOD-152's \
          0031_command_log.sql adds command_log and MOD-122's \
-         0032_worker_log.sql adds worker_log"
+         0032_worker_log.sql adds worker_log and MOD-149's 0034_requirement_keys.sql adds \
+         requirement_child_counter"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 54 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 55 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
          0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
          and MOD-146's 0021_project_type.sql (project_type) and MOD-163's 0022_memory.sql \
          (memory_entry, memory_entry_revision) and MOD-139's 0029_divided_fanout.sql \
          (run_plan) and MOD-152's 0031_command_log.sql (command_log) and MOD-122's \
-         0032_worker_log.sql (worker_log) and nothing else, \
+         0032_worker_log.sql (worker_log) and MOD-149's 0034_requirement_keys.sql \
+         (requirement_child_counter) and nothing else, \
          got {present:?}"
     );
 
@@ -4253,8 +4259,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(33),
-        "thirty-three embedded migrations, none applied (through MOD-164's 0033_memory_capture.sql)"
+        MigrationState::Pending(34),
+        "thirty-four embedded migrations, none applied (through MOD-149's 0034_requirement_keys.sql)"
     );
 
     db.drop_db().await;
@@ -4354,8 +4360,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(33),
-        "thirty-three embedded migrations, through MOD-164's 0033_memory_capture.sql"
+        MigrationState::Pending(34),
+        "thirty-four embedded migrations, through MOD-149's 0034_requirement_keys.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4363,8 +4369,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(33),
-        "every one of the thirty-three, through MOD-164's 0033_memory_capture.sql, is pending"
+        HeadlessError::MigrationsPending(34),
+        "every one of the thirty-four, through MOD-149's 0034_requirement_keys.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4386,8 +4392,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(33),
-        "every one of the thirty-three, through MOD-164's 0033_memory_capture.sql, is pending"
+        HeadlessError::MigrationsPending(34),
+        "every one of the thirty-four, through MOD-149's 0034_requirement_keys.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4538,8 +4544,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        33,
-        "the later applies migrate nothing: the thirty-three embedded migrations (through MOD-164's 0033_memory_capture.sql) are applied once"
+        34,
+        "the later applies migrate nothing: the thirty-four embedded migrations (through MOD-149's 0034_requirement_keys.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -7801,6 +7807,309 @@ async fn bootstrap_gives_every_existing_workspace_one_scope_row() {
             assert_eq!(members, 0, "{pass} pass: a scope row joins no workspace");
         }
     }
+
+    db.drop_db().await;
+}
+
+/// MOD-149: a `requirement_area` row, raw-inserted.
+async fn insert_requirement_area(
+    pool: &sqlx::PgPool,
+    project: uuid::Uuid,
+    code: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO requirement_area (id, project_id, code, title) VALUES ($1, $2, $3, $3)",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(code)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|err| panic!("insert requirement_area {code}: {err}"));
+    id
+}
+
+/// MOD-149: a `requirement` row in the 0034 shape (`key` written, `number` or `child_number`),
+/// raw-inserted. The result is the statement's, so a refusal can be asserted.
+#[allow(clippy::too_many_arguments)]
+async fn try_requirement(
+    pool: &sqlx::PgPool,
+    project: uuid::Uuid,
+    area: uuid::Uuid,
+    code: &str,
+    number: Option<i32>,
+    key: &str,
+    refines: Option<uuid::Uuid>,
+    child_number: Option<i32>,
+    user: uuid::Uuid,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO requirement (id, project_id, area_id, area_code, number, key, refines_id, \
+                                  child_number, body, priority, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'b', 'must', $9)",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(area)
+    .bind(code)
+    .bind(number)
+    .bind(key)
+    .bind(refines)
+    .bind(child_number)
+    .bind(user)
+    .execute(pool)
+    .await
+    .map(|_| id)
+}
+
+/// MOD-149 plan D1: 0034 turns `requirement.key` into a stored column, keeping every value, and
+/// re-letters a workspace scope row's keys `W-`; `number` becomes nullable beside the new
+/// `refines_id` and `child_number`, and `requirement_child_counter` is created. Staged at v33, as
+/// on a real box.
+#[tokio::test]
+async fn migration_0034_stores_keys_and_letters_scope_rows() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(33, &db.pool)
+        .await
+        .expect("apply 0001 through 0033");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod149").await;
+    let (project, _) = plant_project_kind(pool, user, "shop-app").await;
+    let workspace = insert_workspace(pool, user, "shop").await;
+    let scope = try_scope_row(pool, user, workspace, "@shop")
+        .await
+        .expect("plant the scope row");
+    let mut planted = Vec::new();
+    for (owner, code) in [(project, "ENT"), (scope, "ORCH")] {
+        let area = insert_requirement_area(pool, owner, code).await;
+        // v33's `key` is generated: the insert names no key.
+        let id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO requirement (id, project_id, area_id, area_code, number, body, priority, \
+                                      created_by) VALUES ($1, $2, $3, $4, 1, 'b', 'must', $5)",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(area)
+        .bind(code)
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert a v33 requirement in {code}: {err}"));
+        planted.push(id);
+    }
+
+    MIGRATOR.run(pool).await.expect("apply 0034");
+
+    for (id, expected, what) in [
+        (
+            planted[0],
+            "R-ENT-1",
+            "a project's requirement keeps its key",
+        ),
+        (
+            planted[1],
+            "W-ORCH-1",
+            "a scope row's requirement is re-lettered W-",
+        ),
+    ] {
+        let key: String = sqlx::query_scalar("SELECT key FROM requirement WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the key");
+        assert_eq!(key, expected, "{what}");
+    }
+    let generated: String = sqlx::query_scalar(
+        "SELECT is_generated::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'requirement' AND column_name = 'key'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read requirement.key's column");
+    assert_eq!(
+        generated, "NEVER",
+        "requirement.key is stored, not generated"
+    );
+    for (column, nullable) in [
+        ("key", "NO"),
+        ("number", "YES"),
+        ("refines_id", "YES"),
+        ("child_number", "YES"),
+    ] {
+        assert_eq!(
+            column_nullable(pool, "requirement", column)
+                .await
+                .as_deref(),
+            Some(nullable),
+            "requirement.{column} exists with is_nullable {nullable}"
+        );
+    }
+    assert_eq!(
+        column_nullable(pool, "requirement_child_counter", "last_value")
+            .await
+            .as_deref(),
+        Some("NO"),
+        "requirement_child_counter exists"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-149 plan D1: 0034's CHECKs and uniques tie a key's shape to the row: a nested child names
+/// its parent and has no number, a key is `R-`/`W-` shaped and unique per project, a child number
+/// is unique per parent, and every row writes its key. Deleting a project that holds a nested
+/// child succeeds: the parent's `ON DELETE SET NULL` meets no surviving child.
+#[tokio::test]
+async fn migration_0034_checks_tie_the_key_shape() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let (project, _) = plant_project_kind(pool, user, "keys").await;
+    let area = insert_requirement_area(pool, project, "ENT").await;
+    let parent = try_requirement(
+        pool,
+        project,
+        area,
+        "ENT",
+        Some(1),
+        "R-ENT-1",
+        None,
+        None,
+        user,
+    )
+    .await
+    .expect("a top-level requirement lands");
+    try_requirement(
+        pool,
+        project,
+        area,
+        "ENT",
+        None,
+        "R-ENT-1.1",
+        Some(parent),
+        Some(1),
+        user,
+    )
+    .await
+    .expect("a nested child lands");
+
+    assert_refused(
+        try_requirement(
+            pool,
+            project,
+            area,
+            "ENT",
+            None,
+            "R-ENT-1.2",
+            None,
+            Some(2),
+            user,
+        )
+        .await,
+        "23514",
+        "chk_requirement_child_refines",
+        "a child number without a parent",
+    );
+    assert_refused(
+        try_requirement(
+            pool,
+            project,
+            area,
+            "ENT",
+            Some(2),
+            "R-ENT-1.2",
+            Some(parent),
+            Some(2),
+            user,
+        )
+        .await,
+        "23514",
+        "chk_requirement_number_or_child",
+        "both a number and a child number",
+    );
+    assert_refused(
+        try_requirement(
+            pool,
+            project,
+            area,
+            "ENT",
+            Some(2),
+            "X-ENT-2",
+            None,
+            None,
+            user,
+        )
+        .await,
+        "23514",
+        "chk_requirement_key_shape",
+        "a key with neither R- nor W-",
+    );
+    assert_refused(
+        try_requirement(
+            pool,
+            project,
+            area,
+            "ENT",
+            Some(3),
+            "R-ENT-1",
+            None,
+            None,
+            user,
+        )
+        .await,
+        "23505",
+        "uq_requirement_key",
+        "a second row with the project's key",
+    );
+    assert_refused(
+        try_requirement(
+            pool,
+            project,
+            area,
+            "ENT",
+            None,
+            "R-ENT-1.9",
+            Some(parent),
+            Some(1),
+            user,
+        )
+        .await,
+        "23505",
+        "uq_requirement_child",
+        "a second child number 1 under one parent",
+    );
+    let err = sqlx::query(
+        "INSERT INTO requirement (project_id, area_id, area_code, number, body, priority, \
+                                  created_by) VALUES ($1, $2, 'ENT', 4, 'b', 'must', $3)",
+    )
+    .bind(project)
+    .bind(area)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect_err("an insert without a key is refused");
+    assert_eq!(
+        err.as_database_error()
+            .and_then(|e| e.code())
+            .map(|c| c.into_owned())
+            .as_deref(),
+        Some("23502"),
+        "key is NOT NULL: {err}"
+    );
+
+    sqlx::query("DELETE FROM project WHERE id = $1")
+        .bind(project)
+        .execute(pool)
+        .await
+        .expect("a project holding a nested child is deleted whole");
 
     db.drop_db().await;
 }
