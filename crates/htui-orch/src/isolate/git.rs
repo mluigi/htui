@@ -1142,13 +1142,17 @@ const TRANSPORT_MARKERS: [&str; 6] = [
     "Couldn't connect to server",
 ];
 
-/// MOD-133 F2 L1: the markers of an authentication failure, which stays a refusal.
-const AUTH_MARKERS: [&str; 5] = [
+/// MOD-133 F2 L1: the markers of an authentication failure (or an ssh refusal that will not fix
+/// itself, such as an unknown host key), which stays a refusal.
+const AUTH_MARKERS: [&str; 8] = [
     "Permission denied",
     "Authentication failed",
     "could not read Username",
     "could not read Password",
     "Access denied",
+    "Too many authentication failures",
+    "No supported authentication methods",
+    "Host key verification failed",
 ];
 
 /// MOD-133 F2 L1: whether a failed network verb's stderr says the remote could not be reached (a
@@ -4943,6 +4947,12 @@ mod tests {
             "fatal: could not read Username for 'https://forge.example': terminal prompts disabled\n",
             "fatal: unable to access 'https://forge.example/o/r.git/': The requested URL returned error: 403\n",
             "fatal: unable to access 'https://forge.example/o/r.git/': The requested URL returned error: 401\n",
+            "Received disconnect from 192.0.2.1 port 22:2: Too many authentication failures\r\n\
+             Disconnected from 192.0.2.1 port 22\r\n\
+             fatal: Could not read from remote repository.\n",
+            "Host key verification failed.\r\nfatal: Could not read from remote repository.\n",
+            "git@forge.example: No supported authentication methods available (server sent: publickey)\r\n\
+             fatal: Could not read from remote repository.\n",
             "remote: Repository not found.\nfatal: Could not read from remote repository.\n",
             "ERROR: Repository not found.\nfatal: Could not read from remote repository.\n",
             "fatal: '../nonexist.git' does not appear to be a git repository\n\
