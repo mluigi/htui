@@ -738,7 +738,8 @@ async fn item_link_offers_the_seven_kinds() {
          cannot start until `to` is finished; `origin`: this item was spawned by `to`; `relates`: \
          see also; `supersedes`: this item replaces `to`; `parent`: this item is a part of `to`; \
          `duplicates`: this item is the same as `to`; `implements`: this item carries out `to`'s \
-         decision. An item has at most one `parent` and one `duplicates`."
+         decision. An item has at most one `parent` and one `duplicates`. A `to_document` link \
+         takes only `origin`, `relates` or `implements`."
     );
     assert!(!description.contains('\n'), "one line: {description}");
 
@@ -1281,13 +1282,64 @@ async fn item_link_to_document_second_version_is_one_line() {
     let reason = refused(&answer);
     assert_eq!(
         reason,
-        "refused: ANA-2 already implements ANA-1 verdict v1; remove it before linking another \
-         version"
+        "refused: ANA-2 already has an implements link to ANA-1 verdict v1; remove it before \
+         linking another version"
     );
     assert!(!reason.contains('\n'), "one line: {reason}");
     assert_eq!(
         fx.pins().await,
         [(Some(ids::HTUI_ANA_1), "verdict".to_owned(), 1, 2)]
+    );
+}
+
+/// D4, D11, R1 L3: the same one line for an owner document, named by project slug or by a
+/// workspace's `@` slug; the pin is read back by that slug.
+#[tokio::test]
+async fn item_link_to_owner_document_second_version_is_one_line() {
+    let fx = Leased::ana_2().await;
+    for _ in 0..2 {
+        owner_version(&fx.store, ids::PROJECT_HTUI, "goals").await;
+        owner_version(&fx.store, ids::PROJECT_SCOPE_PLATFORM, "charter").await;
+    }
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    for (kind, owner, doc_kind, article) in [
+        ("relates", "htui", "goals", "a"),
+        ("origin", "@platform", "charter", "an"),
+    ] {
+        ok(&client
+            .call(
+                "item_link",
+                json!({"op": "add", "kind": kind,
+                       "to_document": {"owner": owner, "kind": doc_kind, "version": 1}}),
+            )
+            .await
+            .expect("a call"));
+        let answer = client
+            .call(
+                "item_link",
+                json!({"op": "add", "kind": kind,
+                       "to_document": {"owner": owner, "kind": doc_kind}}),
+            )
+            .await
+            .expect("a call");
+        assert_eq!(
+            refused(&answer),
+            format!(
+                "refused: ANA-2 already has {article} {kind} link to {owner} {doc_kind} v1; \
+                 remove it before linking another version"
+            ),
+            "{owner}"
+        );
+    }
+    let mut pins = fx.pins().await;
+    pins.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        pins,
+        [
+            (None, "charter".to_owned(), 1, 2),
+            (None, "goals".to_owned(), 1, 2)
+        ]
     );
 }
 
@@ -1424,6 +1476,59 @@ async fn item_link_to_document_outside_reach_is_out_of_scope() {
         .await
         .expect("a call");
     assert_eq!(refused(&missing), "not found: document ANA-1 verdict v9");
+    assert!(fx.linked_documents().await.is_empty());
+}
+
+/// R1 M1: whether an owner outside the reach exists, or has the kind or version named, never
+/// shows: each refusal is the same sentence, the agent's label aside, on `add` and `remove`.
+#[tokio::test]
+async fn item_link_to_document_outside_reach_never_says_what_exists() {
+    let fx = Leased::ana_2().await;
+    item_versions(&fx.store, ids::VULKAN_FEAT_1, "verdict", 1).await;
+    owner_version(&fx.store, ids::PROJECT_VULKAN, "goals").await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let mut replies = Vec::new();
+    for (owner, kind, version) in [
+        ("vulkan-tutorials", "goals", None),
+        ("no-such-project", "goals", None),
+        ("vulkan-tutorials", "ruling", None),
+        ("vulkan-tutorials", "goals", Some(9)),
+        ("vulkan-tutorials:FEAT-1", "verdict", None),
+        ("vulkan-tutorials:NOPE-9", "verdict", None),
+        ("NOPE-9", "verdict", None),
+    ] {
+        let label = match version {
+            Some(version) => format!("{owner} {kind} v{version}"),
+            None => format!("{owner} {kind}"),
+        };
+        let answer = client
+            .call(
+                "item_link",
+                json!({"op": "add", "kind": "relates",
+                       "to_document": {"owner": owner, "kind": kind, "version": version}}),
+            )
+            .await
+            .expect("a call");
+        replies.push((label.clone(), refused(&answer).replace(&label, "<label>")));
+    }
+    let expected = "out of scope: document <label> is outside this project and its workspaces";
+    for (label, reply) in &replies {
+        assert_eq!(reply, expected, "{label}");
+    }
+    let unknown = client
+        .call(
+            "item_link",
+            json!({"op": "remove", "kind": "relates",
+                   "to_document": {"owner": "no-such-project", "kind": "goals"}}),
+        )
+        .await
+        .expect("a call");
+    assert_eq!(
+        refused(&unknown).replace("no-such-project goals", "<label>"),
+        expected,
+        "a remove naming an unknown owner"
+    );
     assert!(fx.linked_documents().await.is_empty());
 }
 

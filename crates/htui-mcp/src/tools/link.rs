@@ -88,7 +88,8 @@ struct LinkArgs {
                        this item was spawned by `to`; `relates`: see also; `supersedes`: this \
                        item replaces `to`; `parent`: this item is a part of `to`; `duplicates`: \
                        this item is the same as `to`; `implements`: this item carries out `to`'s \
-                       decision. An item has at most one `parent` and one `duplicates`."
+                       decision. An item has at most one `parent` and one `duplicates`. A \
+                       `to_document` link takes only `origin`, `relates` or `implements`."
     )]
     #[schemars(schema_with = "kind_schema")]
     kind: LinkKind,
@@ -128,8 +129,9 @@ fn kind_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 pub(crate) const DEF: ToolDef = ToolDef {
     name: "item_link",
     description: "Proposes or withdraws a link from this step's item to another item of its \
-                  project or its workspaces, named by key: FEAT-12 here, api:FEAT-12 in project \
-                  api, @shop:WS-1 for workspace shop's own items.",
+                  project or its workspaces, or to a version of a document (`to_document`). An \
+                  item is named by key: FEAT-12 here, api:FEAT-12 in project api, @shop:WS-1 for \
+                  workspace shop's own items.",
     schema: schema_of::<LinkArgs>,
     advertised: |scope, _| scope.item_id.is_some(),
 };
@@ -355,10 +357,15 @@ async fn document_call<H: WorkerHost>(
                         && names_owner(&to.owner, doc, scope.project_id)
                         && sentence == document_already_pinned(from, kind, doc.version)
                 });
+            // "an origin", "an implements", "a relates".
+            let article = match kind {
+                ArtifactLinkKind::Origin | ArtifactLinkKind::Implements => "an",
+                ArtifactLinkKind::Relates => "a",
+            };
             return Err(match pinned {
                 Some(doc) => ToolError(format!(
-                    "refused: {from_key} already {kind} {} {} v{}; remove it before linking \
-                     another version",
+                    "refused: {from_key} already has {article} {kind} link to {} {} v{}; remove \
+                     it before linking another version",
                     canonical_owner(&doc, scope.project_id),
                     doc.doc_kind,
                     doc.version
