@@ -173,6 +173,9 @@ pub struct ConceptsSearch {
     /// The last search sent, in flight or answered: what tells `Enter`-searches from `Enter`-opens
     /// (D234, blueprint D255). `None` before the first and after a failed one, so `Enter` retries.
     sent: Option<SearchQuery>,
+    /// The `scope_row_of` `sent` went with (MOD-147 M4 R1 M1): a one-member workspace's "all
+    /// projects" and its member cycled to send the same query and differ only here.
+    sent_scope_row: Option<WorkspaceId>,
     /// A search is in flight.
     searching: bool,
     /// This overlay has had a search answered: `searching…` rather than the model line (F10).
@@ -231,9 +234,11 @@ impl ConceptsSearch {
         )
     }
 
-    /// Whether the query or a toggle moved since the last search was sent (blueprint D255).
+    /// Whether the query or a toggle moved since the last search was sent (blueprint D255), the
+    /// scope row it covers included (MOD-147 M4 R1 M1).
     fn changed(&self, scope: &Scope) -> bool {
         self.sent.as_ref() != Some(&self.current(scope))
+            || self.sent_scope_row != self.scope_row_of(scope)
     }
 
     /// `Ctrl+P`: every project, then each in the workspace's order, then every project again. A
@@ -278,8 +283,8 @@ impl ConceptsSearch {
     /// `Enter` (D234, blueprint D255): search when the state moved since the last search, else
     /// open the highlighted hit — close, then reveal, both applied by the same drain (D235).
     fn enter(&mut self, ctx: &Ctx<'_>) {
-        let query = self.current(ctx.scope);
-        if self.sent.as_ref() != Some(&query) {
+        if self.changed(ctx.scope) {
+            let query = self.current(ctx.scope);
             let scope_row_of = self.scope_row_of(ctx.scope);
             if query.projects.is_empty() && scope_row_of.is_none() {
                 self.notice = Some(NO_PROJECTS);
@@ -287,6 +292,7 @@ impl ConceptsSearch {
                 self.notice = Some(EMPTY_QUERY);
             } else {
                 self.sent = Some(query.clone());
+                self.sent_scope_row = scope_row_of;
                 self.searching = true;
                 self.hits.clear();
                 self.cursor = 0;
@@ -444,7 +450,7 @@ impl Overlay for ConceptsSearch {
         Handled::Consumed
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         let StoreReply::Concepts(reply) = reply else {
             return;
         };
@@ -452,6 +458,14 @@ impl Overlay for ConceptsSearch {
             ConceptsReply::Hits { query, outcome } => {
                 // A list answers the search it echoes; any other is an older one's.
                 if self.sent.as_ref() != Some(query) {
+                    return;
+                }
+                // MOD-147 M4 R1 M1: the reply echoes the query alone, not the scope row. Sent
+                // with another scope row than the overlay's now (`Ctrl+P` since), it answers a
+                // scope no longer shown: its hits go, nothing is in flight, and `Enter` searches.
+                if self.sent_scope_row != self.scope_row_of(ctx.scope) {
+                    self.searching = false;
+                    self.sent = None;
                     return;
                 }
                 self.searching = false;
@@ -989,6 +1003,87 @@ mod tests {
                 (vec![ids::PROJECT_HTUI], None),
                 (vec![ids::PROJECT_HTUI], None),
             ]
+        );
+    }
+
+    /// A workspace holding `htui` alone, inside `platform`: "all projects" and `htui` cycled to
+    /// search the same projects and differ only by the scope row (MOD-147 M4 R1 M1).
+    fn one_member() -> Bench {
+        Bench::over(vec![project(ids::PROJECT_HTUI, "htui", 0)]).in_platform()
+    }
+
+    /// MOD-147 M4 R1 M1: in a one-member workspace `Ctrl+P` from "all projects" to its member
+    /// keeps the projects and drops the scope row; that is a change, so `Enter` searches again,
+    /// without the scope row, rather than opening a hit of the "all projects" search.
+    #[test]
+    fn a_cycle_that_drops_the_scope_row_makes_enter_search_again() {
+        let bench = one_member();
+        let mut search = ConceptsSearch::new();
+        let goals = htui_core::model::DocumentId::new();
+        let owned = Hit {
+            point_type: PointType::Document,
+            owner: Owner::Document(goals),
+            key: "@platform".to_owned(),
+            document: Some((goals, "goals".to_owned())),
+            ..item_hit()
+        };
+        searched(&bench, &mut search, "goals", vec![item_hit(), owned]);
+        assert!(!bench.render(&search).contains(&changed(Some("Enter"))));
+
+        bench.ctrl(&mut search, 'p');
+        assert!(
+            bench.render(&search).contains(&changed(Some("Enter"))),
+            "the list is stale"
+        );
+        bench.code(&mut search, KeyCode::Enter);
+        let emitted = bench.emit.take();
+        assert!(
+            !emitted
+                .iter()
+                .any(|action| matches!(action, Action::Reveal(_))),
+            "nothing revealed: {emitted:?}"
+        );
+        let sent: Vec<_> = emitted
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Store(StoreRequest::SearchConcepts {
+                    query,
+                    scope_row_of,
+                }) => Some((query.projects, scope_row_of)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [(vec![ids::PROJECT_HTUI], None)]);
+    }
+
+    /// MOD-147 M4 R1 M1: the reply to an "all projects" search that lands after `Ctrl+P` dropped
+    /// the scope row answers a scope the overlay no longer shows: its hits are dropped and `Enter`
+    /// searches the member alone.
+    #[test]
+    fn a_reply_to_the_all_projects_search_after_a_cycle_is_dropped() {
+        let bench = one_member();
+        let mut search = ConceptsSearch::new();
+        bench.typed(&mut search, "goals");
+        bench.code(&mut search, KeyCode::Enter);
+        let sent = searches(&bench);
+        assert_eq!(sent.len(), 1);
+
+        bench.ctrl(&mut search, 'p');
+        bench.reply(
+            &mut search,
+            ConceptsReply::Hits {
+                query: sent[0].clone(),
+                outcome: Ok(vec![item_hit()]),
+            },
+        );
+        assert!(search.hits.is_empty(), "the hits of another scope");
+        assert!(!search.searching, "nothing left in flight for this scope");
+
+        bench.code(&mut search, KeyCode::Enter);
+        assert_eq!(
+            scope_rows(&bench),
+            [(vec![ids::PROJECT_HTUI], None)],
+            "Enter searched rather than opened"
         );
     }
 
