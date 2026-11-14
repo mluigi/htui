@@ -306,6 +306,8 @@ pub const CASES: &[&str] = &[
     "a_stop_after_a_resume_leaves_a_leased_running_run_pending_stops_lists",
     "cancel_stopped_run_settles_run_and_steps_cancelled",
     "cancel_and_resume_of_one_stopped_run_race_on_one_cas",
+    // MOD-125 M4 (plan D4): the CLI verbs' read of a workspace's unfinished runs
+    "workspace_live_runs_lists_the_workspaces_unfinished_runs",
     // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
     "replace_graph_applies_nodes_edges_and_bumps_revision",
     "replace_graph_refuses_a_stale_revision_and_writes_nothing",
@@ -1101,6 +1103,13 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "cancel_and_resume_of_one_stopped_run_race_on_one_cas" => {
             boxed(cancel_and_resume_of_one_stopped_run_race_on_one_cas, store).await;
+        }
+        "workspace_live_runs_lists_the_workspaces_unfinished_runs" => {
+            boxed(
+                workspace_live_runs_lists_the_workspaces_unfinished_runs,
+                store,
+            )
+            .await;
         }
         "replace_graph_applies_nodes_edges_and_bumps_revision" => {
             boxed(replace_graph_applies_nodes_edges_and_bumps_revision, store).await;
@@ -10245,6 +10254,129 @@ async fn cancel_and_resume_of_one_stopped_run_race_on_one_cas<S: WriteStore>(sto
             .await
             .expect(CASE),
         "{CASE}: under the resumer's lease"
+    );
+}
+
+/// MOD-125 M4 D4: `workspace_live_runs(ws)` lists every run of `ws` that is not terminal
+/// (`queued`, `running`, `awaiting_approval`, `stopped`) in `(queued_at, id)` order, whole rows as
+/// `run` reads them. A finished run (`done`, `cancelled`), another workspace's run and a run
+/// without a workspace never appear; an unknown workspace answers empty. The stopped run is
+/// reached as an executor reaches it (a stop row, a lease, `stop_run`), never by a bare
+/// transition (M3 D1).
+async fn workspace_live_runs_lists_the_workspaces_unfinished_runs<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_live_runs_lists_the_workspaces_unfinished_runs";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = fresh_workspace(CASE, store, "live").await;
+    let other = fresh_workspace(CASE, store, "elsewhere").await;
+    let ws = Some(workspace);
+
+    // The two claims fill the box's two slots; the other runs move by bare transitions (no lease).
+    let running_item = mint_tagged(CASE, store, "Running", &[]).await;
+    let running = claimed_in(CASE, store, running_item, ws, owner).await;
+    let stopped_item = mint_tagged(CASE, store, "Stopped", &[]).await;
+    let stopped = claimed_in(CASE, store, stopped_item, ws, owner).await;
+    let elsewhere_item = mint_tagged(CASE, store, "Elsewhere", &[]).await;
+    let elsewhere = create_scoped_run(CASE, store, elsewhere_item, Some(other)).await;
+    assert!(
+        store
+            .transition_run(elsewhere, RunStatus::Queued, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the other workspace's run starts"
+    );
+    let unscoped_item = mint_tagged(CASE, store, "Unscoped", &[]).await;
+    let unscoped = create_scoped_run(CASE, store, unscoped_item, None).await;
+
+    let queued_item = mint_tagged(CASE, store, "Queued", &[]).await;
+    let queued = create_scoped_run(CASE, store, queued_item, ws).await;
+    let parked_item = mint_tagged(CASE, store, "Parked", &[]).await;
+    let parked = create_scoped_run(CASE, store, parked_item, ws).await;
+    for (from, to) in [
+        (RunStatus::Queued, RunStatus::Running),
+        (RunStatus::Running, RunStatus::AwaitingApproval),
+    ] {
+        assert!(
+            store
+                .transition_run(parked, from, to, at)
+                .await
+                .expect(CASE),
+            "{CASE}: the parked run moves {from} -> {to}"
+        );
+    }
+    let done_item = mint_tagged(CASE, store, "Done", &[]).await;
+    let done = create_scoped_run(CASE, store, done_item, ws).await;
+    assert!(
+        store
+            .transition_run(done, RunStatus::Queued, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the done run starts"
+    );
+    store
+        .finish_run(done, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+    let cancelled_item = mint_tagged(CASE, store, "Cancelled", &[]).await;
+    let cancelled = create_scoped_run(CASE, store, cancelled_item, ws).await;
+    store
+        .finish_run(cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect(CASE);
+
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store.stop_run(stopped, owner).await.expect(CASE),
+        "{CASE}: the poll stops one run of the workspace"
+    );
+
+    let live = store.workspace_live_runs(workspace).await.expect(CASE);
+    assert_eq!(
+        live.iter().map(|run| run.id).collect::<Vec<_>>(),
+        runs_in_queue_order(CASE, store, &[queued, running, parked, stopped]).await,
+        "{CASE}: the queued, running, parked and stopped runs, in (queued_at, id) order; never \
+         the done {done} or the cancelled {cancelled}"
+    );
+    let mut statuses: Vec<String> = live.iter().map(|run| run.status.to_string()).collect();
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        ["awaiting_approval", "queued", "running", "stopped"],
+        "{CASE}: one run of each unfinished status"
+    );
+    for row in &live {
+        assert_eq!(
+            Some(row),
+            store.run(row.id).await.expect(CASE).as_ref(),
+            "{CASE}: {} is the whole row `run` reads",
+            row.id
+        );
+    }
+    assert_eq!(
+        store
+            .workspace_live_runs(other)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>(),
+        vec![elsewhere],
+        "{CASE}: the other workspace lists its own run only"
+    );
+    assert!(
+        !live.iter().any(|run| run.id == unscoped),
+        "{CASE}: a run without a workspace never appears"
+    );
+    assert_eq!(
+        store
+            .workspace_live_runs(WorkspaceId::new())
+            .await
+            .expect(CASE),
+        Vec::new(),
+        "{CASE}: an unknown workspace answers empty"
     );
 }
 

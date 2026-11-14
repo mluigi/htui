@@ -7915,6 +7915,48 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-125 M4 D4: the workspace's runs that are not terminal, whole rows as
+    /// [`ReadStore::run`](htui_core::store::ReadStore::run) reads them, in `(queued_at, id)` order,
+    /// served by `idx_run_workspace_status` (`0019_stop_runs.sql`). Read on the pool.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn workspace_live_runs(&self, workspace: WorkspaceId) -> Result<Vec<Run>> {
+        sqlx::query_as!(
+            Run,
+            r#"
+            SELECT id               AS "id: RunId",
+                   project_id       AS "project_id: ProjectId",
+                   item_id          AS "item_id: ItemId",
+                   workspace_id     AS "workspace_id: WorkspaceId",
+                   kind             AS "kind: RunKind",
+                   mode             AS "mode: RunMode",
+                   status           AS "status: RunStatus",
+                   target_box_id    AS "target_box_id: BoxId",
+                   executing_box_id AS "executing_box_id: BoxId",
+                   graph_snapshot,
+                   started_by       AS "started_by: UserId",
+                   queued_at,
+                   started_at,
+                   finished_at,
+                   failure,
+                   repo_scope       AS "repo_scope: Vec<RepoId>",
+                   lease_box_id     AS "lease_box_id: BoxId",
+                   lease_expires_at,
+                   updated_at
+              FROM run
+             WHERE workspace_id = $1
+               AND status IN ('queued', 'running', 'awaiting_approval', 'stopped')
+             ORDER BY queued_at, id
+            "#,
+            workspace.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
     /// MOD-125 D4: one `DELETE`; zero rows are told apart from an unknown workspace by one
     /// follow-up read, as [`WriteStore::refresh_lease`] tells its zero rows apart.
     ///
@@ -8038,9 +8080,9 @@ impl WriteStore for PgStore {
     }
 
     /// MOD-125 M3 D1: the box's stopped runs with no `workspace_stop` row for their workspace;
-    /// `NOT EXISTS` over a `NULL` workspace matches nothing, so a run without one is listed. No
-    /// index serves it (`idx_run_lease` is partial on `queued|running`): a scan of the box's runs
-    /// is accepted, as `claim_run`'s stopped count already scans. Read on the pool.
+    /// `NOT EXISTS` over a `NULL` workspace matches nothing, so a run without one is listed.
+    /// Served by `idx_run_stopped_box` (`0036_stopped_run_index.sql`, M4), partial on this read's
+    /// `status = 'stopped'` and keyed on `executing_box_id`. Read on the pool.
     ///
     /// # Errors
     ///

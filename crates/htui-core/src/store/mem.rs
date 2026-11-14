@@ -11745,6 +11745,19 @@ impl WriteStore for MemStore {
         self.write(|state| state.resume_workspace(workspace))
     }
 
+    async fn workspace_live_runs(&self, workspace: WorkspaceId) -> Result<Vec<Run>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<Run> = state
+                .runs
+                .values()
+                .filter(|row| row.workspace_id == Some(workspace) && !row.status.is_terminal())
+                .cloned()
+                .collect();
+            rows.sort_unstable_by_key(|row| (row.queued_at, row.id));
+            rows
+        }))
+    }
+
     async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
         let now = self.now();
         self.write(|state| state.stop_run(run, owner, now))

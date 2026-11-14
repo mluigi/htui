@@ -1707,6 +1707,16 @@ pub trait WriteStore: ReadStore {
     /// apart from "not stopped" by one follow-up read.
     async fn resume_workspace(&self, workspace: WorkspaceId) -> Result<bool>;
 
+    /// MOD-125 M4 D4: every run whose `workspace_id` is `workspace` and whose status is not terminal
+    /// (`queued`, `running`, `awaiting_approval`, `stopped`; `RunStatus::is_terminal`), in
+    /// `(queued_at, id)` order, whole rows as [`ReadStore::run`]. Empty for an unknown workspace (a list
+    /// read is total). Runs without a workspace never appear. Postgres serves it from
+    /// `idx_run_workspace_status` (`0019_stop_runs.sql`).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn workspace_live_runs(&self, workspace: WorkspaceId) -> Result<Vec<Run>>;
+
     /// MOD-125 D7: a compare-and-set `running -> stopped` on a run whose `lease_owner` is `owner`.
     /// In one transaction every `running` step of the run moves to `stopped` and the lease is
     /// released as [`release_lease`](WriteStore::release_lease) releases it (`lease_owner = NULL`,
@@ -1727,7 +1737,7 @@ pub trait WriteStore: ReadStore {
     /// order. The request is the absence of the stop row ([`resume_workspace`] deletes it), so a
     /// box that was offline resumes its runs when it comes back. A run without a workspace has no
     /// stop row and is listed as soon as it stops; a box-less stopped run never is (it can only be
-    /// cancelled). No index serves the read; a scan of the box's runs is accepted.
+    /// cancelled). Served by `idx_run_stopped_box` (`0036_stopped_run_index.sql`, M4).
     ///
     /// [`resume_workspace`]: WriteStore::resume_workspace
     ///
