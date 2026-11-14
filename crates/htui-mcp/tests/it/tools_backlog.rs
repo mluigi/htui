@@ -9,9 +9,9 @@
 use chrono::{TimeDelta, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Claim, Document, DocumentId, GraphSnapshot, Isolation, ItemId, LinkKind, NewItem, NewRun,
-    NewRunStep, Note, NoteId, ProjectId, RunId, RunMode, SnapshotGraph, SnapshotSettings, StepId,
-    StepRole, Transport,
+    ArtifactLinkKind, Claim, Document, DocumentId, GraphSnapshot, Isolation, ItemId, LinkKind,
+    LinkedDocument, NewDocument, NewItem, NewOwnerDocument, NewRun, NewRunStep, Note, NoteId,
+    ProjectId, RunId, RunMode, SnapshotGraph, SnapshotSettings, StepId, StepRole, Transport,
 };
 use htui_core::prompt::render::HostnameLine;
 use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
@@ -741,6 +741,35 @@ async fn item_link_offers_the_seven_kinds() {
          decision. An item has at most one `parent` and one `duplicates`."
     );
     assert!(!description.contains('\n'), "one line: {description}");
+
+    // MOD-150 M3 D11: `to` and `to_document` are both optional, one is named per call.
+    let schema = &item_link["inputSchema"];
+    assert_eq!(schema["required"], json!(["op", "kind"]));
+    assert_eq!(
+        schema["properties"]["to"]["description"],
+        "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or \
+         `@shop:WS-1` for workspace `shop`'s own item (or use `to_document`)."
+    );
+    let document = &schema["properties"]["to_document"];
+    assert_eq!(document["type"], json!(["object", "null"]), "{document}");
+    assert_eq!(document["additionalProperties"], false, "{document}");
+    assert_eq!(document["required"], json!(["owner", "kind"]), "{document}");
+    let fields = &document["properties"];
+    assert_eq!(fields["owner"]["type"], "string");
+    assert_eq!(fields["kind"]["type"], "string");
+    assert_eq!(fields["version"]["type"], json!(["integer", "null"]));
+    for field in ["owner", "kind", "version"] {
+        let line = fields[field]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} has a description"));
+        assert!(!line.contains('\n'), "{field} in one line: {line}");
+    }
+    assert!(
+        !serde_json::to_string(schema)
+            .expect("a schema")
+            .contains("$ref"),
+        "the document is inline: {schema}"
+    );
 }
 
 #[tokio::test]
@@ -1018,6 +1047,384 @@ async fn item_link_remove_of_its_own_proposal_tombstones_it() {
         !fx.live_link(ids::HTUI_ANA_1, LinkKind::Origin).await,
         "the link is tombstoned"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// item_link to a document (MOD-150 M3 D11)
+// ---------------------------------------------------------------------------------------------
+
+/// Writes `n` more versions of `item`'s `kind` (the demo has `htui` `ANA-1`'s `verdict` v1).
+async fn item_versions(store: &MemStore, item: ItemId, kind: &str, n: usize) {
+    for _ in 0..n {
+        store
+            .write_document(NewDocument {
+                id: DocumentId::new(),
+                item_id: item,
+                kind: kind.to_owned(),
+                title: format!("{kind} of {item}"),
+                body: String::new(),
+                produced_by_step_id: None,
+                created_by: ids::USER,
+                created_at: Utc::now(),
+            })
+            .await
+            .expect("a document");
+    }
+}
+
+/// Writes one more version of `project`'s own `kind`.
+async fn owner_version(store: &MemStore, project: ProjectId, kind: &str) {
+    store
+        .write_owner_document(NewOwnerDocument {
+            id: DocumentId::new(),
+            project_id: project,
+            kind: kind.to_owned(),
+            title: format!("{kind} of {project}"),
+            body: String::new(),
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("an owner document");
+}
+
+impl Leased {
+    /// The live document links of the scope item, as its zero-hop graph reads them.
+    async fn linked_documents(&self) -> Vec<LinkedDocument> {
+        self.store
+            .links(self.item, 0)
+            .await
+            .expect("links")
+            .documents
+    }
+
+    /// `(owner item, doc kind, version, latest)` of each live document link of the scope item.
+    async fn pins(&self) -> Vec<(Option<ItemId>, String, i32, i32)> {
+        self.linked_documents()
+            .await
+            .into_iter()
+            .map(|doc| {
+                (
+                    doc.owner_item,
+                    doc.doc_kind,
+                    doc.version,
+                    doc.latest_version,
+                )
+            })
+            .collect()
+    }
+}
+
+/// D3, D11: no version pins the latest at write; the reply names it and the latest, and the
+/// graph reads the same link.
+#[tokio::test]
+async fn item_link_to_document_pins_the_latest_version() {
+    let fx = Leased::ana_2().await;
+    item_versions(&fx.store, ids::HTUI_ANA_1, "verdict", 1).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "implements",
+                   "to_document": {"owner": "ANA-1", "kind": "verdict"}}),
+        )
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"from": "ANA-2",
+               "to_document": {"owner": "ANA-1", "kind": "verdict", "version": 2, "latest": 2},
+               "kind": "implements", "live": true})
+    );
+    let documents = fx.linked_documents().await;
+    assert_eq!(documents.len(), 1, "{documents:?}");
+    let doc = &documents[0];
+    assert_eq!(
+        (
+            doc.from_item_id,
+            doc.kind,
+            doc.owner_item,
+            doc.doc_kind.as_str(),
+            doc.version,
+            doc.latest_version,
+        ),
+        (
+            fx.item,
+            ArtifactLinkKind::Implements,
+            Some(ids::HTUI_ANA_1),
+            "verdict",
+            2,
+            2
+        )
+    );
+}
+
+/// D3: a named version is pinned as named, below the latest.
+#[tokio::test]
+async fn item_link_to_document_names_a_version() {
+    let fx = Leased::ana_2().await;
+    item_versions(&fx.store, ids::HTUI_ANA_1, "verdict", 1).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "relates",
+                   "to_document": {"owner": "htui:ANA-1", "kind": "verdict", "version": 1}}),
+        )
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"from": "ANA-2",
+               "to_document": {"owner": "ANA-1", "kind": "verdict", "version": 1, "latest": 2},
+               "kind": "relates", "live": true}),
+        "the own project's qualified key answers bare"
+    );
+    assert_eq!(
+        fx.pins().await,
+        [(Some(ids::HTUI_ANA_1), "verdict".to_owned(), 1, 2)]
+    );
+}
+
+/// MOD-147 D2, D3: an `agy` step reaches a co-member's document; the reply names it qualified.
+#[tokio::test]
+async fn item_link_to_document_of_a_co_member_reads_qualified() {
+    let fx = Leased::on(ids::PROJECT_AGY, ids::AGY_FIX_1).await;
+    item_versions(&fx.store, ids::HTUI_FEAT_3, "spec", 1).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "origin",
+                   "to_document": {"owner": "htui:FEAT-3", "kind": "spec"}}),
+        )
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"from": "FIX-1",
+               "to_document": {"owner": "htui:FEAT-3", "kind": "spec", "version": 1, "latest": 1},
+               "kind": "origin", "live": true})
+    );
+    assert_eq!(
+        fx.pins().await,
+        [(Some(ids::HTUI_FEAT_3), "spec".to_owned(), 1, 1)]
+    );
+}
+
+/// D3: an owner that is no item key is a project slug, and a workspace's scope row is its `@`
+/// slug; the reply names the owner by that slug.
+#[tokio::test]
+async fn item_link_to_document_by_project_slug() {
+    let fx = Leased::ana_2().await;
+    owner_version(&fx.store, ids::PROJECT_HTUI, "goals").await;
+    owner_version(&fx.store, ids::PROJECT_HTUI, "goals").await;
+    owner_version(&fx.store, ids::PROJECT_SCOPE_PLATFORM, "charter").await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    for (owner, kind, version) in [("htui", "goals", 2), ("@platform", "charter", 1)] {
+        let answer = ok(&client
+            .call(
+                "item_link",
+                json!({"op": "add", "kind": "relates",
+                       "to_document": {"owner": owner, "kind": kind}}),
+            )
+            .await
+            .expect("a call"));
+        assert_eq!(
+            answer,
+            json!({"from": "ANA-2",
+                   "to_document": {"owner": owner, "kind": kind, "version": version,
+                                   "latest": version},
+                   "kind": "relates", "live": true}),
+            "{owner}"
+        );
+    }
+    let mut pins = fx.pins().await;
+    pins.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        pins,
+        [
+            (None, "charter".to_owned(), 1, 1),
+            (None, "goals".to_owned(), 2, 2)
+        ]
+    );
+}
+
+/// D4, D11: a second version of the same owner's kind is one line naming the pinned version;
+/// the first pin stays.
+#[tokio::test]
+async fn item_link_to_document_second_version_is_one_line() {
+    let fx = Leased::ana_2().await;
+    item_versions(&fx.store, ids::HTUI_ANA_1, "verdict", 1).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "implements",
+                   "to_document": {"owner": "ANA-1", "kind": "verdict", "version": 1}}),
+        )
+        .await
+        .expect("a call"));
+    let answer = client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "implements",
+                   "to_document": {"owner": "htui:ANA-1", "kind": "verdict"}}),
+        )
+        .await
+        .expect("a call");
+    let reason = refused(&answer);
+    assert_eq!(
+        reason,
+        "refused: ANA-2 already implements ANA-1 verdict v1; remove it before linking another \
+         version"
+    );
+    assert!(!reason.contains('\n'), "one line: {reason}");
+    assert_eq!(
+        fx.pins().await,
+        [(Some(ids::HTUI_ANA_1), "verdict".to_owned(), 1, 2)]
+    );
+}
+
+/// D11: a document link takes `origin`, `relates` or `implements` only.
+#[tokio::test]
+async fn item_link_to_document_with_blocked_by_is_refused() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    for op in ["add", "remove"] {
+        for kind in ["blocked_by", "supersedes", "parent", "duplicates"] {
+            let answer = client
+                .call(
+                    "item_link",
+                    json!({"op": op, "kind": kind,
+                           "to_document": {"owner": "ANA-1", "kind": "verdict"}}),
+                )
+                .await
+                .expect("a call");
+            assert_eq!(
+                refused(&answer),
+                "refused: a link to a document is origin, relates or implements",
+                "{op} {kind}"
+            );
+        }
+    }
+    assert!(fx.linked_documents().await.is_empty());
+}
+
+/// D11: `to` and `to_document` together name two targets.
+#[tokio::test]
+async fn item_link_with_both_targets_is_invalid() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "relates", "to": "FEAT-1",
+                   "to_document": {"owner": "ANA-1", "kind": "verdict"}}),
+        )
+        .await
+        .expect("a call");
+    assert_eq!(
+        refused(&answer),
+        "invalid arguments: name `to` or `to_document`"
+    );
+    assert!(!fx.live_link(ids::HTUI_FEAT_1, LinkKind::Relates).await);
+    assert!(fx.linked_documents().await.is_empty());
+}
+
+/// D11: neither `to` nor `to_document` names no target.
+#[tokio::test]
+async fn item_link_with_neither_target_is_invalid() {
+    let fx = Leased::ana_2().await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    for op in ["add", "remove"] {
+        let answer = client
+            .call("item_link", json!({"op": op, "kind": "relates"}))
+            .await
+            .expect("a call");
+        assert_eq!(
+            refused(&answer),
+            "invalid arguments: name `to` or `to_document`",
+            "{op}"
+        );
+    }
+}
+
+/// D4, D11: `remove` tombstones the link this run proposed, whatever version it pins; the reply
+/// names that version and reads `live: false`.
+#[tokio::test]
+async fn item_link_remove_to_document_tombstones_it() {
+    let fx = Leased::ana_2().await;
+    item_versions(&fx.store, ids::HTUI_ANA_1, "verdict", 1).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    ok(&client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "origin",
+                   "to_document": {"owner": "ANA-1", "kind": "verdict", "version": 1}}),
+        )
+        .await
+        .expect("a call"));
+    let answer = ok(&client
+        .call(
+            "item_link",
+            json!({"op": "remove", "kind": "origin",
+                   "to_document": {"owner": "ANA-1", "kind": "verdict"}}),
+        )
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"from": "ANA-2",
+               "to_document": {"owner": "ANA-1", "kind": "verdict", "version": 1, "latest": 2},
+               "kind": "origin", "live": false})
+    );
+    assert!(
+        fx.linked_documents().await.is_empty(),
+        "the link is tombstoned"
+    );
+}
+
+/// D5, D11: `vulkan-tutorials` lies outside every workspace `htui` belongs to, so its document
+/// is `out of scope`; a document no owner has is `not found`, with the agent's own label.
+#[tokio::test]
+async fn item_link_to_document_outside_reach_is_out_of_scope() {
+    let fx = Leased::ana_2().await;
+    item_versions(&fx.store, ids::VULKAN_FEAT_1, "verdict", 1).await;
+    let host = fx.host();
+    let (_lease, mut client) = open(&host, fx.scope()).await;
+    let answer = client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "relates",
+                   "to_document": {"owner": "vulkan-tutorials:FEAT-1", "kind": "verdict"}}),
+        )
+        .await
+        .expect("a call");
+    assert_eq!(
+        refused(&answer),
+        "out of scope: document vulkan-tutorials:FEAT-1 verdict is outside this project and its \
+         workspaces"
+    );
+    let missing = client
+        .call(
+            "item_link",
+            json!({"op": "add", "kind": "relates",
+                   "to_document": {"owner": "ANA-1", "kind": "verdict", "version": 9}}),
+        )
+        .await
+        .expect("a call");
+    assert_eq!(refused(&missing), "not found: document ANA-1 verdict v9");
+    assert!(fx.linked_documents().await.is_empty());
 }
 
 // ---------------------------------------------------------------------------------------------

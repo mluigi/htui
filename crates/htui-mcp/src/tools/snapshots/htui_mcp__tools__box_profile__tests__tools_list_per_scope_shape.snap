@@ -128,8 +128,43 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
             "description": "`add` proposes the link, `remove` withdraws one this run proposed."
           },
           "to": {
-            "type": "string",
-            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item (or use `to_document`).",
+            "default": null
+          },
+          "to_document": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "owner": {
+                "type": "string",
+                "description": "The document's owner: an item key (`ANA-35`, `api:FEAT-12`, `@shop:WS-1`) for an item's document, else a project slug (`api`, `@shop` for workspace `shop`) for a project's own document."
+              },
+              "kind": {
+                "type": "string",
+                "description": "The document's kind, such as `plan` or `verdict`."
+              },
+              "version": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "The version to link; the latest when omitted.",
+                "default": null
+              }
+            },
+            "required": [
+              "owner",
+              "kind"
+            ],
+            "description": "Instead of `to`, a document: its owner, its kind and optionally the version; `kind` is then `origin`, `relates` or `implements`."
           },
           "kind": {
             "type": "string",
@@ -147,7 +182,6 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
         },
         "required": [
           "op",
-          "to",
           "kind"
         ],
         "title": "LinkArgs"
@@ -268,8 +302,43 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
             "description": "`add` proposes the link, `remove` withdraws one this run proposed."
           },
           "to": {
-            "type": "string",
-            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item (or use `to_document`).",
+            "default": null
+          },
+          "to_document": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "owner": {
+                "type": "string",
+                "description": "The document's owner: an item key (`ANA-35`, `api:FEAT-12`, `@shop:WS-1`) for an item's document, else a project slug (`api`, `@shop` for workspace `shop`) for a project's own document."
+              },
+              "kind": {
+                "type": "string",
+                "description": "The document's kind, such as `plan` or `verdict`."
+              },
+              "version": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "The version to link; the latest when omitted.",
+                "default": null
+              }
+            },
+            "required": [
+              "owner",
+              "kind"
+            ],
+            "description": "Instead of `to`, a document: its owner, its kind and optionally the version; `kind` is then `origin`, `relates` or `implements`."
           },
           "kind": {
             "type": "string",
@@ -287,7 +356,6 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
         },
         "required": [
           "op",
-          "to",
           "kind"
         ],
         "title": "LinkArgs"
@@ -408,8 +476,43 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
             "description": "`add` proposes the link, `remove` withdraws one this run proposed."
           },
           "to": {
-            "type": "string",
-            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The other item's key: `FEAT-12` in this project, `api:FEAT-12` in project `api`, or `@shop:WS-1` for workspace `shop`'s own item (or use `to_document`).",
+            "default": null
+          },
+          "to_document": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "owner": {
+                "type": "string",
+                "description": "The document's owner: an item key (`ANA-35`, `api:FEAT-12`, `@shop:WS-1`) for an item's document, else a project slug (`api`, `@shop` for workspace `shop`) for a project's own document."
+              },
+              "kind": {
+                "type": "string",
+                "description": "The document's kind, such as `plan` or `verdict`."
+              },
+              "version": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "The version to link; the latest when omitted.",
+                "default": null
+              }
+            },
+            "required": [
+              "owner",
+              "kind"
+            ],
+            "description": "Instead of `to`, a document: its owner, its kind and optionally the version; `kind` is then `origin`, `relates` or `implements`."
           },
           "kind": {
             "type": "string",
@@ -427,7 +530,6 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
         },
         "required": [
           "op",
-          "to",
           "kind"
         ],
         "title": "LinkArgs"
