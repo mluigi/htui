@@ -28,6 +28,10 @@ use crate::model::link::{
 };
 use crate::model::split_qualified;
 use crate::model::{
+    ActivityClass, ActivityEvent, ActivityKind, ActivityPage, PINNED_LIMIT, activity_text,
+    park_kind,
+};
+use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
     BOX_PROBE_SPEC_KEY, BatchClose, BatchId, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo,
     BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
@@ -72,6 +76,7 @@ use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
 use crate::seed;
+use crate::store::activity::ActivityStore;
 use crate::store::error::{Result, StoreError};
 use crate::store::graph_rules::{
     body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
@@ -409,6 +414,22 @@ struct State {
     worker_logs: Vec<WorkerLogRow>,
     /// The last `worker_log.id` handed out, the identity column's counter.
     worker_log_last_id: i64,
+    /// MOD-122 M3 plan D2: `activity_event`, in id order, each row with its user. Written by
+    /// [`State::record_activity`] inside [`MemStore::write`], never by a caller; no fixture loads
+    /// one (plan D13).
+    activity: Vec<ActivityRow>,
+    /// The last `activity_event.id` handed out, the identity column's counter.
+    activity_last_id: i64,
+}
+
+/// One `activity_event` row: the event the panel reads, and the user it belongs to (plan D5:
+/// `run.started_by`, or `item.created_by` for an item event).
+#[derive(Debug, Clone)]
+struct ActivityRow {
+    /// `activity_event.user_id`.
+    user_id: UserId,
+    /// Every other column.
+    event: ActivityEvent,
 }
 
 /// One `worker_log` row: the line the TUI reads, and the user it belongs to.
@@ -546,6 +567,8 @@ impl MemStore {
             run_plans: Vec::new(),
             worker_logs: Vec::new(),
             worker_log_last_id: 0,
+            activity: Vec::new(),
+            activity_last_id: 0,
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -1546,9 +1569,18 @@ impl MemStore {
     }
 
     /// Takes the write lock, runs `f`, drops the guard and returns `f`'s owned result.
+    ///
+    /// MOD-122 M3 plan D2 (blueprint F5): every mutation passes here, so this is the activity
+    /// writer's one hook. The statuses are snapshotted before `f` and diffed after it, under the
+    /// same guard, and the events the write owes are appended there ([`State::record_activity`]).
+    /// `now` is read before the lock: [`MemClock`] takes none.
     fn write<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        let now = self.now();
         let mut guard = self.state.write().unwrap_or_else(PoisonError::into_inner);
-        f(&mut guard)
+        let before = guard.status_snapshot();
+        let r = f(&mut guard);
+        guard.record_activity(&before, now);
+        r
     }
 
     /// MOD-4 plan D152: `on` makes the write `fault` names answer [`StoreError::Unreachable`]
@@ -1562,6 +1594,19 @@ impl MemStore {
         } else {
             faults.remove(&fault);
         }
+    }
+
+    /// MOD-122 M3 plan D1: appends `event` to the feed as this store's user's (the earliest
+    /// `app_user`, or the nil id in an empty store), with the next id and this handle's "now";
+    /// answers the id. Seeds rows for UI tests only: no product path appends an event (plan D2).
+    #[cfg(feature = "test-support")]
+    pub fn push_activity(&self, event: ActivityEvent) -> i64 {
+        // Both before the write lock: `this_user` takes the read lock.
+        let user = self
+            .this_user()
+            .unwrap_or_else(|| UserId::from_uuid(Uuid::nil()));
+        let now = self.now();
+        self.write(|state| state.push_activity(user, event, now))
     }
 
     /// This handle, reading `clock` for every stamp and every lease comparison it makes (MOD-40
@@ -6107,6 +6152,16 @@ impl State {
         {
             entry.workspace_id = None;
         }
+        // MOD-122 M3 plan D7: `activity_event.workspace_id ... ON DELETE SET NULL`, whatever the
+        // event's kind.
+        for event in self
+            .activity
+            .iter_mut()
+            .map(|row| &mut row.event)
+            .filter(|event| event.workspace == Some(id))
+        {
+            event.workspace = None;
+        }
         self.workspaces.remove(&id);
         Ok(reach)
     }
@@ -6299,6 +6354,8 @@ impl State {
                 row.updated_at = now;
             }
         }
+        // MOD-122 M3 plan D7: the feed keeps a gone item's failures, unattributed.
+        self.remove_project_activity(id, &gone);
         self.items.retain(|id, _| !gone.items.contains(id));
         self.item_key_counter
             .retain(|(project, _), _| *project != id);
@@ -12387,6 +12444,448 @@ impl WorkerLogStore for MemStore {
     }
 }
 
+/// MOD-122 M3 plan D1: `activity_event` in memory, `PgStore`'s rules. The rows are written by
+/// `State::record_activity` under `MemStore::write`'s lock; the reads take `this_user` before
+/// the lock, as [`WorkerLogStore`]'s do.
+impl ActivityStore for MemStore {
+    async fn activity(&self, after: Option<i64>, limit: u32) -> Result<ActivityPage> {
+        let user = self.this_user();
+        Ok(self.read(|state| state.activity(user, after, limit)))
+    }
+
+    async fn prune_activity(&self, older_than: DateTime<Utc>, per_user_cap: u32) -> Result<u64> {
+        Ok(self.write(|state| state.prune_activity(older_than, per_user_cap)))
+    }
+}
+
+/// The before-image of one [`MemStore::write`] (MOD-122 M3 blueprint F5): the statuses the
+/// activity writer diffs, and nothing else, so the copy is four maps of `Copy` values.
+struct StatusSnapshot {
+    /// `run.status` by id.
+    runs: HashMap<RunId, RunStatus>,
+    /// `run_step.status` by id.
+    steps: HashMap<StepId, StepStatus>,
+    /// `item.status` by id.
+    items: HashMap<ItemId, Status>,
+    /// Every `step_permission` id: a new `pending` id writes an event (plan D2).
+    permissions: HashSet<PermissionId>,
+}
+
+impl State {
+    /// The statuses [`State::record_activity`] compares against after the write.
+    fn status_snapshot(&self) -> StatusSnapshot {
+        let mut runs = HashMap::with_capacity(self.runs.len());
+        runs.extend(self.runs.values().map(|row| (row.id, row.status)));
+        let mut steps = HashMap::with_capacity(self.steps.len());
+        steps.extend(self.steps.values().map(|row| (row.id, row.status)));
+        let mut items = HashMap::with_capacity(self.items.len());
+        items.extend(self.items.values().map(|row| (row.id, row.status)));
+        let mut permissions = HashSet::with_capacity(self.permissions.len());
+        permissions.extend(self.permissions.keys().copied());
+        StatusSnapshot {
+            runs,
+            steps,
+            items,
+            permissions,
+        }
+    }
+
+    /// MOD-122 M3 plan D2, D3 (blueprint F5): the events one write owes, appended under its lock
+    /// with `now` as their `at`. The `MemStore` half of Postgres's deferred triggers, with the
+    /// same "final state of the write" semantics.
+    ///
+    /// A row whose status changed passes plan D2's filter (`run_step`: `awaiting_approval`,
+    /// `failed`; `run`: `awaiting_approval`, `failed`, `running`, `done`; `item`: `blocked`), then
+    /// D3's table. A row that appeared during the write is an event source only for permissions
+    /// (a new `pending` request), as only `step_permission` carries an insert trigger; a removed
+    /// row writes nothing (plan D7's deletes are [`State::remove_project`]'s). Each event belongs
+    /// to its row's user (`run.started_by`, `item.created_by`, plan D5), so nothing here reads
+    /// [`MemStore::this_user`], which takes the read lock this write holds.
+    ///
+    /// Accepted divergence: a row that moves B → C → B inside one Postgres transaction writes an
+    /// event there, while this diff sees B → B and writes none. No store method does that today;
+    /// a conformance case that finds such a write is a finding to flag, not to paper over.
+    fn record_activity(&mut self, before: &StatusSnapshot, now: DateTime<Utc>) {
+        let mut owed: Vec<(UserId, ActivityEvent)> = Vec::new();
+
+        let mut steps: Vec<&RunStep> = self
+            .steps
+            .values()
+            .filter(|row| {
+                matches!(
+                    row.status,
+                    StepStatus::AwaitingApproval | StepStatus::Failed
+                ) && before
+                    .steps
+                    .get(&row.id)
+                    .is_some_and(|old| *old != row.status)
+            })
+            .collect();
+        steps.sort_by_key(|row| row.id);
+        for step in steps {
+            let Some(run) = self.runs.get(&step.run_id) else {
+                continue;
+            };
+            let kind = if step.status == StepStatus::Failed {
+                ActivityKind::StepFailed
+            } else {
+                ActivityKind::Gate
+            };
+            owed.push((
+                run.started_by,
+                self.activity_event(
+                    kind,
+                    Some(run),
+                    None,
+                    Some(step),
+                    None,
+                    step.gate_note.as_deref(),
+                ),
+            ));
+        }
+
+        let mut runs: Vec<(&Run, RunStatus)> = self
+            .runs
+            .values()
+            .filter_map(|row| {
+                let old = *before.runs.get(&row.id)?;
+                (old != row.status).then_some((row, old))
+            })
+            .collect();
+        runs.sort_by_key(|(row, _)| row.id);
+        for (run, old) in runs {
+            if let Some(event) = self.run_activity(run, old) {
+                owed.push((run.started_by, event));
+            }
+        }
+
+        let mut items: Vec<&Item> = self
+            .items
+            .values()
+            .filter(|row| {
+                row.status == Status::Blocked
+                    && before
+                        .items
+                        .get(&row.id)
+                        .is_some_and(|old| *old != row.status)
+            })
+            .collect();
+        items.sort_by_key(|row| row.id);
+        for item in items {
+            let run = self
+                .runs
+                .values()
+                .filter(|row| row.item_id == Some(item.id) && row.status.is_active())
+                .max_by_key(|row| (row.queued_at, row.id));
+            owed.push((
+                item.created_by,
+                self.activity_event(ActivityKind::Unblock, run, Some(item), None, None, None),
+            ));
+        }
+
+        for permission in self.permissions.values().map(|p| &p.row).filter(|row| {
+            row.status == PermissionStatus::Pending && !before.permissions.contains(&row.id)
+        }) {
+            let Some(run) = self.runs.get(&permission.run_id) else {
+                continue;
+            };
+            owed.push((
+                run.started_by,
+                self.activity_event(
+                    ActivityKind::Permission,
+                    Some(run),
+                    None,
+                    self.steps.get(&permission.run_step_id),
+                    Some(permission.id),
+                    permission.summary.as_deref(),
+                ),
+            ));
+        }
+
+        for (user_id, mut event) in owed {
+            self.activity_last_id += 1;
+            event.id = self.activity_last_id;
+            event.at = now;
+            self.activity.push(ActivityRow { user_id, event });
+        }
+    }
+
+    /// Plan D3's run rows: the event `run`'s move from `old` writes, if any.
+    fn run_activity(&self, run: &Run, old: RunStatus) -> Option<ActivityEvent> {
+        let graph = run.kind == RunKind::Graph;
+        let of_run = || self.steps.values().filter(|row| row.run_id == run.id);
+        match run.status {
+            RunStatus::AwaitingApproval => {
+                if of_run().any(|row| row.status == StepStatus::AwaitingApproval) {
+                    return None;
+                }
+                let steps: Vec<RunStep> = of_run().cloned().collect();
+                let (kind, step) = park_kind(&steps);
+                let step = step.and_then(|id| self.steps.get(&id));
+                let text = step
+                    .filter(|_| kind == ActivityKind::JudgeFailed)
+                    .and_then(|row| row.gate_note.as_deref());
+                Some(self.activity_event(kind, Some(run), None, step, None, text))
+            }
+            RunStatus::Failed => {
+                let newest = of_run().max_by_key(|row| (row.updated_at, row.id));
+                Some(self.activity_event(
+                    ActivityKind::RunFailed,
+                    Some(run),
+                    None,
+                    newest,
+                    None,
+                    run.failure.as_deref(),
+                ))
+            }
+            RunStatus::Running if graph && old == RunStatus::Queued => Some(self.activity_event(
+                ActivityKind::RunStarted,
+                Some(run),
+                None,
+                None,
+                None,
+                None,
+            )),
+            RunStatus::Done if graph => {
+                let open = run
+                    .item_id
+                    .and_then(|item| self.items.get(&item))
+                    .is_some_and(|item| item.status != Status::Closed);
+                let kind = if open {
+                    ActivityKind::CloseOut
+                } else {
+                    ActivityKind::RunFinished
+                };
+                Some(self.activity_event(kind, Some(run), None, None, None, None))
+            }
+            _ => None,
+        }
+    }
+
+    /// One event of `kind` over its rows, with plan D5's workspace and the copies plan D7 keeps.
+    /// `item` defaults to the run's; `id` and `at` are the caller's to stamp.
+    fn activity_event(
+        &self,
+        kind: ActivityKind,
+        run: Option<&Run>,
+        item: Option<&Item>,
+        step: Option<&RunStep>,
+        permission: Option<PermissionId>,
+        text: Option<&str>,
+    ) -> ActivityEvent {
+        let item = item.or_else(|| {
+            run.and_then(|row| row.item_id)
+                .and_then(|id| self.items.get(&id))
+        });
+        let project = run
+            .map(|row| row.project_id)
+            .or_else(|| item.map(|row| row.project_id));
+        ActivityEvent {
+            id: 0,
+            at: DateTime::<Utc>::MIN_UTC,
+            kind,
+            workspace: self.activity_workspace(run, project),
+            project,
+            project_slug: project
+                .and_then(|id| self.projects.get(&id))
+                .map(|row| row.slug.clone())
+                .unwrap_or_default(),
+            item: item.map(|row| row.id),
+            item_key: item.map(|row| row.key.clone()),
+            run: run.map(|row| row.id),
+            chat: run.is_some_and(|row| row.kind == RunKind::Chat),
+            step: step.map(|row| row.id),
+            step_name: step.map(|row| row.phase_name.clone()),
+            permission,
+            text: text.map(activity_text).unwrap_or_default(),
+        }
+    }
+
+    /// Plan D5: the run's workspace, else the project's own scope workspace, else the only
+    /// workspace the project sits in, else `None`.
+    fn activity_workspace(
+        &self,
+        run: Option<&Run>,
+        project: Option<ProjectId>,
+    ) -> Option<WorkspaceId> {
+        if let Some(workspace) = run.and_then(|row| row.workspace_id) {
+            return Some(workspace);
+        }
+        let project = project?;
+        if let Some(workspace) = self
+            .projects
+            .get(&project)
+            .and_then(|row| row.owner_workspace_id)
+        {
+            return Some(workspace);
+        }
+        let mut links = self
+            .workspace_projects
+            .iter()
+            .filter(|row| row.project_id == project);
+        match (links.next(), links.next()) {
+            (Some(only), None) => Some(only.workspace_id),
+            _ => None,
+        }
+    }
+
+    /// The row a needs-you event waits on (plan D4): its step, run, item or request, by kind.
+    /// `None` for a failure or a plain event, and for a reference its delete cleared.
+    fn activity_subject(event: &ActivityEvent) -> Option<Uuid> {
+        match event.kind {
+            ActivityKind::Gate => event.step.map(|id| id.as_uuid()),
+            ActivityKind::JudgeFailed | ActivityKind::Selection | ActivityKind::Interrupted => {
+                event.run.map(|id| id.as_uuid())
+            }
+            ActivityKind::Unblock => event.item.map(|id| id.as_uuid()),
+            ActivityKind::Permission => event.permission.map(|id| id.as_uuid()),
+            ActivityKind::StepFailed
+            | ActivityKind::RunFailed
+            | ActivityKind::RunStarted
+            | ActivityKind::RunFinished
+            | ActivityKind::CloseOut => None,
+        }
+    }
+
+    /// Plan D4: whether `event`'s subject still waits, read from its current state.
+    fn still_waiting(&self, event: &ActivityEvent) -> bool {
+        match event.kind {
+            ActivityKind::Gate => event
+                .step
+                .and_then(|id| self.steps.get(&id))
+                .is_some_and(|row| row.status == StepStatus::AwaitingApproval),
+            ActivityKind::JudgeFailed | ActivityKind::Selection | ActivityKind::Interrupted => {
+                event.run.is_some_and(|id| {
+                    self.runs
+                        .get(&id)
+                        .is_some_and(|row| row.status == RunStatus::AwaitingApproval)
+                        && !self.steps.values().any(|row| {
+                            row.run_id == id && row.status == StepStatus::AwaitingApproval
+                        })
+                })
+            }
+            ActivityKind::Unblock => event
+                .item
+                .and_then(|id| self.items.get(&id))
+                .is_some_and(|row| row.status == Status::Blocked),
+            ActivityKind::Permission => event
+                .permission
+                .and_then(|id| self.permissions.get(&id))
+                .is_some_and(|p| p.row.status == PermissionStatus::Pending),
+            ActivityKind::StepFailed
+            | ActivityKind::RunFailed
+            | ActivityKind::RunStarted
+            | ActivityKind::RunFinished
+            | ActivityKind::CloseOut => false,
+        }
+    }
+
+    /// [`MemStore::activity`]'s body: `user`'s rows only, none for no user; the pins are the
+    /// newest needs-you event per subject whose subject still waits, newest first.
+    fn activity(&self, user: Option<UserId>, after: Option<i64>, limit: u32) -> ActivityPage {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mine = || {
+            self.activity
+                .iter()
+                .filter(move |row| Some(row.user_id) == user)
+                .map(|row| &row.event)
+        };
+        let events = if let Some(after) = after {
+            mine()
+                .filter(|event| event.id > after)
+                .take(limit)
+                .cloned()
+                .collect()
+        } else {
+            let mut newest: Vec<ActivityEvent> = mine().rev().take(limit).cloned().collect();
+            newest.reverse();
+            newest
+        };
+        let mut newest_per_subject: HashMap<Uuid, &ActivityEvent> = HashMap::new();
+        for event in mine().filter(|event| event.kind.class() == ActivityClass::NeedsYou) {
+            if let Some(subject) = Self::activity_subject(event) {
+                newest_per_subject.insert(subject, event);
+            }
+        }
+        let mut pinned: Vec<ActivityEvent> = newest_per_subject
+            .into_values()
+            .filter(|event| self.still_waiting(event))
+            .cloned()
+            .collect();
+        pinned.sort_by_key(|event| std::cmp::Reverse(event.id));
+        pinned.truncate(usize::try_from(PINNED_LIMIT).unwrap_or(usize::MAX));
+        ActivityPage { events, pinned }
+    }
+
+    /// [`MemStore::prune_activity`]'s body: the age cut, then each user's newest
+    /// `per_user_cap` kept.
+    fn prune_activity(&mut self, older_than: DateTime<Utc>, per_user_cap: u32) -> u64 {
+        let before = self.activity.len();
+        self.activity.retain(|row| row.event.at >= older_than);
+        let cap = usize::try_from(per_user_cap).unwrap_or(usize::MAX);
+        let mut seen: HashMap<UserId, usize> = HashMap::new();
+        let mut keep = vec![true; self.activity.len()];
+        for (index, row) in self.activity.iter().enumerate().rev() {
+            let count = seen.entry(row.user_id).or_default();
+            *count += 1;
+            keep[index] = *count <= cap;
+        }
+        let mut keep = keep.into_iter();
+        self.activity.retain(|_| keep.next().unwrap_or(true));
+        u64::try_from(before - self.activity.len()).unwrap_or(u64::MAX)
+    }
+
+    /// [`MemStore::push_activity`]'s body: the next id and `now`, on `user`.
+    #[cfg(feature = "test-support")]
+    fn push_activity(
+        &mut self,
+        user_id: UserId,
+        mut event: ActivityEvent,
+        now: DateTime<Utc>,
+    ) -> i64 {
+        self.activity_last_id += 1;
+        event.id = self.activity_last_id;
+        event.at = now;
+        self.activity.push(ActivityRow { user_id, event });
+        self.activity_last_id
+    }
+
+    /// Plan D7's `MemStore` half (blueprint F5), beside the other cascades of a project delete:
+    /// a non-failure event of a gone item or run goes (Postgres's `BEFORE DELETE` triggers), and
+    /// a survivor loses every reference whose row went (`ON DELETE SET NULL`), keeping its copies.
+    fn remove_project_activity(&mut self, id: ProjectId, gone: &ProjectReach) {
+        self.activity.retain(|row| {
+            row.event.kind.class() == ActivityClass::Failure
+                || !(row
+                    .event
+                    .item
+                    .is_some_and(|item| gone.items.contains(&item))
+                    || row.event.run.is_some_and(|run| gone.runs.contains(&run)))
+        });
+        let permissions = &self.permissions;
+        for event in self.activity.iter_mut().map(|row| &mut row.event) {
+            if event.item.is_some_and(|item| gone.items.contains(&item)) {
+                event.item = None;
+            }
+            if event.run.is_some_and(|run| gone.runs.contains(&run)) {
+                event.run = None;
+            }
+            if event.step.is_some_and(|step| gone.steps.contains(&step)) {
+                event.step = None;
+            }
+            if event
+                .permission
+                .is_some_and(|permission| !permissions.contains_key(&permission))
+            {
+                event.permission = None;
+            }
+            if event.project == Some(id) {
+                event.project = None;
+            }
+        }
+    }
+}
+
 impl State {
     /// [`MemStore::append_worker_logs`]'s body: `NotFound` for a box that is not `user`'s, else
     /// every line, in order, under rising ids.
@@ -12518,6 +13017,7 @@ mod tests {
     use super::{FollowUpPayload, MemStore};
     use crate::clock::{Clock as _, TestClock};
     use crate::fixtures::ids;
+    use crate::model::{ACTIVITY_PAGE, ActivityClass, ActivityEvent, ActivityKind};
     use crate::model::{
         AgentBox, AgentId, AnswerOutcome, BatchClose, BoxId, BoxProbe, CancelRequest, ChatRunSpec,
         CitationKind, Claim, CommandRunId, CommandRunStatus, DocumentId, FOLLOW_UP_SESSION_ENDED,
@@ -12535,6 +13035,7 @@ mod tests {
     use crate::model::{EdgeId, EdgeKind, GraphScope, PhasePart, StepGraphEdge};
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
+    use crate::store::ActivityStore as _;
     use crate::store::error::StoreError;
     use crate::store::{
         CasOutcome, DeleteTarget, ReadStore as _, SettingRung, StepFence, WriteStore as _,
@@ -15096,6 +15597,170 @@ mod tests {
         );
     }
 
+    /// MOD-122 M3 plan D5: the feed reads this user's events only, and an event belongs to its
+    /// row's user (`item.created_by` here), never to whoever wrote. The generic half is the
+    /// conformance case `paging`.
+    #[tokio::test]
+    async fn activity_reads_only_this_users_events() {
+        let store = MemStore::demo();
+        let other = UserId::new();
+        store.write(|state| {
+            let mut row = state.users[&ids::USER].clone();
+            row.id = other;
+            row.name = "someone-else".to_owned();
+            row.created_at += TimeDelta::days(1);
+            state.users.insert(other, row);
+            state
+                .items
+                .get_mut(&ids::HTUI_ANA_2)
+                .expect("the fixture item")
+                .created_by = other;
+        });
+        for item in [ids::HTUI_ANA_2, ids::HTUI_FEAT_3] {
+            assert!(
+                store
+                    .transition(item, Status::Open, Status::Blocked)
+                    .await
+                    .expect("open -> blocked")
+            );
+        }
+        assert_eq!(
+            store.read(|state| {
+                state
+                    .activity
+                    .iter()
+                    .map(|row| (row.user_id, row.event.item))
+                    .collect::<Vec<_>>()
+            }),
+            [
+                (other, Some(ids::HTUI_ANA_2)),
+                (ids::USER, Some(ids::HTUI_FEAT_3))
+            ],
+            "each event is its item creator's"
+        );
+        let page = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.item)
+                .collect::<Vec<_>>(),
+            [Some(ids::HTUI_FEAT_3)],
+            "another user's event is not read"
+        );
+        assert_eq!(page.pinned, page.events, "nor pinned");
+    }
+
+    /// MOD-122 M3 plan D3: a graph run done over a `closed` item is `run_finished`. No product
+    /// write reaches it (close-out refuses an item with a live run), so the item is closed by hand.
+    #[tokio::test]
+    async fn a_graph_run_done_over_a_closed_item_is_run_finished() {
+        let store = MemStore::demo();
+        store.write(|state| {
+            state
+                .items
+                .get_mut(&ids::HTUI_FEAT_1)
+                .expect("the fixture item")
+                .status = Status::Closed;
+        });
+        store
+            .finish_run(ids::RUN_4, RunStatus::Done, None, Utc::now())
+            .await
+            .expect("the running run finishes");
+        let page = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| (event.kind, event.run, event.item))
+                .collect::<Vec<_>>(),
+            [(
+                ActivityKind::RunFinished,
+                Some(ids::RUN_4),
+                Some(ids::HTUI_FEAT_1)
+            )]
+        );
+    }
+
+    /// MOD-122 M3 plan D7: a workspace delete clears `workspace` on every event of that workspace,
+    /// whatever its kind, and leaves its other references.
+    #[tokio::test]
+    async fn delete_workspace_clears_the_workspace_of_every_event() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        assert!(
+            store
+                .transition(ids::VULKAN_FEAT_1, Status::Open, Status::Blocked)
+                .await
+                .expect("open -> blocked")
+        );
+        store
+            .fail_run(ids::RUN_8, "verify failed", at)
+            .await
+            .expect("the stopped run fails");
+        let before = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        assert_eq!(
+            before
+                .events
+                .iter()
+                .map(|event| (event.kind, event.workspace))
+                .collect::<Vec<_>>(),
+            [
+                (ActivityKind::Unblock, Some(ids::WORKSPACE_GRAPHICS)),
+                (ActivityKind::RunFailed, Some(ids::WORKSPACE_GRAPHICS)),
+            ],
+            "plan D5: the run's recorded workspace"
+        );
+        store
+            .delete_workspace(ids::WORKSPACE_GRAPHICS)
+            .await
+            .expect("the workspace goes");
+        let after = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        let cleared: Vec<ActivityEvent> = before
+            .events
+            .iter()
+            .map(|event| ActivityEvent {
+                workspace: None,
+                ..event.clone()
+            })
+            .collect();
+        assert_eq!(after.events, cleared);
+    }
+
+    /// MOD-122 M3 plan D1: `push_activity` seeds a row with the next id and this handle's clock,
+    /// on this store's user, through no transition.
+    #[tokio::test]
+    async fn push_activity_assigns_the_id_and_the_clock() {
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let store = MemStore::demo().with_clock(Arc::new(TestClock::at(at)));
+        let event = ActivityEvent {
+            id: 0,
+            at: at - TimeDelta::days(1),
+            kind: ActivityKind::RunStarted,
+            workspace: Some(ids::WORKSPACE_PLATFORM),
+            project: Some(ids::PROJECT_HTUI),
+            project_slug: "htui".to_owned(),
+            item: Some(ids::HTUI_FEAT_3),
+            item_key: Some("FEAT-3".to_owned()),
+            run: Some(ids::RUN_2),
+            chat: false,
+            step: None,
+            step_name: None,
+            permission: None,
+            text: String::new(),
+        };
+        assert_eq!(store.push_activity(event.clone()), 1);
+        assert_eq!(store.push_activity(event.clone()), 2);
+        let page = store.activity(None, ACTIVITY_PAGE).await.expect("reads");
+        assert_eq!(
+            page.events,
+            [1, 2].map(|id| ActivityEvent {
+                id,
+                at,
+                ..event.clone()
+            })
+        );
+        assert_eq!(page.pinned, Vec::new(), "a plain event is never pinned");
+    }
+
     /// PRD D13's cascade with no ghost left behind, read straight out of `State`.
     ///
     /// `project_delete_takes_everything_and_says_so` asserts the counts, which is all §6.1 can
@@ -15316,10 +15981,51 @@ mod tests {
             1,
             "precondition: one run plan"
         );
+        // MOD-122 M3 plan D7 (blueprint F5): the staged request above wrote a `permission`; a
+        // failed run adds a failure, on the run's step.
+        store
+            .fail_run(ids::RUN_2, "verify failed", Utc::now())
+            .await
+            .expect("the queued run fails");
+        assert_eq!(
+            store.read(|state| {
+                state
+                    .activity
+                    .iter()
+                    .map(|row| row.event.kind)
+                    .collect::<Vec<_>>()
+            }),
+            [ActivityKind::Permission, ActivityKind::RunFailed],
+            "precondition: one needs-you event and one failure of the project"
+        );
         store.delete_project(gone).await.expect("the delete lands");
 
         store.read(|state| {
             assert!(!state.projects.contains_key(&gone), "the project itself");
+            assert_eq!(
+                state.activity.len(),
+                1,
+                "only the failure survives: {:?}",
+                state.activity
+            );
+            assert!(
+                state.activity.iter().all(|row| {
+                    let event = &row.event;
+                    event.kind.class() == ActivityClass::Failure
+                        && (
+                            event.project,
+                            event.item,
+                            event.run,
+                            event.step,
+                            event.permission,
+                        ) == (None, None, None, None, None)
+                        && event.project_slug == "htui"
+                        && event.item_key.as_deref() == Some("FEAT-3")
+                }),
+                "every surviving event is a failure with every reference cleared and its copies \
+                 kept (MOD-122 M3 plan D7): {:?}",
+                state.activity
+            );
             assert!(
                 state
                     .edges

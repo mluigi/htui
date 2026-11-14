@@ -9,7 +9,7 @@
 //! FEAT-2, blocked with no run: Reopen) and one active run (`RUN_2`, queued), blueprint H-5.
 #![cfg(feature = "testkit")]
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, register_all};
 use htui::testkit::Harness;
@@ -96,6 +96,12 @@ fn list_is_open(harness: &mut Harness) -> bool {
 /// `feature` phases. Answers the run, the parked step and the claim's owner, which still holds the
 /// lease (a park keeps it).
 async fn park_ana_2(store: &MemStore) -> (RunId, StepId, Uuid) {
+    park_ana_2_leased(store, TimeDelta::minutes(30)).await
+}
+
+/// [`park_ana_2`] with a lease of `ttl` from `store`'s clock: a [`seeding`] handle's is frozen in
+/// the past, so its claim needs one that lasts past the wall clock's now.
+async fn park_ana_2_leased(store: &MemStore, ttl: TimeDelta) -> (RunId, StepId, Uuid) {
     let snapshot = store
         .run(ids::RUN_1)
         .await
@@ -124,7 +130,7 @@ async fn park_ana_2(store: &MemStore) -> (RunId, StepId, Uuid) {
         .id;
     assert_eq!(
         store
-            .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(30))
+            .claim_run(run, ids::BOX, owner, at, ttl)
             .await
             .expect("claim_run"),
         Claim::Admitted
@@ -407,14 +413,31 @@ async fn the_list_over_graphics_says_nothing_is_waiting() {
     insta::assert_snapshot!("graphics_empty", frame);
 }
 
+/// A handle on `store`'s rows whose clock is frozen a day before any run of these tests (review
+/// L5): the events its writes record are stamped then, so the activity pane below the Backlog
+/// (its `ide_activity` default, MOD-122 M3 D11), whose times the harness prints in UTC, reads
+/// `11-02 09:41` on every machine.
+fn seeding(store: &MemStore) -> MemStore {
+    store.handle_at(seeded_at())
+}
+
+/// The instant a [`seeding`] handle's clock is frozen at.
+fn seeded_at() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 2, 9, 41, 0)
+        .single()
+        .expect("a valid instant")
+}
+
 /// Plan D9: the rows in project, key, run and step order, a run's gate before its permission and
 /// the item's Reopen row last of all.
 #[tokio::test]
 async fn the_list_over_platform_holds_a_gate_a_permission_and_a_reopen() {
     let store = MemStore::demo();
     let mut harness = platform(&store).await;
-    let (run, step, owner) = park_ana_2(&store).await;
-    ask_permission(&store, run, step, owner).await;
+    // The lease lasts to half an hour past now, as `park_ana_2`'s, so the permission is live.
+    let lease = Utc::now() - seeded_at() + TimeDelta::minutes(30);
+    let (run, step, owner) = park_ana_2_leased(&seeding(&store), lease).await;
+    ask_permission(&seeding(&store), run, step, owner).await;
     refresh(&mut harness).await;
 
     harness.key("ctrl-w");

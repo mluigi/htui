@@ -352,11 +352,15 @@ async fn f1_opens_help_from_the_reject_note_and_the_note_stays() {
 }
 
 /// The hints (MOD-67 M6 T2): MOD-115 draws them on the body's bottom border, the frame's last
-/// row, so this is that row with the rule and the corners trimmed off.
+/// row, so this is that row with the rule and the corners trimmed off. Under the Backlog's
+/// `ide_activity` default (MOD-122 M3 D11) the tab's border is the row above the activity pane.
 fn hint_row(frame: &str) -> String {
-    frame
-        .lines()
-        .last()
+    let lines: Vec<&str> = frame.lines().collect();
+    lines
+        .iter()
+        .position(|line| line.starts_with("\u{256d}\u{2500} Activity"))
+        .and_then(|at| at.checked_sub(1))
+        .map_or_else(|| lines.last().copied(), |at| Some(lines[at]))
         .unwrap_or_default()
         .trim_matches([
             '\u{2514}', '\u{2518}', '\u{2500}', '\u{2570}', '\u{256f}', ' ',
@@ -400,7 +404,10 @@ async fn the_runs_browse_hint_row() {
     );
     harness.key("v");
 
-    // The list's `j` moves the cursor while the list is focused.
+    // The list's `j` moves the cursor while the list is focused: from the detail the pane key
+    // passes the activity pane (the Backlog's `ide_activity` default, MOD-122 M3 D11) first.
+    harness.key("tab");
+    harness.render();
     harness.key("tab");
     for _ in 0..TO_ANA_2 {
         harness.key("j");

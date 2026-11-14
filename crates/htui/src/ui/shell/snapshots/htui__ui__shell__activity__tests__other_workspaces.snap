@@ -1,0 +1,12 @@
+---
+source: crates/htui/src/ui/shell/activity.rs
+expression: frame
+---
+╭─ Activity · all workspaces ──────────────────────────────────────────────────╮
+│▌◐ started 09:04 @? MOD-4 research                                            │
+│ ✓ ready to close 09:03 @alpha MOD-3 research                                 │
+│ ◐ started 09:02 @aud MOD-2 research                                          │
+│ ◐ started 09:01 MOD-1 research                                               │
+│                                                                              │
+│                                                                              │
+╰─Enter open · f filter · j/k move─────────────────────────────────────────────╯

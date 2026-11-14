@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{BoxId, LogShipLevel};
-use htui_core::store::{StoreError, WorkerLogStore};
+use htui_core::store::{ActivityStore, PER_USER_CAP, StoreError, WorkerLogStore};
 use htui_store::PgStore;
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -32,10 +32,11 @@ pub const SWEEP_RETRY: Duration = Duration::from_secs(60);
 /// R1 M2: the longest shutdown waits for the flusher's final flush before aborting it.
 pub const FINAL_FLUSH_MAX: Duration = Duration::from_secs(2);
 
-/// What the flusher reads and writes: the worker log store, plus the worker's own box and two
-/// reads that are inherent on [`PgStore`], not on a trait (blueprint F7f).
+/// What the flusher reads and writes: the worker log store, the activity store (its sweep, MOD-122
+/// M3 plan D6), plus the worker's own box and two reads that are inherent on [`PgStore`], not on a
+/// trait (blueprint F7f).
 #[allow(async_fn_in_trait, reason = "no dyn ShipSource is formed")]
-pub trait ShipSource: WorkerLogStore {
+pub trait ShipSource: WorkerLogStore + ActivityStore {
     /// The box this worker ships as.
     fn ship_box(&self) -> BoxId;
     /// The settings blob of [`ship_box`](Self::ship_box)'s row, `None` when the row is gone.
@@ -66,6 +67,16 @@ pub fn retention_days(app: &BTreeMap<String, Value>) -> u64 {
         .and_then(Value::as_u64)
         .filter(|days| (1..=365).contains(days))
         .unwrap_or(DEFAULT_RETENTION_DAYS)
+}
+
+/// Plan D4, MOD-122 M3 plan D6: the sweep's cut at `now`, [`retention_days`] of `app` before it;
+/// the worker's sweep and the TUI's `SweepRetention` prune the worker log and the activity feed
+/// at it.
+#[must_use]
+pub fn retention_cut(app: &BTreeMap<String, Value>, now: DateTime<Utc>) -> DateTime<Utc> {
+    // At most 365, so the conversion never falls back.
+    let days = i64::try_from(retention_days(app)).unwrap_or(365);
+    now - TimeDelta::days(days)
 }
 
 /// The flusher's state between cycles.
@@ -108,18 +119,18 @@ impl<S: ShipSource> Flusher<S> {
         pause_after(self.failures)
     }
 
-    /// Plan D4: rows older than the retention, then beyond [`PER_BOX_CAP`] per box. Quiet: a
-    /// failure makes the next sweep due after [`SWEEP_RETRY`] (R1 M4), not every cycle.
+    /// Plan D4: rows older than the retention, then beyond [`PER_BOX_CAP`] per box; MOD-122 M3
+    /// plan D6: activity events at the same cut, then beyond [`PER_USER_CAP`] per user. Quiet: a
+    /// failure of either makes the next sweep due after [`SWEEP_RETRY`] (R1 M4), not every cycle.
     async fn sweep(&mut self, now: DateTime<Utc>) {
         let swept = match self.store.ship_app_settings().await {
             Ok(app) => {
-                // At most 365, so the conversion never falls back.
-                let days = i64::try_from(retention_days(&app)).unwrap_or(365);
-                let older_than = now - TimeDelta::days(days);
-                self.store
-                    .prune_worker_logs(older_than, PER_BOX_CAP)
-                    .await
-                    .is_ok()
+                let older_than = retention_cut(&app, now);
+                // Both run, whatever the first answers: one table's failure keeps no row of the
+                // other.
+                let logs = self.store.prune_worker_logs(older_than, PER_BOX_CAP).await;
+                let events = self.store.prune_activity(older_than, PER_USER_CAP).await;
+                logs.is_ok() && events.is_ok()
             }
             Err(_) => false,
         };
@@ -248,7 +259,7 @@ pub fn spawn_flusher(pg: PgStore, handle: ShipHandle) -> FlusherTask {
 mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
 
-    use htui_core::model::{NewWorkerLog, WorkerLogLevel, WorkerLogLine};
+    use htui_core::model::{ActivityPage, NewWorkerLog, WorkerLogLevel, WorkerLogLine};
     use htui_core::store::Result;
     use serde_json::json;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -269,6 +280,10 @@ mod tests {
         settings: Option<Value>,
         app: BTreeMap<String, Value>,
         sweeps: Vec<(DateTime<Utc>, u32)>,
+        /// Only the sweep's `prune_activity` fails.
+        activity_prune_failing: bool,
+        /// Every `prune_activity` call that succeeded, as `(older_than, per_user_cap)`.
+        activity_sweeps: Vec<(DateTime<Utc>, u32)>,
     }
 
     #[derive(Clone, Default)]
@@ -322,6 +337,21 @@ mod tests {
 
         async fn set_box_log_level(&self, _: BoxId, _: Option<LogShipLevel>) -> Result<bool> {
             Ok(true)
+        }
+    }
+
+    impl ActivityStore for Fake {
+        async fn activity(&self, _: Option<i64>, _: u32) -> Result<ActivityPage> {
+            Ok(ActivityPage::default())
+        }
+
+        async fn prune_activity(&self, older_than: DateTime<Utc>, cap: u32) -> Result<u64> {
+            let mut state = self.state();
+            if state.failing || state.activity_prune_failing {
+                return Err(down());
+            }
+            state.activity_sweeps.push((older_than, cap));
+            Ok(0)
         }
     }
 
@@ -608,6 +638,51 @@ mod tests {
         let took = started.elapsed();
         assert!(took >= FINAL_FLUSH_MAX, "{took:?}");
         assert!(took < FINAL_FLUSH_MAX + FLUSH_EVERY / 4, "{took:?}");
+    }
+
+    /// MOD-122 M3 plan D6: the hourly sweep also prunes the activity feed, with the cut it gives
+    /// the worker log and the per-user cap.
+    #[tokio::test]
+    async fn worker_log_the_sweep_prunes_activity_with_the_same_cut() {
+        let fake = Fake::default();
+        let mut flusher = Flusher::new(fake.clone(), ShipHandle::new());
+        flusher.cycle(t0()).await;
+        fake.state().app.insert(RETENTION_KEY.to_owned(), json!(3));
+        let hour = t0() + TimeDelta::hours(1);
+        flusher.cycle(hour).await;
+        let state = fake.state();
+        assert_eq!(
+            state.activity_sweeps,
+            [
+                (t0() - TimeDelta::days(14), PER_USER_CAP),
+                (hour - TimeDelta::days(3), PER_USER_CAP),
+            ]
+        );
+        let cuts: Vec<DateTime<Utc>> = state.sweeps.iter().map(|(cut, _)| *cut).collect();
+        let activity_cuts: Vec<DateTime<Utc>> =
+            state.activity_sweeps.iter().map(|(cut, _)| *cut).collect();
+        assert_eq!(cuts, activity_cuts, "one cut for both tables");
+    }
+
+    /// MOD-122 M3 plan D6: a failed `prune_activity` makes the next sweep due after
+    /// [`SWEEP_RETRY`], as a failed worker log prune does.
+    #[tokio::test]
+    async fn worker_log_a_failed_activity_prune_is_retried_a_minute_later() {
+        let fake = Fake::default();
+        fake.state().activity_prune_failing = true;
+        let mut flusher = Flusher::new(fake.clone(), ShipHandle::new());
+        flusher.cycle(t0()).await;
+        fake.state().activity_prune_failing = false;
+        flusher.cycle(t0() + TimeDelta::seconds(58)).await;
+        assert!(fake.state().activity_sweeps.is_empty());
+        flusher.cycle(t0() + TimeDelta::seconds(60)).await;
+        assert_eq!(
+            fake.state().activity_sweeps,
+            [(
+                t0() + TimeDelta::seconds(60) - TimeDelta::days(14),
+                PER_USER_CAP
+            )]
+        );
     }
 
     /// R1 L7: a flusher dropped without `shutdown` (an early return) is aborted, not leaked.

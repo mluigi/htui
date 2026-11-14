@@ -58,7 +58,7 @@ use crate::store_worker::{QUEUE_REQUEST_NAMES, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
 use crate::ui::kit::pane::{Focus, Pane, capture_area};
 use crate::ui::kit::{chips::key_line, scroll::Step};
-use crate::ui::shell::{ListSize, PaneAreas, PaneId, Panes, TabLayout, TabLoc};
+use crate::ui::shell::{ListSize, PaneAreas, PaneId, Panes, Preset, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailId, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab,
     RunsTab,
@@ -71,13 +71,17 @@ use crate::ui::tabs::backlog::navigation::{ITEM_CURSOR, PROJECT_CURSOR, parse_cu
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crossterm::event::{KeyEvent, MouseEvent};
 
-/// The Backlog's default layout (MOD-115 M2 D2): the list beside the detail, 55% of the body.
+/// The Backlog's default layout (MOD-115 M2 D2, MOD-122 M3 D11): the list beside the detail, 55%
+/// of the body, with the activity pane below both (`ide_activity`).
 ///
 /// The list gets the larger half: it carries the longest strings (`KEY  status  title`, with
 /// `⚠ needs you` in it) and it is the pane a reader navigates from. The shell's layout
 /// engine splits it as `Layout::horizontal([Percentage(55), Percentage(45)])` did, cell for cell.
+/// The activity pane is the UI review's round 7 ("Backlog with the activity panel"); a layout
+/// already saved in `ui-state.toml` wins over this default.
 pub const BACKLOG_LAYOUT: TabLayout = TabLayout {
     list: ListSize::Percent(55),
+    preset: Preset::IdeActivity,
     ..TabLayout::DEFAULT
 };
 

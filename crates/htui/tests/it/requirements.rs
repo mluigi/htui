@@ -14,6 +14,7 @@
 #![cfg(feature = "testkit")]
 
 use chrono::TimeDelta;
+use crossterm::event::{MouseButton, MouseEventKind};
 use htui::app::register_all;
 use htui::requirements::not_the_maintainer;
 use htui::testkit::Harness;
@@ -824,53 +825,72 @@ async fn a_form_opened_with_the_tree_zoomed_is_on_screen() {
     );
 }
 
-/// MOD-115 M2 §7 (T7 repair): with the activity pane zoomed, `a` draws the new-area form over
-/// it, not under the shell's placeholder.
-#[tokio::test]
-async fn a_form_opened_with_the_activity_zoomed_is_on_screen() {
-    let mut harness = open().await;
-    // The layout with the activity pane, its focus (the third pane) and the zoom; a frame
-    // after each, as the app draws one, so the focus cycle reads the panes on screen.
-    for key in ["p", "tab", "tab", "z"] {
-        harness.key(key);
-        harness.settle().await;
-        harness.render();
-    }
-    assert!(
-        harness.render().contains("Activity"),
-        "the activity pane is zoomed:\n{}",
-        harness.render()
-    );
-    harness.key("a");
+/// A left click on the activity pane's first row inside its border, which focuses it (the
+/// shell's mouse, MOD-115 M2 §7) whatever holds the keys; a frame drawn after it.
+async fn click_activity(harness: &mut Harness) {
+    let frame = harness.render();
+    let row = frame
+        .lines()
+        .position(|line| line.contains("\u{2500} Activity \u{b7}"))
+        .unwrap_or_else(|| panic!("the activity pane:\n{frame}"));
+    let row = u16::try_from(row + 1).expect("on screen");
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 4, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 4, row);
     harness.settle().await;
+    harness.render();
+}
+
+/// MOD-115 M2 §7 (T7 repair), MOD-122 M3 D10: a form takes every key, so the new-area form `a`
+/// opened in the tree stays on screen when a click moves the focus to the activity pane, and
+/// `Esc` still closes it there.
+///
+/// It once opened the form with `a` while the activity pane was zoomed. `a` no longer gets there:
+/// the focused activity pane holds the keys, so the tab never sees `a`, and once the form is open
+/// it takes the zoom key too. A form whose data comes back after the zoom does (the Backlog's item
+/// form, `backlog::an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it`);
+/// this pins the new-area form's nearest state: the form open, the focus on the activity pane
+/// beside it.
+#[tokio::test]
+async fn a_form_stays_on_screen_when_a_click_focuses_the_activity_pane() {
+    let mut harness = open().await;
+    let opened = after(&mut harness, &["p", "a"]).await;
+    assert!(
+        opened.contains(&titled("New area in htui")),
+        "the form is open:\n{opened}"
+    );
+    click_activity(&mut harness).await;
     let frame = harness.render();
     assert!(
-        frame.contains(&titled("New area in htui")),
-        "the form is drawn:\n{frame}"
+        frame.contains(&titled("New area in htui")) && frame.contains("\u{2500} Activity \u{b7}"),
+        "the form is drawn beside the activity pane:\n{frame}"
+    );
+    let closed = after(&mut harness, &["esc"]).await;
+    assert!(
+        !closed.contains(&titled("New area in htui")),
+        "the form took `Esc`:\n{closed}"
+    );
+    assert!(
+        closed.contains("Enter open \u{b7} f filter"),
+        "the click had focused the activity pane, which has the keys once the form closes:\n{closed}"
     );
 }
 
-/// MOD-115 M2 §7, RV3 (review M3): with the activity pane zoomed, `/` opens the filter field on
-/// the bottom row, and the tree it filters is drawn above it, not a blank body.
+/// MOD-115 M2 §7, RV3 (review M3): `/` opens the filter field on the bottom row, and the tree it
+/// filters stays drawn and follows what is typed while the activity pane has the focus.
+///
+/// It once pinned this with the activity pane zoomed; with the field open the zoom key is the
+/// field's, so it pins the field's nearest state: the focus moved to the activity pane by a
+/// click. (A zoomed pane under a form is reachable through a form whose data returns late:
+/// `backlog::an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it`.)
 #[tokio::test]
-async fn the_tree_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
+async fn the_tree_follows_the_filter_while_the_activity_pane_has_the_focus() {
     let mut harness = open().await;
-    for key in ["p", "tab", "tab", "z"] {
-        harness.key(key);
-        harness.settle().await;
-        harness.render();
-    }
-    let zoomed = harness.render();
-    assert!(
-        zoomed.contains("Activity") && !zoomed.contains("R-ENT-2"),
-        "the activity pane is zoomed:\n{zoomed}"
-    );
-    harness.key("/");
-    harness.settle().await;
+    after(&mut harness, &["p", "/"]).await;
+    click_activity(&mut harness).await;
     let frame = harness.render();
     assert!(
-        frame.contains("R-ENT-2"),
-        "the tree is drawn over the zoomed pane:\n{frame}"
+        frame.contains("R-ENT-2") && frame.contains("\u{2500} Activity \u{b7}"),
+        "the tree is drawn beside the activity pane:\n{frame}"
     );
     type_text(&mut harness, "STO");
     harness.settle().await;

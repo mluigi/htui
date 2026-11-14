@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/waiting.rs
+source: crates/htui/tests/it/waiting.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   4 waiting · memory ·  ?  keys
@@ -22,13 +22,13 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   
 │      ╰ j/k move · Enter open · Esc close ─────────────────────────────────────────────────╯pless │
 │                                                     ││and lets the legacy importer align the     │
 │                                                     ││counter above the numbers it brings in.    │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
 ╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+╭─ Activity · ⚠ 2 needs you · all workspaces ──────────────────────────────────────────────────────╮
+│ needs you ───────────────────────────────────────────────────────────────────────────────────────│
+│▌⚠ needs you 11-02 09:41 ANA-2 plan permission: edit: src/lib.rs                                  │
+│ ⚠ needs you 11-02 09:41 ANA-2 plan gate                                                          │
+│ recent ──────────────────────────────────────────────────────────────────────────────────────────│
+│ ◐ started 11-02 09:41 ANA-2                                                                      │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

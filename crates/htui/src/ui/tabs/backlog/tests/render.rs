@@ -156,10 +156,11 @@ pub(super) fn split() -> [Rect; 2] {
     panes(Rect::new(0, 0, width, height))
 }
 
-/// The list pane's rows, as text.
+/// The list pane's rows, as text: above the activity pane under the `ide_activity` default
+/// (MOD-122 M3 D11).
 fn list_rows(buffer: &Buffer) -> Vec<String> {
     let [list, _] = split();
-    (0..buffer.area.height)
+    (list.y..list.bottom())
         .map(|y| text(buffer, list.x, y, list.width))
         .collect()
 }
@@ -415,7 +416,7 @@ async fn the_open_filter_form_is_the_focused_pane() {
     let faint = bench.theme.border_faint.fg;
     let mut tab = bench.tab();
     tab.form = Some(FilterForm::open(&tab.filter, &bench.projects));
-    let form_y = DEFAULT_SIZE.1 - crate::ui::tabs::backlog::filter::FORM_HEIGHT;
+    let form_y = split()[0].bottom() - crate::ui::tabs::backlog::filter::FORM_HEIGHT;
     for ctx in [bench.ctx(), bench.ctx().with_focus(PaneId::Detail)] {
         let buffer = buffer_of(&tab, &ctx);
         assert_eq!(corner(&buffer, 0, form_y), accent, "the Filter pane");
@@ -454,7 +455,7 @@ async fn under_an_overlay_no_pane_is_focused() {
     let mut tab = bench.tab();
     tab.form = Some(FilterForm::open(&tab.filter, &bench.projects));
     let buffer = buffer_of(&tab, &bench.ctx().with_covered(true));
-    let form_y = DEFAULT_SIZE.1 - crate::ui::tabs::backlog::filter::FORM_HEIGHT;
+    let form_y = split()[0].bottom() - crate::ui::tabs::backlog::filter::FORM_HEIGHT;
     for (x, y) in [(0, 0), (0, form_y), (detail.x, 0)] {
         assert_eq!(corner(&buffer, x, y), faint, "({x}, {y})");
     }
@@ -476,7 +477,7 @@ async fn the_filter_forms_focused_row_reads_without_colour() {
     let mut tab = bench.tab();
     tab.form = Some(FilterForm::open(&tab.filter, &bench.projects));
     let buffer = buffer_of(&tab, &bench.ctx());
-    let status = DEFAULT_SIZE.1 - crate::ui::tabs::backlog::filter::FORM_HEIGHT + 1;
+    let status = split()[0].bottom() - crate::ui::tabs::backlog::filter::FORM_HEIGHT + 1;
     let row = text(&buffer, 0, status, 40);
     assert!(row.starts_with("│▌status    ‹[ ] needs you›  any"), "{row}");
     assert!(

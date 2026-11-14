@@ -16,7 +16,9 @@ use htui::requirements::decision_citation_stays;
 use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::store_worker::StoreRequest;
 use htui::testkit::Harness;
-use htui::ui::tabs::backlog::BacklogTab;
+use htui::ui::shell::{Preset, TabLayout};
+use htui::ui::state_file::{UiState, UiStore};
+use htui::ui::tabs::backlog::{BACKLOG_LAYOUT, BacklogTab};
 use htui::ui::tabs::registry::Tab;
 use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
@@ -64,6 +66,31 @@ async fn backlog() -> Harness {
         // and `store_worker::spawn` always has. Without one here every selection would answer
         // `Failed` and take the status line, which is a harness artefact and not a shell state.
         .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    harness
+}
+
+/// [`backlog`] laid out `ide` (the list beside the detail, no activity pane): for a frame whose
+/// subject the default `ide_activity` layout's shorter detail pane cuts off (MOD-122 M3 review).
+async fn backlog_ide() -> Harness {
+    let store = UiStore::memory();
+    let mut state = UiState::default();
+    state.layouts.insert(
+        BacklogTab::ID.0.to_owned(),
+        TabLayout {
+            preset: Preset::Ide,
+            ..BACKLOG_LAYOUT
+        },
+    );
+    store.save(&state).expect("a memory store saves");
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_ui_store(store);
     harness.drive_to_end().await;
     harness.app().update(Action::SetScope {
         workspace: workspace("platform").await,
@@ -343,6 +370,8 @@ async fn j_k_g_and_shift_g_move_the_selection() {
     );
 }
 
+/// Laid out `ide` ([`backlog_ide`]): the default layout's detail pane is too short for the body
+/// and the prompt's table, the frames' subject.
 #[tokio::test]
 async fn the_six_sub_tabs_render_the_selected_item() {
     for (steps, name) in [
@@ -356,7 +385,7 @@ async fn the_six_sub_tabs_render_the_selected_item() {
         // enough to read and asserts its bytes.
         (5, "detail_prompt"),
     ] {
-        let mut harness = backlog().await;
+        let mut harness = backlog_ide().await;
         down(&mut harness, TO_FEAT_1).await;
         sub_tab(&mut harness, steps);
         insta::assert_snapshot!(name, harness.render());
@@ -870,6 +899,35 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     );
     insta::assert_snapshot!("runs_closeout_typed", typed);
     assert_eq!(harness.app().status, None);
+    for frame in [&warn, &typed] {
+        assert_dialog_rows_are_clear(frame);
+    }
+}
+
+/// Review L7: every row the close-out dialog spans holds the box alone across the detail pane:
+/// no run row shows through beside it.
+fn assert_dialog_rows_are_clear(frame: &str) {
+    let lines: Vec<&str> = frame.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains("\u{256d} Close out"))
+        .unwrap_or_else(|| panic!("the dialog is drawn:\n{frame}"));
+    let bottom = top
+        + lines[top..]
+            .iter()
+            .position(|line| line.contains("\u{2570} "))
+            .unwrap_or_else(|| panic!("the dialog's bottom border:\n{frame}"));
+    for line in &lines[top..=bottom] {
+        let (_, detail) = line
+            .split_once("\u{2502}\u{2502}")
+            .unwrap_or_else(|| panic!("the detail pane on {line:?}:\n{frame}"));
+        let inside = detail.strip_suffix('\u{2502}').unwrap_or(detail).trim();
+        let edges = ['\u{256d}', '\u{2570}', '\u{2502}', '\u{256e}', '\u{256f}'];
+        assert!(
+            inside.starts_with(edges) && inside.ends_with(edges),
+            "the box alone on {line:?}:\n{frame}"
+        );
+    }
 }
 
 /// MOD-39 plan P13 through the whole tab: the engine's preview starts an `open` item's picker on
@@ -1233,10 +1291,11 @@ async fn an_action_key_in_flow_answers_as_in_the_list() {
 }
 
 /// MOD-72 D1, D5, D6: `FEAT-1`'s plan step recorded the fixture's one tool call, a `read`, so its
-/// node's third line is `⚒ read×1`; no other node draws a chip.
+/// node's third line is `⚒ read×1`; no other node draws a chip. Laid out `ide` ([`backlog_ide`]):
+/// the default layout's detail pane is too short for the flow's `implement` node.
 #[tokio::test]
 async fn the_flow_draws_the_plan_step_s_tool_call_as_a_chip() {
-    let mut harness = backlog().await;
+    let mut harness = backlog_ide().await;
     down(&mut harness, TO_FEAT_1).await;
     sub_tab(&mut harness, 1);
     past_the_rework_run(&mut harness);
@@ -3723,7 +3782,8 @@ fn row_of(frame: &str, needle: &str) -> Option<usize> {
 }
 
 /// MOD-115 M2 §7 (T7): `Tab` focuses the detail, where `j` scrolls the Body and the list cursor
-/// stays on its item; focused again, the list takes `j` as before.
+/// stays on its item; focused again, the list takes `j` as before. Under the Backlog's
+/// `ide_activity` default (MOD-122 M3 D11) the cycle passes the activity pane on its way back.
 #[tokio::test]
 async fn with_the_detail_focused_j_scrolls_the_body_and_the_list_stays() {
     let mut harness = backlog().await;
@@ -3750,7 +3810,9 @@ async fn with_the_detail_focused_j_scrolls_the_body_and_the_list_stays() {
     );
     assert_eq!(row_of(&after, second), Some(at - 1), "a row:\n{after}");
 
-    // Detail -> list: the panes cycle, and `j` is the list's again.
+    // Detail -> activity -> list: the panes cycle, and `j` is the list's again.
+    harness.key("tab");
+    harness.drive_to_end().await;
     harness.key("tab");
     harness.drive_to_end().await;
     harness.key("j");
@@ -3800,6 +3862,35 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
     );
 }
 
+/// Review M3: `e` asks for the item form's data, and `tab`, `tab`, `z` zoom the activity pane
+/// before it returns; the reply then opens the form, whose modal stack holds the keys, over the
+/// zoomed pane, and the panel is not drawn over it (`App::paint_panes`).
+#[tokio::test]
+async fn an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    harness.render();
+    for key in ["e", "tab", "tab", "z"] {
+        harness.key(key);
+        harness.render();
+    }
+    let zoomed = harness.render();
+    assert!(
+        zoomed.contains("\u{2500} Activity \u{b7}") && !zoomed.contains("Edit FEAT-1"),
+        "the activity pane is zoomed before the form's data returns:\n{zoomed}"
+    );
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("Edit FEAT-1"),
+        "the form is drawn over the zoomed pane:\n{frame}"
+    );
+    assert!(
+        !frame.contains("\u{2500} Activity \u{b7}"),
+        "the panel is not drawn over the form:\n{frame}"
+    );
+}
+
 /// Presses each of `keys`, serving and drawing a frame after each as the app does, so the focus
 /// cycle reads the panes on screen.
 async fn press(harness: &mut Harness, keys: &[&str]) {
@@ -3838,37 +3929,78 @@ async fn a_compose_opened_with_the_list_zoomed_is_on_screen() {
     );
 }
 
-/// MOD-115 M2 §7 (T7 repair): the filter form takes every key, so with the activity pane zoomed
-/// `f` draws it at the bottom of the zoomed pane, not into the detail's empty rect.
+/// The activity pane's title row: `─ Activity · <filter>`.
+fn activity_title(frame: &str) -> String {
+    frame
+        .lines()
+        .find(|line| line.contains("\u{2500} Activity \u{b7}"))
+        .unwrap_or_else(|| panic!("the activity pane:\n{frame}"))
+        .to_owned()
+}
+
+/// A left click on the activity pane's first row inside its border, which focuses it (the
+/// shell's mouse, MOD-115 M2 §7) whatever holds the keys.
+async fn click_activity(harness: &mut Harness) {
+    let frame = harness.render();
+    let row = frame
+        .lines()
+        .position(|line| line.contains("\u{2500} Activity \u{b7}"))
+        .unwrap_or_else(|| panic!("the activity pane:\n{frame}"));
+    let row = u16::try_from(row + 1).expect("on screen");
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 4, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 4, row);
+    harness.drive_to_end().await;
+    harness.render();
+}
+
+/// MOD-115 M2 §7 (T7 repair), MOD-122 M3 D10: the filter form takes every key, so it stays on
+/// screen when a click moves the focus to the activity pane, and `Esc` still closes it there.
+///
+/// It once opened the form with `f` while the activity pane was zoomed. `f` no longer gets there:
+/// the focused activity pane holds the keys, so `f` is the panel's filter (pinned below), and once
+/// the form is open it takes the zoom key too. A form whose data comes back after the zoom does
+/// (the item form, pinned by
+/// `an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it`); this pins the
+/// filter's nearest state: the form open, the focus on the activity pane beside it.
 #[tokio::test]
-async fn the_filter_opened_with_the_activity_zoomed_is_on_screen() {
+async fn the_filter_stays_on_screen_when_a_click_focuses_the_activity_pane() {
     let mut harness = backlog().await;
-    press(&mut harness, &["p", "tab", "tab", "z"]).await;
-    let zoomed = harness.render();
-    assert!(
-        zoomed.contains("Activity") && !zoomed.contains("htui"),
-        "the activity pane is zoomed:\n{zoomed}"
-    );
     press(&mut harness, &["f"]).await;
+    let open = harness.render();
+    assert!(
+        open.contains("\u{256d}\u{2500} Filter "),
+        "the form is open:\n{open}"
+    );
+    click_activity(&mut harness).await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{256d}\u{2500} Filter "),
-        "the form is drawn:\n{frame}"
+        frame.contains("\u{256d}\u{2500} Filter ") && frame.contains("\u{2500} Activity \u{b7}"),
+        "the form is drawn beside the activity pane:\n{frame}"
+    );
+    press(&mut harness, &["esc"]).await;
+    let closed = harness.render();
+    assert!(
+        !closed.contains("\u{256d}\u{2500} Filter "),
+        "the form took `Esc`:\n{closed}"
+    );
+    assert!(
+        closed.contains("Enter open \u{b7} f filter"),
+        "the click had focused the activity pane, which has the keys once the form closes:\n{closed}"
     );
 }
 
-/// MOD-115 M2 §7, RV3 (review M3): with the activity pane zoomed, the filter form takes the
-/// bottom of the zoomed pane and the list it filters is drawn above it, not a blank body.
+/// MOD-115 M2 §7, RV3 (review M3): the filter form takes the bottom of the list it filters, and
+/// that list is drawn above it, not a blank body, while the activity pane has the focus.
+///
+/// It once pinned this with the activity pane zoomed; with the form open the zoom key is the
+/// form's, so it pins the filter's nearest state: the focus moved to the activity pane by a
+/// click. (A zoomed pane under a form is reachable through a form whose data returns late:
+/// `an_item_form_whose_data_returns_after_the_activity_zoom_is_drawn_over_it`.)
 #[tokio::test]
-async fn the_list_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
+async fn the_list_is_drawn_above_the_filter_while_the_activity_pane_has_the_focus() {
     let mut harness = backlog().await;
-    press(&mut harness, &["p", "tab", "tab", "z"]).await;
-    let zoomed = harness.render();
-    assert!(
-        zoomed.contains("Activity") && !zoomed.contains("htui"),
-        "the activity pane is zoomed:\n{zoomed}"
-    );
     press(&mut harness, &["f"]).await;
+    click_activity(&mut harness).await;
     let frame = harness.render();
     let lines: Vec<&str> = frame.lines().collect();
     let form = lines
@@ -3880,4 +4012,39 @@ async fn the_list_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
         .position(|line| line.contains("htui"))
         .unwrap_or_else(|| panic!("the list is drawn:\n{frame}"));
     assert!(list < form, "the list is above the form:\n{frame}");
+    assert!(
+        frame.contains("\u{2500} Activity \u{b7}"),
+        "the activity pane is shown:\n{frame}"
+    );
+}
+
+/// MOD-122 M3 D10 (blueprint F8): with the activity pane focused, the Backlog's filter key is the
+/// panel's: `f` cycles the panel's filter (`activity.filter`), and the tab's filter form does not
+/// open.
+#[tokio::test]
+async fn f_in_the_focused_activity_pane_cycles_its_filter_not_the_backlogs() {
+    let mut harness = backlog().await;
+    // The pane key moves the focus among the panes the last frame drew.
+    harness.render();
+    press(&mut harness, &["tab", "tab"]).await;
+    let focused = harness.render();
+    assert!(
+        focused.contains("Enter open \u{b7} f filter"),
+        "the activity pane is focused:\n{focused}"
+    );
+    assert!(
+        activity_title(&focused).contains("all workspaces"),
+        "{focused}"
+    );
+    press(&mut harness, &["f"]).await;
+    let frame = harness.render();
+    let title = activity_title(&frame);
+    assert!(
+        title.contains("Activity \u{b7} needs you"),
+        "the panel's filter moved: {title}"
+    );
+    assert!(
+        !frame.contains("\u{256d}\u{2500} Filter "),
+        "the Backlog's filter form did not open:\n{frame}"
+    );
 }

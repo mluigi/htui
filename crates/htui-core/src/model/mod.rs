@@ -77,6 +77,7 @@ macro_rules! str_enum {
     };
 }
 
+pub mod activity;
 pub mod agent;
 pub mod box_;
 pub mod document;
@@ -113,6 +114,10 @@ pub mod user;
 pub mod waiting;
 pub mod worker_log;
 
+pub use activity::{
+    ACTIVITY_PAGE, ActivityClass, ActivityEvent, ActivityKind, ActivityPage, PINNED_LIMIT,
+    TEXT_MAX_CHARS, activity_text, park_kind,
+};
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
 pub use box_::{
     BOX_PROBE_SPEC_KEY, BoxEdit, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings,
@@ -613,6 +618,27 @@ mod tests {
         check_enum(
             RelayOptionKind::ALL,
             &["allow_once", "allow_always", "reject_once", "reject_always"],
+        );
+    }
+
+    /// MOD-122 M3 plan D3: `chk_activity_event_kind`.
+    #[test]
+    fn activity_kind_matches_check_list() {
+        check_enum(
+            ActivityKind::ALL,
+            &[
+                "gate",
+                "judge_failed",
+                "selection",
+                "unblock",
+                "interrupted",
+                "permission",
+                "step_failed",
+                "run_failed",
+                "run_started",
+                "run_finished",
+                "close_out",
+            ],
         );
     }
 

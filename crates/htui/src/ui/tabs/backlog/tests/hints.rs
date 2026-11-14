@@ -20,7 +20,7 @@ async fn the_list_hint_is_on_the_focused_list_panes_border() {
     );
     let buffer = buffer_of(&tab, &bench.ctx());
     let [list, detail] = split();
-    let bottom = DEFAULT_SIZE.1 - 1;
+    let bottom = list.bottom() - 1;
     assert_eq!(
         text(&buffer, list.x, bottom, list.width),
         format!("╰─{DEFAULT_LIST_HINT}──╯")
@@ -52,7 +52,7 @@ async fn the_focused_detail_carries_its_own_keys() {
         "{wanted}: too wide to join"
     );
     let buffer = buffer_of(&tab, &bench.ctx().with_focus(PaneId::Detail));
-    let bottom = DEFAULT_SIZE.1 - 1;
+    let bottom = list.bottom() - 1;
     let row = text(&buffer, detail.x, bottom, detail.width);
     assert!(
         row.starts_with(&format!("╰─{wanted}")),
@@ -73,7 +73,7 @@ async fn the_filter_forms_keys_are_on_its_pane() {
     tab.form = Some(form);
     let buffer = buffer_of(&tab, &bench.ctx());
     let [list, detail] = split();
-    let bottom = DEFAULT_SIZE.1 - 1;
+    let bottom = list.bottom() - 1;
     let row = text(&buffer, list.x, bottom, list.width);
     assert!(row.starts_with(&format!("╰─{keys}")), "{row}");
     let row = text(&buffer, detail.x, bottom, detail.width);

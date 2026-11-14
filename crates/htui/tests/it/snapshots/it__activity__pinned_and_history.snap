@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/activity.rs
+expression: pinned
+---
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            3 waiting ·  ?  keys
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
+│ ▾ Platform (0)                                      ││Data model, box registry and sync topology │
+│ ▾ htui (8)                                          ││● done · no tags · priority 0 · version 1  │
+│▌ ANA-1    ● done       Data model, box registry and…││                                           │
+│  ANA-2    ○ open       Orchestrator step graphs and…││The store seam is the one interface every  │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││other module reaches through, so it is     │
+│  FEAT-1   ◐ running    TUI scaffold                 ││settled first.                             │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││Postgres holds the truth; every box keeps a│
+│  FIX-1    ✓ closed     Terminal left raw after panic││read-only cache it refreshes on connect.   │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││Writes are compare-and-set on a version    │
+│ ▾ agy (3)                                           ││column, so a losing edit is shown against  │
+│  ANA-1    ● done       Prompt assembly survey       ││its common ancestor rather than silently   │
+│  FEAT-1   ○ open       ACP transport upgrade        ││dropped.                                   │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
+│                                                     ││Item keys are minted from a per-project    │
+│                                                     ││counter table, which keeps numbers gapless │
+│                                                     ││and lets the legacy importer align the     │
+│                                                     ││counter above the numbers it brings in.    │
+╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯
+╭─ Activity · ⚠ 1 needs you · all workspaces ──────────────────────────────────────────────────────╮
+│ needs you ───────────────────────────────────────────────────────────────────────────────────────│
+│▌⚠ needs you 11-02 09:41 ANA-2 plan gate                                                          │
+│ recent ──────────────────────────────────────────────────────────────────────────────────────────│
+│ ◐ started 11-02 09:41 ANA-2                                                                      │
+│ ● finished 11-02 09:41 ANA-1 plan                                                                │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

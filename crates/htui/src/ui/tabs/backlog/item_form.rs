@@ -88,7 +88,7 @@ const PATHS_HEIGHT: u16 = 3;
 
 /// Rows the notice takes at least: a notice (a refusal or `still_behind`) wraps to two at the
 /// detail pane's width. A longer notice (a D11 hedge after a long store message) grows into the
-/// body's rows.
+/// body's rows, then the fixed rows (review H1).
 const NOTICE_HEIGHT: u16 = 2;
 
 /// One focusable part of the form.
@@ -1085,16 +1085,32 @@ pub fn render(
     // Every row but the body and the notice: the one-line rows, the paths and their label, and
     // the body label (the keys are the pane's hints since MOD-67 M6 T2).
     let fixed = one_line.saturating_add(PATHS_HEIGHT + 2);
-    // The notice grows into the body's rows when it has to (a small terminal), and a notice
-    // longer than all of them loses its first rows: the D11 hedge ends the sentence, and it is
-    // what stops a second Ctrl+S from minting a duplicate.
-    let room = inner.height.saturating_sub(fixed);
+    // The notice grows into the body's rows when it has to (a small terminal), and past them
+    // into the fixed rows (review H1), down to the focused field's and one more: the form
+    // scrolls that field into view, and a focused body keeps a row. A notice longer than that
+    // loses its first rows: the D11 hedge ends the sentence and is what stops a second Ctrl+S
+    // from minting a duplicate, so only the store's own message before it is cut.
+    let spare = inner.height.saturating_sub(fixed);
+    let focused = match form.focus {
+        Field::Paths => PATHS_HEIGHT + 1,
+        Field::Body => 2,
+        Field::Project
+        | Field::Kind
+        | Field::Title
+        | Field::Priority
+        | Field::Tags
+        | Field::Graph => 1,
+    };
+    let room = inner.height.saturating_sub(focused + 1);
     let wanted = u16::try_from(notice_lines.len()).unwrap_or(u16::MAX);
     let notice_height = wanted.min(room).max(NOTICE_HEIGHT);
     if wanted > notice_height {
         notice_lines.drain(..usize::from(wanted - notice_height));
     }
-    let body_height = room.saturating_sub(notice_height);
+    let body_height = match form.focus {
+        Field::Body => spare.saturating_sub(notice_height).max(1),
+        _ => spare.saturating_sub(notice_height),
+    };
     let choices: Vec<String> = fields
         .iter()
         .map(|field| form.picker_label(*field))
@@ -2388,9 +2404,36 @@ mod tests {
         );
     }
 
-    /// The notice's rows drawn at `size`, joined back into one sentence.
-    fn flowed_at(form: &ItemForm, size: (u16, u16)) -> (String, String) {
-        let rows = drawn_at(form, size);
+    /// The notice's rows drawn at `size` in the detail pane of the Backlog's default layout
+    /// (`ide_activity`, MOD-122 M3 D11), joined back into one sentence, and the rows as text.
+    fn flowed_at(form: &ItemForm, (width, height): (u16, u16)) -> (String, String) {
+        use crate::ui::shell::{PaneId, layout::areas};
+        use crate::ui::tabs::backlog::BACKLOG_LAYOUT;
+
+        let right = areas(
+            chrome(Rect::new(0, 0, width, height)).body,
+            &BACKLOG_LAYOUT,
+            PaneId::List,
+        )
+        .detail;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            right.width,
+            right.height,
+        ))
+        .expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                framed(frame, frame.area(), form);
+            })
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
         let flowed = rows
             .iter()
             .map(|row| row.trim_matches(|c| c == ' ' || c == '\u{2502}'))
@@ -2426,6 +2469,47 @@ mod tests {
         let tail = mint_may_have_landed("", Some("Ctrl+s"));
         let (flowed, rows) = flowed_at(&form, (80, 24));
         assert!(flowed.contains(tail.trim_start()), "{tail:?} in\n{rows}");
+        assert!(
+            rows.contains("Fresh item"),
+            "the focused field stays:\n{rows}"
+        );
+    }
+
+    /// Review H1: the hedge takes the form's fixed rows when the body's are too few, and the
+    /// focused field scrolls into what is left; a focused body keeps a row.
+    #[tokio::test]
+    async fn the_hedge_takes_fixed_rows_and_a_focused_body_keeps_one() {
+        let why = "store unreachable: error communicating with database: Connection reset by \
+                   peer (os error 104)";
+        let hedge = mint_may_have_landed(why, Some("Ctrl+s"));
+        let mut form = new_form().await;
+        form.focus = Field::Body;
+        type_text(&mut form, "Body words");
+        form.settle(Some(hedge.clone()));
+        let (flowed, rows) = flowed_at(&form, (80, 24));
+        assert!(flowed.contains(&hedge), "{hedge:?} in\n{rows}");
+        assert!(
+            rows.contains("Body words"),
+            "the focused body keeps a row:\n{rows}"
+        );
+
+        let mut form = new_form().await;
+        form.focus = Field::Paths;
+        type_text(&mut form, "src/**");
+        form.settle(Some(hedge.clone()));
+        let (flowed, rows) = flowed_at(&form, (80, 24));
+        assert!(flowed.contains(&hedge), "{hedge:?} in\n{rows}");
+        assert!(rows.contains("src/**"), "the focused paths stay:\n{rows}");
+    }
+
+    /// Review H1: a notice that fits the body's rows leaves the fixed rows alone.
+    #[tokio::test]
+    async fn a_notice_that_fits_leaves_the_fixed_rows() {
+        let mut form = new_form().await;
+        form.settle(Some(NO_KINDS.to_owned()));
+        let (_, rows) = flowed_at(&form, (80, 24));
+        let first = rows.lines().nth(1).unwrap_or_default();
+        assert!(first.contains("project"), "the first row stays:\n{rows}");
     }
 
     /// A word wider than the pane (a long path in a refusal) breaks inside, never off the edge.

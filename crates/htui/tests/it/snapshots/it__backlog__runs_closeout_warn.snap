@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/backlog.rs
+source: crates/htui/tests/it/backlog.rs
 expression: warn
 ---
 Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
@@ -11,24 +11,24 @@ Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI
 │  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▸ research        ● done            —  1h00│
 │  FEAT-1   ◐ running    TUI scaffold                 ││    candidate 1 approved✓  claude/opus     │
 │  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││  research        ↷ superseded      —  2h00│
-│  FEAT-3   ◌ queued     Postgres store and cache     ││    candidate 2 —          agy/default     │
-│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
-│ ▾ agy (3)                                           ││                                           │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││  ╭ Close out ──────────────────────────╮  │
+│  FIX-1    ✓ closed     Terminal left raw after panic││  │close ANA-1 as done · 1 run · 0      │  │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││  │commit rows · summary v2             │  │
+│ ▾ agy (3)                                           ││  ╰ ←/→ resolution · y next · n cancel ─╯  │
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
-│  FEAT-1   ○ open       ACP transport upgrade        ││  ╭ Close out ──────────────────────────╮  │
-│  FIX-1    ○ open       Session leak on cancel       ││  │close ANA-1 as done · 1 run · 0      │  │
-│                                                     ││  │commit rows · summary v2             │  │
-│                                                     ││  ╰ ←/→ resolution · y next · n cancel ─╯  │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 ╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

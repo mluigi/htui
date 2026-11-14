@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT project_id AS \"project_id!\" FROM workspace_project WHERE workspace_id = $1\n            UNION\n            SELECT id FROM project WHERE owner_workspace_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "project_id!",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b563af266d2edf5583b1b31237d738ae4a7fa37d2a1c8106c20dc2706f09d7d0"
+}

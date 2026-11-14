@@ -207,6 +207,13 @@ yet, create one in **Settings › Hierarchy** with `N`.
 Most lists use `j` / `k` (or the arrow keys) to move, and `h` / `l` (or `[` / `]`) to switch
 between sub-tabs or sections.
 
+A tab laid out with the **activity panel** (`p` cycles a tab's layouts, `F3` shows or hides the
+panel) lists what happened in every workspace, newest first: runs that started, finished or
+failed, with what waits on you pinned on top under `needs you` and counted in the panel's title.
+`Tab` to it; `f` cycles its filter (all workspaces, needs you, failures, this workspace), and
+`Enter` opens the row: the item's step in the Backlog's Runs, entering the item's workspace first
+when it is another one, or a chat's replay. `Backspace` comes back to the panel.
+
 ### Changing keys
 
 htui reads your key bindings from `keys.toml` in its configuration directory (see

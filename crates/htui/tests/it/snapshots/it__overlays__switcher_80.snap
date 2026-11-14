@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/overlays.rs
+source: crates/htui/tests/it/overlays.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?  keys
@@ -14,21 +14,21 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
-│                                          ││                                  │
-│                    ╭ Workspaces ─────────────────────────╮                   │
+│                                          ││      No body for this item.      │
+│                    ╭ Workspaces ─────────────────────────╮ites one           │
 │                    │▌Graphics  1 project                 │                   │
 │                    │ Platform  2 projects                │                   │
 │                    ╰ j/k move · Enter switch · Esc close ╯                   │
-│                                          ││      No body for this item.      │
-│                                          ││           e writes one           │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
-│                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
 ╰──────────────────────────────────────────╯╰──────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────╮
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                               No activity yet.                               │
+│                  events appear as runs start, wait and fail                  │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

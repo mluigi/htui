@@ -1,5 +1,6 @@
 ---
-source: crates/htui/tests/backlog_runs.rs
+source: crates/htui/tests/it/backlog_runs.rs
+assertion_line: 238
 expression: frame
 ---
 Platform   ¹Backlog       2 working · 2 waiting · memory ·  F9  about   F1  keys
@@ -11,7 +12,7 @@ Platform   ¹Backlog       2 working · 2 waiting · memory ·  F9  about   F1  
 │  CLEAN-1  ✗ failed     Drop the legacy m…││▸ research        ● done          │
 │  FEAT-1   ◐ running    TUI scaffold      ││    candidate 1 approved✓  claude/│
 │  FEAT-2   ⊘ blocked    Agent driver and …││  research        ↷ superseded    │
-│  FEAT-3   ◌ queued     Postgres store an…││  ╭ Close out ─────────────────╮ef│
+│  FEAT-3   ◌ queued     Postgres store an…││  ╭ Close out ─────────────────╮  │
 │  FIX-1    ✓ closed     Terminal left raw…││  │close ANA-1 as done · 1 run │  │
 │  TOOL-1   ⚠ needs you  CI matrix for the…││  │· 0 commit rows · summary   │  │
 │ ▾ agy (3)                                ││  │v2                          │  │

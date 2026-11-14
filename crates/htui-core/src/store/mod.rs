@@ -3,6 +3,7 @@
 //! The concrete `Backend` enum the TUI holds lives in `htui-store`, not here: it names `PgStore`
 //! and `CacheStore`, and this crate must stay free of `sqlx` (MOD-6 plan D1).
 
+mod activity;
 pub mod error;
 pub mod graph_rules;
 pub mod mem;
@@ -13,6 +14,7 @@ mod worker_log;
 #[cfg(feature = "test-support")]
 pub mod conformance;
 
+pub use activity::{ActivityStore, PER_USER_CAP};
 pub use error::{Result, StoreError};
 pub use graph_rules::{
     WalkEdge, WalkNode, body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,

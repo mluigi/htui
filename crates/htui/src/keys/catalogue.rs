@@ -43,7 +43,7 @@
 //! adds or changes carries `since: 2` (§1.1), so a key file from before M2 can give way to it.
 
 use Context::{
-    Answer, Backlog, BacklogDocs, BacklogFilter, BacklogGraph, BacklogItem, BacklogNotes,
+    Activity, Answer, Backlog, BacklogDocs, BacklogFilter, BacklogGraph, BacklogItem, BacklogNotes,
     BacklogPrompt, BacklogReqs, BacklogRuns, Chat, Choice, Common, Concepts, Confirm, Editor,
     Field, Form, Global, GraphEditor, GraphEditorLinks, History, Layout, Leave, List, Logs,
     Overlay, Pane, Picker, Queue, Requirements, Settings, SettingsAgents, SettingsBoxes,
@@ -161,6 +161,8 @@ pub enum Context {
     Chat,
     /// `[logs]`: the Logs tab (MOD-122 B1).
     Logs,
+    /// `[activity]`: the shell's activity panel (MOD-122 M3 D10), while it holds the keys.
+    Activity,
     /// `[queue]`: the queue overlay (MOD-67 M6 D2).
     Queue,
     /// `[picker]`: the directory picker a Settings section opens (MOD-67 M6 D3; today
@@ -234,6 +236,7 @@ impl Context {
         Self::BacklogItem,
         Self::Chat,
         Self::Logs,
+        Self::Activity,
         Self::Queue,
         Self::Picker,
         Self::Layout,
@@ -295,6 +298,7 @@ impl Context {
             Self::BacklogItem => "backlog.item",
             Self::Chat => "chat",
             Self::Logs => "logs",
+            Self::Activity => "activity",
             Self::Queue => "queue",
             Self::Picker => "picker",
             Self::Layout => "layout",
@@ -358,6 +362,7 @@ impl Context {
             Self::BacklogItem => "Item",
             Self::Chat => "Chat",
             Self::Logs => "Logs",
+            Self::Activity => "Activity",
             Self::Queue => "Queue",
             Self::Picker => "Picker",
             Self::Layout => "Layout",
@@ -414,6 +419,7 @@ impl Context {
                 | Self::BacklogItem
                 | Self::Chat
                 | Self::Logs
+                | Self::Activity
                 | Self::Queue
                 | Self::Picker
                 | Self::Leave
@@ -879,6 +885,11 @@ pub enum Act {
     LogsFollow,
     /// `logs.bottom`: the newest line, following again (MOD-122 D4).
     LogsBottom,
+    /// `activity.open`: open the selected event's item, or its chat's transcript (MOD-122 M3 D9).
+    ActivityOpen,
+    /// `activity.filter`: cycle the activity panel's filter, all workspaces → needs you →
+    /// failures → this workspace → all workspaces (MOD-122 M3 D10).
+    ActivityFilter,
     /// `settings.hierarchy.memory`: open the selected project's memory pane (MOD-163 D20).
     HierarchyMemory,
     /// `settings.memory.body`: edit the selected memory entry's body (MOD-163 D22).
@@ -2332,6 +2343,22 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::LogsLevel, Logs, "level", &["v"], "minimum level"),
     row(Act::LogsFollow, Logs, "follow", &["F"], "follow"),
     row(Act::LogsBottom, Logs, "bottom", &["G"], "newest"),
+    // [activity] (MOD-122 M3 D10): the shell's activity panel. `j`/`k`/`g`/`G` are `list.*`.
+    // ui/shell/activity.rs: on_act.
+    row(
+        Act::ActivityOpen,
+        Activity,
+        "open",
+        &["enter"],
+        "open the item or chat",
+    ),
+    row(
+        Act::ActivityFilter,
+        Activity,
+        "filter",
+        &["f"],
+        "all workspaces \u{b7} needs you \u{b7} failures \u{b7} this workspace",
+    ),
     // [queue]: the queue overlay (MOD-67 M6 D2). `j`/`k` are `list.down`/`up`, `Esc` is
     // `overlay.close`, `?` is `global.help`.
     // queue.rs:450.
@@ -2752,21 +2779,22 @@ mod tests {
             Context::BacklogItem => 44,
             Context::Chat => 45,
             Context::Logs => 46,
-            Context::Queue => 47,
-            Context::Picker => 48,
-            Context::Layout => 49,
-            Context::History => 50,
-            Context::Leave => 51,
-            Context::Field => 52,
-            Context::Choice => 53,
-            Context::Answer => 54,
+            Context::Activity => 47,
+            Context::Queue => 48,
+            Context::Picker => 49,
+            Context::Layout => 50,
+            Context::History => 51,
+            Context::Leave => 52,
+            Context::Field => 53,
+            Context::Choice => 54,
+            Context::Answer => 55,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        // MOD-147 M3 D9: `settings.documents`, 55.
-        assert_eq!(Context::ALL.len(), 55);
+        // MOD-147 M3 D9: `settings.documents`, 55; MOD-122 M3 D10: `activity`, 56.
+        assert_eq!(Context::ALL.len(), 56);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -3056,6 +3084,8 @@ mod tests {
         Act::HierarchyDocuments,
         Act::DocumentsView,
         Act::DocumentsNewVersion,
+        Act::ActivityOpen,
+        Act::ActivityFilter,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3312,6 +3342,8 @@ mod tests {
             Act::HierarchyDocuments => 247,
             Act::DocumentsView => 248,
             Act::DocumentsNewVersion => 249,
+            Act::ActivityOpen => 250,
+            Act::ActivityFilter => 251,
         }
     }
 
@@ -3347,7 +3379,8 @@ mod tests {
     fn every_act_has_exactly_one_row() {
         // MOD-122 M2 D11: `settings.boxes.log_level`, 247.
         // MOD-147 M3 D9: `settings.hierarchy.documents` and the documents pane's two, 250.
-        assert_eq!(CATALOGUE.len(), 250);
+        // MOD-122 M3 D10: `activity.open` and `activity.filter`, 252.
+        assert_eq!(CATALOGUE.len(), 252);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -3689,6 +3722,7 @@ mod tests {
             (Context::BacklogItem, "backlog.item", "Item"),
             (Context::Chat, "chat", "Chat"),
             (Context::Logs, "logs", "Logs"),
+            (Context::Activity, "activity", "Activity"),
             (Context::Queue, "queue", "Queue"),
             (Context::Picker, "picker", "Picker"),
             (Context::Layout, "layout", "Layout"),
@@ -3749,6 +3783,8 @@ mod tests {
             Context::Chat,
             // MOD-122 B1: the Logs tab's own context.
             Context::Logs,
+            // MOD-122 M3 D10: the shell's activity panel's.
+            Context::Activity,
         ] {
             assert!(context.is_view() && !context.is_shared(), "{context:?}");
         }

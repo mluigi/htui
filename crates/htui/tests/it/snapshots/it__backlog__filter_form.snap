@@ -1,34 +1,34 @@
 ---
-source: crates/htui/tests/backlog.rs
+source: crates/htui/tests/it/backlog.rs
 expression: frame
 ---
 Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
-│ ▾ Platform (0)                                      ││Data model, box registry and sync topology │
-│ ▾ htui (8)                                          ││● done · no tags · priority 0 · version 1  │
-│▌ ANA-1    ● done       Data model, box registry and…││                                           │
-│  ANA-2    ○ open       Orchestrator step graphs and…││The store seam is the one interface every  │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││other module reaches through, so it is     │
-│  FEAT-1   ◐ running    TUI scaffold                 ││settled first.                             │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││Postgres holds the truth; every box keeps a│
-│  FIX-1    ✓ closed     Terminal left raw after panic││read-only cache it refreshes on connect.   │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││Writes are compare-and-set on a version    │
+│ ▾ Platform (0)                                      ┃│Data model, box registry and sync topology │
+│ ▾ htui (8)                                          ┃│● done · no tags · priority 0 · version 1  │
+│▌ ANA-1    ● done       Data model, box registry and…┃│                                           │
+│  ANA-2    ○ open       Orchestrator step graphs and…┃│The store seam is the one interface every  │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…┃│other module reaches through, so it is     │
+│  FEAT-1   ◐ running    TUI scaffold                 ┃│settled first.                             │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ┃│                                           │
+│  FEAT-3   ◌ queued     Postgres store and cache     ┃│Postgres holds the truth; every box keeps a│
+│  FIX-1    ✓ closed     Terminal left raw after panic┃│read-only cache it refreshes on connect.   │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ┃│Writes are compare-and-set on a version    │
 │ ▾ agy (3)                                           ││column, so a losing edit is shown against  │
 │  ANA-1    ● done       Prompt assembly survey       ││its common ancestor rather than silently   │
-│  FEAT-1   ○ open       ACP transport upgrade        ││dropped.                                   │
-│  FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││Item keys are minted from a per-project    │
-│                                                     ││counter table, which keeps numbers gapless │
-│                                                     ││and lets the legacy importer align the     │
-│                                                     ││counter above the numbers it brings in.    │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-╰─────────────────────────────────────────────────────╯│                                           │
+╰─────────────────────────────────────────────────────╯│dropped.                                   │
 ╭─ Filter ────────────────────────────────────────────╮│                                           │
-│ status    ‹[x] done›  done                          ││                                           │
-│ project   ‹[ ] htui›  any                           ││                                           │
-│▌tags      rust                                      ││                                           │
-│ ready     [ ] only what this box can start          ││                                           │
+│ status    ‹[x] done›  done                          ││Item keys are minted from a per-project    │
+│ project   ‹[ ] htui›  any                           ││counter table, which keeps numbers gapless │
+│▌tags      rust                                      ││and lets the legacy importer align the     │
+│ ready     [ ] only what this box can start          ││counter above the numbers it brings in.    │
 ╰─comma list · Tab row · Enter apply · Esc cancel─────╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -6,6 +6,7 @@
 //! the shell turns the tab's body region and its layout into [`PaneAreas`], keeps one focused
 //! [`PaneId`] per tab and records a [`TabLoc`] per history entry.
 
+pub mod activity;
 pub mod history;
 pub mod layout;
 

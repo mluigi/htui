@@ -16,6 +16,10 @@ use uuid::Uuid;
 use crate::fixtures::ids;
 use crate::model::link::{ArtifactLinkKind, ProposeLink, WithdrawLink};
 use crate::model::{
+    ACTIVITY_PAGE, ActivityClass, ActivityEvent, ActivityKind, ActivityPage, TEXT_MAX_CHARS,
+    park_kind,
+};
+use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
     Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow, CoverageState,
@@ -62,6 +66,7 @@ use crate::prompt::settings::SettingKey;
 use crate::scrub::MinimalScrubber;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
 use crate::seed::{self, DEFAULT_PROJECT_TYPE, PROJECT_TYPES};
+use crate::store::activity::ActivityStore;
 use crate::store::error::StoreError;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
@@ -1986,6 +1991,1050 @@ async fn worker_log_set_box_log_level_keeps_the_rest_of_the_blob<S: WriteStore +
         );
         assert_eq!(cleared.edit_version, before.edit_version, "{CASE}");
     }
+}
+
+/// The activity half of the suite (MOD-122 M3 plan D1-D4, D7; blueprint F1), in run order. A name
+/// never changes.
+///
+/// A fourth list, for the reason [`WORKER_LOG_CASES`] is a third: these cases need
+/// [`ActivityStore`], which only `MemStore` and `PgStore` implement. Each case writes, so
+/// [`run_all_activity`] builds a fresh store per case, and each asserts first that the fixture
+/// ships no event (plan D13: loading the demo writes none).
+///
+/// What a generic case cannot reach is shown per backend, in `mem.rs` and the Postgres tests:
+/// another user's events, a graph run that finishes over a `closed` item (close-out refuses an
+/// item with a live run), and a workspace delete's cleared workspace.
+pub const ACTIVITY_CASES: &[&str] = &[
+    "gate_is_pinned_until_answered",
+    "run_park_kinds",
+    "blocked_item_is_unblock",
+    "permission_pending_is_pinned",
+    "failures",
+    "plain",
+    "same_status_writes_nothing",
+    "newest_pin_per_subject",
+    "paging",
+    "prune",
+    "delete_project_keeps_failures",
+    "text_is_cut_at_a_char_boundary",
+];
+
+/// Runs one [`ACTIVITY_CASES`] case by name against an already-loaded store. Every arm is boxed,
+/// as [`run_case`]'s are (MOD-137).
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case, and on an unknown `name`.
+pub async fn run_activity_case<S: WriteStore + ActivityStore>(name: &str, store: &S) {
+    Box::pin(run_activity_case_inline(name, store)).await;
+}
+
+async fn run_activity_case_inline<S: WriteStore + ActivityStore>(name: &str, store: &S) {
+    match name {
+        "gate_is_pinned_until_answered" => Box::pin(gate_is_pinned_until_answered(store)).await,
+        "run_park_kinds" => Box::pin(run_park_kinds(store)).await,
+        "blocked_item_is_unblock" => Box::pin(blocked_item_is_unblock(store)).await,
+        "permission_pending_is_pinned" => Box::pin(permission_pending_is_pinned(store)).await,
+        "failures" => Box::pin(failures(store)).await,
+        "plain" => Box::pin(plain(store)).await,
+        "same_status_writes_nothing" => Box::pin(same_status_writes_nothing(store)).await,
+        "newest_pin_per_subject" => Box::pin(newest_pin_per_subject(store)).await,
+        "paging" => Box::pin(paging(store)).await,
+        "prune" => Box::pin(prune(store)).await,
+        "delete_project_keeps_failures" => Box::pin(delete_project_keeps_failures(store)).await,
+        "text_is_cut_at_a_char_boundary" => Box::pin(text_is_cut_at_a_char_boundary(store)).await,
+        other => {
+            panic!("unknown activity case `{other}`; ACTIVITY_CASES and run_activity_case disagree")
+        }
+    }
+}
+
+/// Runs every case in [`ACTIVITY_CASES`], each against a store `make` produced fresh.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case.
+pub async fn run_all_activity<S, F, Fut>(make: F)
+where
+    S: WriteStore + ActivityStore,
+    F: Fn() -> Fut,
+    Fut: Future<Output = S>,
+{
+    for name in ACTIVITY_CASES {
+        run_activity_case(name, &make().await).await;
+    }
+}
+
+/// The whole feed of this user, one page wide.
+async fn feed<S: ActivityStore>(case: &str, store: &S) -> ActivityPage {
+    store.activity(None, ACTIVITY_PAGE).await.expect(case)
+}
+
+/// The fixture ships no event (plan D13), and the feed starts empty.
+async fn no_activity_yet<S: ActivityStore>(case: &str, store: &S) {
+    assert_eq!(
+        feed(case, store).await,
+        ActivityPage::default(),
+        "{case}: the fixture ships no activity (plan D13)"
+    );
+}
+
+/// The events written since `cursor`, oldest first; `cursor` moves to the newest.
+async fn written<S: ActivityStore>(
+    case: &str,
+    store: &S,
+    cursor: &mut Option<i64>,
+) -> Vec<ActivityEvent> {
+    let events = store
+        .activity(*cursor, ACTIVITY_PAGE)
+        .await
+        .expect(case)
+        .events;
+    if let Some(last) = events.last() {
+        *cursor = Some(last.id);
+    }
+    events
+}
+
+/// Each event's kind and step, in order.
+fn kinds_of(events: &[ActivityEvent]) -> Vec<(ActivityKind, Option<StepId>)> {
+    events
+        .iter()
+        .map(|event| (event.kind, event.step))
+        .collect()
+}
+
+/// The ids of `events`, in order.
+fn event_ids(events: &[ActivityEvent]) -> Vec<i64> {
+    events.iter().map(|event| event.id).collect()
+}
+
+/// A step of `run` at the slot, driven `pending -> running`, then `running -> to` unless `to` is
+/// `running`.
+async fn step_at<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    slot: (i32, i32, i32),
+    to: StepStatus,
+    at: DateTime<Utc>,
+) -> StepId {
+    let step = running_step(case, store, run, slot, at).await;
+    if to != StepStatus::Running {
+        assert!(
+            store
+                .transition_step(step, StepStatus::Running, to, at)
+                .await
+                .expect(case),
+            "{case}: running -> {to} is a sanctioned move"
+        );
+    }
+    step
+}
+
+/// A judge row of `run`'s slot, gated and rejected with `note`: `failed` with that note, as the
+/// engine leaves a failed judge.
+async fn failed_judge<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    (position, attempt): (i32, i32),
+    note: &str,
+    at: DateTime<Utc>,
+) -> StepId {
+    let judge = gated_step(case, store, new_run_step(run, position, attempt, -1)).await;
+    assert!(
+        store
+            .answer_gate(judge, GateOutcome::Rejected, Some(note.to_owned()), at)
+            .await
+            .expect(case),
+        "{case}: the judge fails with its note"
+    );
+    judge
+}
+
+/// MOD-122 M3 plan D3 (blueprint F1): parks the running `run` with no step parked
+/// (`transition_run(running -> awaiting_approval)`), and answers the one run-level event it
+/// wrote, after pinning that event's kind and step to [`park_kind`] over the steps read back
+/// (on Postgres: plpgsql == `park_kind`). Then the run resumes, which unpins it and writes
+/// nothing, and is cancelled, which writes nothing either.
+async fn parked_run_event<S: WriteStore + ActivityStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    at: DateTime<Utc>,
+    cursor: &mut Option<i64>,
+) -> ActivityEvent {
+    // The shape's own writes (gates, failures) are not this check's.
+    written(case, store, cursor).await;
+    assert!(
+        store
+            .transition_run(run, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(case),
+        "{case}: the run parks"
+    );
+    let events = written(case, store, cursor).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "{case}: the park writes one run-level event: {events:?}"
+    );
+    let event = events[0].clone();
+    assert!(
+        matches!(
+            event.kind,
+            ActivityKind::JudgeFailed | ActivityKind::Selection | ActivityKind::Interrupted
+        ) && event.run == Some(run),
+        "{case}: a run-level event of the run: {event:?}"
+    );
+    let steps = store.run_steps(run).await.expect(case);
+    assert_eq!(
+        (event.kind, event.step),
+        park_kind(&steps),
+        "{case}: the store writes `park_kind`'s answer over {steps:?}"
+    );
+    assert_eq!(
+        feed(case, store).await.pinned.first(),
+        Some(&event),
+        "{case}: the parked run is pinned, newest first"
+    );
+
+    assert!(
+        store
+            .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, at)
+            .await
+            .expect(case),
+        "{case}: the run resumes"
+    );
+    let page = feed(case, store).await;
+    assert!(
+        !page.pinned.iter().any(|pin| pin.id == event.id),
+        "{case}: a resumed run is no longer pinned: {:?}",
+        page.pinned
+    );
+    assert!(
+        page.events.contains(&event),
+        "{case}: the event stays in the feed"
+    );
+    store
+        .finish_run(run, RunStatus::Cancelled, None, at)
+        .await
+        .expect(case);
+    assert_eq!(
+        written(case, store, cursor).await,
+        Vec::new(),
+        "{case}: a resume and a cancel write nothing"
+    );
+    event
+}
+
+/// MOD-122 M3 plan D3, D4: a parked step writes one `gate`, pinned while it waits; the park's
+/// run half writes nothing (a step of the run is parked). Answering it unpins the event, which
+/// stays in the feed. The event carries plan D5's ids and copies.
+async fn gate_is_pinned_until_answered<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "gate_is_pinned_until_answered";
+    no_activity_yet(CASE, store).await;
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let mut cursor = None;
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    assert_eq!(
+        kinds_of(&written(CASE, store, &mut cursor).await),
+        [(ActivityKind::RunStarted, None)],
+        "{CASE}: the claim starts the run"
+    );
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the step starts"
+    );
+    assert_eq!(
+        written(CASE, store, &mut cursor).await,
+        Vec::new(),
+        "{CASE}: a step that starts writes nothing"
+    );
+
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(a), step)
+            .await
+            .expect(CASE),
+        ParkOutcome::Parked,
+        "{CASE}"
+    );
+    let parked = written(CASE, store, &mut cursor).await;
+    assert_eq!(
+        parked.len(),
+        1,
+        "{CASE}: one gate and no run-level event: {parked:?}"
+    );
+    let gate = parked[0].clone();
+    let item = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        gate,
+        ActivityEvent {
+            id: gate.id,
+            at: gate.at,
+            kind: ActivityKind::Gate,
+            workspace: Some(ids::WORKSPACE_PLATFORM),
+            project: Some(ids::PROJECT_HTUI),
+            project_slug: "htui".to_owned(),
+            item: Some(ids::HTUI_ANA_2),
+            item_key: Some(item.key),
+            run: Some(run),
+            chat: false,
+            step: Some(step),
+            step_name: Some("implement".to_owned()),
+            permission: None,
+            text: String::new(),
+        },
+        "{CASE}: plan D5: a run with no workspace takes its project's only workspace"
+    );
+    assert_eq!(
+        feed(CASE, store).await.pinned,
+        std::slice::from_ref(&gate),
+        "{CASE}: the waiting gate is pinned"
+    );
+
+    assert!(
+        store
+            .answer_gate(step, GateOutcome::Approved, None, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the gate is approved"
+    );
+    let page = feed(CASE, store).await;
+    assert_eq!(page.pinned, Vec::new(), "{CASE}: an answered gate unpins");
+    assert!(
+        page.events.contains(&gate),
+        "{CASE}: the gate stays in the feed"
+    );
+    assert_eq!(
+        written(CASE, store, &mut cursor).await,
+        Vec::new(),
+        "{CASE}: an approval writes nothing"
+    );
+}
+
+/// MOD-122 M3 plan D3 (blueprint F1): each of the rule's shapes, parked through
+/// `transition_run(running -> awaiting_approval)`, writes the kind and step both the literal
+/// expectation and [`park_kind`] name; resuming unpins it. The shapes' own parks write `gate`
+/// events, so only the run-subject event is asserted.
+async fn run_park_kinds<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "run_park_kinds";
+    no_activity_yet(CASE, store).await;
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let mut cursor = None;
+    let item = ids::HTUI_ANA_2;
+    let done = StepStatus::Done;
+
+    // A failed judge with a note, in an unselected slot of two done candidates.
+    let run = claimed(CASE, store, item, owner, at).await;
+    step_at(CASE, store, run, (1, 1, 0), done, at).await;
+    step_at(CASE, store, run, (1, 1, 1), done, at).await;
+    let judge = failed_judge(CASE, store, run, (1, 1), "judge: tie", at).await;
+    let event = parked_run_event(CASE, store, run, at, &mut cursor).await;
+    assert_eq!(
+        (event.kind, event.step, event.text.as_str()),
+        (ActivityKind::JudgeFailed, Some(judge), "judge: tie"),
+        "{CASE}: a failed judge with a note"
+    );
+
+    // An unselected slot of two done candidates and no judge.
+    let run = claimed(CASE, store, item, owner, at).await;
+    let first = step_at(CASE, store, run, (1, 1, 0), done, at).await;
+    step_at(CASE, store, run, (1, 1, 1), done, at).await;
+    let event = parked_run_event(CASE, store, run, at, &mut cursor).await;
+    assert_eq!(
+        (event.kind, event.step),
+        (ActivityKind::Selection, Some(first)),
+        "{CASE}: a selection on the slot's first candidate"
+    );
+
+    // A failed step and no slot.
+    let run = claimed(CASE, store, item, owner, at).await;
+    step_at(CASE, store, run, (0, 1, 0), done, at).await;
+    let failed = step_at(CASE, store, run, (1, 1, 0), StepStatus::Failed, at).await;
+    let event = parked_run_event(CASE, store, run, at, &mut cursor).await;
+    assert_eq!(
+        (event.kind, event.step),
+        (ActivityKind::Interrupted, Some(failed)),
+        "{CASE}: an interrupted park on the failed step"
+    );
+
+    // A failed judge with no note is a selection (`views.rs` reads it so).
+    let run = claimed(CASE, store, item, owner, at).await;
+    let first = step_at(CASE, store, run, (1, 1, 0), done, at).await;
+    step_at(CASE, store, run, (1, 1, 1), done, at).await;
+    step_at(CASE, store, run, (1, 1, -1), StepStatus::Failed, at).await;
+    let event = parked_run_event(CASE, store, run, at, &mut cursor).await;
+    assert_eq!(
+        (event.kind, event.step),
+        (ActivityKind::Selection, Some(first)),
+        "{CASE}: a failed judge with no note"
+    );
+
+    // A slot with a running candidate waits on no pick.
+    let run = claimed(CASE, store, item, owner, at).await;
+    step_at(CASE, store, run, (1, 1, 0), done, at).await;
+    step_at(CASE, store, run, (1, 1, 1), StepStatus::Running, at).await;
+    let event = parked_run_event(CASE, store, run, at, &mut cursor).await;
+    assert_eq!(
+        (event.kind, event.step),
+        (ActivityKind::Interrupted, None),
+        "{CASE}: a slot with a running candidate"
+    );
+
+    // Two slots: the older decided, the newer not.
+    let run = claimed(CASE, store, item, owner, at).await;
+    let winner = step_at(CASE, store, run, (1, 1, 0), done, at).await;
+    step_at(CASE, store, run, (1, 1, 1), done, at).await;
+    store
+        .select_fanout(run, 1, 1, winner, None)
+        .await
+        .expect(CASE);
+    let newer = step_at(CASE, store, run, (2, 1, 0), done, at).await;
+    step_at(CASE, store, run, (2, 1, 1), done, at).await;
+    let event = parked_run_event(CASE, store, run, at, &mut cursor).await;
+    assert_eq!(
+        (event.kind, event.step),
+        (ActivityKind::Selection, Some(newer)),
+        "{CASE}: a selection on the newer slot"
+    );
+}
+
+/// MOD-122 M3 plan D3, D4: an item moved to `blocked` writes one `unblock`, pinned while the item
+/// is `blocked`, on the item's creator; reopening it unpins.
+async fn blocked_item_is_unblock<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "blocked_item_is_unblock";
+    no_activity_yet(CASE, store).await;
+    let mut cursor = None;
+    let item = ids::HTUI_ANA_2;
+    assert!(
+        store
+            .transition(item, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: open -> blocked"
+    );
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(events.len(), 1, "{CASE}: {events:?}");
+    let unblock = events[0].clone();
+    assert_eq!(
+        (
+            unblock.kind,
+            unblock.item,
+            unblock.run,
+            unblock.step,
+            unblock.project,
+            unblock.workspace,
+        ),
+        (
+            ActivityKind::Unblock,
+            Some(item),
+            None,
+            None,
+            Some(ids::PROJECT_HTUI),
+            Some(ids::WORKSPACE_PLATFORM),
+        ),
+        "{CASE}: an item with no active run"
+    );
+    assert_eq!(
+        feed(CASE, store).await.pinned,
+        std::slice::from_ref(&unblock),
+        "{CASE}"
+    );
+
+    assert!(
+        store
+            .transition(item, Status::Blocked, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: blocked -> open"
+    );
+    let page = feed(CASE, store).await;
+    assert_eq!(page.pinned, Vec::new(), "{CASE}: a reopened item unpins");
+    assert_eq!(page.events, [unblock], "{CASE}: reopening writes nothing");
+}
+
+/// MOD-122 M3 plan D3, D4: a request parked `pending` writes one `permission` with its summary,
+/// pinned while it is `pending`; the answer unpins it.
+async fn permission_pending_is_pinned<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "permission_pending_is_pinned";
+    no_activity_yet(CASE, store).await;
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let mut cursor = None;
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the step starts"
+    );
+    written(CASE, store, &mut cursor).await;
+
+    let id = parked(
+        CASE,
+        store,
+        open_request(run, step, RelaySessionId::new(), "req-1", a),
+    )
+    .await;
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(events.len(), 1, "{CASE}: {events:?}");
+    let permission = events[0].clone();
+    assert_eq!(
+        (
+            permission.kind,
+            permission.permission,
+            permission.step,
+            permission.run,
+            permission.item,
+            permission.text.as_str(),
+        ),
+        (
+            ActivityKind::Permission,
+            Some(id),
+            Some(step),
+            Some(run),
+            Some(ids::HTUI_ANA_2),
+            "edit: req-1",
+        ),
+        "{CASE}: the request's ids and summary"
+    );
+    assert_eq!(
+        feed(CASE, store).await.pinned,
+        std::slice::from_ref(&permission),
+        "{CASE}"
+    );
+
+    assert_eq!(
+        answer(CASE, store, id, "allow-once").await,
+        AnswerOutcome::Answered,
+        "{CASE}"
+    );
+    let page = feed(CASE, store).await;
+    assert_eq!(
+        page.pinned,
+        Vec::new(),
+        "{CASE}: an answered request unpins"
+    );
+    assert_eq!(page.events.last(), Some(&permission), "{CASE}");
+}
+
+/// MOD-122 M3 plan D3: a failed step writes `step_failed` with its gate note as text (none: empty),
+/// and a failed run writes `run_failed` with `run.failure` on its most recently updated step.
+async fn failures<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "failures";
+    no_activity_yet(CASE, store).await;
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let mut cursor = None;
+    let run = claimed(CASE, store, ids::HTUI_ANA_2, owner, at).await;
+    written(CASE, store, &mut cursor).await;
+
+    let plain = step_at(CASE, store, run, (0, 1, 0), StepStatus::Failed, at).await;
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(
+        kinds_of(&events),
+        [(ActivityKind::StepFailed, Some(plain))],
+        "{CASE}"
+    );
+    assert_eq!(
+        (events[0].run, events[0].text.as_str()),
+        (Some(run), ""),
+        "{CASE}: a step with no note"
+    );
+
+    let rejected = gated_step(CASE, store, new_run_step(run, 1, 1, 0)).await;
+    written(CASE, store, &mut cursor).await;
+    assert!(
+        store
+            .answer_gate(
+                rejected,
+                GateOutcome::Rejected,
+                Some("not like this".to_owned()),
+                at
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the gate is rejected"
+    );
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(
+        (kinds_of(&events), events[0].text.as_str()),
+        (
+            vec![(ActivityKind::StepFailed, Some(rejected))],
+            "not like this"
+        ),
+        "{CASE}: a rejected gate's note"
+    );
+    assert_eq!(
+        feed(CASE, store).await.pinned,
+        Vec::new(),
+        "{CASE}: a failure is never pinned"
+    );
+
+    store
+        .finish_run(run, RunStatus::Failed, Some("verify failed"), at)
+        .await
+        .expect(CASE);
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(
+        (kinds_of(&events), events[0].text.as_str(), events[0].chat),
+        (
+            vec![(ActivityKind::RunFailed, Some(rejected))],
+            "verify failed",
+            false
+        ),
+        "{CASE}: `run.failure`, on the run's most recently updated step"
+    );
+}
+
+/// MOD-122 M3 plan D3: a graph run's claim writes `run_started`, and its `done` over an open item
+/// `close_out`. A chat run's start and finish write nothing; its failure writes `run_failed`
+/// with `chat`. (`run_finished`, a graph run done over a `closed` item, is per backend: close-out
+/// refuses an item with a live run.)
+async fn plain<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "plain";
+    no_activity_yet(CASE, store).await;
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let mut cursor = None;
+    let run = claimed(CASE, store, ids::HTUI_ANA_2, owner, at).await;
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(
+        (kinds_of(&events), events[0].run, events[0].chat),
+        (vec![(ActivityKind::RunStarted, None)], Some(run), false),
+        "{CASE}: a claim starts the graph run"
+    );
+    store
+        .finish_run(run, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(
+        (kinds_of(&events), events[0].run, events[0].item),
+        (
+            vec![(ActivityKind::CloseOut, None)],
+            Some(run),
+            Some(ids::HTUI_ANA_2)
+        ),
+        "{CASE}: a run done over an open item is ready to close"
+    );
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        None,
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+    store
+        .finish_chat_run(chat.run_id, chat.step_id, RunStatus::Done, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        written(CASE, store, &mut cursor).await,
+        Vec::new(),
+        "{CASE}: a chat's start and finish write nothing"
+    );
+
+    let failing = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        None,
+    );
+    store.start_chat_run(&failing).await.expect(CASE);
+    store
+        .fail_run(failing.run_id, "agent exited", at)
+        .await
+        .expect(CASE);
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(events.len(), 1, "{CASE}: {events:?}");
+    assert_eq!(
+        (
+            events[0].kind,
+            events[0].run,
+            events[0].chat,
+            events[0].item,
+            events[0].project,
+            events[0].text.as_str(),
+        ),
+        (
+            ActivityKind::RunFailed,
+            Some(failing.run_id),
+            true,
+            None,
+            Some(ids::PROJECT_HTUI),
+            "agent exited",
+        ),
+        "{CASE}: a chat's failure"
+    );
+}
+
+/// MOD-122 M3 plan D2: a write that leaves a status where it was writes nothing: a second park of
+/// a parked step is refused before any write, and `awaiting_approval -> awaiting_approval` is not
+/// a change.
+async fn same_status_writes_nothing<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "same_status_writes_nothing";
+    no_activity_yet(CASE, store).await;
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let mut cursor = None;
+    let (_, step) = leased_step(CASE, store, a, at).await;
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}"
+    );
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(a), step)
+            .await
+            .expect(CASE),
+        ParkOutcome::Parked,
+        "{CASE}"
+    );
+    assert_eq!(
+        kinds_of(&written(CASE, store, &mut cursor).await),
+        [
+            (ActivityKind::RunStarted, None),
+            (ActivityKind::Gate, Some(step))
+        ],
+        "{CASE}"
+    );
+
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(a), step)
+            .await
+            .expect(CASE),
+        ParkOutcome::StepMoved,
+        "{CASE}: a parked step does not park again"
+    );
+    assert!(
+        store
+            .transition_step(
+                step,
+                StepStatus::AwaitingApproval,
+                StepStatus::AwaitingApproval,
+                at
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the law allows the same status"
+    );
+    assert_eq!(
+        written(CASE, store, &mut cursor).await,
+        Vec::new(),
+        "{CASE}: neither writes an event"
+    );
+}
+
+/// MOD-122 M3 plan D4: park, resume and park the same run: two events, and only the newest is
+/// pinned.
+async fn newest_pin_per_subject<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "newest_pin_per_subject";
+    no_activity_yet(CASE, store).await;
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let mut cursor = None;
+    let run = claimed(CASE, store, ids::HTUI_ANA_2, owner, at).await;
+    written(CASE, store, &mut cursor).await;
+    for (from, to) in [
+        (RunStatus::Running, RunStatus::AwaitingApproval),
+        (RunStatus::AwaitingApproval, RunStatus::Running),
+        (RunStatus::Running, RunStatus::AwaitingApproval),
+    ] {
+        assert!(
+            store.transition_run(run, from, to, at).await.expect(CASE),
+            "{CASE}: {from} -> {to}"
+        );
+    }
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(
+        kinds_of(&events),
+        [
+            (ActivityKind::Interrupted, None),
+            (ActivityKind::Interrupted, None)
+        ],
+        "{CASE}: each park writes"
+    );
+    assert_eq!(
+        feed(CASE, store).await.pinned,
+        [events[1].clone()],
+        "{CASE}: only the newest event of the run is pinned"
+    );
+}
+
+/// MOD-122 M3 plan D1: ids rise; `after` is exclusive and reads forward, oldest first, at most
+/// `limit`; `None` is the newest `limit`, oldest first; `pinned` ignores `after`. Another user's
+/// events are never read: per backend, `mem.rs` and the Postgres tests.
+async fn paging<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "paging";
+    no_activity_yet(CASE, store).await;
+    let item = ids::HTUI_ANA_2;
+    for _ in 0..5 {
+        for (from, to) in [
+            (Status::Open, Status::Blocked),
+            (Status::Blocked, Status::Open),
+        ] {
+            assert!(
+                store.transition(item, from, to).await.expect(CASE),
+                "{CASE}: {from} -> {to}"
+            );
+        }
+    }
+    assert!(
+        store
+            .transition(item, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: blocked once more"
+    );
+    let all = feed(CASE, store).await.events;
+    assert_eq!(all.len(), 6, "{CASE}: {all:?}");
+    let ids = event_ids(&all);
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "{CASE}: ids rise in read order: {ids:?}"
+    );
+
+    let read = |after: Option<i64>, limit: u32| async move {
+        store.activity(after, limit).await.expect(CASE)
+    };
+    assert_eq!(
+        event_ids(&read(Some(ids[0]), 100).await.events),
+        ids[1..],
+        "{CASE}: `after` is exclusive"
+    );
+    assert_eq!(
+        event_ids(&read(Some(ids[1]), 2).await.events),
+        ids[2..4],
+        "{CASE}: `after` reads forward, oldest first, at most `limit`"
+    );
+    assert_eq!(
+        read(Some(ids[5]), 100).await.events,
+        Vec::new(),
+        "{CASE}: nothing after the newest"
+    );
+    assert_eq!(
+        event_ids(&read(None, 2).await.events),
+        ids[4..],
+        "{CASE}: `None` is the newest `limit`, oldest first"
+    );
+    assert_eq!(
+        read(None, 0).await.events,
+        Vec::new(),
+        "{CASE}: a zero limit reads nothing"
+    );
+    for after in [None, Some(ids[5])] {
+        assert_eq!(
+            read(after, 0).await.pinned,
+            [all[5].clone()],
+            "{CASE}: `pinned` is read whatever `after` and `limit` say"
+        );
+    }
+}
+
+/// MOD-122 M3 plan D1, D6: the age cut deletes the events written before it, the cap then keeps
+/// each user's newest, and a second sweep deletes nothing.
+async fn prune<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "prune";
+    no_activity_yet(CASE, store).await;
+    let far_past = seam_clock() - TimeDelta::days(3650);
+    let item = ids::HTUI_ANA_2;
+    let flip = |n: usize| async move {
+        for _ in 0..n {
+            for (from, to) in [
+                (Status::Open, Status::Blocked),
+                (Status::Blocked, Status::Open),
+            ] {
+                assert!(
+                    store.transition(item, from, to).await.expect(CASE),
+                    "{CASE}: {from} -> {to}"
+                );
+            }
+        }
+    };
+    flip(2).await;
+    // Both stores stamp `at` from a real clock; the pause keeps the two batches apart.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    flip(5).await;
+    let all = feed(CASE, store).await.events;
+    assert_eq!(all.len(), 7, "{CASE}");
+    let cut = all[2].at;
+    assert!(
+        all[1].at < cut,
+        "{CASE}: the batches were written apart: {all:?}"
+    );
+    let ids = event_ids(&all);
+
+    assert_eq!(
+        store.prune_activity(far_past, 100).await.expect(CASE),
+        0,
+        "{CASE}: nothing is older than the far past, and nothing is over the cap"
+    );
+    assert_eq!(
+        store.prune_activity(cut, 100).await.expect(CASE),
+        2,
+        "{CASE}: the events written before the cut go"
+    );
+    assert_eq!(
+        event_ids(&feed(CASE, store).await.events),
+        ids[2..],
+        "{CASE}: an event written at the cut stays"
+    );
+    assert_eq!(
+        store.prune_activity(far_past, 3).await.expect(CASE),
+        2,
+        "{CASE}: the cap removes the two oldest of five"
+    );
+    assert_eq!(
+        event_ids(&feed(CASE, store).await.events),
+        ids[4..],
+        "{CASE}: the cap keeps the newest"
+    );
+    assert_eq!(
+        store.prune_activity(cut, 3).await.expect(CASE),
+        0,
+        "{CASE}: a second sweep deletes nothing"
+    );
+}
+
+/// MOD-122 M3 plan D7: after `delete_project`, the plain and needs-you events of its items and
+/// runs are gone; the failures stay with every gone reference cleared and the copies intact.
+async fn delete_project_keeps_failures<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "delete_project_keeps_failures";
+    no_activity_yet(CASE, store).await;
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}"
+    );
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(a), step)
+            .await
+            .expect(CASE),
+        ParkOutcome::Parked,
+        "{CASE}"
+    );
+    assert!(
+        store
+            .answer_gate(step, GateOutcome::Rejected, Some("no".to_owned()), at)
+            .await
+            .expect(CASE),
+        "{CASE}"
+    );
+    store
+        .finish_run(run, RunStatus::Failed, Some("verify failed"), at)
+        .await
+        .expect(CASE);
+    assert!(
+        store
+            .transition(ids::HTUI_FEAT_3, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}"
+    );
+    let before = feed(CASE, store).await.events;
+    assert_eq!(
+        before.iter().map(|event| event.kind).collect::<Vec<_>>(),
+        [
+            ActivityKind::RunStarted,
+            ActivityKind::Gate,
+            ActivityKind::StepFailed,
+            ActivityKind::RunFailed,
+            ActivityKind::Unblock,
+        ],
+        "{CASE}"
+    );
+    let key = item_row(CASE, store, ids::HTUI_ANA_2).await.key;
+
+    store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    let page = feed(CASE, store).await;
+    assert_eq!(page.pinned, Vec::new(), "{CASE}");
+    let kept: Vec<ActivityEvent> = before
+        .iter()
+        .filter(|event| event.kind.class() == ActivityClass::Failure)
+        .map(|event| ActivityEvent {
+            project: None,
+            item: None,
+            run: None,
+            step: None,
+            permission: None,
+            ..event.clone()
+        })
+        .collect();
+    assert_eq!(
+        page.events, kept,
+        "{CASE}: the failures stay, every gone reference cleared"
+    );
+    for event in &page.events {
+        assert_eq!(
+            (
+                event.project_slug.as_str(),
+                event.item_key.as_deref(),
+                event.step_name.as_deref(),
+                event.workspace,
+            ),
+            (
+                "htui",
+                Some(key.as_str()),
+                Some("implement"),
+                Some(ids::WORKSPACE_PLATFORM)
+            ),
+            "{CASE}: the copies and the surviving workspace stay"
+        );
+    }
+}
+
+/// MOD-122 M3 plan D3: an event's text is cut to [`TEXT_MAX_CHARS`] chars at a char boundary.
+async fn text_is_cut_at_a_char_boundary<S: WriteStore + ActivityStore>(store: &S) {
+    const CASE: &str = "text_is_cut_at_a_char_boundary";
+    no_activity_yet(CASE, store).await;
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let mut cursor = None;
+    let run = claimed(CASE, store, ids::HTUI_ANA_2, owner, at).await;
+    let step = gated_step(CASE, store, new_run_step(run, 0, 1, 0)).await;
+    written(CASE, store, &mut cursor).await;
+    let note = "é".repeat(TEXT_MAX_CHARS + 100);
+    assert!(
+        store
+            .answer_gate(step, GateOutcome::Rejected, Some(note), at)
+            .await
+            .expect(CASE),
+        "{CASE}"
+    );
+    let events = written(CASE, store, &mut cursor).await;
+    assert_eq!(
+        kinds_of(&events),
+        [(ActivityKind::StepFailed, Some(step))],
+        "{CASE}"
+    );
+    assert_eq!(
+        events[0].text,
+        "é".repeat(TEXT_MAX_CHARS),
+        "{CASE}: cut to the cap, in chars"
+    );
 }
 
 /// The `Platform` workspace of the fixture: projects `htui` (position 0) then `agy` (position 1).
@@ -35786,7 +36835,8 @@ async fn document_links_are_leaves_of_the_walk<S: WriteStore>(store: &S) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CASES, READ_CASES, WORKER_LOG_CASES, run_case, run_read_case, run_worker_log_case,
+        ACTIVITY_CASES, CASES, READ_CASES, WORKER_LOG_CASES, run_activity_case, run_case,
+        run_read_case, run_worker_log_case,
     };
     use crate::store::MemStore;
 
@@ -35803,14 +36853,15 @@ mod tests {
             .iter()
             .chain(READ_CASES)
             .chain(WORKER_LOG_CASES)
+            .chain(ACTIVITY_CASES)
             .copied()
             .collect();
         all.sort_unstable();
         all.dedup();
         assert_eq!(
             all.len(),
-            CASES.len() + READ_CASES.len() + WORKER_LOG_CASES.len(),
-            "a case name is unique across the three lists"
+            CASES.len() + READ_CASES.len() + WORKER_LOG_CASES.len() + ACTIVITY_CASES.len(),
+            "a case name is unique across the four lists"
         );
     }
 
@@ -35972,6 +37023,15 @@ mod tests {
     async fn run_worker_log_case_accepts_every_name() {
         for name in WORKER_LOG_CASES {
             run_worker_log_case(name, &MemStore::demo()).await;
+        }
+    }
+
+    /// The same guard for the activity half (MOD-122 M3): each case writes, so each gets a fresh
+    /// store.
+    #[tokio::test]
+    async fn run_activity_case_accepts_every_name() {
+        for name in ACTIVITY_CASES {
+            run_activity_case(name, &MemStore::demo()).await;
         }
     }
 }

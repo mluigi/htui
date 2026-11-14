@@ -9,26 +9,26 @@ Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI
 │▌ ANA-1    ● done       Data model, box registry and…││graph  ● done      DESKTOP-HTUI 09-02 14:00│
 │  ANA-2    ○ open       Orchestrator step graphs and…││manual                          09-02 17:00│
 │  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▸ research        ● done            —  1h00│
-│  FEAT-1   ◐ running    TUI scaffold                 ││    candidate 1 approved✓  claude/opus     │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││  research        ↷ superseded      —  2h00│
-│  FEAT-3   ◌ queued     Postgres store and cache     ││    candidate 2 —          agy/default     │
-│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
-│ ▾ agy (3)                                           ││  ╭ Close out ──────────────────────────╮  │
-│  ANA-1    ● done       Prompt assembly survey       ││  │close ANA-1 as duplicate · 1 run · 0 │  │
-│  FEAT-1   ○ open       ACP transport upgrade        ││  │commit rows · summary v2             │  │
-│  FIX-1    ○ open       Session leak on cancel       ││  │duplicate of which item? type its    │  │
-│                                                     ││  │key:                                 │  │
-│                                                     ││  │                                     │  │
-│                                                     ││  │                                     │  │
-│                                                     ││  ╰ Enter next · Esc cancel ────────────╯  │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│  FEAT-1   ◐ running    TUI scaffold                 ││  ╭ Close out ──────────────────────────╮  │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││  │close ANA-1 as duplicate · 1 run · 0 │  │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││  │commit rows · summary v2             │  │
+│  FIX-1    ✓ closed     Terminal left raw after panic││  │duplicate of which item? type its    │  │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││  │key:                                 │  │
+│ ▾ agy (3)                                           ││  │                                     │  │
+│  ANA-1    ● done       Prompt assembly survey       ││  │                                     │  │
+│  FEAT-1   ○ open       ACP transport upgrade        ││  ╰ Enter next · Esc cancel ────────────╯  │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 ╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

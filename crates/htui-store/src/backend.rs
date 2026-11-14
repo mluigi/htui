@@ -610,6 +610,31 @@ impl Backend {
         }
     }
 
+    /// This user's activity feed (MOD-122 M3 plan D1, D4): the events with `id > after`, oldest
+    /// first, at most `limit` (`after: None` is the newest `limit`, still oldest first), and
+    /// every needs-you event still waiting. Offline there is no feed to read, so the answer is an
+    /// empty page, never an error: a caller merges it (adds nothing) rather than replacing what
+    /// it holds.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports.
+    pub async fn activity(
+        &self,
+        after: Option<i64>,
+        limit: u32,
+    ) -> Result<htui_core::model::ActivityPage> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::ActivityStore::activity(store, after, limit).await
+            }
+            Self::Online { pg, .. } => {
+                htui_core::store::ActivityStore::activity(pg, after, limit).await
+            }
+            Self::Offline { .. } => Ok(htui_core::model::ActivityPage::default()),
+        }
+    }
+
     /// One whole `box` row, unlike [`Backend::box_info`]'s top-bar projection.
     ///
     /// # Errors

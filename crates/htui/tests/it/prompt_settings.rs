@@ -9,9 +9,9 @@
 //! `HTUI_TEST_DATABASE_URL` is unset, as every other Postgres-backed suite in this crate does: it
 //! is the only store where the ten seeded `app_setting` rows exist before anything writes one
 //! (`0002_agent_probe.sql:68-79`), and therefore the only one where a set carries a token rather
-//! than `expected: None`. MOD-163's `memory_capture`, MOD-141's `compete_fan_out` and MOD-164's
-//! `light_model` are the three `App` keys past `0002`'s ten and have no seed row, so each is
-//! `expected: None` on both stores.
+//! than `expected: None`. MOD-163's `memory_capture`, MOD-141's `compete_fan_out`, MOD-164's
+//! `light_model` and MOD-122's `log_retention_days` are the four `App` keys past `0002`'s ten and
+//! have no seed row, so each is `expected: None` on both stores.
 #![cfg(feature = "testkit")]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -102,7 +102,7 @@ async fn demo_settings(backend: &Backend) -> SettingsSnapshot {
 fn app_token(snapshot: &SettingsSnapshot, key: SettingKey) -> DateTime<Utc> {
     snapshot
         .app_entry(key)
-        .expect("the snapshot carries all thirteen keys")
+        .expect("the snapshot carries all fourteen keys")
         .updated_at
         .expect("an applied write leaves the row a token")
 }
@@ -151,9 +151,9 @@ fn prompt_settings_names_are_stable() {
     assert_eq!(unique.len(), REQUEST_NAMES.len(), "three distinct names");
 }
 
-/// The shape of one read (D3/D4): thirteen `App` entries in `SettingKey::app_keys` order (`0002`'s
-/// ten plus MOD-163's `memory_capture`, MOD-141's `compete_fan_out` and MOD-164's `light_model`;
-/// the test keeps the name it was given at eleven), all empty on a fresh `MemStore` (F-7), the
+/// The shape of one read (D3/D4): fourteen `App` entries in `SettingKey::app_keys` order (`0002`'s
+/// ten plus MOD-163's `memory_capture`, MOD-141's `compete_fan_out`, MOD-164's `light_model` and
+/// MOD-122's `log_retention_days`; the test keeps the name it was given at eleven), all empty on a fresh `MemStore` (F-7), the
 /// agent registry the `light_model` row cycles through (MOD-164 D7), and one project
 /// entry per scope project carrying exactly the keys the `Project` rung accepts, in
 /// [`project_keys`] order — `allow_env_files` first (MOD-89 D4), then `box_hostname` (MOD-33
@@ -166,7 +166,7 @@ fn prompt_settings_names_are_stable() {
 async fn the_demo_snapshot_has_eleven_app_entries_and_five_keys_per_project() {
     let snapshot = demo_settings(&demo()).await;
 
-    assert_eq!(snapshot.app.len(), 13);
+    assert_eq!(snapshot.app.len(), 14);
     let names: Vec<&str> = snapshot
         .agents
         .iter()
@@ -227,7 +227,7 @@ async fn app_map_holds_only_entries_with_a_value() {
     );
 
     let map = snapshot.app_map();
-    assert_eq!(map.len(), 1, "twelve entries hold nothing: {map:?}");
+    assert_eq!(map.len(), 1, "thirteen entries hold nothing: {map:?}");
     assert_eq!(map.get("max_skill_tokens"), Some(&json!(4_000)));
 }
 
@@ -254,7 +254,7 @@ async fn set_setting_on_app_with_no_row_applies_then_the_old_token_is_stale() {
     let applied = settings(serve(&backend, &set_budget(None)).await);
     let entry = applied
         .app_entry(SettingKey::TokenBudget)
-        .expect("the snapshot carries all thirteen keys");
+        .expect("the snapshot carries all fourteen keys");
     assert_eq!(entry.value, Some(json!(5_000)));
     let first = app_token(&applied, SettingKey::TokenBudget);
 
@@ -303,7 +303,7 @@ async fn clear_setting_on_app_returns_the_entry_to_none() {
     );
     let entry = cleared
         .app_entry(SettingKey::MaxSkillTokens)
-        .expect("the snapshot carries all thirteen keys");
+        .expect("the snapshot carries all fourteen keys");
     assert_eq!(entry.value, None);
     assert_eq!(entry.updated_at, None);
     assert!(cleared.app_map().is_empty());
@@ -312,7 +312,7 @@ async fn clear_setting_on_app_returns_the_entry_to_none() {
     assert_eq!(
         reset
             .app_entry(SettingKey::MaxSkillTokens)
-            .expect("the snapshot carries all thirteen keys")
+            .expect("the snapshot carries all fourteen keys")
             .value,
         Some(json!(4_000)),
         "the rung is writable again with `expected: None`"
@@ -643,9 +643,9 @@ async fn serve_refuses_a_foreign_request_by_name() {
 /// The store difference D16 exists for: a migrated Postgres holds all ten seeded `app_setting`
 /// rows before anything writes one, so each of those entries carries a value **and** a token, and
 /// the map the resolvers read is the compiled default table verbatim. MOD-163's `memory_capture`
-/// (D19), MOD-141's `compete_fan_out` (M2 D5) and MOD-164's `light_model` (D7) are the three
-/// `App` keys past the ten and have no seed row: no value, no token, and each resolver falls
-/// through to its compiled default.
+/// (D19), MOD-141's `compete_fan_out` (M2 D5), MOD-164's `light_model` (D7) and MOD-122's
+/// `log_retention_days` (M3 D6) are the four `App` keys past the ten and have no seed row: no
+/// value, no token, and each reader falls through to its compiled default.
 ///
 /// Skipped, not failed, with `HTUI_TEST_DATABASE_URL` unset.
 #[tokio::test(flavor = "multi_thread")]
@@ -659,27 +659,39 @@ async fn a_migrated_postgres_presents_ten_seeded_app_rows_and_an_unseeded_memory
         .await
         .expect("one read of the migrated scope");
 
-    assert_eq!(snapshot.app.len(), 13);
+    assert_eq!(snapshot.app.len(), 14);
     let capture = snapshot
         .app_entry(SettingKey::MemoryCapture)
-        .expect("the snapshot carries all thirteen keys");
+        .expect("the snapshot carries all fourteen keys");
     assert_eq!(capture.value, None, "0002 seeds no `memory_capture` row");
     assert_eq!(capture.updated_at, None, "so a set passes `expected: None`");
     let compete = snapshot
         .app_entry(SettingKey::CompeteFanOut)
-        .expect("the snapshot carries all thirteen keys");
+        .expect("the snapshot carries all fourteen keys");
     assert_eq!(compete.value, None, "0002 seeds no `compete_fan_out` row");
     assert_eq!(compete.updated_at, None, "so a set passes `expected: None`");
     let light = snapshot
         .app_entry(SettingKey::LightModel)
-        .expect("the snapshot carries all thirteen keys");
+        .expect("the snapshot carries all fourteen keys");
     assert_eq!(light.value, None, "0002 seeds no `light_model` row");
     assert_eq!(light.updated_at, None, "so a set passes `expected: None`");
     assert!(!snapshot.agents.is_empty(), "the seeded agents come along");
+    let retention = snapshot
+        .app_entry(SettingKey::LogRetentionDays)
+        .expect("the snapshot carries all fourteen keys");
+    assert_eq!(
+        retention.value, None,
+        "0002 seeds no `log_retention_days` row"
+    );
+    assert_eq!(
+        retention.updated_at, None,
+        "so a set passes `expected: None`"
+    );
     let unseeded = [
         SettingKey::MemoryCapture,
         SettingKey::CompeteFanOut,
         SettingKey::LightModel,
+        SettingKey::LogRetentionDays,
     ];
     for entry in snapshot
         .app
@@ -814,15 +826,15 @@ fn project_token(snapshot: &SettingsSnapshot) -> DateTime<Utc> {
     snapshot.projects[0].project.updated_at
 }
 
-/// Which row of the tree one `App` key is: the `app` header is row 0 and the thirteen keys follow in
+/// Which row of the tree one `App` key is: the `app` header is row 0 and the fourteen keys follow in
 /// `SettingKey::app_keys` order (D9).
 fn app_row(key: SettingKey) -> usize {
     1 + SettingKey::app_keys()
         .position(|candidate| candidate == key)
-        .expect("one of the thirteen")
+        .expect("one of the fourteen")
 }
 
-/// Which row of the tree one `Project`-rung key of the scope's single project is: the thirteen `App`
+/// Which row of the tree one `Project`-rung key of the scope's single project is: the fourteen `App`
 /// rows and their header, then the `project` header.
 fn project_row(key: SettingKey) -> usize {
     SettingKey::app_keys().count()
@@ -1003,7 +1015,7 @@ fn row_of(frame: &str, key: SettingKey, nth: usize) -> &str {
         .unwrap_or_else(|| panic!("no row {nth} for `{key}`: {frame}"))
 }
 
-/// The demo world as the section draws it (D9): the `app` group with the thirteen registry keys, then
+/// The demo world as the section draws it (D9): the `app` group with the fourteen registry keys, then
 /// one group per project of the scope with the keys the `Project` rung accepts.
 ///
 /// The demo project's blob already holds `token_budget` (`fixtures.rs:644-648`), so that row reads
@@ -1094,7 +1106,7 @@ async fn the_demo_snapshot_renders_the_tree() {
 }
 
 /// A scope with no project is the `app` group alone: there is no rung below it to list, and the
-/// thirteen `App` rows are never empty.
+/// fourteen `App` rows are never empty.
 #[tokio::test]
 async fn no_workspace_lists_the_app_group_alone() {
     let mut harness = prompt_over(MemStore::new()).await;
@@ -1158,7 +1170,7 @@ async fn offline_is_unavailable_with_the_worker_sentence() {
     insta::assert_snapshot!("offline", frame);
 }
 
-/// D9: a key is listed on a rung only when its spec admits it. The `App` group is the thirteen of
+/// D9: a key is listed on a rung only when its spec admits it. The `App` group is the fourteen of
 /// `SettingKey::app_keys`; a project group is `project_keys()` and nothing else.
 #[tokio::test]
 async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
@@ -1169,7 +1181,7 @@ async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
     assert_eq!(
         rows.len(),
         SettingKey::app_keys().count() + project_keys().count(),
-        "thirteen app rows and one group of project rows: {frame}"
+        "fourteen app rows and one group of project rows: {frame}"
     );
 
     let project_rows = &rows[SettingKey::app_keys().count()..];
@@ -1385,7 +1397,7 @@ async fn memory_capture_is_listed_and_set_on_both_rungs() {
     .await;
     assert_eq!(
         off.app_entry(SettingKey::MemoryCapture)
-            .expect("the snapshot carries all thirteen keys")
+            .expect("the snapshot carries all fourteen keys")
             .value,
         Some(json!(false))
     );
@@ -1446,7 +1458,7 @@ async fn compete_fan_out_is_listed_on_the_app_rung_only_and_set_there() {
     .await;
     assert_eq!(
         on.app_entry(SettingKey::CompeteFanOut)
-            .expect("the snapshot carries all thirteen keys")
+            .expect("the snapshot carries all fourteen keys")
             .value,
         Some(json!(true))
     );
@@ -1470,6 +1482,107 @@ async fn compete_fan_out_is_listed_on_the_app_rung_only_and_set_there() {
         project_keys().all(|key| key != SettingKey::CompeteFanOut),
         "the project rung refuses the key, so no project lists it"
     );
+}
+
+/// MOD-122 M3 D6 (T7): `log_retention_days` is listed on the `App` rung only, with its help, and
+/// `e` sets it there as a JSON number with `expected: None` (0002 seeds no row). The re-read
+/// shows the App row; the seam refuses a day count the shipper would ignore.
+#[tokio::test]
+async fn log_retention_days_is_listed_on_the_app_rung_only_and_set_there() {
+    let key = SettingKey::LogRetentionDays;
+    let backend = demo();
+    let (bench, mut section, _) = bench_with(&backend).await;
+    move_to(&bench, &mut section, app_row(key));
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        row_of(&frame, key, 0).contains("unset | 14 (default)"),
+        "fourteen days until the App row says otherwise: {frame}"
+    );
+    let help = flat(&frame);
+    assert!(
+        help.contains("Days stored logs and activity events are kept; all boxes"),
+        "the row's help: {frame}"
+    );
+    assert!(help.contains("range 1..=365 days"), "{frame}");
+    assert!(help.contains("rungs app"), "{frame}");
+    assert!(!help.contains("rungs app|project"), "{frame}");
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "30");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            scope,
+            rung,
+            key: written,
+            value,
+            expected,
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` writes once: {asked:?}");
+    };
+    assert_eq!(*scope, bench_scope().await, "every write carries the scope");
+    assert_eq!(*rung, SettingRung::App);
+    assert_eq!(*written, key);
+    assert_eq!(
+        *value,
+        json!(30),
+        "a JSON number, the shape the shipper's `as_u64` reads"
+    );
+    assert_eq!(
+        *expected, None,
+        "no `app_setting` row: `expected: None` is the token"
+    );
+
+    let kept = applied(&backend, set_app(key, json!(30), None)).await;
+    assert_eq!(
+        kept.app_entry(key)
+            .expect("the snapshot carries all fourteen keys")
+            .value,
+        Some(json!(30))
+    );
+    assert_eq!(kept.app_map().get(key.key()), Some(&json!(30)));
+    let (bench, section) = bench_from(&kept).await;
+    let frame = bench.render_section(&section, 100);
+    let app_setting = label::setting_source(BudgetSource::AppSetting);
+    assert!(
+        row_of(&frame, key, 0).contains(&format!("30 | 30 ({app_setting})")),
+        "the re-read shows the App row: {frame}"
+    );
+    let listed = value_rows(&frame)
+        .into_iter()
+        .filter(|line| line.split_whitespace().next() == Some(key.key()))
+        .count();
+    assert_eq!(
+        listed, 1,
+        "the App row alone; no project lists `log_retention_days`: {frame}"
+    );
+    assert!(project_keys().all(|candidate| candidate != key));
+
+    for (days, sentence) in [
+        (json!(0), "`log_retention_days` = 0 is outside 1..=365 days"),
+        (
+            json!(366),
+            "`log_retention_days` = 366 is outside 1..=365 days",
+        ),
+        (
+            json!("30"),
+            "`log_retention_days` must be a JSON integer, got \"30\"",
+        ),
+    ] {
+        let token = app_token(&kept, key);
+        let (request, message) =
+            refusal(serve(&backend, &set_app(key, days.clone(), Some(token))).await);
+        assert_eq!(request, "set_setting");
+        assert!(
+            message.contains(sentence),
+            "{days} is refused with the validator's sentence: {message}"
+        );
+    }
 }
 
 /// The `light_model` value naming `agent` and `model` (MOD-164 D7's shape).
@@ -1506,7 +1619,7 @@ fn with_light(
         .app
         .iter_mut()
         .find(|entry| entry.key == SettingKey::LightModel)
-        .expect("the snapshot carries all thirteen keys");
+        .expect("the snapshot carries all fourteen keys");
     entry.value = held;
     entry.updated_at = at;
     next
@@ -1706,7 +1819,7 @@ async fn not_set_clears_the_row() {
     let cleared = applied(&backend, request.clone()).await;
     let entry = cleared
         .app_entry(SettingKey::LightModel)
-        .expect("the snapshot carries all thirteen keys");
+        .expect("the snapshot carries all fourteen keys");
     assert_eq!(entry.value, None, "the row is gone");
     assert_eq!(entry.updated_at, None);
     assert_eq!(resolve_light_model(&cleared.app_map()), None);
@@ -2833,10 +2946,13 @@ async fn the_section_scrolls_its_cursor_and_help_into_view() {
 
 /// MOD-81: the section at 80 columns, through the shell. The value rows fit the pane instead of
 /// being cut at its right edge, so every row ends with its unit.
+///
+/// 25 rows rather than 24 since MOD-122's `log_retention_days` (M3 T7): the case is about the
+/// width, and the whole demo tree has to be on screen for the row count below to hold.
 #[tokio::test]
 async fn the_section_at_80_columns() {
     let mut harness = Harness::over(MemStore::demo())
-        .size(80, 24)
+        .size(80, 25)
         .with_tab(Box::new(SettingsTab::with_sections(vec![
             Box::new(AgentsSection::new()),
             Box::new(HierarchySection::new()),
@@ -2851,7 +2967,7 @@ async fn the_section_at_80_columns() {
     let frame = harness.render();
 
     let units = [
-        "lines", "bytes", "files", "ms", "tokens", "fraction", "hops", "on/off",
+        "lines", "bytes", "files", "ms", "tokens", "fraction", "hops", "on/off", "days",
     ];
     let rows: Vec<&str> = body(&frame)
         .into_iter()

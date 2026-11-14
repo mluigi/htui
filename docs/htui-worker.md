@@ -526,6 +526,11 @@ another box can read them (the Logs tab lists one source per worker box):
   box's lines beyond the newest 100 000. Two workers sweeping at once is harmless. When a box row is
   deleted, its lines go too, except its `error` lines, which stay under the box's name until they
   age out.
+- **Activity events age out with them.** The same hourly sweep also removes the activity feed's
+  events older than `log_retention_days` days, at the same cut, and every user's events beyond the
+  newest 100 000. The TUI runs the same sweep when it starts and then hourly, so events still age
+  out on a database no worker serves. If either half fails, the worker tries the whole sweep again
+  a minute later.
 
 ## Exit codes
 

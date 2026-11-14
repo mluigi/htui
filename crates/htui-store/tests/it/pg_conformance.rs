@@ -192,3 +192,29 @@ async fn pg_store_worker_log_conformance() {
         db.drop_db().await;
     }
 }
+
+/// MOD-122 M3's activity suite (`ACTIVITY_CASES`, blueprint F1) run against `PgStore`.
+///
+/// A fourth loop for the worker log loop's reason: `run_activity_case` is bound to
+/// `WriteStore + ActivityStore`. Every case writes, so each gets its own database. On Postgres
+/// `run_park_kinds` is what pins the plpgsql park rule of `0036_activity_event.sql` against
+/// `park_kind` (F1), and every case first asserts that `load_demo` wrote no event (D13).
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_activity_conformance() {
+    use htui_core::store::conformance;
+
+    assert_eq!(
+        conformance::ACTIVITY_CASES.len(),
+        12,
+        "MOD-122 M3's twelve activity cases, as `mem_store.rs` pins them"
+    );
+    for name in conformance::ACTIVITY_CASES {
+        let Some(db) = Box::pin(common::demo_db()).await else {
+            return; // `common` printed the skip line already (plan D13).
+        };
+        println!("activity case {name}");
+        conformance::run_activity_case(name, &db.store).await;
+        db.drop_db().await;
+    }
+}

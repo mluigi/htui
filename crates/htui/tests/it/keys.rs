@@ -807,10 +807,18 @@ fn the_readme_backlog_example_is_refused_naming_the_backlog() {
     };
     assert_eq!(
         errors,
-        [(
-            4,
-            r#"[global] quit = "f": "f" is already backlog.filter (default) in Backlog > Body"#
-                .to_owned()
-        )]
+        [
+            (
+                4,
+                r#"[global] quit = "f": "f" is already backlog.filter (default) in Backlog > Body"#
+                    .to_owned()
+            ),
+            // MOD-122 M3: the activity panel's filter is `f` too, so the same line names it.
+            (
+                4,
+                r#"[global] quit = "f": "f" is already activity.filter (default) in the activity panel"#
+                    .to_owned()
+            ),
+        ]
     );
 }

@@ -32,7 +32,8 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// then the one of `0029_divided_fanout.sql` (MOD-139 plan D1), then the one of
 /// `0031_command_log.sql` (MOD-152 plan D1).
 /// `0032_worker_log.sql` (MOD-122 M2 plan D1), then the one of `0034_item_artifact_link.sql`
-/// (MOD-150 M3 plan D1), then the one of `0035_requirement_keys.sql` (MOD-149 plan D1).
+/// (MOD-150 M3 plan D1), then the one of `0035_requirement_keys.sql` (MOD-149 plan D1), then the
+/// one of `0036_activity_event.sql` (MOD-122 M3 plan D2).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -105,6 +106,8 @@ const TABLES: &[&str] = &[
     "item_artifact_link",
     // 0035_requirement_keys.sql (MOD-149)
     "requirement_child_counter",
+    // 0036_activity_event.sql (MOD-122 M3)
+    "activity_event",
 ];
 
 #[tokio::test]
@@ -127,7 +130,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -143,8 +146,8 @@ async fn migrations_apply_on_a_clean_database() {
          0026_workspace_scope.sql, MOD-163 M2's 0027_trim_record_v5.sql, MOD-97's \
          0028_seed_api_billing_env.sql, MOD-139's 0029_divided_fanout.sql, MOD-150's \
          0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql, \
-         MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql and \
-         MOD-149's 0035_requirement_keys.sql, in ordinal order"
+         MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql, \
+         MOD-149's 0035_requirement_keys.sql and MOD-122 M3's 0036_activity_event.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -162,7 +165,7 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        56,
+        57,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
@@ -174,7 +177,7 @@ async fn migrations_apply_on_a_clean_database() {
          0031_command_log.sql adds command_log and MOD-122's \
          0032_worker_log.sql adds worker_log and MOD-150 M3's 0034_item_artifact_link.sql \
          adds item_artifact_link and MOD-149's 0035_requirement_keys.sql adds \
-         requirement_child_counter"
+         requirement_child_counter and MOD-122 M3's 0036_activity_event.sql adds activity_event"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
@@ -188,7 +191,8 @@ async fn migrations_apply_on_a_clean_database() {
          (run_plan) and MOD-152's 0031_command_log.sql (command_log) and MOD-122's \
          0032_worker_log.sql (worker_log) and MOD-150 M3's 0034_item_artifact_link.sql \
          (item_artifact_link) and MOD-149's 0035_requirement_keys.sql \
-         (requirement_child_counter) and nothing else, \
+         (requirement_child_counter) and MOD-122 M3's 0036_activity_event.sql \
+         (activity_event) and nothing else, \
          got {present:?}"
     );
 
@@ -4263,8 +4267,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(35),
-        "thirty-five embedded migrations, none applied (through MOD-149's 0035_requirement_keys.sql)"
+        MigrationState::Pending(36),
+        "thirty-six embedded migrations, none applied (through MOD-122 M3's 0036_activity_event.sql)"
     );
 
     db.drop_db().await;
@@ -4364,8 +4368,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(35),
-        "thirty-five embedded migrations, through MOD-149's 0035_requirement_keys.sql"
+        MigrationState::Pending(36),
+        "thirty-six embedded migrations, through MOD-122 M3's 0036_activity_event.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4373,8 +4377,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(35),
-        "every one of the thirty-five, through MOD-149's 0035_requirement_keys.sql, is pending"
+        HeadlessError::MigrationsPending(36),
+        "every one of the thirty-six, through MOD-122 M3's 0036_activity_event.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4396,8 +4400,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(35),
-        "every one of the thirty-five, through MOD-149's 0035_requirement_keys.sql, is pending"
+        HeadlessError::MigrationsPending(36),
+        "every one of the thirty-six, through MOD-122 M3's 0036_activity_event.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4548,8 +4552,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        35,
-        "the later applies migrate nothing: the thirty-five embedded migrations (through MOD-149's 0035_requirement_keys.sql) are applied once"
+        36,
+        "the later applies migrate nothing: the thirty-six embedded migrations (through MOD-122 M3's 0036_activity_event.sql) are applied once"
     );
 
     db.drop_db().await;

@@ -18,7 +18,7 @@ use crate::app::action::{
 use crate::app::pane::OpenEditor;
 use crate::editor::{EDITOR_BUSY, ExternalEdit, ExternalEditOutcome};
 use crate::keys::translate::translate;
-use crate::keys::{Act, Context, HelpLine, KeyChord, Keys, Stack};
+use crate::keys::{Act, Context, HelpLine, KeyChord, Keys, Stack, views};
 use crate::logging::Logging;
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::header::{self, Flash, ShellChips};
@@ -26,6 +26,7 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::modal;
 use crate::ui::kit::pane::{Focus, Pane, paint_bottom_note};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
+use crate::ui::shell::activity::ActivityPanel;
 use crate::ui::shell::history::{History, Loc};
 use crate::ui::shell::layout::{self as pane_layout, NoteLabels, Seam};
 use crate::ui::shell::{HiddenBy, PaneAreas, PaneId, Panes, TabLayout};
@@ -184,12 +185,26 @@ fn hides(
     layout: &TabLayout,
     pane: PaneId,
 ) -> bool {
-    let region = last_claim
-        .filter(|(claimed, _, _)| *claimed == id)
-        .map_or(Rect::new(0, 0, 200, 60), |(_, region, _)| region);
-    let areas = pane_layout::areas(region, layout, pane);
+    let areas = pane_layout::areas(claimed_region(last_claim, id), layout, pane);
     !pane_layout::visible(&areas).contains(&pane)
 }
+
+/// The region tab `id` split last, else a stand-in large enough for every pane.
+fn claimed_region(last_claim: Option<(TabId, Rect, PaneAreas)>, id: TabId) -> Rect {
+    last_claim
+        .filter(|(claimed, _, _)| *claimed == id)
+        .map_or(Rect::new(0, 0, 200, 60), |(_, region, _)| region)
+}
+
+/// MOD-122 M3 D10: the acts the activity panel takes itself (`ActivityPanel::on_act`).
+const PANEL_ACTS: [Act; 6] = [
+    Act::ActivityOpen,
+    Act::ActivityFilter,
+    Act::ListDown,
+    Act::ListUp,
+    Act::ListTop,
+    Act::ListBottom,
+];
 
 impl<'a> Ctx<'a> {
     /// Builds the context of one view. The shell is the only caller.
@@ -541,6 +556,12 @@ pub struct App {
     /// MOD-115 M2 D3: the focused pane per tab; a tab with none focuses its list (a list + detail
     /// tab) or its detail (a single-pane one).
     pub(crate) focus: HashMap<TabId, PaneId>,
+    /// MOD-122 M3 D8: the shell's activity panel, one per shell (events are global, not a
+    /// tab's): read on the refresh tick while the active tab shows its pane.
+    pub(crate) activity: ActivityPanel,
+    /// MOD-122 M3 D6 (blueprint F10): the tick count at or after which the next retention sweep
+    /// goes; `0` sweeps on the first refresh tick.
+    pub(super) sweep_due: u64,
     /// MOD-115 M2 B5: the active tab's claim this frame. `None` at the top of every `render`.
     pub(super) pane_claim: Cell<Option<PaneClaim>>,
     /// MOD-115 M2 B5: the panes the active tab claimed in the last frame, and the region it
@@ -631,6 +652,8 @@ impl App {
             editor_rect: None,
             ui: UiState::default(),
             focus: HashMap::new(),
+            activity: ActivityPanel::new(),
+            sweep_due: 0,
             pane_claim: Cell::new(None),
             last_claim: None,
             ui_store: UiStore::memory(),
@@ -785,17 +808,19 @@ impl App {
     }
 
     /// The shell's own pane among those the active tab claimed (MOD-115 M2 §6.4, M3 C2): the
-    /// activity pane, a kit pane holding an empty state until MOD-122 fills it. It is drawn as
+    /// activity pane, which holds the shell's activity panel (MOD-122 M3 D8). It is drawn as
     /// every tab draws its panes (MOD-115 M4 E8): focused through [`Ctx::pane_focus`], so not
     /// under an overlay or the in-pane editor, in the tab's [`Ctx::accent`], and carrying the
-    /// tab's [`Tab::key_hint`] while it is the focused pane, since no tab can put them there.
+    /// panel's hints while it holds the keys ([`App::activity_has_keys`]).
     fn paint_panes(&self, frame: &mut Frame<'_>, areas: &PaneAreas) {
         let Some(tab) = self.tabs.active() else {
             return;
         };
         let stack = tab.key_stack().unwrap_or(Stack::BASE);
         // T7 repair: with the activity pane zoomed, a tab whose keys a modal stack holds (an
-        // open form) draws what captures them over the zoomed pane; no placeholder covers it.
+        // open form) draws what captures them over the zoomed pane; the panel does not cover it.
+        // Reachable (review M3): `e`, `tab`, `tab`, `z` before the item form's read answers
+        // opens the form under the zoom (`backlog::an_item_form_whose_data_returns_…`).
         let modal = stack.global().is_some_and(|(_, layer)| layer.is_modal());
         let zoomed = areas.list.is_none() && areas.detail.is_empty();
         let Some(activity) = areas.activity.filter(|rect| !rect.is_empty()) else {
@@ -804,26 +829,12 @@ impl App {
         if modal && zoomed {
             return;
         }
-        let next = self
-            .keys
-            .reachable_chord(stack, Act::LayoutToggleActivity)
-            .map(|chord| chord.label())
-            .map_or_else(
-                || ACTIVITY_NEXT_UNBOUND.to_owned(),
-                |key| format!("{key} {ACTIVITY_NEXT}"),
-            );
         let ctx = self
             .tab_ctx(tab)
             .with_covered(!self.overlays.is_empty() || self.editor_visible());
-        let focus = ctx.pane_focus(PaneId::Activity);
-        let mut pane = Pane::new(ACTIVITY_TITLE).focus(focus).accent(ctx.accent());
-        if focus == Focus::Focused
-            && let Some(hints) = tab.key_hint(activity.width.saturating_sub(4), &ctx)
-        {
-            pane = pane.hints(hints);
-        }
-        let inner = pane.render(frame, activity, &self.theme);
-        empty::render(frame, inner, ACTIVITY_WHAT, NextStep(&next), &self.theme);
+        let focused =
+            ctx.pane_focus(PaneId::Activity) == Focus::Focused && self.activity_has_keys();
+        self.activity.render(frame, activity, &ctx, focused);
     }
 
     /// R-TUI-12: what a hidden pane says about bringing it back, right-aligned on the bottom
@@ -973,13 +984,70 @@ impl App {
     }
 
     /// The stack of the view that holds the keyboard (MOD-67 D4, PA-8): the top overlay's when
-    /// an overlay is up, else the active tab's. `None` while that view is unconverted: the
-    /// status line and the `?` box are then today's.
+    /// an overlay is up, the activity panel's while its focused pane holds the keys (MOD-122 M3
+    /// D10), else the active tab's. `None` while that view is unconverted: the status line and
+    /// the `?` box are then today's.
     #[must_use]
     pub fn active_stack(&self) -> Option<Stack<'static>> {
         match self.overlays.top() {
             Some(top) => top.key_stack(),
+            None if self.activity_has_keys() => Some(views::ACTIVITY_BROWSE),
             None => self.tabs.active().and_then(Tab::key_stack),
+        }
+    }
+
+    /// MOD-122 M3 D10 (blueprint F8): whether the activity pane holds the keys: no overlay is
+    /// up, the active tab focuses the activity pane and its layout shows it, and no modal stack
+    /// of the tab's (an open form, which the T7 repair draws over a zoomed activity pane) holds
+    /// them.
+    #[must_use]
+    pub fn activity_has_keys(&self) -> bool {
+        let Some(tab) = self.tabs.active() else {
+            return false;
+        };
+        self.overlays.is_empty()
+            && self.focus_of(tab) == PaneId::Activity
+            && self.activity_shown()
+            && !tab
+                .key_stack()
+                .and_then(|stack| stack.global())
+                .is_some_and(|(_, layer)| layer.is_modal())
+    }
+
+    /// MOD-122 M3 D8: whether the active tab's layout shows the activity pane, with its focused
+    /// pane (a zoom shows that one only), over the region it split last.
+    #[must_use]
+    pub fn activity_shown(&self) -> bool {
+        let Some(tab) = self.tabs.active() else {
+            return false;
+        };
+        let view = self.tab_view(tab);
+        let Some(layout) = view.layout else {
+            return false;
+        };
+        let areas = pane_layout::areas(
+            claimed_region(self.last_claim, tab.id()),
+            &layout,
+            view.focus,
+        );
+        pane_layout::visible(&areas).contains(&PaneId::Activity)
+    }
+
+    /// MOD-122 M3 D10: a key while the activity pane holds them. The first candidate through
+    /// `ACTIVITY_BROWSE` wins: a panel act (open, filter, the list moves) goes to the panel, and
+    /// `Enter`'s jump to the shell (`App::activity_jump`); any other the shell maps is applied.
+    fn activity_key(&mut self, chord: KeyChord) {
+        for act in self.keys.actions(views::ACTIVITY_BROWSE, chord) {
+            if PANEL_ACTS.contains(&act) {
+                if let Some(jump) = self.activity.on_act(act, &self.scope) {
+                    self.activity_jump(jump);
+                }
+                return;
+            }
+            if let Some(action) = self.action_for(act) {
+                self.update(action);
+                return;
+            }
         }
     }
 
@@ -1482,6 +1550,13 @@ impl App {
             }
         }
 
+        // MOD-122 M3 D10 (blueprint F8): the focused activity pane holds the keys, so the tab
+        // below never sees one, whether or not the panel took it.
+        if self.activity_has_keys() {
+            self.activity_key(chord);
+            return;
+        }
+
         if let Some(id) = self.tabs.active_id()
             && self.call_tab(id, |tab, ctx| {
                 ctx.set_pressed(key, pressed);
@@ -1763,13 +1838,6 @@ impl App {
         modal::help(frame, area, "Keys", &rows, content_w, &self.theme);
     }
 }
-
-/// The activity placeholder's title, what it says and its next step (MOD-115 M2 D2): the pane
-/// MOD-122 fills.
-const ACTIVITY_TITLE: &str = "Activity";
-const ACTIVITY_WHAT: &str = "Activity appears here once the activity panel lands";
-const ACTIVITY_NEXT: &str = "hides this pane";
-const ACTIVITY_NEXT_UNBOUND: &str = "a layout without it hides this pane";
 
 /// The offset from the grabbed cell `(x, y)` on `seam` to the line the layout's setter reads:
 /// the list's right border, the activity pane's left border (columns) or top border (stacked).
@@ -2143,6 +2211,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod shell_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use htui_core::model::activity::{ActivityEvent, ActivityKind, ActivityPage};
     use htui_core::model::{Scope, WorkspaceId};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -2473,9 +2542,41 @@ pub(crate) mod shell_tests {
         assert!(text.ends_with("z unzoom\u{2500}\u{256f}"), "{text}");
     }
 
-    /// D2: until MOD-122 the activity pane is a placeholder that says what will be there.
+    /// MOD-122 M3 D8: the shell draws its activity panel in the pane: the empty state before
+    /// any event, then the rows a read brought, under the panel's title.
     #[test]
-    fn the_activity_pane_is_a_placeholder() {
+    fn the_shell_draws_the_activity_panel() {
+        let mut app = activity_app();
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let activity = areas.activity.expect("the preset shows the activity pane");
+        assert!(
+            row(&buf, activity.y).contains(" Activity \u{b7} all workspaces "),
+            "{}",
+            row(&buf, activity.y)
+        );
+        let inside: String = (activity.y..activity.bottom())
+            .map(|y| row(&buf, y))
+            .collect();
+        assert!(inside.contains("No activity yet."), "{inside}");
+        assert!(!inside.contains("Activity appears here"), "{inside}");
+
+        app.activity.merge(
+            ActivityPage {
+                events: vec![activity_event(1)],
+                pinned: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let buf = draw(&mut app, 100, 30);
+        let inside: String = (activity.y..activity.bottom())
+            .map(|y| row(&buf, y))
+            .collect();
+        assert!(inside.contains("MOD-1"), "{inside}");
+    }
+
+    /// A [`split_app`] laid out with the activity pane.
+    fn activity_app() -> App {
         let mut app = split_app();
         app.ui.layouts.insert(
             SPLIT.0.to_owned(),
@@ -2484,14 +2585,83 @@ pub(crate) mod shell_tests {
                 ..SPLIT_LAYOUT
             },
         );
+        app
+    }
+
+    /// Event `id`: a run of `MOD-<id>` started, in no workspace the shell is in.
+    fn activity_event(id: i64) -> ActivityEvent {
+        ActivityEvent {
+            id,
+            at: htui_core::fixtures::demo_at(0, 0),
+            kind: ActivityKind::RunStarted,
+            workspace: None,
+            project: None,
+            project_slug: "p".to_owned(),
+            item: None,
+            item_key: Some(format!("MOD-{id}")),
+            run: None,
+            chat: false,
+            step: None,
+            step_name: None,
+            permission: None,
+            text: String::new(),
+        }
+    }
+
+    /// The double's list cursor, as its location says it.
+    fn tab_cursor(app: &App) -> Option<String> {
+        app.tabs.active().and_then(|tab| tab.location().cursor)
+    }
+
+    /// MOD-122 M3 D10 (blueprint F8): while the focused activity pane holds the keys, they
+    /// resolve through `ACTIVITY_BROWSE` and the tab never sees one: `j` does not move its list,
+    /// `f` cycles the panel's filter. Focused elsewhere, the tab has them back.
+    #[test]
+    fn the_focused_activity_pane_holds_the_keys() {
+        let mut app = activity_app();
+        let _ = draw(&mut app, 100, 30);
+        app.focus.insert(SPLIT, PaneId::Activity);
+        assert_eq!(app.active_stack(), Some(views::ACTIVITY_BROWSE));
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(tab_cursor(&app).as_deref(), Some("0"), "the tab saw no key");
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
         let buf = draw(&mut app, 100, 30);
         let (_, areas) = claim(&app);
-        let activity = areas.activity.expect("the preset shows the activity pane");
-        assert!(row(&buf, activity.y).contains(" Activity "));
-        let inside: String = (activity.y..activity.bottom())
-            .map(|y| row(&buf, y))
-            .collect();
-        assert!(inside.contains("Activity appears here"), "{inside}");
+        let activity = areas.activity.expect("shown");
+        assert!(
+            row(&buf, activity.y).contains(" Activity \u{b7} needs you "),
+            "{}",
+            row(&buf, activity.y)
+        );
+
+        app.focus.insert(SPLIT, PaneId::List);
+        assert_eq!(app.active_stack(), Some(views::BACKLOG_BODY));
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(tab_cursor(&app).as_deref(), Some("1"), "the list's again");
+    }
+
+    /// MOD-122 M3 D10 (the T7 repair): a tab whose open modal form holds its keys keeps them
+    /// though the activity pane is focused: a typed key reaches the form.
+    #[test]
+    fn an_open_modal_form_keeps_the_keys_over_the_focused_activity_pane() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.about_visible = false;
+        let mut tab = SplitTab::new(SPLIT, "Backlog");
+        tab.stack = views::CAPTURE;
+        app.register_tab(Box::new(tab));
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                preset: Preset::IdeActivity,
+                ..SPLIT_LAYOUT
+            },
+        );
+        let _ = draw(&mut app, 100, 30);
+        app.focus.insert(SPLIT, PaneId::Activity);
+        assert_eq!(app.active_stack(), Some(views::CAPTURE));
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(tab_cursor(&app).as_deref(), Some("1"), "the form took it");
     }
 
     /// What [`SplitTab::accent`] names for a test: a colour no border role or tab accent uses.
@@ -2554,7 +2724,7 @@ pub(crate) mod shell_tests {
     /// M3 D1, M4 E8: the shell paints no hint of its own over a tab's panes, whichever pane is
     /// focused: a tab whose panes draw no hints shows none though it has keys to hint (RV1-M2),
     /// and one whose panes draw them shows them once, on its focused pane. The activity pane is
-    /// the shell's, so the shell hints there, and there only.
+    /// the shell's, so the shell hints there, and there only: the panel's hints (MOD-122 M3).
     #[test]
     fn the_shell_paints_no_hint_over_a_tabs_panes() {
         let mut app = sentinel_app();
@@ -2584,6 +2754,11 @@ pub(crate) mod shell_tests {
             rows_with(&buf, "j/k move"),
             [activity.bottom() - 1],
             "the shell's own pane"
+        );
+        assert_eq!(
+            rows_with(&buf, "Enter open"),
+            [activity.bottom() - 1],
+            "the panel's hints, not the tab's"
         );
 
         let mut app = split_app();
@@ -2667,20 +2842,13 @@ pub(crate) mod shell_tests {
         assert!(!text.contains("j/k move"), "{text}");
     }
 
-    /// M3 C2, M4 E8: the activity pane is the shell's kit pane: drawn unfocused in the faint
-    /// role, focused in the tab's accent through `Ctx::pane_focus`, and carrying the tab's hints
-    /// when it is the focused pane.
+    /// M3 C2, M4 E8, MOD-122 M3 D8: the activity pane is the shell's panel: drawn unfocused in
+    /// the faint role, focused in the tab's accent through `Ctx::pane_focus`, and carrying the
+    /// panel's own hints (`ACTIVITY_BROWSE`'s, not the tab's) when it is the focused pane.
     #[test]
-    fn the_activity_placeholder_is_still_the_shells() {
+    fn the_activity_panel_is_the_shells() {
         let theme = Theme::default();
-        let mut app = split_app();
-        app.ui.layouts.insert(
-            SPLIT.0.to_owned(),
-            TabLayout {
-                preset: Preset::IdeActivity,
-                ..SPLIT_LAYOUT
-            },
-        );
+        let mut app = activity_app();
         let buf = draw(&mut app, 100, 30);
         let (_, areas) = claim(&app);
         let activity = areas.activity.expect("the preset shows the activity pane");
@@ -2690,7 +2858,7 @@ pub(crate) mod shell_tests {
             theme.border_faint.fg.unwrap_or_default()
         );
         assert!(
-            !pane_bottom(&buf, activity).contains("j/k move"),
+            !pane_bottom(&buf, activity).contains("open"),
             "no hint on the unfocused activity pane"
         );
 
@@ -2702,13 +2870,16 @@ pub(crate) mod shell_tests {
             accent.fg.unwrap_or_default()
         );
         let bottom = activity.bottom() - 1;
-        assert_eq!(rows_with(&buf, "j/k move"), [bottom]);
+        assert_eq!(rows_with(&buf, "Enter open"), [bottom]);
         let cells: Vec<&str> = (0..buf.area.width)
             .map(|x| buf[(x, bottom)].symbol())
             .collect();
         let at = usize::from(activity.x);
-        assert_eq!(cells[at + 2..at + 10].concat(), "j/k move");
-        assert!(!cells[..at].concat().contains("j/k"));
+        assert_eq!(
+            cells[at + 2..at + 34].concat(),
+            "Enter open \u{b7} f filter \u{b7} j/k move"
+        );
+        assert!(!cells[..at].concat().contains("open"));
 
         // Under an overlay the activity pane is not focused either, so it draws no hints.
         app.push_overlay(Box::new(crate::ui::overlay::WorkspaceSwitcher::new()));
@@ -2717,7 +2888,7 @@ pub(crate) mod shell_tests {
             buf[(activity.x, activity.y)].fg,
             theme.border_faint.fg.unwrap_or_default()
         );
-        assert!(!pane_bottom(&buf, activity).contains("j/k move"));
+        assert!(!pane_bottom(&buf, activity).contains("open"));
     }
 
     /// A bench context addressed to `origin`, focused on `focus` when one is given.

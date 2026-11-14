@@ -12,23 +12,23 @@ no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Log
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│             No items in this workspace.             ││             No item selected.             │
+│         Settings › Hierarchy adds a project         ││         a chosen item shows here          │
 │                                                     ││                                           │
 │                            ╭ Workspaces ────────────────────────────╮                            │
 │                            │             no workspaces              │                            │
-│             No items in thi│`N` in Settings › Hierarchy creates one │ item selected.             │
-│         Settings › Hierarch╰ j/k move · Enter switch · Esc close ───╯en item shows here          │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│                            │`N` in Settings › Hierarchy creates one │                            │
+│                            ╰ j/k move · Enter switch · Esc close ───╯                            │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 ╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                         No activity yet.                                         │
+│                            events appear as runs start, wait and fail                            │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -600,6 +600,34 @@ impl htui_core::store::WorkerLogStore for Writer {
     }
 }
 
+/// MOD-122 M3 (plan D1, blueprint F6): T3's retention sweep runs through `backend.writer()`,
+/// which is `Memory` under every `SectionBench` and Harness test, so the trait forwards per arm.
+impl htui_core::store::ActivityStore for Writer {
+    async fn activity(
+        &self,
+        after: Option<i64>,
+        limit: u32,
+    ) -> Result<htui_core::model::ActivityPage> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::ActivityStore::activity(store, after, limit).await
+            }
+            Self::Online(pg) => htui_core::store::ActivityStore::activity(pg, after, limit).await,
+        }
+    }
+    async fn prune_activity(&self, older_than: DateTime<Utc>, per_user_cap: u32) -> Result<u64> {
+        match self {
+            Self::Memory(store) => {
+                htui_core::store::ActivityStore::prune_activity(store, older_than, per_user_cap)
+                    .await
+            }
+            Self::Online(pg) => {
+                htui_core::store::ActivityStore::prune_activity(pg, older_than, per_user_cap).await
+            }
+        }
+    }
+}
+
 impl htui_core::store::RelayStore for Writer {
     async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
         WriteStore::open_permission(self, open).await

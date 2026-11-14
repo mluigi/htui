@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use htui::worker_log::{FLUSH_EVERY, ShipHandle, ShipSource, run_flusher, spawn_flusher};
-use htui_core::model::{BoxId, LogShipLevel, NewWorkerLog, WorkerLogLevel, WorkerLogLine};
-use htui_core::store::{Result, StoreError, WorkerLogStore};
+use htui_core::model::{
+    ActivityPage, BoxId, LogShipLevel, NewWorkerLog, WorkerLogLevel, WorkerLogLine,
+};
+use htui_core::store::{ActivityStore, Result, StoreError, WorkerLogStore};
 use htui_store::testkit::{self, TestDb};
 use htui_store::{Backend, CacheStore, PgStore};
 use serde_json::Value;
@@ -265,6 +267,17 @@ impl WorkerLogStore for Timed {
 
     async fn set_box_log_level(&self, box_id: BoxId, level: Option<LogShipLevel>) -> Result<bool> {
         self.pg.set_box_log_level(box_id, level).await
+    }
+}
+
+/// MOD-122 M3 plan D6: the sweep's activity half, forwarded untimed.
+impl ActivityStore for Timed {
+    async fn activity(&self, after: Option<i64>, limit: u32) -> Result<ActivityPage> {
+        self.pg.activity(after, limit).await
+    }
+
+    async fn prune_activity(&self, older_than: DateTime<Utc>, cap: u32) -> Result<u64> {
+        self.pg.prune_activity(older_than, cap).await
     }
 }
 

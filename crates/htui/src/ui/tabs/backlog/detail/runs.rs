@@ -91,7 +91,7 @@ use crate::ui::cells::{self, cell_width};
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::label::{self, Mark, plural};
-use crate::ui::kit::modal::{Ask, modal_rest};
+use crate::ui::kit::modal::{Ask, CHROME, modal_rest};
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::STAMP;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Framing, Told, message, no_item};
@@ -2257,7 +2257,26 @@ impl DetailTab for RunsTab {
             if let Some(field) = question.input {
                 ask = ask.input("", field);
             }
-            ask.render(frame, area, ctx.theme);
+            let content = ask.render(frame, area, ctx.theme);
+            clear_beside(frame, area, content);
+        }
+    }
+}
+
+/// Review L7: blanks the cells of `area` on the rows a question's box spans, left and right of
+/// the box, so no run row shows through beside it on a pane shorter than the table. `content` is
+/// the box's content rect ([`Ask::render`]): the box is one border cell around it, and a padding
+/// column and a border cell to its right (`CHROME`).
+fn clear_beside(frame: &mut Frame<'_>, area: Rect, content: Rect) {
+    let top = content.y.saturating_sub(1).max(area.y);
+    let bottom = content.bottom().saturating_add(1).min(area.bottom());
+    let left = content.x.saturating_sub(1);
+    let right = content.right().saturating_add(CHROME - 1);
+    let buffer = frame.buffer_mut();
+    let area = area.intersection(buffer.area);
+    for y in top..bottom.min(area.bottom()) {
+        for x in (area.left()..area.right()).filter(|&x| x < left || x >= right) {
+            buffer[(x, y)].reset();
         }
     }
 }

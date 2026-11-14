@@ -1,0 +1,18 @@
+---
+source: crates/htui/src/ui/shell/activity.rs
+expression: frame
+---
+╭─ Activity · ⚠ 2 needs you · all workspaces ────────────────────────────────────────────╮
+│ needs you ─────────────────────────────────────────────────────────────────────────────│
+│▌⚠ needs you 09:07 MOD-7 research gate: approve the plan                                │
+│ ⚠ needs you 09:05 MOD-5 research permission                                            │
+│ recent ────────────────────────────────────────────────────────────────────────────────│
+│ ✗ failed 09:06 MOD-6 research step failed                                              │
+│ ✗ failed 09:04 MOD-4 research run failed                                               │
+│ ◐ started 09:03 @aud MOD-3 research                                                    │
+│ ● finished 09:02 MOD-2 research                                                        │
+│ ◐ started 09:01 MOD-1 research                                                         │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+╰─Enter open · f filter · j/k move───────────────────────────────────────────────────────╯

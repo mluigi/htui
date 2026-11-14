@@ -135,6 +135,9 @@ impl Harness {
         // MOD-115: the about panel is off, so a tab's frame keeps the rows it was written
         // against; `tests/shell.rs` turns it on for the one frame that shows it.
         app.about_visible = false;
+        // MOD-122 M3 review L5: the activity panel prints its rows' times in UTC, so a frame
+        // that shows them reads the same on every machine.
+        app.activity.print_in_utc();
         app.start();
         let (width, height) = DEFAULT_SIZE;
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
