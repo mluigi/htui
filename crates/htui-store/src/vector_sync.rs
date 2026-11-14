@@ -20,10 +20,10 @@
 //! [`workspace_search_scope`].
 //!
 //! Deletes are guarded (MOD-159 D6): each project's deletes wait for one batch at its end, a
-//! [`DeleteGuard`] (the indexer lease's renewal) is asked right before it, and a point of an
-//! item, requirement or owner document the listing missed goes only when a fresh read confirms
-//! the row is gone (or, for an owner document, no longer the newest of its kind). Upserts are
-//! idempotent and never guarded.
+//! point of an item, requirement or owner document the listing missed joins it only when a
+//! re-listing of its kind confirms the row is gone from the project (or, for an owner document,
+//! no longer the newest of its kind), and a [`DeleteGuard`] (the indexer lease's renewal) is asked
+//! right before a batch that is not empty. Upserts are idempotent and never guarded.
 use crate::vector::{
     ConceptPoint, DocumentRef, IndexedPoint, Owner, PointType, Subject, VectorStore,
 };
@@ -32,7 +32,7 @@ use htui_core::model::{
     RequirementFilter, RequirementId, Scope,
 };
 use htui_core::store::{ReadStore, StoreError};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 /// Longest section of a document embedded as one point, in characters. BGE-small reads about 512
@@ -75,7 +75,8 @@ impl std::ops::AddAssign for SyncReport {
     }
 }
 
-/// Asked right before each project's one delete batch (MOD-159 D6). The indexer lease's holder
+/// Asked right before each project's one delete batch, once its orphans are confirmed and only
+/// when something is to go (MOD-159 D6). The indexer lease's holder
 /// renews its lease here, so a pass that lost the lease stops before it deletes anything.
 #[allow(async_fn_in_trait)]
 pub trait DeleteGuard {
@@ -97,14 +98,14 @@ impl DeleteGuard for Unguarded {
     }
 }
 
-/// One project's deletes, gathered over its whole pass (MOD-159 D6), before the guard and the
-/// orphan confirmation.
+/// One project's deletes, gathered over its whole pass (MOD-159 D6), before the orphan
+/// confirmation and the guard.
 #[derive(Debug, Default)]
 struct Doomed {
-    /// Points no fresh read can save: stale sections of rebuilt items and owner documents, a
+    /// Points no re-listing can save: stale sections of rebuilt items and owner documents, a
     /// rebuilt requirement's off-ID points, and owner documents superseded in the listing.
     stale: Vec<Uuid>,
-    /// Points of items the listing missed, kept when a fresh read finds the item in the project.
+    /// Points of items the listing missed, kept when a re-listing finds the item in the project.
     items: HashMap<ItemId, Vec<Uuid>>,
     /// Points of requirements the listing missed, kept as `items` are.
     requirements: HashMap<RequirementId, Vec<Uuid>>,
@@ -121,30 +122,42 @@ impl Doomed {
             && self.documents.is_empty()
     }
 
-    /// The batch to delete: `stale`, and every orphan a fresh read does not show to be the
-    /// project's after all. A kept point is left for the next pass to settle.
+    /// The batch to delete: `stale`, and every orphan a re-listing of its kind does not show to
+    /// be the project's after all. Each re-listing is the call the pass listed with (`one` is the
+    /// pass's one-project scope), made once per kind with orphans, so a row counts as present
+    /// exactly when that listing would index it; an item moved to another project is missing from
+    /// it. A kept point is left for the next pass to settle.
     async fn confirm(
         self,
         read: &impl ReadStore,
+        one: &Scope,
         project: ProjectId,
     ) -> Result<Vec<Uuid>, StoreError> {
         let mut batch = self.stale;
-        for (id, points) in self.items {
-            if !read
-                .item(id)
+        if !self.items.is_empty() {
+            let present: HashSet<ItemId> = read
+                .items(one, &ItemFilter::default())
                 .await?
-                .is_some_and(|item| item.project_id == project)
-            {
-                batch.extend(points);
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            for (id, points) in self.items {
+                if !present.contains(&id) {
+                    batch.extend(points);
+                }
             }
         }
-        for (id, points) in self.requirements {
-            if !read
-                .requirement(id)
+        if !self.requirements.is_empty() {
+            let present: HashSet<RequirementId> = read
+                .requirements(project, &RequirementFilter::default())
                 .await?
-                .is_some_and(|row| row.project_id == project)
-            {
-                batch.extend(points);
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            for (id, points) in self.requirements {
+                if !present.contains(&id) {
+                    batch.extend(points);
+                }
             }
         }
         if !self.documents.is_empty() {
@@ -169,11 +182,11 @@ pub struct Indexer;
 
 impl Indexer {
     /// Reconciles the index with every project of `scope`. Per project, the upserts go as they
-    /// are built and every delete waits for one batch at the project's end (MOD-159 D6):
-    /// `guard` is asked first, and a refusal ends the pass with
-    /// [`abandoned`](SyncReport::abandoned) set and nothing of the batch deleted; then each
-    /// orphan (a point of an item, requirement or owner document the listing missed) is read
-    /// again, and one that turns out to be the project's stays.
+    /// are built and every delete waits for one batch at the project's end (MOD-159 D6): each
+    /// orphan (a point of an item, requirement or owner document the listing missed) is checked
+    /// against a re-listing of its kind, and one that turns out to be the project's stays; then,
+    /// when the batch is not empty, `guard` is asked, and a refusal ends the pass with
+    /// [`abandoned`](SyncReport::abandoned) set and nothing of the batch deleted.
     ///
     /// # Errors
     /// The first failed store read, vector-store call or guard check.
@@ -246,15 +259,18 @@ impl Indexer {
             if doomed.is_empty() {
                 continue;
             }
+            // Confirm first and ask the guard last, right before the delete it guards, and only
+            // when something is to go (review R1).
+            let batch = doomed.confirm(read, &one, project).await?;
+            if batch.is_empty() {
+                continue;
+            }
             if !guard.before_delete().await? {
                 report.abandoned = true;
                 return Ok(report);
             }
-            let batch = doomed.confirm(read, project).await?;
-            if !batch.is_empty() {
-                report.points_deleted += batch.len();
-                store.delete(batch).await?;
-            }
+            report.points_deleted += batch.len();
+            store.delete(batch).await?;
         }
         Ok(report)
     }
@@ -571,7 +587,7 @@ mod tests {
     };
     use htui_core::store::{MemStore, Result as StoreResult, WriteStore};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn item_of(p: &ConceptPoint) -> Option<ItemId> {
         p.subject.owner().item()
@@ -1399,13 +1415,16 @@ mod tests {
         assert_eq!(idle.asked(), 0, "nothing to delete, nothing asked");
     }
 
-    /// `MemStore` as a pass that listed before some rows existed: its first listings miss them,
-    /// while a read by ID (and, for owner documents, a re-listing) finds them (MOD-159 D6).
+    /// `MemStore` as a pass that listed before some rows existed: its first listing of each kind
+    /// misses them, while a re-listing finds them (MOD-159 D6). A read by ID of the hidden item
+    /// or requirement answers `None`, so only a re-listing can keep their points (review R1).
     struct Unlisted<'a> {
         inner: &'a MemStore,
         item: Option<ItemId>,
         requirement: Option<RequirementId>,
         document: Mutex<Option<DocumentId>>,
+        items_listed: AtomicBool,
+        requirements_listed: AtomicBool,
     }
 
     impl<'a> Unlisted<'a> {
@@ -1415,17 +1434,25 @@ mod tests {
                 item: None,
                 requirement: None,
                 document: Mutex::new(None),
+                items_listed: AtomicBool::new(false),
+                requirements_listed: AtomicBool::new(false),
             }
         }
     }
 
     impl ReadStore for Unlisted<'_> {
+        /// The first listing misses `item`; every later one is the store's.
         async fn items(&self, scope: &Scope, filter: &ItemFilter) -> StoreResult<Vec<ItemSummary>> {
             let mut rows = self.inner.items(scope, filter).await?;
-            rows.retain(|row| Some(row.id) != self.item);
+            if !self.items_listed.swap(true, Ordering::SeqCst) {
+                rows.retain(|row| Some(row.id) != self.item);
+            }
             Ok(rows)
         }
         async fn item(&self, id: ItemId) -> StoreResult<Option<Item>> {
+            if Some(id) == self.item {
+                return Ok(None);
+            }
             self.inner.item(id).await
         }
         async fn links(&self, id: ItemId, hops: u8) -> StoreResult<LinkGraph> {
@@ -1493,16 +1520,22 @@ mod tests {
         async fn requirement_areas(&self, project: ProjectId) -> StoreResult<Vec<RequirementArea>> {
             self.inner.requirement_areas(project).await
         }
+        /// The first listing misses `requirement`; every later one is the store's.
         async fn requirements(
             &self,
             project: ProjectId,
             filter: &RequirementFilter,
         ) -> StoreResult<Vec<Requirement>> {
             let mut rows = self.inner.requirements(project, filter).await?;
-            rows.retain(|row| Some(row.id) != self.requirement);
+            if !self.requirements_listed.swap(true, Ordering::SeqCst) {
+                rows.retain(|row| Some(row.id) != self.requirement);
+            }
             Ok(rows)
         }
         async fn requirement(&self, id: RequirementId) -> StoreResult<Option<Requirement>> {
+            if Some(id) == self.requirement {
+                return Ok(None);
+            }
             self.inner.requirement(id).await
         }
         async fn requirement_revisions(
@@ -1561,7 +1594,9 @@ mod tests {
     }
 
     /// MOD-159 D6: an item created after the listing, whose points another indexer already
-    /// wrote, is the project's on a fresh read, so its points stay for the next pass.
+    /// wrote, is the project's on a re-listing, so its points stay for the next pass. Nothing
+    /// else was to go, so the guard is never asked (review R1: it is asked after the
+    /// confirmation, only for a batch that is not empty).
     #[tokio::test]
     async fn an_item_created_after_the_listing_keeps_its_points() {
         let read = MemStore::demo();
@@ -1586,8 +1621,8 @@ mod tests {
         let report = Indexer::sync(&late, &s, &store, &guard).await.unwrap();
         assert_eq!(
             guard.asked(),
-            1,
-            "its points were in the batch until the fresh read"
+            0,
+            "the re-listing kept its points, so nothing is to go"
         );
         assert_eq!(report.points_deleted, 0);
         assert_eq!(store.points(), before);
@@ -1613,7 +1648,7 @@ mod tests {
         };
         let guard = CountingGuard::answering(true);
         let report = Indexer::sync(&late, &s, &store, &guard).await.unwrap();
-        assert_eq!(guard.asked(), 1);
+        assert_eq!(guard.asked(), 0, "nothing is to go");
         assert_eq!(report.points_deleted, 0);
         assert_eq!(store.points(), before);
     }
@@ -1636,7 +1671,7 @@ mod tests {
         };
         let guard = CountingGuard::answering(true);
         let report = Indexer::sync(&late, &s, &store, &guard).await.unwrap();
-        assert_eq!(guard.asked(), 1);
+        assert_eq!(guard.asked(), 0, "nothing is to go");
         assert_eq!(report.points_deleted, 0);
         assert_eq!(store.points(), before);
 
@@ -1650,6 +1685,28 @@ mod tests {
         assert_eq!(report.points_deleted, 2, "v1's two sections");
         let points = owner_document_points(&store);
         assert_eq!(indexed_documents(&points), BTreeSet::from([v2.id]));
+    }
+
+    /// MOD-159 D6 (review R1): a point of a real item held under another project, as when the
+    /// item moved there, is an orphan of the project it names: that project's listing misses the
+    /// item, so the point goes.
+    #[tokio::test]
+    async fn an_item_moved_to_another_project_loses_its_points() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let item = item_with_documents(&read).await;
+        assert_eq!(item.project_id, ids::PROJECT_HTUI);
+        let mut moved = item_point(&item);
+        moved.project_id = ids::PROJECT_AGY;
+        store.upsert(vec![moved]).await.unwrap();
+
+        let guard = CountingGuard::answering(true);
+        let report = Indexer::sync(&read, &scope(vec![ids::PROJECT_AGY]), &store, &guard)
+            .await
+            .unwrap();
+        assert_eq!(guard.asked(), 1);
+        assert_eq!(report.points_deleted, 1, "{report:?}");
+        assert!(store.points().iter().all(|p| item_of(p) != Some(item.id)));
     }
 
     #[tokio::test]
