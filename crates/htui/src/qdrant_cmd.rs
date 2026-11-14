@@ -205,7 +205,7 @@ pub(crate) async fn connect() -> Result<PgStore, StateExit> {
 
 /// [`state_cmd::read_dsn`]'s refusal as this command's ending: `NO_DSN` as it is, the keyring's
 /// own error after [`KEYRING_UNREADABLE`] (blueprint T5.2).
-pub(crate) fn dsn_exit(failure: Failure) -> StateExit {
+fn dsn_exit(failure: Failure) -> StateExit {
     match failure.error.code {
         ErrorCode::KeyringUnreadable => {
             StateExit::Refused(format!("{KEYRING_UNREADABLE}: {}", failure.error.message))
@@ -215,7 +215,7 @@ pub(crate) fn dsn_exit(failure: Failure) -> StateExit {
 }
 
 /// A state verb's [`Failure`] as this command's ending: offline 3, refused 2, anything else 1.
-pub(crate) fn failure_exit(failure: Failure) -> StateExit {
+fn failure_exit(failure: Failure) -> StateExit {
     let message = failure.error.message;
     match failure.store {
         StoreState::Offline => StateExit::Offline(message),

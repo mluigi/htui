@@ -155,6 +155,10 @@ pub enum StepResume {
     Rerun,
 }
 
+/// The `fanout_index` of a fan-out slot's judge row (`docs/ANA-2.md` §4.5); `recover.rs` and
+/// `status.rs` keep their own copies private.
+const JUDGE_FANOUT_INDEX: i32 = -1;
+
 /// MOD-125 M4 D4: [`StepResume`] for a `stopped` row `step`, from `caps`, its agent's caps, and
 /// `events`, its `step_events`.
 ///
@@ -172,8 +176,7 @@ pub fn stopped_step_resume(
     caps: DriverCaps,
     events: &[SessionEvent],
 ) -> StepResume {
-    // `fanout_index == -1` is the judge row (ANA-2 §4.5; the engine's `JUDGE_FANOUT_INDEX`).
-    if step.fanout_index == -1 || events.is_empty() {
+    if step.fanout_index == JUDGE_FANOUT_INDEX || events.is_empty() {
         return StepResume::Rerun;
     }
     match opening_kind(caps, events) {
