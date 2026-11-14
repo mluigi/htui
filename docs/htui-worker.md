@@ -451,25 +451,36 @@ for now).
 - **One process indexes each collection: the holder of its lease.** Each collection has one row
   in the database's `indexer_lease` table. Every `htui worker` and every TUI connected to the
   database (not `--demo`, not offline) competes for every collection, so on a team the collections
-  are spread over whichever processes are running, and a collection is never indexed by two at
-  once.
+  are spread over whichever processes are running. Only the lease holder deletes points; a process
+  that loses the lease stops at its next delete batch.
 - **Every beat** (the run lease's refresh: `lease_refresh_seconds`, at most a third of
   `lease_ttl_seconds`, so 40 seconds by default, both read again every beat) the worker takes or
   renews the lease of every collection. A collection whose lease another process holds is left
-  to it.
+  to it. A beat reads the Qdrant URL only; the API key is read when a collection is due for a
+  reconcile, so a beat with nothing to reconcile never touches the keyring. A key that cannot be
+  read is one `warn` line until its error changes, and that reconcile waits for the next interval.
 - **A collection it holds is reconciled once when it is taken, then every
   `concepts_sync_minutes` minutes.** That is an `app_setting` key holding a positive whole number,
   read again every beat; without it, or with any other value, the interval is 15 minutes. The
-  reconcile renews the lease before it deletes anything from a project's points. If another
-  process has taken the lease meanwhile (this one stalled past the lease's time-to-live), it stops
-  there, deletes nothing, and leaves the collection to the new holder.
+  reconcile renews the lease before it deletes anything from a project's points. While one
+  collection reconciles (the first build of a large workspace takes minutes), every lease the
+  process holds, that collection's included, is still renewed every beat interval, so none lapses
+  behind it. If another process has taken a lease meanwhile (this one stalled past the lease's
+  time-to-live), it stops there, deletes nothing, and leaves the collection to the new holder.
 - **On shutdown the worker lets go of its leases**, so another process takes its collections over
-  on its next beat rather than after the lease lapses. A worker that dies without letting go
+  on its next beat rather than after the lease lapses (it waits at most 5 seconds for that; the
+  TUI, whose whole shutdown has 5 seconds, waits at most 1). A worker that dies without letting go
   holds them until the lease's time-to-live (`lease_ttl_seconds`, 120 seconds by default) runs out.
 - **The global collection's holder** creates that collection and drops `htui_concepts_v2`, the one
   shared collection earlier versions wrote, once per process (one `info` line when it was there).
 - `Ctrl+R` in the TUI's knowledge search and `htui --index-items` index a workspace only when its
-  lease is free or their own process's; otherwise they say which box indexes it.
+  lease is free or their own process's; otherwise they say which box indexes it. A `Ctrl+R` on a
+  free lease takes it for that one press and lets it go after; one the TUI's own index job holds
+  stays the job's. A `Ctrl+R` stopped half-way (a second press, or quitting) leaves its lease to
+  lapse within the time-to-live.
+- **MCP `search_concepts`** reads every workspace's collection; one that fails (a stale
+  collection, or one another embedder wrote) is skipped and logged while the others answer. The
+  search fails only when no workspace collection answered.
 
 - **The Qdrant URL is one setting for the whole database**, the `app_setting` `qdrant_url` that
   **Settings › Qdrant** and `htui --set-qdrant-url` write, so every box indexes into the same

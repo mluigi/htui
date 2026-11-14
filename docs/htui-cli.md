@@ -337,9 +337,11 @@ off by the difference; an age that would be negative is reported as `0`.
 | `error` | object | Present for `offline`, `refused` and `error` only: `code` and `message`, as in [Failure documents](#failure-documents). |
 | `unavailable` | array of strings | Present only when some collections answered and others did not: the slugs of the workspaces whose collection is missing (never indexed) or refused the search. Their projects are not in `hits`. Absent otherwise. |
 
-When every collection is missing, `index` is `empty` (exit 0), as before. When no collection
-answered and one failed, `index` is that failure (`offline`, `refused` or `error`) with its exit,
-and there is no `unavailable`.
+When every collection is missing, `index` is `empty` (exit 0), as before. When no workspace's
+collection answered and one failed, `index` is that failure (`offline`, `refused` or `error`) with
+its exit, and there is no `unavailable`. The global collection answering does not count here: it
+is empty on most boxes, so a workspace whose collection refuses the search (another embedder's
+vectors, say) is still a failure when it is the only workspace searched.
 
 A failure before the index is asked (no DSN, Postgres unreachable, no Qdrant URL, an unknown
 project) is a [failure document](#failure-documents) with `"kind": "search"`, and has no `index`,
@@ -565,7 +567,9 @@ nothing there, and its sentence goes to standard error as `htui: <sentence>`.
   the longest key.
 - **`htui --search-items`** prints one line per hit, as before. No hits, or no index yet, prints a
   note on standard error and exits 0. When some workspaces' collections could not be read, it
-  also prints `knowledge search unavailable for workspace(s): <slug>, …` on standard error.
+  also prints `knowledge search unavailable for workspace(s): <slug>, …` on standard error,
+  followed, when one of them failed rather than being missing, by why the first one failed in
+  parentheses (`(embedder mismatch: …)`). The `--json` document names the slugs only.
 
 Control characters are removed from stored text before it is printed, so a note cannot drive your
 terminal. Text output is for people; scripts should use `--json`.
