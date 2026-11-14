@@ -78,6 +78,8 @@ fn concept_hit(hit: Hit) -> ConceptHit {
         owner_kind: match hit.owner {
             Owner::Item(_) => OwnerKind::Item,
             Owner::Requirement(_) => OwnerKind::Requirement,
+            // MOD-147 M4 D11: a project's own document; its key is the project's slug.
+            Owner::Document(_) => OwnerKind::Project,
         },
         key: hit.key,
         document_kind: hit.document.map(|(_, kind)| kind),
@@ -174,6 +176,24 @@ mod tests {
         }
     }
 
+    /// A section of `project`'s own `kind` document, keyed by the project's slug (MOD-147 M4).
+    fn owner_document(project: ProjectId, slug: &str, kind: &str) -> ConceptPoint {
+        let id = DocumentId::new();
+        ConceptPoint {
+            subject: Subject::OwnerDocument { id },
+            key: slug.to_owned(),
+            project_id: project,
+            updated_at: at(),
+            document: Some(DocumentRef {
+                id,
+                kind: kind.to_owned(),
+                version: 1,
+                chunk: 0,
+            }),
+            text: format!("{slug} {WORDS}"),
+        }
+    }
+
     async fn seeded(points: Vec<ConceptPoint>) -> McpSearch {
         let index = MemIndex::new();
         index
@@ -229,6 +249,7 @@ mod tests {
             item(project, "HTUI-1", Some(Resolution::Done)),
             document(project, "HTUI-2", "plan"),
             requirement(project, "R-STO-8"),
+            owner_document(project, "htui", "goals"),
         ])
         .await;
 
@@ -275,6 +296,17 @@ mod tests {
                     state: Some("active".to_owned()),
                     score: score("R-STO-8"),
                     snippet: format!("R-STO-8 {WORDS}"),
+                },
+                // MOD-147 M4 D11: the project's own document.
+                ConceptHit {
+                    point_type: ConceptType::Document,
+                    owner_kind: OwnerKind::Project,
+                    key: "htui".to_owned(),
+                    document_kind: Some("goals".to_owned()),
+                    resolution: None,
+                    state: None,
+                    score: score("htui"),
+                    snippet: format!("htui {WORDS}"),
                 },
             ]
         );

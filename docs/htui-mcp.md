@@ -134,8 +134,11 @@ and has already withdrawn. `live` says whether the link is in force after the ca
 [Search](../README.md#search)) within the session's project only. `types` keeps `item`,
 `document` or `requirement` points (an unknown name answers `invalid arguments: unknown type
 <name>`); `statuses` keeps items in those statuses, and naming any status leaves requirements out.
-A hit carries `point_type`, `owner_kind` (`item` or `requirement`), `key`, `score`, `snippet`, and
-when they apply `document_kind`, `resolution` (a closed item's) and `state` (a requirement's). The
+A hit carries `point_type`, `owner_kind` (`item`, `requirement` or `project`), `key`, `score`,
+`snippet`, and when they apply `document_kind`, `resolution` (a closed item's) and `state` (a
+requirement's). A `project` hit is a section of one of the project's own documents (not an
+item's), and its `key` is the project's slug; such a hit has no status, so naming any status leaves
+it out too. The
 `snippet` is the start of the indexed text as stored (whitespace folded, control characters
 dropped, at most 280 characters), not scrubbed. It looks nothing else up. A search that cannot
 answer (Qdrant down or refusing the key, an index written by another embedding model, the model

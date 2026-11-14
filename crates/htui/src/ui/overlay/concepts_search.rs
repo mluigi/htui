@@ -86,6 +86,11 @@ pub const NO_PROJECTS: &str = "this workspace has no projects";
 /// `Enter` on an empty query.
 pub const EMPTY_QUERY: &str = "type a query first";
 
+/// `Enter` on a project's or a workspace's own document (MOD-147 M4 D10): it lives in the Settings
+/// documents pane, so nothing is revealed and the overlay stays open.
+pub const OWNER_DOCUMENT: &str =
+    "a project or workspace document: open it from Settings › Hierarchy";
+
 /// A search that found nothing. `reindex` is `ConceptsReindex`'s label through `CONCEPTS_QUERY`
 /// (MOD-67 M6 D4); with none bound the hint goes.
 #[must_use]
@@ -283,8 +288,13 @@ impl ConceptsSearch {
             return;
         }
         if let Some(hit) = self.hits.get(self.cursor) {
-            ctx.emit(Action::Overlay(OverlayAction::Close));
-            ctx.emit(Action::Reveal(target(hit)));
+            match target(hit) {
+                Some(target) => {
+                    ctx.emit(Action::Overlay(OverlayAction::Close));
+                    ctx.emit(Action::Reveal(target));
+                }
+                None => self.notice = Some(OWNER_DOCUMENT),
+            }
         }
     }
 
@@ -550,17 +560,19 @@ impl Overlay for ConceptsSearch {
 }
 
 /// What `Enter` on `hit` reveals: its item (a document hit's owner item) or its requirement, with
-/// the key the tab's miss sentence names (D235, blueprint D248).
-fn target(hit: &Hit) -> RevealTarget {
+/// the key the tab's miss sentence names (D235, blueprint D248). `None` for a project's or a
+/// workspace's own document (MOD-147 M4 D10): it opens from Settings, not a tab `Reveal` reaches.
+fn target(hit: &Hit) -> Option<RevealTarget> {
     match hit.owner {
-        Owner::Item(id) => RevealTarget::Item {
+        Owner::Item(id) => Some(RevealTarget::Item {
             id,
             key: hit.key.clone(),
-        },
-        Owner::Requirement(id) => RevealTarget::Requirement {
+        }),
+        Owner::Requirement(id) => Some(RevealTarget::Requirement {
             id,
             key: hit.key.clone(),
-        },
+        }),
+        Owner::Document(_) => None,
     }
 }
 
@@ -1014,6 +1026,36 @@ mod tests {
             &emitted[1],
             Action::Reveal(RevealTarget::Item { id, key })
                 if *id == ids::HTUI_ANA_1 && key == "ANA-1"
+        ));
+    }
+
+    /// MOD-147 M4 D10: `Enter` on a project's or a workspace's own document reveals nothing,
+    /// keeps the overlay open and says where the document opens; the next hit still reveals.
+    #[test]
+    fn an_owner_document_hit_stays_open_and_names_where_it_opens() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        let goals = htui_core::model::DocumentId::new();
+        let owned = Hit {
+            point_type: PointType::Document,
+            owner: Owner::Document(goals),
+            key: "@platform".to_owned(),
+            document: Some((goals, "goals".to_owned())),
+            ..item_hit()
+        };
+        searched(&bench, &mut search, "postgres", vec![owned, item_hit()]);
+
+        bench.code(&mut search, KeyCode::Enter);
+        assert!(bench.emit.take().is_empty(), "no close, no reveal");
+        assert!(bench.render(&search).contains(OWNER_DOCUMENT));
+
+        bench.code(&mut search, KeyCode::Down);
+        bench.code(&mut search, KeyCode::Enter);
+        let emitted = bench.emit.take();
+        assert!(matches!(emitted[0], Action::Overlay(OverlayAction::Close)));
+        assert!(matches!(
+            &emitted[1],
+            Action::Reveal(RevealTarget::Item { id, .. }) if *id == ids::HTUI_FEAT_1
         ));
     }
 

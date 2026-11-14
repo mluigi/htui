@@ -268,6 +268,40 @@ async fn requirement_hits_carry_owner_kind_requirement() {
     );
 }
 
+/// MOD-147 M4 D11: a project's own document is a `project` hit keyed by the project's slug.
+#[tokio::test]
+async fn a_project_document_hit_carries_owner_kind_project() {
+    let goals = ConceptHit {
+        point_type: ConceptType::Document,
+        owner_kind: OwnerKind::Project,
+        key: "htui".to_owned(),
+        document_kind: Some("goals".to_owned()),
+        resolution: None,
+        state: None,
+        score: 1.5,
+        snippet: "htui Goals (goals)".to_owned(),
+    };
+    let index = Recording::answering(Ok(vec![goals]));
+    let host = host(Some(index));
+    let (_lease, mut client) = open(&host, phase_scope(ids::PROJECT_HTUI)).await;
+
+    let answer = ok(&client
+        .call("search_concepts", json!({"query": "goals"}))
+        .await
+        .expect("a call"));
+    assert_eq!(
+        answer,
+        json!({"hits": [{
+            "point_type": "document",
+            "owner_kind": "project",
+            "key": "htui",
+            "document_kind": "goals",
+            "score": 1.5,
+            "snippet": "htui Goals (goals)"
+        }]})
+    );
+}
+
 #[tokio::test]
 async fn an_unavailable_index_is_is_error_with_its_cause() {
     let cause = "Qdrant is unreachable at http://qdrant:6334";

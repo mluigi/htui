@@ -9,8 +9,10 @@
 #![cfg(feature = "test-support")]
 
 use htui_core::fixtures::ids;
+use htui_core::model::document::GOALS_KIND;
 use htui_core::model::{
-    ItemFilter, RequirementFilter, RequirementState, Resolution, Scope, Status,
+    DocumentId, ItemFilter, NewOwnerDocument, RequirementFilter, RequirementState, Resolution,
+    Scope, Status,
 };
 use htui_core::store::StoreError;
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
@@ -22,7 +24,7 @@ use htui_store::vector::{
     PointType, Probe, QdrantStore, SPARSE, SearchArms, SearchQuery, VectorStore as _,
     is_embedder_mismatch, probe_with,
 };
-use htui_store::vector_sync::Indexer;
+use htui_store::vector_sync::{Indexer, workspace_search_scope};
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     CountPointsBuilder, CreateCollectionBuilder, Distance, Modifier, SparseVectorParamsBuilder,
@@ -323,6 +325,65 @@ async fn a_resolution_filter_keeps_decisions_and_leaves_requirements_out() {
         ..decisions
     };
     assert!(store.search(&rejected).await.expect("search").is_empty());
+    store.drop_collection().await.expect("drop");
+}
+
+/// MOD-147 M4: the Platform workspace's goals document, indexed through the workspace's widened
+/// scope, is found by a search of the widened projects as an owner-document hit keyed by the
+/// scope row's slug, and not by a search of the members alone.
+#[tokio::test]
+async fn a_workspace_goals_document_is_found_by_a_workspace_search() {
+    let Some((_turn, store)) = throwaway().await else {
+        return;
+    };
+    let read = MemStore::demo();
+    let goals = read
+        .write_owner_document(NewOwnerDocument {
+            id: DocumentId::new(),
+            project_id: ids::PROJECT_SCOPE_PLATFORM,
+            kind: GOALS_KIND.to_owned(),
+            title: "Goals".to_owned(),
+            body: "## Aim\nOne quartzite search across every platform project.".to_owned(),
+            created_by: ids::USER,
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("write the goals");
+    let members = scope();
+    let wide = workspace_search_scope(&read, &members).await;
+    assert_eq!(wide.project_ids[0], ids::PROJECT_SCOPE_PLATFORM);
+    Indexer::sync(&read, &wide, &store).await.expect("sync");
+
+    let search = |projects: Vec<_>| SearchQuery {
+        projects,
+        limit: 20,
+        ..query("quartzite platform goals")
+    };
+    let own = |hits: &[Hit]| {
+        hits.iter()
+            .find(|h| h.owner == Owner::Document(goals.id))
+            .cloned()
+    };
+    let hits = store
+        .search(&search(wide.project_ids.clone()))
+        .await
+        .expect("search");
+    let hit = own(&hits).unwrap_or_else(|| panic!("the goals not among {hits:?}"));
+    assert_eq!(hit.point_type, PointType::Document);
+    assert_eq!(hit.key, "@platform");
+    assert_eq!(hit.document, Some((goals.id, GOALS_KIND.to_owned())));
+    assert_eq!(hit.resolution, None);
+
+    let hits = store
+        .search(&search(members.project_ids.clone()))
+        .await
+        .expect("search");
+    assert!(own(&hits).is_none(), "{hits:?}");
+
+    // In step: a second sync of the widened scope writes nothing.
+    let again = Indexer::sync(&read, &wide, &store).await.expect("resync");
+    assert_eq!(again.points_upserted, 0);
+    assert_eq!(again.points_deleted, 0);
     store.drop_collection().await.expect("drop");
 }
 

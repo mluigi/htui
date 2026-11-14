@@ -88,6 +88,8 @@ pub enum OwnerKind {
     Item,
     /// A requirement.
     Requirement,
+    /// A project's or a workspace's own document (MOD-147 M4 D11); `key` is its slug.
+    Project,
 }
 
 /// One hit, as the tool returns it: what the index carries, no title or status lookups.
@@ -97,7 +99,7 @@ pub struct ConceptHit {
     pub point_type: ConceptType,
     /// The point's owner.
     pub owner_kind: OwnerKind,
-    /// The owner's key (`HTUI-12`, `R-STO-8`).
+    /// The owner's key (`HTUI-12`, `R-STO-8`), or a project's slug (`htui`) on its own document.
     pub key: String,
     /// A document point's kind.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,7 +118,22 @@ pub struct ConceptHit {
 
 #[cfg(test)]
 mod tests {
-    use super::ConceptType;
+    use super::{ConceptType, OwnerKind};
+
+    /// MOD-147 M4 D11: the wire names of a hit's owner.
+    #[test]
+    fn an_owner_kind_serialises_its_wire_name() {
+        for (kind, wire) in [
+            (OwnerKind::Item, "item"),
+            (OwnerKind::Requirement, "requirement"),
+            (OwnerKind::Project, "project"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialises"),
+                serde_json::json!(wire)
+            );
+        }
+    }
 
     #[test]
     fn a_concept_type_parses_its_own_wire_name_only() {
