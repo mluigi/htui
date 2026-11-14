@@ -256,6 +256,9 @@ struct Shared<P: ReplySink> {
     /// MOD-12 M2 D4: the batch under which a malformed project cap was warned; later ones of it
     /// are `debug`.
     bad_cap_noted: StdMutex<Option<BatchId>>,
+    /// MOD-133 F2 L5: the integrate refusals noted on their items, `(batch, item, reason)`, of
+    /// the current batch only ([`Shared::first_integrate_refusal`]).
+    integrate_refused_noted: StdMutex<HashSet<(BatchId, ItemId, String)>>,
     /// I-1: the executor the last sweep read, so a change is logged once.
     last_executor: StdMutex<Option<Executor>>,
     /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
@@ -377,6 +380,27 @@ impl<P: ReplySink> Shared<P> {
             tracing::debug!(%batch, %project, %err, "a project's queue cap is still malformed");
         }
         first
+    }
+
+    /// MOD-133 F2 L5: whether `item`'s integrate refusal for `reason` is new under `batch`,
+    /// recording it if so; the refusals of any other batch are forgotten, so a pause and a resume
+    /// note again. True when the item is to be noted.
+    fn first_integrate_refusal(&self, batch: BatchId, item: ItemId, reason: &str) -> bool {
+        let mut noted = self
+            .integrate_refused_noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        noted.retain(|(noted_batch, _, _)| *noted_batch == batch);
+        noted.insert((batch, item, reason.to_owned()))
+    }
+
+    /// MOD-133 F2 L5: the note [`Shared::first_integrate_refusal`] allowed was not written, so
+    /// the next sweep tries again.
+    fn forget_integrate_refusal(&self, batch: BatchId, item: ItemId, reason: &str) {
+        self.integrate_refused_noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(batch, item, reason.to_owned()));
     }
 
     /// OQ-6: `run`'s resume failed again; its next one waits, 5 s doubling to 5 min. Warned once
@@ -1389,6 +1413,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 queue_failing: AtomicBool::new(false),
                 batch_stop_noted: StdMutex::new(None),
                 bad_cap_noted: StdMutex::new(None),
+                integrate_refused_noted: StdMutex::new(HashSet::new()),
                 last_executor: StdMutex::default(),
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
@@ -2222,8 +2247,9 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// holding a slot on this box), then the claim scan, always unless the runtime was built
 /// [`RunRuntime::without_claim_scan`] (blueprint B-8: `queued` rows hold no slot, so the
 /// adoption's short-circuit must not skip them). Between the adoption and the claim scan, the
-/// land arm lands this box's pending integration records (MOD-133 D10, [`land`]), then the
-/// queue runner admits this box's queued ready items (MOD-12 D6, [`admit`]).
+/// queue runner admits this box's queued ready items (MOD-12 D6, [`admit`]). Last, the land arm
+/// lands this box's pending integration records (MOD-133 D10, [`land`]): after the claims (F2
+/// M1), so a remote that does not answer delays no admission and no claim.
 async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>) {
     let host = &ctx.host;
     if !ctx.shared.sweep_fixed
@@ -2274,14 +2300,15 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     {
         adopt(&ctx).await;
     }
-    // MOD-133 D10: unconditionally, for both roles; it builds nothing when nothing is pending.
-    land(&ctx, box_id).await;
     if claims {
         // MOD-12 D6: admission first, under the same guard, so the claim scan below claims and
         // walks what it created; there is no second admission path.
         Box::pin(admit(&ctx, box_id, &settings)).await;
         claim_scan(&ctx, box_id).await;
     }
+    // MOD-133 D10: unconditionally, for both roles; it builds nothing when nothing is pending.
+    // F2 M1: last, so its network verbs never hold up the admission and the claims above.
+    land(&ctx, box_id).await;
 }
 
 /// MOD-133 D10: the sweep's land arm, once per sweep of the box's executing process (I-1 is
@@ -2352,7 +2379,8 @@ async fn land<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>
 /// `workspace_id` is a placeholder neither store reads, blueprint H-4), kept to the queued ones in
 /// queue order (D4, [`admission_order`]), and up to [`free_slots`] of them enqueued `auto` under
 /// the batch (D7). Every refusal is logged at `debug` and the next entry tried; one that writes a
-/// note on its item (rung 4, missing tags) is visible there. A `Constraint` re-reads the open
+/// note on its item (rung 4, missing tags) is visible there, and an integrate refusal, which
+/// writes none, is noted here once per batch and reason (MOD-133 F2 L5). A `Constraint` re-reads the open
 /// batch and stops when it is no longer this one (a pause won the race, H-6). The `Kit` is read
 /// only when something is to be admitted. A failed store read stops the sweep's admission and is
 /// warned once per streak (review M2, [`Shared::queue_read_failed`]).
@@ -2600,6 +2628,17 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
                 match host.open_batch_of(box_id).await {
                     Ok(Some(open)) if open.id == batch.id => {}
                     _ => return,
+                }
+            }
+            // MOD-133 F2 L5: an integrate refusal writes nothing and leaves the item `open` and
+            // queued, so it is noted on the item here, once per batch and reason.
+            Err(EngineError::Resolve(ResolveError::IntegrateRefused { reason, .. })) => {
+                tracing::debug!(%item, %reason, "the queue's run was refused by the integrate rules");
+                if ctx.shared.first_integrate_refusal(batch.id, item, &reason)
+                    && let Err(err) = engine.note_queue_refusal(item, &reason).await
+                {
+                    ctx.shared.forget_integrate_refusal(batch.id, item, &reason);
+                    tracing::warn!(%item, %err, "the queue could not note an integrate refusal");
                 }
             }
             Err(err) => tracing::debug!(%item, %err, "the queue skipped an entry"),

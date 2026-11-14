@@ -10,6 +10,8 @@
 //!
 //! The ticker is one hour, so every sweep a case sees is an explicit `sweep_with`.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -18,12 +20,17 @@ use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{
     BoxEdit, BoxId, Claim, Executor, GraphSnapshot, IntegrateMode, IntegrateSnapshot,
-    IntegrationState, ItemId, NewItem, NewRepo, NewRun, NewRunStep, RepoId, RunId, RunMode,
-    RunStatus, RunStepCommit, StepId, StepRole, StepStatus,
+    IntegrationState, Isolation, ItemId, LandOutcome, NewItem, NewRepo, NewRun, NewRunStep,
+    PremergeReport, RepoId, RunId, RunMode, RunStatus, RunStepCommit, RunStepTree, StepId,
+    StepRole, StepStatus,
 };
+use htui_core::prompt::DiffBlock;
 use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
 use htui_orch::Isolator;
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
+use htui_orch::isolate::{
+    ChangedPaths, EnvFiles, FanoutSlot, IsolatorFuture, LandRequest, PartTip, Prepared, ResetReport,
+};
 use htui_store::Backend;
 use htui_worker::{ReplySink, Role, RunReply, RunRuntime};
 use uuid::Uuid;
@@ -367,4 +374,170 @@ async fn a_sweep_whose_role_does_not_execute_the_box_lands_nothing() {
     h.sweep(&mut worker).await;
     assert_eq!(h.isolator.land_requests().len(), 1);
     assert_eq!(h.states(run).await, [IntegrationState::Landed]);
+}
+
+/// The [`FakeIsolator`], whose `land` first reads whether this box still has an open batch: the
+/// sweep's admission closes an empty one (`drained`), so a `false` read means admission ran
+/// before the land arm.
+#[derive(Debug)]
+struct BatchWatch {
+    inner: Arc<FakeIsolator>,
+    store: MemStore,
+    /// One entry per `land`: whether the box's batch was still open then.
+    open_at_land: StdMutex<Vec<bool>>,
+}
+
+impl Isolator for BatchWatch {
+    fn prepare<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        scope: &'a [RepoId],
+        isolation: Isolation,
+        slot: Option<FanoutSlot<'a>>,
+    ) -> IsolatorFuture<'a, Prepared> {
+        self.inner.prepare(run, step, scope, isolation, slot)
+    }
+
+    fn capture<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
+        self.inner.capture(step, trees)
+    }
+
+    fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
+        self.inner.base(scope)
+    }
+
+    fn diff<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Option<DiffBlock>> {
+        self.inner.diff(trees, commits)
+    }
+
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, ChangedPaths> {
+        self.inner.changed_paths(trees, commits)
+    }
+
+    fn env_files<'a>(
+        &'a self,
+        cwd: &'a Path,
+        extra_dirs: &'a [PathBuf],
+    ) -> IsolatorFuture<'a, EnvFiles> {
+        self.inner.env_files(cwd, extra_dirs)
+    }
+
+    fn reconcile<'a>(
+        &'a self,
+        winner: StepId,
+        trees: &'a [RunStepTree],
+        siblings: &'a [StepId],
+    ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
+        self.inner.reconcile(winner, trees, siblings)
+    }
+
+    fn premerge<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, PremergeReport> {
+        self.inner.premerge(step, trees, parts)
+    }
+
+    fn unmerged<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+        heads: &'a [RunStepCommit],
+        parts: &'a [PartTip],
+    ) -> IsolatorFuture<'a, Vec<StepId>> {
+        self.inner.unmerged(step, trees, heads, parts)
+    }
+
+    fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
+        self.inner.cleanup(run, trees)
+    }
+
+    fn reset<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ResetReport> {
+        self.inner.reset(step, trees)
+    }
+
+    fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
+        self.inner.release(run)
+    }
+
+    fn reacquire<'a>(
+        &'a self,
+        run: RunId,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ()> {
+        self.inner.reacquire(run, step, trees)
+    }
+
+    fn land<'a>(&'a self, request: &'a LandRequest) -> IsolatorFuture<'a, LandOutcome> {
+        Box::pin(async move {
+            let open = self
+                .store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("MemStore never fails a read")
+                .is_some();
+            self.open_at_land
+                .lock()
+                .expect("no panic holds the watch")
+                .push(open);
+            self.inner.land(request).await
+        })
+    }
+}
+
+/// F2 M1: the land arm runs after the sweep's admission and claims, so a remote that does not
+/// answer never holds them up. Here the box's batch is open and empty: admission closes it
+/// (`drained`), and the land arm, which lands the pending record in the same sweep, sees it
+/// closed.
+#[tokio::test]
+async fn the_land_arm_runs_after_admission_and_claims() {
+    let h = Harness::new().await;
+    let repo = h.push_repo("after").await;
+    let item = h.item("landed after the claims").await;
+    let run = h.pushed_run(item, repo, ids::BOX).await;
+    h.store
+        .open_batch(ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the batch opens");
+    let watch = Arc::new(BatchWatch {
+        inner: Arc::clone(&h.isolator),
+        store: h.store.clone(),
+        open_at_land: StdMutex::new(Vec::new()),
+    });
+
+    let mut runtime = RunRuntime::with_parts(
+        Arc::clone(&watch) as Arc<dyn Isolator>,
+        Arc::new(FakeVerifier::new()),
+        DriverFactory::new(),
+    )
+    .with_sweep_every(Duration::from_secs(3600))
+    .with_role(Role::Tui);
+    h.sweep(&mut runtime).await;
+
+    assert_eq!(h.states(run).await, [IntegrationState::Landed]);
+    assert_eq!(
+        *watch.open_at_land.lock().expect("no panic holds the watch"),
+        [false],
+        "the batch was drained before the land arm ran"
+    );
 }

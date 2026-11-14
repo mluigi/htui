@@ -900,6 +900,55 @@ async fn a_queued_item_missing_a_tag_waits_unblocked() {
     assert_eq!(h.only_run(plain).await.mode, RunMode::Auto);
 }
 
+/// MOD-133 F2 L5: an entry whose run the integrate rules refuse (here the project's `integrate`
+/// default is not a mode) is noted on its item once per batch, with the refusal's sentence, and
+/// stays queued and `open`; a later sweep of the same batch notes nothing more.
+#[tokio::test]
+async fn an_integrate_refusal_is_noted_once_per_batch() {
+    let h = Harness::overlapping().await;
+    h.parts.open();
+    let mut settings = h
+        .store
+        .project_settings(ids::PROJECT_HTUI)
+        .await
+        .expect("the read answers")
+        .expect("the project exists");
+    if !settings.is_object() {
+        settings = json!({});
+    }
+    settings
+        .as_object_mut()
+        .expect("an object")
+        .insert("integrate".to_owned(), json!("bogus"));
+    h.store.set_project_settings(ids::PROJECT_HTUI, settings);
+    let item = mint_ana(&h.store, "refused", 0).await;
+    h.queue(item).await;
+    h.resume().await;
+    let mut runtime = h.runtime();
+    h.sweep(&mut runtime).await;
+    h.sweep(&mut runtime).await;
+
+    assert!(h.runs(item).await.is_empty(), "no run is created");
+    assert_eq!(h.status(item).await, Status::Open);
+    let notes: Vec<String> = h
+        .store
+        .notes(item)
+        .await
+        .expect("the read answers")
+        .into_iter()
+        .map(|note| note.body)
+        .filter(|body| body.starts_with("the queue cannot start a run"))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "the queue cannot start a run: project setting `integrate` is \"bogus\", not one of \
+          local, push, pull_request"
+        ],
+        "noted once, with the refusal's sentence"
+    );
+}
+
 /// Repoints `item` at a clone of its graph whose first phase names a template no row has: the
 /// conformance `repoint` recipe (`htui-orch`'s `conformance.rs`), over the store.
 async fn repoint_at_no_template(store: &MemStore, item: ItemId) {
