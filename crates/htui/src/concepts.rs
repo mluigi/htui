@@ -183,8 +183,8 @@ fn store_context(err: &StoreError) -> &'static str {
 /// scope row first, then its members by position, so the workspace's own `WS` items and
 /// documents are indexed and found. A workspace with neither members nor a scope row is left out.
 /// `@<workspace-slug>` narrows to that workspace's scope row alone; any other slug narrows to
-/// the member projects of that slug. A slug that matches nothing is an error, which
-/// `search_projects` answers as `unknown_project`.
+/// the member projects of that slug. A slug that matches nothing is an error, naming a workspace
+/// for an `@` slug and a project otherwise, which `search_projects` answers as `unknown_project`.
 pub(crate) async fn scopes(pg: &PgStore, project: Option<&str>) -> anyhow::Result<Vec<Scope>> {
     let mut scopes = Vec::new();
     for ws in pg.workspaces().await? {
@@ -220,7 +220,11 @@ pub(crate) async fn scopes(pg: &PgStore, project: Option<&str>) -> anyhow::Resul
     if let Some(slug) = project
         && scopes.is_empty()
     {
-        bail!("no project with slug `{slug}`");
+        // MOD-147 M4 R1 L3: an `@` slug names a workspace; the code stays `unknown_project`.
+        match slug.strip_prefix('@') {
+            Some(workspace) => bail!("no workspace with slug `{workspace}`"),
+            None => bail!("no project with slug `{slug}`"),
+        }
     }
     Ok(scopes)
 }
@@ -1064,6 +1068,11 @@ mod tests {
             .await
             .expect_err("an unknown workspace slug");
         assert_eq!(refused.error.code, ErrorCode::UnknownProject, "{refused:?}");
+        // MOD-147 M4 R1 L3: an `@` slug names a workspace, so the sentence does too.
+        assert_eq!(
+            refused.error.message, "no workspace with slug `nope`",
+            "{refused:?}"
+        );
         pg.close().await;
         db.drop_db().await;
     }
