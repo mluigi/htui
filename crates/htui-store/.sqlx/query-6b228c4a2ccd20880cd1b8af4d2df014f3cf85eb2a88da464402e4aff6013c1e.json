@@ -34,7 +34,7 @@
       ]
     },
     "nullable": [
-      true,
+      false,
       false
     ]
   },

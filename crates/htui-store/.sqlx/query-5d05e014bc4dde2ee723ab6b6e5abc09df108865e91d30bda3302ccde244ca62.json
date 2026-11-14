@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, project_id, area_id, area_code, number, key as \"key!\", body, rationale,\n                  priority, state, version, created_by, created_at, updated_at\n             FROM requirement WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
+  "query": "\n        SELECT id         AS \"id: RequirementId\",\n               project_id AS \"project_id: ProjectId\",\n               area_id    AS \"area_id: RequirementAreaId\",\n               area_code,\n               number,\n               key        AS \"key!\",\n               refines_id AS \"refines_id: RequirementId\",\n               child_number,\n               body,\n               rationale,\n               priority   AS \"priority: Priority\",\n               state      AS \"state: RequirementState\",\n               version,\n               created_by AS \"created_by: UserId\",\n               created_at,\n               updated_at\n          FROM requirement WHERE id = $1 FOR UPDATE\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id: RequirementId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "project_id",
+        "name": "project_id: ProjectId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "area_id",
+        "name": "area_id: RequirementAreaId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -71,6 +71,28 @@
       },
       {
         "ordinal": 6,
+        "name": "refines_id: RequirementId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "refines_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "child_number",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "child_number"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "body",
         "type_info": "Text",
         "origin": {
@@ -81,7 +103,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "rationale",
         "type_info": "Text",
         "origin": {
@@ -92,8 +114,8 @@
         }
       },
       {
-        "ordinal": 8,
-        "name": "priority",
+        "ordinal": 10,
+        "name": "priority: Priority",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -103,8 +125,8 @@
         }
       },
       {
-        "ordinal": 9,
-        "name": "state",
+        "ordinal": 11,
+        "name": "state: RequirementState",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -125,8 +147,8 @@
         }
       },
       {
-        "ordinal": 11,
-        "name": "created_by",
+        "ordinal": 13,
+        "name": "created_by: UserId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -136,7 +158,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -147,7 +169,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -160,8 +182,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Timestamptz"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -169,7 +190,9 @@
       false,
       false,
       false,
+      true,
       false,
+      true,
       true,
       false,
       false,
@@ -181,5 +204,5 @@
       false
     ]
   },
-  "hash": "edc3ec24d183f3021706e400026b3e4089bcf1a0b8168b4a1cc02fa0ecf60a48"
+  "hash": "5d05e014bc4dde2ee723ab6b6e5abc09df108865e91d30bda3302ccde244ca62"
 }

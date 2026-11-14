@@ -550,7 +550,7 @@ impl PgStore {
         }
 
         // MOD-38 (blueprint §8): the requirement set, in foreign-key order - spec, areas, their
-        // counters, requirements (never `key`, which is generated), revisions, citations. Every
+        // counters, requirements (`key` stored since MOD-149's 0034), revisions, citations. Every
         // `updated_at` is passed, as above; `item_requirement` follows the steps for the same
         // reason `item_link` does.
         for row in &data.requirement_specs {
@@ -601,14 +601,18 @@ impl PgStore {
 
         for row in &data.requirements {
             sqlx::query!(
-                "INSERT INTO requirement (id, project_id, area_id, area_code, number, body, \
-                 rationale, priority, state, version, created_by, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                "INSERT INTO requirement (id, project_id, area_id, area_code, number, key, \
+                 refines_id, child_number, body, rationale, priority, state, version, created_by, \
+                 created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
                 RequirementId::as_uuid(row.id),
                 ProjectId::as_uuid(row.project_id),
                 RequirementAreaId::as_uuid(row.area_id),
                 row.area_code,
                 row.number,
+                row.key,
+                row.refines_id.map(RequirementId::as_uuid),
+                row.child_number,
                 row.body,
                 row.rationale,
                 row.priority.as_str(),

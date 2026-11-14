@@ -380,9 +380,11 @@ fn run_plan_of(row: &SqliteRow) -> Result<RunPlan> {
 /// Every `requirement` column, aliased `r`, in [`requirement_of`]'s names: shared by the three
 /// reads that build a [`Requirement`] so a column added to one cannot be missed by another.
 const REQUIREMENT_SELECT: &str = "r.id, r.project_id, r.area_id, r.area_code, r.number, r.key, \
-     r.body, r.rationale, r.priority, r.state, r.version, r.created_by, r.created_at, r.updated_at";
+     r.refines_id, r.child_number, r.body, r.rationale, r.priority, r.state, r.version, \
+     r.created_by, r.created_at, r.updated_at";
 
-/// One `requirement` row (MOD-38), every column of `cache_migrations/0004_requirements.sql`.
+/// One `requirement` row (MOD-38), every column of `cache_migrations/0011_requirement_keys.sql`'s
+/// shape (MOD-149: `number` nullable, `refines_id` and `child_number`).
 fn requirement_of(row: &SqliteRow) -> Result<Requirement> {
     Ok(Requirement {
         id: uuid_col("requirement.id", &text(row, "id")?)?,
@@ -391,6 +393,11 @@ fn requirement_of(row: &SqliteRow) -> Result<Requirement> {
         area_code: text(row, "area_code")?,
         number: get(row, "number")?,
         key: text(row, "key")?,
+        refines_id: opt_uuid_col::<RequirementId>(
+            "requirement.refines_id",
+            opt_text(row, "refines_id")?.as_deref(),
+        )?,
+        child_number: get(row, "child_number")?,
         body: text(row, "body")?,
         rationale: text(row, "rationale")?,
         priority: get::<Priority>(row, "priority")?,
@@ -1267,7 +1274,7 @@ impl ReadStore for CacheStore {
                 " AND (instr(lower(r.key), lower(?)) > 0 OR instr(lower(r.body), lower(?)) > 0)",
             );
         }
-        sql.push_str(" ORDER BY r.area_code, r.number");
+        // MOD-149 D6: SQLite has no arrays, so the list order is sorted below.
 
         let mut query = sqlx::query(AssertSqlSafe(sql)).bind(project.to_string());
         if let Some(codes) = &filter.area_codes {
@@ -1290,7 +1297,31 @@ impl ReadStore for CacheStore {
         }
 
         let rows = query.fetch_all(&self.pool).await.map_err(map_sqlx)?;
-        rows.iter().map(requirement_of).collect()
+        let mut requirements = rows
+            .iter()
+            .map(requirement_of)
+            .collect::<Result<Vec<_>>>()?;
+        requirements.sort_by(Requirement::list_cmp);
+        Ok(requirements)
+    }
+
+    /// MOD-149 D7: the mirrored requirements refining `id`, in list order then `id`; a
+    /// refinement in a project this box does not mirror is not here.
+    async fn requirement_refinements(&self, id: RequirementId) -> Result<Vec<Requirement>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {REQUIREMENT_SELECT} FROM requirement r WHERE r.refines_id = ?"
+        )))
+        .bind(id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let mut requirements = rows
+            .iter()
+            .map(requirement_of)
+            .collect::<Result<Vec<_>>>()?;
+        requirements
+            .sort_by(|left, right| left.list_cmp(right).then_with(|| left.id.cmp(&right.id)));
+        Ok(requirements)
     }
 
     async fn requirement(&self, id: RequirementId) -> Result<Option<Requirement>> {
@@ -1394,14 +1425,15 @@ impl ReadStore for CacheStore {
                     ir.proposed_by_step_id, (r.version > ir.requirement_version) AS suspect \
                FROM item_requirement ir \
                JOIN requirement r ON r.id = ir.requirement_id \
-              WHERE ir.item_id = ? \
-              ORDER BY r.area_code, r.number, ir.kind"
+              WHERE ir.item_id = ?"
         )))
         .bind(item.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        rows.iter()
+        // MOD-149 D6: the requirement's list order, then `kind` by bytes, sorted here.
+        let mut citations = rows
+            .iter()
             .map(|row| {
                 Ok(ItemCitation {
                     requirement: requirement_of(row)?,
@@ -1414,7 +1446,13 @@ impl ReadStore for CacheStore {
                     suspect: bool_col(get::<i64>(row, "suspect")?),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        citations.sort_by(|left, right| {
+            left.requirement
+                .list_cmp(&right.requirement)
+                .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+        });
+        Ok(citations)
     }
 
     async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {

@@ -990,7 +990,9 @@ impl ReadStore for PgStore {
     }
 
     /// Every [`RequirementFilter`] field in SQL, the way `items` binds [`ItemFilter`] (plan D14),
-    /// in `(area_code, number)` order.
+    /// in MOD-149 D6's list order: `area_code` by bytes, the key's number path as an `int[]`
+    /// (whose order is `Vec<i32>`'s, so `R-ENT-1.1` follows `R-ENT-1` and `R-ENT-10` follows
+    /// `R-ENT-9`), then the key by bytes.
     async fn requirements(
         &self,
         project: ProjectId,
@@ -1016,6 +1018,8 @@ impl ReadStore for PgStore {
                    r.area_code,
                    r.number,
                    r.key        AS "key!",
+                   r.refines_id AS "refines_id: RequirementId",
+                   r.child_number,
                    r.body,
                    r.rationale,
                    r.priority   AS "priority: Priority",
@@ -1033,7 +1037,9 @@ impl ReadStore for PgStore {
                AND ($5::text IS NULL
                     OR position(lower($5::text) in lower(r.key)) > 0
                     OR position(lower($5::text) in lower(r.body)) > 0)
-             ORDER BY r.area_code COLLATE "C", r.number
+             ORDER BY r.area_code COLLATE "C",
+                      string_to_array(split_part(r.key, '-', 3), '.')::int[],
+                      r.key COLLATE "C"
             "#,
             project.as_uuid(),
             filter.area_codes.as_deref(),
@@ -1057,6 +1063,8 @@ impl ReadStore for PgStore {
                    area_code,
                    number,
                    key        AS "key!",
+                   refines_id AS "refines_id: RequirementId",
+                   child_number,
                    body,
                    rationale,
                    priority   AS "priority: Priority",
@@ -1246,8 +1254,8 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    /// The item's live citations, each joined to the requirement as it is now, in
-    /// `(area_code, number, kind)` order.
+    /// The item's live citations, each joined to the requirement as it is now, in the
+    /// requirement's list order ([`requirements`](ReadStore::requirements)), then `kind`.
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
         let rows = sqlx::query!(
             r#"
@@ -1255,8 +1263,10 @@ impl ReadStore for PgStore {
                    r.project_id           AS "project_id!: ProjectId",
                    r.area_id              AS "area_id!: RequirementAreaId",
                    r.area_code            AS "area_code!",
-                   r.number               AS "number!",
+                   r.number               AS "number?",
                    r.key                  AS "key!",
+                   r.refines_id           AS "refines_id?: RequirementId",
+                   r.child_number         AS "child_number?",
                    r.body                 AS "body!",
                    r.rationale            AS "rationale!",
                    r.priority             AS "priority!: Priority",
@@ -1272,7 +1282,10 @@ impl ReadStore for PgStore {
               FROM item_requirement ir
               JOIN requirement r ON r.id = ir.requirement_id
              WHERE ir.item_id = $1 AND ir.deleted_at IS NULL
-             ORDER BY r.area_code COLLATE "C", r.number, ir.kind COLLATE "C"
+             ORDER BY r.area_code COLLATE "C",
+                      string_to_array(split_part(r.key, '-', 3), '.')::int[],
+                      r.key COLLATE "C",
+                      ir.kind COLLATE "C"
             "#,
             item.as_uuid(),
         )
@@ -1290,6 +1303,8 @@ impl ReadStore for PgStore {
                     area_code: row.area_code,
                     number: row.number,
                     key: row.key,
+                    refines_id: row.refines_id,
+                    child_number: row.child_number,
                     body: row.body,
                     rationale: row.rationale,
                     priority: row.priority,
@@ -1373,6 +1388,43 @@ impl ReadStore for PgStore {
                 suspect: row.suspect,
             })
             .collect())
+    }
+
+    /// MOD-149 D7: every requirement refining `id`, nested or across owners, from any project,
+    /// in [`requirements`](ReadStore::requirements)' list order then `id`. `uq_requirement_child`
+    /// leads with `refines_id`, so it serves the lookup.
+    async fn requirement_refinements(&self, id: RequirementId) -> Result<Vec<Requirement>> {
+        sqlx::query_as!(
+            Requirement,
+            r#"
+            SELECT r.id         AS "id: RequirementId",
+                   r.project_id AS "project_id: ProjectId",
+                   r.area_id    AS "area_id: RequirementAreaId",
+                   r.area_code,
+                   r.number,
+                   r.key        AS "key!",
+                   r.refines_id AS "refines_id: RequirementId",
+                   r.child_number,
+                   r.body,
+                   r.rationale,
+                   r.priority   AS "priority: Priority",
+                   r.state      AS "state: RequirementState",
+                   r.version,
+                   r.created_by AS "created_by: UserId",
+                   r.created_at,
+                   r.updated_at
+              FROM requirement r
+             WHERE r.refines_id = $1
+             ORDER BY r.area_code COLLATE "C",
+                      string_to_array(split_part(r.key, '-', 3), '.')::int[],
+                      r.key COLLATE "C",
+                      r.id
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
     /// MOD-72 plan D2, D3: per `(step, tool_kind)`, the item's `tool_call` rows. The kind is

@@ -315,6 +315,13 @@ impl ReadStore for Writer {
         }
     }
 
+    async fn requirement_refinements(&self, id: RequirementId) -> Result<Vec<Requirement>> {
+        match self {
+            Self::Memory(store) => store.requirement_refinements(id).await,
+            Self::Online(pg) => pg.requirement_refinements(id).await,
+        }
+    }
+
     async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
         match self {
             Self::Memory(store) => store.tool_call_counts(item).await,
