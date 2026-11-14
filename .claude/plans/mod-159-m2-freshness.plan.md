@@ -3,6 +3,7 @@
 **Source PRD**: `.claude/prds/mod-159-knowledge-indexer.prd.md`
 **Selected Milestone**: 2 — Freshness
 **Complexity**: Medium
+**Status**: complete (`b4509a9f..d9020fcf`, review fix round R1 `d9020fcf`)
 **Run**: `/handoff-run MOD-159` in an hr sandbox (`hr/MOD-159`); CONFIRM waived by `/handoff-run`. Lane shape: one
 serial lane T1 → T2 → T3 → T4 (T2 and T3 have disjoint file sets and may run side by side after T1, but only in
 separate worktrees: both build `htui-store` with `SQLX_OFFLINE=true`, so T2's new `sqlx::query!` breaks T3's builds

@@ -101,7 +101,7 @@ MOD-70's were before), so a branch adding a migration renumbers at merge time an
 comment keeps its own bytes ("written before 0026") and `MOD163_M2_COLUMN_COMMENTS` pins them (`8d69db61`); an applied
 migration's SQL is never edited to follow a rename. Items that still owe one include MOD-143
 and MOD-171. Pins: store conformance `CASES` 325 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
-`ACTIVITY_CASES` 12 (`htui-core/src/store/conformance.rs`, MOD-122 M3), `INDEXER_LEASE_CASES` 10 (MOD-159), `htui-orch` `CASES` 265
+`ACTIVITY_CASES` 12 (`htui-core/src/store/conformance.rs`, MOD-122 M3), `INDEXER_LEASE_CASES` 10 (MOD-159), `INDEX_CHANGES_CASES` 7 (MOD-159 M2), `htui-orch` `CASES` 265
 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 58
 (`htui-store/tests/migrations.rs` `TABLES`).
 ---
@@ -881,8 +881,17 @@ items it follows are done.
   drops. The worker and TUI index job reconciles under each collection's lease and renews before each delete batch,
   confirming orphans by re-listing. Searches read the workspace collections plus global. `Ctrl+R`/`--index-items` defer to
   a live holder. PRD `.claude/prds/mod-159-knowledge-indexer.prd.md`, plan
-  `.claude/plans/mod-159-m1-lease-and-collections.plan.md`. M2 (60 s incremental cycle) and M3 (pass requests, holder
-  visibility) remain. Owed on the host: the live-Qdrant suites.
+  `.claude/plans/mod-159-m1-lease-and-collections.plan.md`. Owed on the host: the live-Qdrant suites.
+  **Phase 2 landed (`b4509a9f..d9020fcf` on `hr/MOD-159`, 2026-11-14):** M2 freshness. `IndexChangesStore` (MemStore,
+  PgStore; no migration, two `.sqlx` entries) lists items, item documents, requirements and owner documents written
+  after a store-clock instant; `Indexer::sync_changes` rebuilds only those rows, deleting only their stale points under
+  the lease guard (deleted rows stay with the full reconcile). The index job runs it every 60 s (`INCREMENTAL_CYCLE`)
+  per held collection from an in-process cursor pulled back by `cache_overlap_seconds`, with no keyring read; a full
+  reconcile still runs every `concepts_sync_minutes`. Plan `.claude/plans/mod-159-m2-freshness.plan.md`. Accepted, for
+  the write-up: document `created_at` is the writer's clock (a writer lagging the database by more than the overlap
+  waits for the reconcile); a pass with changes reads the changed project's points from Qdrant each cycle while a write
+  stays in the overlap; `document` has no `created_at` index. M3 (pass requests, holder visibility, release on exit)
+  remains.
 - [ ] **MOD-161 - Related items at draft time** (from ANA-37, `docs/ANA-37.md` §7.4, §8 Q7).
   `R-STO-8`, `R-ID-6`, `R-ENT-9`, `R-MCP-2`. The top 5 nearest items across the workspace (open and
   closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's
