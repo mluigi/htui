@@ -635,12 +635,14 @@ fn payload(point: &ConceptPoint) -> HashMap<String, Value> {
         }
         // MOD-147 M4 D2: the document, and no item: no `item_id`, `kind_id`, `status` or
         // `resolution`, so a status or resolution filter leaves it out as it does a requirement.
-        Subject::OwnerDocument { id } => {
-            p.insert(DOCUMENT_ID.to_owned(), Value::from(id.0.to_string()));
-            if let Some(doc) = &point.document {
-                insert_document(&mut p, doc);
+        // MOD-147 M4 R1 Nit: `document_id` written once, by the document reference, or alone
+        // when the point has none, so the point still names its document.
+        Subject::OwnerDocument { id } => match &point.document {
+            Some(doc) => insert_document(&mut p, doc),
+            None => {
+                p.insert(DOCUMENT_ID.to_owned(), Value::from(id.0.to_string()));
             }
-        }
+        },
         Subject::Requirement {
             id,
             area_code,
