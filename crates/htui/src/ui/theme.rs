@@ -276,9 +276,9 @@ impl Theme {
     pub fn status_style(&self, state: ItemState) -> Style {
         match state {
             ItemState::Open | ItemState::Queued | ItemState::Stopped => self.base,
-            ItemState::Running => self.running,
+            ItemState::Running | ItemState::Landing => self.running,
             ItemState::NeedsYou => self.warning,
-            ItemState::Blocked | ItemState::Failed => self.error,
+            ItemState::Blocked | ItemState::Failed | ItemState::LandRefused => self.error,
             ItemState::Done | ItemState::Closed => self.dim,
         }
     }
