@@ -15475,6 +15475,129 @@ async fn a_level_set_behind_a_retire_is_refused() {
     db.drop_db().await;
 }
 
+/// MOD-130 M2 R1 F2: `create_run` behind a retire or a delete holding the target's row lock.
+/// Opens the racing transaction, locks the target as `retire_target` and `delete_target` lock
+/// it, runs `statement` on it, spawns a `create_run` naming the target, checks it waits, commits,
+/// and answers what `create_run` answered, after checking it wrote no run.
+async fn create_run_behind(
+    db: &common::TestDb,
+    target: TargetId,
+    statement: &str,
+) -> htui_core::store::Result<htui_core::model::Run> {
+    let runs_before = db.store.runs(ids::HTUI_ANA_2).await.expect("runs").len();
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("the racing connection");
+    sqlx::query("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM target WHERE id = $1 FOR UPDATE")
+        .bind(target.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("lock the target");
+    sqlx::query(AssertSqlSafe(statement.to_owned()))
+        .bind(target.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing statement");
+
+    let creator = {
+        let store = db.store.clone();
+        let new = NewRun {
+            target: Some(htui_core::model::ResolvedTarget {
+                target,
+                source: htui_core::model::TargetSource::Item,
+            }),
+            ..race_run(ids::HTUI_ANA_2)
+        };
+        tokio::spawn(async move { store.create_run(new).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !creator.is_finished(),
+        "create_run waits on the target's row lock ({statement})"
+    );
+    sqlx::query("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("commit the race");
+    racer.close().await.expect("close the racing connection");
+
+    let answer = creator.await.expect("the create_run task");
+    assert_eq!(
+        db.store.runs(ids::HTUI_ANA_2).await.expect("runs").len(),
+        runs_before,
+        "a refused create_run writes no run ({statement})"
+    );
+    answer
+}
+
+/// MOD-130 M2 R1 F2 (P8): a `create_run` that waits behind a retire holding the target's row
+/// lock sees the retire, and answers `target_retired`; no run is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_run_behind_a_retire_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "racing run docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create a target");
+
+    match create_run_behind(
+        &db,
+        target.id,
+        "UPDATE target SET retired_at = now() WHERE id = $1",
+    )
+    .await
+    {
+        Err(htui_core::store::StoreError::Constraint(sentence)) => {
+            assert_eq!(sentence, target_retired("racing run docker"));
+        }
+        other => panic!("a create_run behind a retire is refused, got {other:?}"),
+    }
+    db.drop_db().await;
+}
+
+/// MOD-130 M2 R1 F2 (P8): a `create_run` that waits behind a delete holding the target's row
+/// lock sees no row, and answers `references_no_row("run.target_id", ..)`, never a raw `23503`;
+/// no run is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_run_behind_a_delete_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "deleted run docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create a target");
+
+    match create_run_behind(&db, target.id, "DELETE FROM target WHERE id = $1").await {
+        Err(htui_core::store::StoreError::Constraint(sentence)) => {
+            assert_eq!(
+                sentence,
+                htui_core::store::references_no_row("run.target_id", target.id, "target")
+            );
+        }
+        other => panic!("a create_run behind a delete is refused, got {other:?}"),
+    }
+    db.drop_db().await;
+}
+
 /// MOD-130 M1 R1 (blueprint B7): an item writer naming a target reads it `FOR SHARE`, so an
 /// `update_item` or a `mint_item` that waits behind a retire holding the target's row lock sees
 /// the retire and answers `target_retired`, never storing a retired target.

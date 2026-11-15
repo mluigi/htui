@@ -1387,6 +1387,103 @@ async fn the_0005_opening_reaches_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-130 M2 R1 L4: a run's target (`run.target_id`, `run.target_source`, the mirror's
+/// `0014_execution_targets.sql`) round-trips: `create_run` on Postgres with a resolved target,
+/// one pass, and the mirror's `run(id)` answers the Postgres row's pair.
+#[tokio::test]
+async fn a_runs_target_reaches_the_mirror() {
+    use htui_core::model::{
+        GraphSnapshot, Isolation, NewRun, ResolvedTarget, RunMode, SnapshotGraph, SnapshotSettings,
+        TargetSource,
+    };
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let run = db
+        .store
+        .create_run(NewRun {
+            workspace_id: None,
+            id: RunId::new(),
+            project_id: ids::PROJECT_HTUI,
+            item_id: ids::HTUI_ANA_2,
+            mode: RunMode::Manual,
+            target_box_id: ids::BOX,
+            started_by: ids::USER,
+            graph_snapshot: GraphSnapshot {
+                v: GraphSnapshot::V,
+                graph: SnapshotGraph {
+                    id: ids::GRAPH_HTUI_FEAT,
+                    name: "feature".to_owned(),
+                    is_override: false,
+                    scope: None,
+                    revision: None,
+                },
+                topology: "sha256:cache".to_owned(),
+                mode: RunMode::Manual,
+                phases: Vec::new(),
+                settings: SnapshotSettings {
+                    default_isolation: Isolation::Worktree,
+                    per_token_cap_run: None,
+                    per_token_cap_batch: None,
+                    max_fan_out: 4,
+                    max_agents_per_run: 8,
+                    max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+                    max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+                    max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+                    runtime_changes: htui_core::model::RuntimeChanges::Ask,
+                },
+                scope: None,
+                personas: Vec::new(),
+                memory: None,
+                capture: None,
+                source: None,
+                edges: Vec::new(),
+                integrate: std::collections::BTreeMap::new(),
+            },
+            repo_scope: Vec::new(),
+            queued_at: Utc::now().trunc_subsecs(6),
+            batch_id: None,
+            target: Some(ResolvedTarget {
+                target: htui_core::seed::LOCAL_TARGET_ID,
+                source: TargetSource::Project,
+            }),
+        })
+        .await
+        .expect("create_run");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let pg = db
+        .store
+        .run(run.id)
+        .await
+        .expect("pg run")
+        .expect("the run is on Postgres");
+    assert_eq!(
+        (pg.target_id, pg.target_source),
+        (
+            Some(htui_core::seed::LOCAL_TARGET_ID),
+            Some(TargetSource::Project)
+        ),
+        "control: Postgres recorded the target"
+    );
+    let mirrored = cache
+        .run(run.id)
+        .await
+        .expect("cache run")
+        .expect("the run is mirrored");
+    assert_eq!(
+        (mirrored.target_id, mirrored.target_source),
+        (pg.target_id, pg.target_source),
+        "`run.target_id` and `run.target_source` come off the mirror"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// MOD-146 plan D6 (blueprint F-5): `project.type` (`cache_migrations/0007_project_type.sql`)
 /// reaches the mirror. Every demo project is `software`, which is also the mirror column's
 /// default, so an equality against Postgres proves nothing about it: this writes another type by
