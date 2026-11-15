@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize as _, Serialize};
 use serde_json::Value;
 
-use crate::model::AgentId;
+use crate::model::{AgentId, IntegrateMode};
 use crate::prompt::excerpt::ExcerptCaps;
 
 /// ANA-5 §5.3's ten reserved `app_setting` keys, with the defaults migration `0002` seeds
@@ -136,6 +136,8 @@ impl Defaults {
             SettingKey::ExcerptMaxFiles => Value::from(self.excerpt_max_files),
             SettingKey::ExcerptMaxScanFiles => Value::from(self.excerpt_max_scan_files),
             SettingKey::ExcerptProviderDeadlineMs => Value::from(self.excerpt_provider_deadline_ms),
+            // MOD-133 M2 E7: no key is `local`, `IntegrateMode::project_default`'s reading.
+            SettingKey::Integrate => Value::from(IntegrateMode::Local.as_str()),
             // MOD-164 D7: not configured; capture is skipped until someone picks one.
             SettingKey::LightModel => Value::Null,
             SettingKey::LogRetentionDays => Value::from(LOG_RETENTION_DAYS_DEFAULT),
@@ -170,8 +172,8 @@ impl Defaults {
             SettingKey::ExcerptProviderDeadlineMs => {
                 i64::try_from(self.excerpt_provider_deadline_ms).unwrap_or(i64::MAX)
             }
-            // No number at all; nothing is `not_above` it, so the zero is never compared.
-            SettingKey::LightModel => 0,
+            // No number at all; nothing is `not_above` them, so the zero is never compared.
+            SettingKey::Integrate | SettingKey::LightModel => 0,
             SettingKey::LogRetentionDays => LOG_RETENTION_DAYS_DEFAULT.cast_signed(),
             SettingKey::MaxSkillTokens => self.max_skill_tokens,
             SettingKey::MemoryCapture => i64::from(MEMORY_CAPTURE_DEFAULT),
@@ -182,8 +184,9 @@ impl Defaults {
     }
 }
 
-/// The sixteen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
-/// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files`, MOD-163's
+/// The seventeen keys of the registry — ANA-5 §5.3's ten `app_setting` keys, two project-only
+/// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files`, MOD-133's project-only
+/// `integrate` (the project's default [`IntegrateMode`]), MOD-163's
 /// `memory_capture`, a switch both the App and the Project rung hold, MOD-141's
 /// `compete_fan_out`, a switch only the App rung holds, MOD-164's `light_model`, an agent and
 /// model only the App rung holds, and MOD-122's `log_retention_days`, a number of days only the
@@ -214,27 +217,30 @@ pub enum SettingKey {
     ExcerptMaxScanFiles = 7,
     /// `excerpt_provider_deadline_ms`.
     ExcerptProviderDeadlineMs = 8,
+    /// `integrate`, MOD-133 M2 E7: the project's default [`IntegrateMode`], read by
+    /// [`IntegrateMode::project_default`]; project only, the one [`SettingKind::Integrate`].
+    Integrate = 9,
     /// `light_model`, MOD-164 D7: the agent and model the run-end memory capture runs on; App
     /// only, the one [`SettingKind::AgentModel`].
-    LightModel = 9,
+    LightModel = 10,
     /// `log_retention_days`, MOD-122 M3 D6: the days stored worker logs and activity events are
     /// kept, on every box; App only.
-    LogRetentionDays = 10,
+    LogRetentionDays = 11,
     /// `max_skill_tokens`.
-    MaxSkillTokens = 11,
+    MaxSkillTokens = 12,
     /// `memory_capture`, MOD-163 D19: automatic memory capture at run end; read by MOD-164.
-    MemoryCapture = 12,
+    MemoryCapture = 13,
     /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the App keys.
-    PromptReserveFraction = 13,
+    PromptReserveFraction = 14,
     /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
-    UpstreamHops = 14,
+    UpstreamHops = 15,
     /// `token_budget`, the only key all three rungs accept.
-    TokenBudget = 15,
+    TokenBudget = 16,
 }
 
 impl SettingKey {
     /// Every key, in key byte order. Not the `app_setting` list — that is [`Self::app_keys`].
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::AllowEnvFiles,
         Self::BoxHostname,
         Self::CompeteFanOut,
@@ -244,6 +250,7 @@ impl SettingKey {
         Self::ExcerptMaxFiles,
         Self::ExcerptMaxScanFiles,
         Self::ExcerptProviderDeadlineMs,
+        Self::Integrate,
         Self::LightModel,
         Self::LogRetentionDays,
         Self::MaxSkillTokens,
@@ -276,7 +283,7 @@ impl SettingKey {
         self.spec().key
     }
 
-    /// The reverse of [`Self::key`], `None` for a string outside the sixteen.
+    /// The reverse of [`Self::key`], `None` for a string outside the seventeen.
     ///
     /// The two MOD-6 cache keys (`cache_refresh_seconds`, `cache_overlap_seconds`) are deliberately
     /// outside: their reader is `connect.rs`'s own `> 0` rule and the `0002` pin asserts exactly
@@ -351,8 +358,8 @@ impl core::fmt::Display for Rungs {
 
 /// How a key's JSON is read (PRD D7's `kind`): ten keys are integers,
 /// `prompt_reserve_fraction` is a float the reader rounds to basis points, the four switches,
-/// `allow_env_files`, `box_hostname`, `compete_fan_out` and `memory_capture`, are booleans, and
-/// `light_model` is an agent and one of its models.
+/// `allow_env_files`, `box_hostname`, `compete_fan_out` and `memory_capture`, are booleans,
+/// `light_model` is an agent and one of its models, and `integrate` is an [`IntegrateMode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     /// Read through `positive_i64` or a narrowing of it.
@@ -366,6 +373,10 @@ pub enum SettingKind {
     /// D7). `min` and `max` bound the model's length in characters; the agent is not checked
     /// against the registry, because ACP agents list no models until their first handshake.
     AgentModel,
+    /// A JSON string naming an [`IntegrateMode`] (MOD-133 M2 E7). `"local"` and `"push"` are
+    /// accepted; `"pull_request"` is refused until the forge adapter lands (MOD-134). `min` 0 and
+    /// `max` 2 are nominal, the three modes. Clearing the key is `local`.
+    Integrate,
 }
 
 /// One row of the registry (plan D7): the single source `DEFAULTS`, the migration pin, the
@@ -405,7 +416,7 @@ pub struct SettingSpec {
 const U32_MAX: i64 = u32::MAX as i64;
 
 /// The registry, indexed by [`SettingKey`]'s discriminant.
-pub const SPECS: [SettingSpec; 16] = [
+pub const SPECS: [SettingSpec; 17] = [
     SettingSpec {
         key: "allow_env_files",
         project_key: Some("allow_env_files"),
@@ -504,6 +515,18 @@ pub const SPECS: [SettingSpec; 16] = [
         not_above: None,
         unit: "ms",
         doc: "Wall clock the excerpt provider gets; read as an i64 (F2).",
+    },
+    SettingSpec {
+        key: "integrate",
+        project_key: Some(IntegrateMode::PROJECT_SETTING),
+        kind: SettingKind::Integrate,
+        min: 0,
+        max: 2,
+        rungs: Rungs::PROJECT,
+        not_above: None,
+        unit: "mode",
+        doc: "How a finished run reaches the remote: local or push (pull_request comes with \
+              MOD-134); a repo may override it.",
     },
     SettingSpec {
         key: "light_model",
@@ -634,6 +657,9 @@ pub fn rung_refusal(key: SettingKey, at: Rungs) -> Option<String> {
 ///   only other check is the rung
 /// - `` `{key}` must be null or {"agent_id": a UUID, "model": 1..=200 characters}, got {value} ``
 ///   — for a [`SettingKind::AgentModel`], whose only other check is the rung
+/// - [`IntegrateMode::PullRequest`]'s [`selectable_refusal`](IntegrateMode::selectable_refusal)
+///   sentence, or `` `integrate` is local, push or pull_request `` — for a
+///   [`SettingKind::Integrate`], whose only other check is the rung
 pub fn validate(
     key: SettingKey,
     at: Rungs,
@@ -699,6 +725,20 @@ pub fn validate(
                  got {value}",
                 spec.min, spec.max
             ));
+        }
+        // MOD-133 M2 E7: `local` and `push`; `pull_request` waits for the forge adapter. Whether
+        // a repo has a remote is the form's check, not the writer's (M1 D3: runs refuse at start).
+        SettingKind::Integrate => {
+            let mode = value
+                .as_str()
+                .and_then(|text| text.parse::<IntegrateMode>().ok())
+                .ok_or_else(|| format!("`{key}` is local, push or pull_request"))?;
+            return match mode {
+                IntegrateMode::PullRequest => Err(mode
+                    .selectable_refusal(true)
+                    .unwrap_or_else(|| format!("`{key}` cannot be {mode}"))),
+                IntegrateMode::Local | IntegrateMode::Push => Ok(()),
+            };
         }
     };
 
@@ -1304,7 +1344,7 @@ mod tests {
         );
         assert!(rung_refusal(SettingKey::MemoryCapture, Rungs::PHASE).is_some());
         assert_eq!(
-            SettingKey::ALL[12],
+            SettingKey::ALL[13],
             SettingKey::MemoryCapture,
             "`memory_capture` sorts between `max_skill_tokens` and `prompt_reserve_fraction`"
         );
@@ -1402,6 +1442,78 @@ mod tests {
         }
     }
 
+    /// MOD-133 M2 E7: the project default `integrate`, a project-only string key that sorts
+    /// between `excerpt_provider_deadline_ms` and `light_model`.
+    #[test]
+    fn integrate_is_a_project_only_mode() {
+        let key = SettingKey::Integrate;
+        let spec = key.spec();
+        assert_eq!(spec.key, "integrate");
+        assert_eq!(spec.project_key, Some(IntegrateMode::PROJECT_SETTING));
+        assert_eq!(spec.kind, SettingKind::Integrate);
+        assert_eq!(spec.rungs, Rungs::PROJECT);
+        assert_eq!(spec.not_above, None);
+        assert!(!spec.doc.is_empty(), "the editor has a line to show");
+        assert!(rung_refusal(key, Rungs::APP).is_some());
+        assert!(rung_refusal(key, Rungs::PHASE).is_some());
+        assert_eq!(rung_refusal(key, Rungs::PROJECT), None);
+        assert_eq!(key as usize, 9, "discriminant 9 in key byte order");
+        assert_eq!(SettingKey::ALL[9], key);
+        assert_eq!(SettingKey::from_key("integrate"), Some(key));
+        assert_eq!(
+            DEFAULTS.value_of(key),
+            json!("local"),
+            "clearing the key is `local`, `IntegrateMode::project_default`'s absent reading"
+        );
+        assert_eq!(
+            IntegrateMode::project_default(&json!({})),
+            Ok(IntegrateMode::Local),
+            "…which no reader has to learn"
+        );
+    }
+
+    /// MOD-133 M2 E7: `validate` takes `local` and `push`; `pull_request` waits for MOD-134 and
+    /// is refused with the form's own sentence; anything else names the three modes.
+    #[test]
+    fn integrate_validates_local_and_push_only() {
+        let key = SettingKey::Integrate;
+        for ok in ["local", "push"] {
+            assert_eq!(
+                validate(key, Rungs::PROJECT, &json!(ok), None),
+                Ok(()),
+                "{ok} is a selectable mode"
+            );
+        }
+        assert_eq!(
+            validate(key, Rungs::PROJECT, &json!("pull_request"), None),
+            Err(IntegrateMode::PullRequest
+                .selectable_refusal(true)
+                .expect("pull_request is refused")),
+            "pull_request is refused until MOD-134"
+        );
+        let modes = "`integrate` is local, push or pull_request".to_owned();
+        for dud in [
+            json!("bogus"),
+            json!("Push"),
+            json!(""),
+            json!(1),
+            json!(true),
+            Value::Null,
+            json!({ "mode": "push" }),
+        ] {
+            assert_eq!(
+                validate(key, Rungs::PROJECT, &dud, None),
+                Err(modes.clone()),
+                "{dud} is not a mode"
+            );
+        }
+        assert_eq!(
+            validate(key, Rungs::APP, &json!("push"), None),
+            Err(rung_refusal(key, Rungs::APP).expect("no app rung")),
+            "the rung is checked before the value"
+        );
+    }
+
     /// A `light_model` value naming `agent` and `model`, the one shape the key takes.
     fn light(agent: &str, model: &str) -> Value {
         json!({ "agent_id": agent, "model": model })
@@ -1432,9 +1544,9 @@ mod tests {
         );
         assert!(!spec.doc.is_empty(), "the editor has a line to show");
         assert_eq!(
-            SettingKey::ALL[9],
+            SettingKey::ALL[10],
             key,
-            "`light_model` sorts between `excerpt_provider_deadline_ms` and `max_skill_tokens`"
+            "`light_model` sorts between `integrate` and `log_retention_days`"
         );
         assert_eq!(DEFAULTS.value_of(key), Value::Null, "unset: not configured");
         assert_eq!(DEFAULTS.integer(key), 0);
@@ -1561,7 +1673,7 @@ mod tests {
             spec.doc
         );
         assert_eq!(
-            SettingKey::ALL[10],
+            SettingKey::ALL[11],
             key,
             "`log_retention_days` sorts between `light_model` and `max_skill_tokens`"
         );
@@ -1624,11 +1736,15 @@ mod tests {
         assert!(app.contains(&SettingKey::LogRetentionDays));
         assert!(!app.contains(&SettingKey::AllowEnvFiles));
         assert!(!app.contains(&SettingKey::BoxHostname));
+        assert!(!app.contains(&SettingKey::Integrate));
         assert_eq!(
             app,
             SettingKey::ALL
                 .into_iter()
-                .filter(|key| !matches!(key, SettingKey::AllowEnvFiles | SettingKey::BoxHostname))
+                .filter(|key| !matches!(
+                    key,
+                    SettingKey::AllowEnvFiles | SettingKey::BoxHostname | SettingKey::Integrate
+                ))
                 .collect::<Vec<_>>(),
             "`ALL` without the project-only keys, in the same order"
         );
@@ -1740,7 +1856,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             keys, sorted,
-            "sixteen distinct keys, strictly ascending as bytes"
+            "seventeen distinct keys, strictly ascending as bytes"
         );
         assert!(
             SettingKey::from_key("cache_refresh_seconds").is_none(),
