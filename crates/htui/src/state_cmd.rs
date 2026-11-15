@@ -825,6 +825,8 @@ pub enum ReasonDoc {
     Selection,
     /// A blocked item `u` clears.
     Unblock,
+    /// A finished run whose landing was refused; `u` retries it (MOD-133 M2 E4).
+    Landing,
     /// A run parked by an interrupt.
     Interrupted,
     /// An open permission request.
@@ -839,6 +841,7 @@ impl From<WaitingReason> for ReasonDoc {
             WaitingReason::JudgeFailed => Self::JudgeFailed,
             WaitingReason::Selection => Self::Selection,
             WaitingReason::Unblock => Self::Unblock,
+            WaitingReason::Landing => Self::Landing,
             WaitingReason::Interrupted => Self::Interrupted,
             WaitingReason::Permission => Self::Permission,
         }
@@ -853,6 +856,7 @@ impl ReasonDoc {
             Self::JudgeFailed => WaitingReason::JudgeFailed.label(),
             Self::Selection => WaitingReason::Selection.label(),
             Self::Unblock => WaitingReason::Unblock.label(),
+            Self::Landing => WaitingReason::Landing.label(),
             Self::Interrupted => WaitingReason::Interrupted.label(),
             Self::Permission => WaitingReason::Permission.label(),
         }
@@ -1281,11 +1285,12 @@ mod tests {
         }
     }
 
-    const EVERY_REASON: [WaitingReason; 6] = [
+    const EVERY_REASON: [WaitingReason; 7] = [
         WaitingReason::Gate,
         WaitingReason::JudgeFailed,
         WaitingReason::Selection,
         WaitingReason::Unblock,
+        WaitingReason::Landing,
         WaitingReason::Interrupted,
         WaitingReason::Permission,
     ];
@@ -1354,7 +1359,7 @@ mod tests {
     }
 
     /// One row per reason, a Reopen row among them.
-    fn six_rows() -> Vec<WaitingRow> {
+    fn seven_rows() -> Vec<WaitingRow> {
         vec![
             row(
                 1,
@@ -1393,6 +1398,15 @@ mod tests {
                 demo_at(1, 0),
             ),
             row(
+                7,
+                "MOD-10",
+                WaitingReason::Landing,
+                true,
+                "",
+                "`htui` (push to main): non_fast_forward: main moved - u retries the landing",
+                demo_at(2, 4),
+            ),
+            row(
                 5,
                 "MOD-8",
                 WaitingReason::Interrupted,
@@ -1425,7 +1439,7 @@ mod tests {
     fn status_answer() -> Answer {
         let workspaces = [workspace()];
         let target = first_workspace(&workspaces);
-        let rows = six_rows().into_iter().take(2).collect();
+        let rows = seven_rows().into_iter().take(2).collect();
         let this_box = BoxDoc {
             id: BoxId::from_uuid(Uuid::from_u128(0xb0)),
             hostname: "desk".into(),
@@ -1516,7 +1530,7 @@ mod tests {
         let target = first_workspace(&workspaces);
         let answer = Answer {
             kind: Kind::Waiting,
-            outcome: Outcome::Waiting(waiting_body(&target, &view(six_rows()), now(), &keys())),
+            outcome: Outcome::Waiting(waiting_body(&target, &view(seven_rows()), now(), &keys())),
         };
         insta::assert_snapshot!("waiting_online", pretty(&answer));
     }

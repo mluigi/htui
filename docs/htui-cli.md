@@ -255,7 +255,7 @@ not in `projects`. With `--project` or `--cwd` the rows cover that one project o
 | `run_id` | uuid or `null` | The run the row is about. `null` for an Unblock row that reopens the item (no run). |
 | `step_id` | uuid or `null` | The step the row is about. `null` when the row is about a whole run, or about no run. |
 | `step` | string or `null` | The step as the Runs pane labels it after its phase: `prd 0.1`, `research 0.1/1` (a fan-out slot), `research 0.1/j` (its judge). `null` when there is no step. |
-| `text` | string | The reason's text: the gate note or judge note, the tool a permission asks for, or the Unblock sentence. |
+| `text` | string | The reason's text: the gate note or judge note, the tool a permission asks for, the Unblock sentence, or a landing row's refused repos. |
 | `since` | timestamp | When the row began waiting. See below. |
 | `age_seconds` | integer | Whole seconds from `since` to now, never below 0. |
 
@@ -267,6 +267,7 @@ The `reason` values:
 | `judge_failed` | pick a fan-out winner after the judge failed | the judge step's `updated_at` |
 | `selection` | pick a fan-out winner (no judge verdict) | the run's `updated_at` |
 | `unblock` | press `u` on a blocked item: reopen it, follow its parked run, or resume the run | the run's `updated_at`; for a reopen row (no run), the item's `updated_at` |
+| `landing` | press `u` to retry a finished run's refused landing; the text names each refused repo, its mode and target branch, and the reason | the newest refusal's `updated_at` |
 | `interrupted` | retry, promote or cancel a run parked by an interrupt | the run's `updated_at` |
 | `permission` | answer an agent's permission request | the request's `created_at` |
 

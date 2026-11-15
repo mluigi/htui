@@ -88,6 +88,8 @@ empty list is `[]`, and the count of waiting rows is the length of `rows`.
   - `judge_failed`: pick a fan-out winner after the judge failed.
   - `selection`: pick a fan-out winner (no judge verdict).
   - `unblock`: press `u` on a blocked item: reopen it, follow its parked run, or resume the run.
+  - `landing`: press `u` to retry a finished run's refused landing; `text` names each refused
+    repo as `` `repo` (mode to branch): reason ``.
   - `interrupted`: retry, promote or cancel a run parked by an interrupt.
   - `permission`: answer an agent's permission request.
 - `item_key`: the item's key, such as `MOD-4`.
