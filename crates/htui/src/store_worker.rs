@@ -931,8 +931,8 @@ pub enum StoreRequest {
     },
     /// `set_skill_binding`: attach, change or detach the one row at `key` (D78, D90). Answered
     /// with [`StoreReply::SkillWritten`] when it applied (MOD-59), [`StoreReply::SkillsStale`]
-    /// when the row at the key is not the one the form opened on, or its skill, project or phase
-    /// is gone.
+    /// when the row at the key is not the one the form opened on, or its skill, workspace,
+    /// project, item kind or phase is gone.
     SetSkillBinding {
         /// The scope the reply re-reads.
         scope: Scope,

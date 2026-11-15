@@ -2431,6 +2431,8 @@ mod tests {
 
         // `a` on `rust-style`; `j` from `global` to `vulkan-tutorials`; `Enter` opens a new form.
         view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        // MOD-127 M1 T4: the workspace row sits between `global` and the project's.
+        view.on_key(key(KeyCode::Char('j')), &mut ctx);
         view.on_key(key(KeyCode::Char('j')), &mut ctx);
         view.on_key(key(KeyCode::Enter), &mut ctx);
         assert!(view.captures_input(), "the form takes every key");
@@ -2512,6 +2514,8 @@ mod tests {
 
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`).
         view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        // MOD-127 M1 T4: the workspace row sits between `global` and the project's.
+        view.on_key(key(KeyCode::Char('j')), &mut ctx);
         view.on_key(key(KeyCode::Char('j')), &mut ctx);
         view.on_key(key(KeyCode::Enter), &mut ctx);
         view.on_key(ctrl('s'), &mut ctx);
@@ -2824,6 +2828,8 @@ mod tests {
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`);
         // `Space` twice while the save is in flight: `always` becomes `off`.
         view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        // MOD-127 M1 T4: the workspace row sits between `global` and the project's.
+        view.on_key(key(KeyCode::Char('j')), &mut ctx);
         view.on_key(key(KeyCode::Char('j')), &mut ctx);
         view.on_key(key(KeyCode::Enter), &mut ctx);
         view.on_key(ctrl('s'), &mut ctx);
@@ -2961,6 +2967,8 @@ mod tests {
 
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form; save it.
         view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        // MOD-127 M1 T4: the workspace row sits between `global` and the project's.
+        view.on_key(key(KeyCode::Char('j')), &mut ctx);
         view.on_key(key(KeyCode::Char('j')), &mut ctx);
         view.on_key(key(KeyCode::Enter), &mut ctx);
         view.on_key(ctrl('s'), &mut ctx);
@@ -4024,6 +4032,7 @@ mod tests {
             snapshot: Some(SkillsSnapshot {
                 skills: Vec::new(),
                 global: Vec::new(),
+                workspaces: Vec::new(),
                 projects: Vec::new(),
             }),
             ..LibraryView::default()
@@ -4203,6 +4212,7 @@ mod tests {
             snapshot: Some(SkillsSnapshot {
                 skills: Vec::new(),
                 global: Vec::new(),
+                workspaces: Vec::new(),
                 projects: Vec::new(),
             }),
             ..LibraryView::default()

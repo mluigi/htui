@@ -363,7 +363,19 @@ async fn any_two_versions_diff() {
 
 #[tokio::test]
 async fn the_attachments_pane_lists_global_projects_and_phases() {
-    let mut harness = open_platform_over(MemStore::demo()).await;
+    // MOD-127 M1 T4: a workspace row sits between `global` and the projects.
+    let store = MemStore::demo();
+    set_binding(
+        &store,
+        SkillBindingKey::workspace(ids::SKILL_RUST_STYLE, ids::WORKSPACE_PLATFORM),
+        None,
+        BindingChange::Attach(Attachment {
+            position: 3,
+            ..always()
+        }),
+    )
+    .await;
+    let mut harness = open_platform_over(store).await;
     select(&mut harness, "rust-style");
     harness.key("a");
     let frame = harness.render();
@@ -371,9 +383,28 @@ async fn the_attachments_pane_lists_global_projects_and_phases() {
         frame.contains("attachments \u{b7} rust-style"),
         "the pane's title: {frame}"
     );
-    for label in ["global", "htui", "  analysis \u{203a} research"] {
+    for label in [
+        "global",
+        "workspace Platform",
+        "htui",
+        "  analysis \u{203a} research",
+    ] {
         assert!(frame.contains(label), "row `{label}`: {frame}");
     }
+    assert!(
+        line_with(&frame, "workspace Platform").ends_with("always \u{b7} latest \u{b7} pos 3"),
+        "the workspace row's summary: {frame}"
+    );
+    let at = |label: &str| {
+        frame
+            .lines()
+            .position(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("no row `{label}`: {frame}"))
+    };
+    assert!(
+        at("global") < at("workspace Platform") && at("workspace Platform") < at("htui"),
+        "specificity order: {frame}"
+    );
     assert!(
         line_with(&frame, "htui").contains("always \u{b7} latest \u{b7} pos 1"),
         "the project row's summary: {frame}"
@@ -385,12 +416,49 @@ async fn the_attachments_pane_lists_global_projects_and_phases() {
     insta::assert_snapshot!("attachments", frame);
 }
 
+/// MOD-127 M1 T4: `Enter` then `Ctrl+S` on the workspace row writes the workspace key, and a
+/// qualified glob is refused there before anything is sent.
+#[tokio::test]
+async fn attaching_on_the_workspace_row_writes_the_workspace_key() {
+    let store = MemStore::demo();
+    let mut harness = open_platform_over(store.clone()).await;
+    select(&mut harness, "rust-style");
+    harness.key("a");
+    harness.key("j");
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        frame.contains("attach rust-style \u{b7} workspace Platform"),
+        "the form's title: {frame}"
+    );
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let rows = store
+        .skill_bindings(BindingHome::Workspace(ids::WORKSPACE_PLATFORM))
+        .await
+        .expect("the workspace rows");
+    assert_eq!(
+        rows.iter().map(SkillBindingKey::of).collect::<Vec<_>>(),
+        vec![SkillBindingKey::workspace(
+            ids::SKILL_RUST_STYLE,
+            ids::WORKSPACE_PLATFORM
+        )],
+        "one workspace row"
+    );
+    let frame = harness.render();
+    assert!(
+        line_with(&frame, "workspace Platform").contains("always \u{b7} latest \u{b7} pos 0"),
+        "the row shows its attachment: {frame}"
+    );
+}
+
 #[tokio::test]
 async fn the_form_shows_the_effective_globs_before_save() {
     let mut harness = open_platform_over(MemStore::demo()).await;
     select(&mut harness, "tests");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("enter");
     harness.key("space");
     for _ in 0..3 {
@@ -424,6 +492,7 @@ async fn ctrl_r_picks_a_repo_of_the_project() {
     select(&mut harness, "tests");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("enter");
     harness.key("ctrl-r");
     let frame = harness.render();
@@ -456,6 +525,7 @@ async fn ctrl_r_separates_the_qualifier_from_a_typed_glob() {
     select(&mut harness, "tests");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("enter");
     for _ in 0..4 {
         harness.key("tab");
@@ -799,6 +869,7 @@ async fn detach_asks_first() {
     select(&mut harness, "tests");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("x");
     let frame = harness.render();
     assert!(
@@ -831,6 +902,7 @@ async fn an_attachment_saved_in_the_form_lands_and_the_form_closes() {
     select(&mut harness, "tests");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("enter");
     harness.key("space");
     harness.key("tab");
@@ -902,6 +974,7 @@ async fn a_glob_naming_no_repo_is_shown_before_save_and_refused_by_the_store() {
     select(&mut harness, "tests");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("enter");
     for _ in 0..4 {
         harness.key("tab");
@@ -936,6 +1009,7 @@ async fn an_attachment_changed_elsewhere_keeps_the_form_and_saves_over_it() {
     select(&mut harness, "tests");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("enter");
     for _ in 0..2 {
         harness.key("tab");
@@ -1444,6 +1518,7 @@ async fn an_existing_attachment_is_never_reseeded_from_a_source() {
     select(&mut harness, "rust-style");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("enter");
 
     let frame = harness.render();
@@ -1844,6 +1919,7 @@ async fn alt_y_at_the_detach_question_detaches_nothing() {
     select(&mut harness, "tests");
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("x");
     harness.key("alt-y");
     assert_eq!(harness.queued(), 0, "no SetSkillBinding");

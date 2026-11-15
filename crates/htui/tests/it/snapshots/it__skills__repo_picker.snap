@@ -5,22 +5,22 @@ expression: frame
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           2 waiting ·  F1  keys
 ╭─ attachments · tests ───────────────────────────────────────────────────────── Skills  Templates ╮
 │   global                       —                                                                 ┃
+│   workspace Platform           —                                                                 ┃
 │▌* htui                         always · latest · pos 0                                           ┃
-│     analysis › research        —                                                                 ┃
-│     analysis › verdict         —                                                                 ┃
-│     bug › reproduce            —                                                                 ┃
-│     bug › fix                  —                                                                 ┃
-│     bug › review               —                                                                 ┃
-│     feature › prd              —                                                                 ┃
+│     item kind ANA              —                                                                 ┃
+│     item kind FEAT             —                                                                 ┃
+│     item kind FIX              —                                                                 ┃
+│     item kind CLEAN            —                                                                 │
+│     item kind TOOL             —                                                                 │
+│     analysis › research        —                                                                 │
+│     analysis › verdict         —                                                                 │
+│     bug › reproduce            —                                                                 │
+│     bug › fix                  —                                                                 │
+│     bug › review               —                                                                 │
+│     feature › prd              —                                                                 │
 │     feature › plan             —                                                                 │
 │     feature › implement        —                                                                 │
 │     feature › review           —                                                                 │
-│     refactor › plan            —                                                                 │
-│     refactor › implement       —                                                                 │
-│     refactor › review          —                                                                 │
-│     tooling › plan             —                                                                 │
-│     tooling › implement        —                                                                 │
-│     tooling › review           —                                                                 │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ repos of htui ──────────────────────────────────────────────────────────────────────────────────╮
 │▌core                                                                                             │

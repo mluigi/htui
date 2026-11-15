@@ -19,8 +19,8 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillBinding, SkillBindingKey,
-    SkillId, SkillVersion, StepGraph, StepGraphPhase,
+    ItemKind, NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillBinding,
+    SkillBindingKey, SkillId, SkillVersion, StepGraph, StepGraphPhase, WorkspaceId,
 };
 use htui_core::store::{BindingHome, CasOutcome, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
@@ -28,8 +28,9 @@ use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
 use crate::skill_import::{self, SkillImports};
 use crate::store_worker::{StoreReply, StoreRequest, WriteOutcome};
 
-/// The whole Skills view in one read (D81): the library, the global attachments, and each scope
-/// project's attachments, graphs and repo names.
+/// The whole Skills view in one read (D81): the library, the global attachments, the scope
+/// workspace's attachments (MOD-127 M1), and each scope project's attachments, item kinds, graphs
+/// and repo names.
 ///
 /// `PartialEq` only: [`StepGraph`] derives no `Eq`.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,8 +39,22 @@ pub struct SkillsSnapshot {
     pub skills: Vec<SkillEntry>,
     /// The global attachments (`skill_bindings(BindingHome::Global)`), in D91 order.
     pub global: Vec<SkillBinding>,
+    /// One entry per workspace the view attaches at: the scope's workspace
+    /// (`skill_bindings(BindingHome::Workspace(w))`, D91 order).
+    pub workspaces: Vec<WorkspaceSkills>,
     /// One entry per id of `scope.project_ids`, in that order.
     pub projects: Vec<ProjectSkills>,
+}
+
+/// One workspace's side of the attachment pane (MOD-127 M1 D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSkills {
+    /// Which workspace.
+    pub workspace: WorkspaceId,
+    /// `workspace.name`, for the row's label; the id's first eight chars when the row is gone.
+    pub name: String,
+    /// Its attachments, in D91 order.
+    pub bindings: Vec<SkillBinding>,
 }
 
 /// One skill and its versions.
@@ -58,9 +73,12 @@ pub struct SkillEntry {
 pub struct ProjectSkills {
     /// Which project.
     pub project: ProjectId,
-    /// Its project and phase attachments, `(skill_id, phase_id)` byte order with the project row
-    /// first (D91).
+    /// Its project, item-kind and phase attachments, `(skill_id, item_kind_id, phase_id)` byte
+    /// order with the project row first (D91, MOD-127 D6).
     pub bindings: Vec<SkillBinding>,
+    /// Its item kinds, by `position` (the store's order): the rows an item-kind attachment sits
+    /// under.
+    pub item_kinds: Vec<ItemKind>,
     /// Its graphs in `name` byte order, **override graphs excluded** (a per-item clone is not
     /// where an attachment is authored), each with its phases by `position`.
     pub graphs: Vec<(StepGraph, Vec<StepGraphPhase>)>,
@@ -109,14 +127,24 @@ impl SkillsSnapshot {
         self.projects.iter().find(|entry| entry.project == project)
     }
 
-    /// The row at `key`: from [`global`](Self::global) when `key.project` is `None`, otherwise
-    /// from that project's `bindings`. `None` when no row sits there, which is also the
-    /// `expected: None` a new attachment passes.
+    /// A scope workspace's entry; `None` for a workspace the view does not attach at.
+    #[must_use]
+    pub fn workspace(&self, workspace: WorkspaceId) -> Option<&WorkspaceSkills> {
+        self.workspaces
+            .iter()
+            .find(|entry| entry.workspace == workspace)
+    }
+
+    /// The row at `key`: from that workspace's `bindings` when `key.workspace` is set, from
+    /// [`global`](Self::global) when `key.project` is `None`, otherwise from that project's
+    /// `bindings`. `None` when no row sits there, which is also the `expected: None` a new
+    /// attachment passes.
     #[must_use]
     pub fn binding(&self, key: SkillBindingKey) -> Option<&SkillBinding> {
-        let rows = match key.project {
-            None => &self.global,
-            Some(project) => &self.project(project)?.bindings,
+        let rows = match (key.workspace, key.project) {
+            (Some(workspace), _) => &self.workspace(workspace)?.bindings,
+            (None, None) => &self.global,
+            (None, Some(project)) => &self.project(project)?.bindings,
         };
         rows.iter().find(|row| SkillBindingKey::of(row) == key)
     }
@@ -131,13 +159,15 @@ pub enum StaleWhat {
     /// [`StoreRequest::SaveSkillVersion`]: the head moved, or the skill is gone.
     Version(SkillId),
     /// [`StoreRequest::SetSkillBinding`]: the row at the key changed, appeared or went, or its
-    /// skill, project or phase is gone.
+    /// skill, workspace, project, item kind or phase is gone.
     Binding(SkillBindingKey),
 }
 
-/// One read (D81, D97), through the writer: `skill_bindings(BindingHome::Global)`; then per id of
-/// `scope.project_ids`, in that order, `skill_bindings(BindingHome::Project(p))`, `step_graphs(p)` without the
-/// override graphs, `phases(g)` per graph and `repos(p)`'s names; then `skills()` and
+/// One read (D81, D97), through the writer: `skill_bindings(BindingHome::Global)`; the scope
+/// workspace's `workspace(w)` and `skill_bindings(BindingHome::Workspace(w))`; then per id of
+/// `scope.project_ids`, in that order, `skill_bindings(BindingHome::Project(p))`, `item_kinds(p)`,
+/// `step_graphs(p)` without the override graphs, `phases(g)` per graph and `repos(p)`'s names;
+/// then `skills()` and
 /// `skill_versions(s)` per skill.
 ///
 /// `box_paths` is this box's `repo_box_path` rows, read by the caller once per request through
@@ -157,11 +187,24 @@ pub async fn snapshot(
     box_paths: &[RepoBoxPath],
 ) -> Result<SkillsSnapshot> {
     let global = writer.skill_bindings(BindingHome::Global).await?;
+    let workspace = scope.workspace_id;
+    let name = writer.workspace(workspace).await?.map_or_else(
+        || workspace.to_string().chars().take(8).collect(),
+        |row| row.name,
+    );
+    let workspaces = vec![WorkspaceSkills {
+        workspace,
+        name,
+        bindings: writer
+            .skill_bindings(BindingHome::Workspace(workspace))
+            .await?,
+    }];
     let mut projects = Vec::with_capacity(scope.project_ids.len());
     for project in &scope.project_ids {
         let bindings = writer
             .skill_bindings(BindingHome::Project(*project))
             .await?;
+        let item_kinds = writer.item_kinds(*project).await?;
         let mut graphs = Vec::new();
         for graph in writer.step_graphs(*project).await? {
             if graph.is_override {
@@ -182,6 +225,7 @@ pub async fn snapshot(
         projects.push(ProjectSkills {
             project: *project,
             bindings,
+            item_kinds,
             graphs,
             repos,
             unrooted,
@@ -195,6 +239,7 @@ pub async fn snapshot(
     Ok(SkillsSnapshot {
         skills,
         global,
+        workspaces,
         projects,
     })
 }
@@ -277,7 +322,7 @@ impl SkillWrite {
 /// applied, with the [`SkillWrite`] the store's own return names, even when only the re-read
 /// after it failed (MOD-59 D1, D5); and [`StoreReply::SkillsStale`] when its token was spent or
 /// the row it names is gone: `NotFound` of the skill for `EditSkill`; of the skill or
-/// `skill_version` for `SaveSkillVersion`; of the skill, project or `step_graph_phase` for
+/// `skill_version` for `SaveSkillVersion`; of the skill, workspace, project, `item_kind` or `step_graph_phase` for
 /// `SetSkillBinding`. Every other refusal stays an error, so [`crate::store_worker::serve`]
 /// answers `Failed` with the store's sentence.
 ///
@@ -394,7 +439,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 }
                 Ok(CasOutcome::Stale(_))
                 | Err(StoreError::NotFound {
-                    entity: "skill" | "project" | "step_graph_phase",
+                    entity: "skill" | "project" | "step_graph_phase" | "workspace" | "item_kind",
                     ..
                 }) => WriteOutcome::Stale(StaleWhat::Binding(*key)),
                 Err(other) => return Err(other),
@@ -751,6 +796,94 @@ mod tests {
             "no global row"
         );
         assert_eq!(snapshot.project(ids::PROJECT_VULKAN), None);
+    }
+
+    /// MOD-127 M1 T4: the snapshot holds the scope workspace's attachments and each project's
+    /// item kinds, and `binding` finds a row at either level by its full key; a workspace
+    /// attachment through the request answers `SkillWritten`, one onto a vanished workspace or
+    /// item kind `SkillsStale`.
+    #[tokio::test]
+    async fn the_snapshot_carries_workspace_rows_and_item_kinds() {
+        let store = MemStore::demo();
+        let kinds = store
+            .item_kinds(ids::PROJECT_HTUI)
+            .await
+            .expect("htui's kinds");
+        let kind = kinds.first().expect("the demo gives htui a kind").clone();
+        let backend = Backend::memory(store);
+        let scope = platform_scope(&backend).await;
+
+        let before = read(&backend, &scope).await;
+        assert_eq!(
+            before.workspaces.len(),
+            1,
+            "one entry, the scope's workspace"
+        );
+        assert_eq!(before.workspaces[0].workspace, scope.workspace_id);
+        assert_eq!(before.workspaces[0].name, "Platform");
+        assert!(before.workspaces[0].bindings.is_empty());
+        let htui = before.project(ids::PROJECT_HTUI).expect("htui");
+        assert_eq!(
+            htui.item_kinds.iter().map(|k| k.id).collect::<Vec<_>>(),
+            kinds.iter().map(|k| k.id).collect::<Vec<_>>(),
+            "the project's kinds, the store's order"
+        );
+
+        let ws_key = SkillBindingKey::workspace(ids::SKILL_TESTS, scope.workspace_id);
+        let (after, wrote) = applied(
+            &backend,
+            &bind(&scope, ws_key, None, BindingChange::Attach(always())),
+        )
+        .await;
+        assert!(matches!(wrote, SkillWrite::Attached { key, .. } if key == ws_key));
+        assert_eq!(
+            after.binding(ws_key).map(|row| row.workspace_id),
+            Some(Some(scope.workspace_id)),
+            "a workspace row is found by its key, in the workspace's entry"
+        );
+        assert!(after.global.is_empty(), "and is not a global row");
+
+        let kind_key = SkillBindingKey::item_kind(ids::SKILL_TESTS, ids::PROJECT_HTUI, kind.id);
+        let (after, _) = applied(
+            &backend,
+            &bind(&scope, kind_key, None, BindingChange::Attach(always())),
+        )
+        .await;
+        assert_eq!(
+            after.binding(kind_key).map(|row| row.item_kind_id),
+            Some(Some(kind.id)),
+            "an item-kind row is found in its project's rows"
+        );
+        assert_eq!(
+            after
+                .binding(SkillBindingKey::project(
+                    ids::SKILL_TESTS,
+                    ids::PROJECT_HTUI
+                ))
+                .map(|row| (row.id, row.item_kind_id)),
+            Some((ids::BINDING_HTUI_TESTS, None)),
+            "the demo's project row is another key, untouched"
+        );
+
+        let gone =
+            SkillBindingKey::workspace(ids::SKILL_TESTS, htui_core::model::WorkspaceId::new());
+        let (_, what) = stale(
+            &backend,
+            &bind(&scope, gone, None, BindingChange::Attach(always())),
+        )
+        .await;
+        assert_eq!(what, StaleWhat::Binding(gone), "a vanished workspace");
+        let gone = SkillBindingKey::item_kind(
+            ids::SKILL_TESTS,
+            ids::PROJECT_HTUI,
+            htui_core::model::ItemKindId::new(),
+        );
+        let (_, what) = stale(
+            &backend,
+            &bind(&scope, gone, None, BindingChange::Attach(always())),
+        )
+        .await;
+        assert_eq!(what, StaleWhat::Binding(gone), "a vanished item kind");
     }
 
     /// MOD-9 D126: the snapshot names the repos this box has no checkout path for, so the

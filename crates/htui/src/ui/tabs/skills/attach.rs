@@ -24,10 +24,12 @@ use htui_core::model::skill_glob::{SkillGlobs, canonical_globs, split_list};
 use htui_core::model::skill_import::prefill_from_source;
 use htui_core::model::skill_language;
 use htui_core::model::{
-    Activation, Attachment, BindingChange, PhaseId, ProjectId, SkillBinding, SkillBindingKey,
-    SkillGlob, SkillId, SkillLevel,
+    Activation, Attachment, BindingChange, ItemKindId, PhaseId, ProjectId, SkillBinding,
+    SkillBindingKey, SkillGlob, SkillId, SkillLevel, WorkspaceId,
 };
-use htui_core::store::{glob_names_unknown_repo, global_glob_names_a_repo};
+use htui_core::store::{
+    glob_names_unknown_repo, global_glob_names_a_repo, workspace_glob_names_a_repo,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -38,7 +40,7 @@ use super::{framed, holder, view_chips};
 use crate::app::{Ctx, Handled};
 use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
-use crate::skills::{ProjectSkills, SkillsSnapshot};
+use crate::skills::{ProjectSkills, SkillsSnapshot, WorkspaceSkills};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
 use crate::ui::kit::chips::key_line;
@@ -72,6 +74,9 @@ const GLOB_HELP: &str =
 
 /// `Ctrl+R` on the global row.
 const GLOBAL_HAS_NO_REPOS: &str = "a global attachment's globs cannot name a repo";
+
+/// `Ctrl+R` on the workspace row (MOD-127 D7).
+const WORKSPACE_HAS_NO_REPOS: &str = "a workspace attachment's globs cannot name a repo";
 
 /// A pin the form cannot read.
 const BAD_PIN: &str = "pin is `latest` or a version number";
@@ -163,11 +168,15 @@ enum AttachMode {
 enum ARow {
     /// The global attachment.
     Global,
+    /// One workspace's attachment (MOD-127 M1): the scope's workspace.
+    Workspace(WorkspaceId),
     /// One scope project's attachment.
     Project {
         /// Index into `snapshot.projects`.
         p: usize,
     },
+    /// One item kind's attachment (MOD-127 M1): the kind of a scope project.
+    ItemKind(ProjectId, ItemKindId),
     /// One phase's attachment.
     Phase {
         /// Index into `snapshot.projects`.
@@ -612,6 +621,7 @@ impl AttachPane {
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
         let refusal = match form.key.project {
+            None if form.key.workspace.is_some() => Some(WORKSPACE_HAS_NO_REPOS.to_owned()),
             None => Some(GLOBAL_HAS_NO_REPOS.to_owned()),
             Some(project) => snapshot
                 .project(project)
@@ -746,21 +756,23 @@ impl AttachPane {
 
     /// The key a row writes under.
     fn key_of(&self, row: ARow, snapshot: &SkillsSnapshot) -> SkillBindingKey {
-        let (project, phase) = match row {
-            ARow::Global => (None, None),
-            ARow::Project { p } => (snapshot.projects.get(p).map(|entry| entry.project), None),
+        let global = SkillBindingKey::global(self.skill);
+        match row {
+            ARow::Global => global,
+            ARow::Workspace(workspace) => SkillBindingKey::workspace(self.skill, workspace),
+            ARow::Project { p } => SkillBindingKey {
+                project: snapshot.projects.get(p).map(|entry| entry.project),
+                ..global
+            },
+            ARow::ItemKind(project, kind) => SkillBindingKey::item_kind(self.skill, project, kind),
             ARow::Phase { p, g, i } => {
                 let entry = snapshot.projects.get(p);
-                (
-                    entry.map(|entry| entry.project),
-                    entry.and_then(|entry| phase_id(entry, g, i)),
-                )
+                SkillBindingKey {
+                    project: entry.map(|entry| entry.project),
+                    phase: entry.and_then(|entry| phase_id(entry, g, i)),
+                    ..global
+                }
             }
-        };
-        SkillBindingKey {
-            project,
-            phase,
-            ..SkillBindingKey::global(self.skill)
         }
     }
 
@@ -856,7 +868,7 @@ impl AttachPane {
                 let star = if winners.contains(&row) { '*' } else { ' ' };
                 let label = label(row, snapshot, ctx);
                 let summary = self.summary(row, snapshot);
-                let style = if matches!(row, ARow::Phase { .. }) {
+                let style = if matches!(row, ARow::Phase { .. } | ARow::ItemKind(..)) {
                     theme.base
                 } else {
                     theme.title
@@ -941,51 +953,72 @@ impl AttachPane {
         };
         let name = entry.skill.name.clone();
         let mine = |row: &&SkillBinding| row.skill_id == self.skill;
+        let workspaces: Vec<Option<&WorkspaceSkills>> = if snapshot.workspaces.is_empty() {
+            vec![None]
+        } else {
+            snapshot.workspaces.iter().map(Some).collect()
+        };
         let mut winners = Vec::new();
-        for (p, project) in snapshot.projects.iter().enumerate() {
-            let mut phases: Vec<Option<(usize, usize, PhaseId)>> = project
-                .graphs
-                .iter()
-                .enumerate()
-                .flat_map(|(g, (_, phases))| {
-                    phases
-                        .iter()
-                        .enumerate()
-                        .map(move |(i, phase)| Some((g, i, phase.id)))
-                })
-                .collect();
-            if phases.is_empty() {
-                phases.push(None);
-            }
-            for at in phases {
-                let phase = at.map(|(_, _, id)| id);
-                let applies: Vec<(SkillBinding, String)> = snapshot
-                    .global
+        for workspace in workspaces {
+            for (p, project) in snapshot.projects.iter().enumerate() {
+                let mut phases: Vec<Option<(usize, usize, PhaseId)>> = project
+                    .graphs
                     .iter()
-                    .filter(mine)
-                    .chain(
-                        project
-                            .bindings
+                    .enumerate()
+                    .flat_map(|(g, (_, phases))| {
+                        phases
+                            .iter()
+                            .enumerate()
+                            .map(move |(i, phase)| Some((g, i, phase.id)))
+                    })
+                    .collect();
+                if phases.is_empty() {
+                    phases.push(None);
+                }
+                // An item of no kind meets no item-kind row; an item of each kind meets its own.
+                let kinds: Vec<Option<ItemKindId>> = std::iter::once(None)
+                    .chain(project.item_kinds.iter().map(|kind| Some(kind.id)))
+                    .collect();
+                for at in phases {
+                    let phase = at.map(|(_, _, id)| id);
+                    for kind in &kinds {
+                        let applies: Vec<(SkillBinding, String)> = snapshot
+                            .global
                             .iter()
                             .filter(mine)
-                            .filter(|row| row.phase_id.is_none() || row.phase_id == phase),
-                    )
-                    .map(|row| (row.clone(), name.clone()))
-                    .collect();
-                let Some(winner) = resolve(applies, &entry.versions).into_iter().next() else {
-                    continue;
-                };
-                let row = match (winner.level, at) {
-                    (SkillLevel::Global, _) => ARow::Global,
-                    (SkillLevel::Project, _) => ARow::Project { p },
-                    (SkillLevel::Phase, Some((g, i, _))) => ARow::Phase { p, g, i },
-                    (SkillLevel::Phase, None) => continue,
-                    // No pane row writes at these levels yet (MOD-127 M1 T4 adds them), so no
-                    // winner can sit there.
-                    (SkillLevel::Workspace | SkillLevel::ItemKind, _) => continue,
-                };
-                if !winners.contains(&row) {
-                    winners.push(row);
+                            .chain(
+                                workspace
+                                    .map_or(&[][..], |entry| entry.bindings.as_slice())
+                                    .iter()
+                                    .filter(mine),
+                            )
+                            .chain(project.bindings.iter().filter(mine).filter(|row| {
+                                (row.phase_id.is_none() || row.phase_id == phase)
+                                    && (row.item_kind_id.is_none() || row.item_kind_id == *kind)
+                            }))
+                            .map(|row| (row.clone(), name.clone()))
+                            .collect();
+                        let Some(winner) = resolve(applies, &entry.versions).into_iter().next()
+                        else {
+                            continue;
+                        };
+                        let row = match (winner.level, at, kind, workspace) {
+                            (SkillLevel::Global, ..) => ARow::Global,
+                            (SkillLevel::Workspace, _, _, Some(entry)) => {
+                                ARow::Workspace(entry.workspace)
+                            }
+                            (SkillLevel::Project, ..) => ARow::Project { p },
+                            (SkillLevel::ItemKind, _, Some(kind), _) => {
+                                ARow::ItemKind(project.project, *kind)
+                            }
+                            (SkillLevel::Phase, Some((g, i, _)), ..) => ARow::Phase { p, g, i },
+                            // A level whose key the scope does not carry cannot have won here.
+                            _ => continue,
+                        };
+                        if !winners.contains(&row) {
+                            winners.push(row);
+                        }
+                    }
                 }
             }
         }
@@ -993,12 +1026,25 @@ impl AttachPane {
     }
 }
 
-/// The pane's rows (D83): `global`; then per scope project its row and, under it, each phase of
-/// its non-override graphs, graphs by name and phases by position (the snapshot's order).
+/// The pane's rows (D83, MOD-127 D1): `global`; the scope's workspace; then per scope project its
+/// row and, under it, its item kinds and each phase of its non-override graphs, graphs by name and
+/// phases by position (the snapshot's order): specificity order.
 fn rows(snapshot: &SkillsSnapshot) -> Vec<ARow> {
     let mut rows = vec![ARow::Global];
+    rows.extend(
+        snapshot
+            .workspaces
+            .iter()
+            .map(|entry| ARow::Workspace(entry.workspace)),
+    );
     for (p, project) in snapshot.projects.iter().enumerate() {
         rows.push(ARow::Project { p });
+        rows.extend(
+            project
+                .item_kinds
+                .iter()
+                .map(|kind| ARow::ItemKind(project.project, kind.id)),
+        );
         for (g, (_, phases)) in project.graphs.iter().enumerate() {
             rows.extend((0..phases.len()).map(|i| ARow::Phase { p, g, i }));
         }
@@ -1015,10 +1061,21 @@ fn phase_id(project: &ProjectSkills, g: usize, i: usize) -> Option<PhaseId> {
         .map(|phase| phase.id)
 }
 
-/// A row's label: `global`, the project's slug, or `  <graph> › <phase>` under its project.
+/// A row's label: `global`, `workspace <name>`, the project's slug, `  item kind <prefix>` or
+/// `  <graph> › <phase>` under its project.
 fn label(row: ARow, snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> String {
     match row {
         ARow::Global => "global".to_owned(),
+        ARow::Workspace(workspace) => format!(
+            "{} {}",
+            label::skill_level(SkillLevel::Workspace),
+            workspace_name(snapshot, workspace)
+        ),
+        ARow::ItemKind(project, kind) => format!(
+            "  {} {}",
+            label::skill_level(SkillLevel::ItemKind),
+            item_kind_prefix(snapshot, project, kind)
+        ),
         ARow::Project { p } => snapshot
             .projects
             .get(p)
@@ -1027,11 +1084,16 @@ fn label(row: ARow, snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> String {
     }
 }
 
-/// What the form's title and the notices call a row: `global`, the slug, or
-/// `<slug> <graph> › <phase>`.
+/// What the form's title and the notices call a row: `global`, `workspace <name>`, the slug,
+/// `<slug> item kind <prefix>` or `<slug> <graph> › <phase>`.
 fn target(row: ARow, snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> String {
     match row {
-        ARow::Global | ARow::Project { .. } => label(row, snapshot, ctx),
+        ARow::Global | ARow::Workspace(_) | ARow::Project { .. } => label(row, snapshot, ctx),
+        ARow::ItemKind(project, _) => format!(
+            "{} {}",
+            slug(ctx, project),
+            label(row, snapshot, ctx).trim_start()
+        ),
         ARow::Phase { p, g, i } => {
             let project = snapshot
                 .projects
@@ -1040,6 +1102,25 @@ fn target(row: ARow, snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> String {
             format!("{project} {}", graph_phase(snapshot, p, g, i))
         }
     }
+}
+
+/// A workspace's name from the snapshot, else the id's first eight chars.
+fn workspace_name(snapshot: &SkillsSnapshot, workspace: WorkspaceId) -> String {
+    snapshot.workspace(workspace).map_or_else(
+        || workspace.to_string().chars().take(8).collect(),
+        |entry| entry.name.clone(),
+    )
+}
+
+/// An item kind's prefix from its project's entry, else the id's first eight chars.
+fn item_kind_prefix(snapshot: &SkillsSnapshot, project: ProjectId, kind: ItemKindId) -> String {
+    snapshot
+        .project(project)
+        .and_then(|entry| entry.item_kinds.iter().find(|row| row.id == kind))
+        .map_or_else(
+            || kind.to_string().chars().take(8).collect(),
+            |row| row.prefix.clone(),
+        )
 }
 
 /// `<graph> › <phase>`.
@@ -1212,6 +1293,9 @@ fn repo_refusal(
     ctx: &Ctx<'_>,
 ) -> Option<String> {
     match form.key.project {
+        None if form.key.workspace.is_some() => {
+            first_qualified(globs).map(|(glob, repo)| workspace_glob_names_a_repo(&glob, &repo))
+        }
         None => first_qualified(globs).map(|(glob, repo)| global_glob_names_a_repo(&glob, &repo)),
         Some(project) => {
             let repos = snapshot
@@ -1435,6 +1519,7 @@ mod tests {
         SkillsSnapshot {
             skills: Vec::new(),
             global: Vec::new(),
+            workspaces: Vec::new(),
             projects: Vec::new(),
         }
     }
@@ -1554,6 +1639,7 @@ mod tests {
             projects: vec![ProjectSkills {
                 project,
                 bindings: Vec::new(),
+                item_kinds: Vec::new(),
                 graphs: Vec::new(),
                 repos: vec!["app".to_owned()],
                 unrooted: Vec::new(),
@@ -1582,6 +1668,7 @@ mod tests {
             projects: vec![ProjectSkills {
                 project,
                 bindings: Vec::new(),
+                item_kinds: Vec::new(),
                 graphs: Vec::new(),
                 repos: vec!["app".to_owned(), "core".to_owned()],
                 unrooted: Vec::new(),
@@ -1626,5 +1713,176 @@ mod tests {
         assert_eq!(Some(buffer[(0, 0)].fg), theme.border_faint.fg, "{rows:#?}");
         assert!(rows[0].contains(" Skills "), "the view chips: {rows:#?}");
         assert!(rows[19].contains("Ctrl+s save"), "{rows:#?}");
+    }
+
+    // ---- MOD-127 M1 T4: the workspace and item-kind levels ------------------------------------
+
+    /// One item kind of `project`, named `prefix`.
+    fn kind_of(project: ProjectId, prefix: &str) -> htui_core::model::ItemKind {
+        htui_core::model::ItemKind {
+            id: ItemKindId::new(),
+            project_id: project,
+            prefix: prefix.to_owned(),
+            name: prefix.to_lowercase(),
+            description: String::new(),
+            default_graph_id: htui_core::model::StepGraphId::new(),
+            position: 0,
+            updated_at: DateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// The Graphics workspace with one project holding one item kind, `MOD`, and no graph.
+    fn with_levels() -> (SkillsSnapshot, ItemKindId) {
+        use htui_core::fixtures::ids;
+        let kind = kind_of(ids::PROJECT_VULKAN, "MOD");
+        let id = kind.id;
+        let snapshot = SkillsSnapshot {
+            workspaces: vec![WorkspaceSkills {
+                workspace: ids::WORKSPACE_GRAPHICS,
+                name: "Graphics".to_owned(),
+                bindings: Vec::new(),
+            }],
+            projects: vec![ProjectSkills {
+                project: ids::PROJECT_VULKAN,
+                bindings: Vec::new(),
+                item_kinds: vec![kind],
+                graphs: Vec::new(),
+                repos: Vec::new(),
+                unrooted: Vec::new(),
+            }],
+            ..no_projects()
+        };
+        (snapshot, id)
+    }
+
+    /// Runs `f` over a context in the Graphics workspace.
+    fn in_graphics<R>(f: impl FnOnce(&Ctx<'_>) -> R) -> R {
+        use crate::app::{Emit, TopBarState};
+        use crate::store_worker::Origin;
+        use crate::ui::tabs::SkillsTab;
+        use htui_core::fixtures::ids;
+        let scope = htui_core::model::Scope {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            project_ids: vec![ids::PROJECT_VULKAN],
+        };
+        let theme = crate::ui::Theme::default();
+        let (top_bar, emit) = (TopBarState::default(), Emit::default());
+        let ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            Keys::compiled(),
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        f(&ctx)
+    }
+
+    /// Opens the form over `row` and saves it unchanged: the key the write goes under.
+    fn saved_key(pane: &mut AttachPane, row: ARow, snapshot: &SkillsSnapshot) -> SkillBindingKey {
+        in_graphics(|ctx| {
+            let rows = rows(snapshot);
+            pane.cursor = rows
+                .iter()
+                .position(|r| *r == row)
+                .expect("the row is listed");
+            pane.choose(&rows, snapshot, ctx);
+            let AttachMode::Form(form) = std::mem::take(&mut pane.mode) else {
+                panic!("the form opened");
+            };
+            let AttachOutcome::Save { request, .. } = pane.save(form, ctx) else {
+                panic!("a save");
+            };
+            let StoreRequest::SetSkillBinding { key, expected, .. } = *request else {
+                panic!("a set_skill_binding");
+            };
+            assert_eq!(expected, None, "an attach");
+            key
+        })
+    }
+
+    /// MOD-127 D1: the rows run `global`, the workspace, then per project its row, its item
+    /// kinds and its phases: specificity order.
+    #[tokio::test]
+    async fn rows_list_in_specificity_order() {
+        use htui_core::fixtures::ids;
+        use htui_core::store::{MemStore, WriteStore as _};
+        let (mut snapshot, kind) = with_levels();
+        let store = MemStore::demo();
+        let graph = store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect("graphs")
+            .into_iter()
+            .find(|graph| !graph.is_override)
+            .expect("a demo graph");
+        let phases = store.phases(graph.id).await.expect("phases");
+        assert!(!phases.is_empty(), "the demo graph has phases");
+        let count = phases.len();
+        snapshot.projects[0].graphs.push((graph, phases));
+        let mut expected = vec![
+            ARow::Global,
+            ARow::Workspace(ids::WORKSPACE_GRAPHICS),
+            ARow::Project { p: 0 },
+            ARow::ItemKind(ids::PROJECT_VULKAN, kind),
+        ];
+        expected.extend((0..count).map(|i| ARow::Phase { p: 0, g: 0, i }));
+        assert_eq!(rows(&snapshot), expected);
+    }
+
+    /// MOD-127 D2: the workspace row writes `(workspace)` and nothing else.
+    #[test]
+    fn attach_at_workspace_level() {
+        use htui_core::fixtures::ids;
+        let (snapshot, _) = with_levels();
+        let skill = SkillId::new();
+        let mut pane = AttachPane {
+            skill,
+            cursor: 0,
+            mode: AttachMode::Browse,
+        };
+        let key = saved_key(
+            &mut pane,
+            ARow::Workspace(ids::WORKSPACE_GRAPHICS),
+            &snapshot,
+        );
+        assert_eq!(
+            key,
+            SkillBindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
+        );
+        assert_eq!(key.level(), SkillLevel::Workspace);
+        in_graphics(|ctx| {
+            assert_eq!(
+                target(ARow::Workspace(ids::WORKSPACE_GRAPHICS), &snapshot, ctx),
+                "workspace Graphics"
+            );
+        });
+    }
+
+    /// MOD-127 D2: the item-kind row writes `(project, item_kind)`.
+    #[test]
+    fn attach_at_item_kind_level() {
+        use htui_core::fixtures::ids;
+        let (snapshot, kind) = with_levels();
+        let skill = SkillId::new();
+        let mut pane = AttachPane {
+            skill,
+            cursor: 0,
+            mode: AttachMode::Browse,
+        };
+        let row = ARow::ItemKind(ids::PROJECT_VULKAN, kind);
+        let key = saved_key(&mut pane, row, &snapshot);
+        assert_eq!(
+            key,
+            SkillBindingKey::item_kind(skill, ids::PROJECT_VULKAN, kind)
+        );
+        assert_eq!(key.level(), SkillLevel::ItemKind);
+        in_graphics(|ctx| {
+            assert_eq!(
+                target(row, &snapshot, ctx),
+                format!("{} item kind MOD", slug(ctx, ids::PROJECT_VULKAN))
+            );
+        });
     }
 }
