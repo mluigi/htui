@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-133-integration-modes.prd.md`
 **Selected Milestone**: 3 — `pull_request` run branch
 **Complexity**: Large
-**Status**: in progress 2026-11-15
+**Status**: complete 2026-11-15 (`50345b9c..30ad4529`; review fix round R1, brief `R1.md`)
 **Routing**: plan path on the accepted PRD (C2 fired: the walk's step base and reconcile target change;
 C1, C3, C4 not), no ultracode by the verdict. The lane script runs (more than two tasks), as one serial lane.
 A code-architect blueprint ran (C2) and its decisions are folded in below (D1-D8). `/handoff-run` waived
