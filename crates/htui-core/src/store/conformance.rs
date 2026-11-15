@@ -22058,9 +22058,11 @@ async fn waiting_candidates_hold_an_open_item_over_a_refused_landing<S: WriteSto
 }
 
 /// MOD-133 M2 E5: `retry_landing` puts every `refused` record of the run back to `pending` with
-/// its refusal and lease cleared, leaves a landed and a pending record alone, and answers how many
-/// moved: `0` on a second press and for an unknown run. After it the item reads `landing`, is no
-/// longer a refused waiting candidate, and still holds its dependent.
+/// its refusal cleared, so it is takeable again; leaves a landed and a pending record alone, and
+/// answers how many moved: `0` on a second press and for an unknown run. After it the item reads
+/// `landing`, is no longer a refused waiting candidate, and still holds its dependent. (A refused
+/// record holds no lease through the public API, since the refusing settle clears it, so this case
+/// cannot tell whether `retry_landing` clears one; it claims nothing about it.)
 async fn retry_landing_resets_only_refused_records<S: WriteStore>(store: &S) {
     const CASE: &str = "retry_landing_resets_only_refused_records";
     let owner = Uuid::now_v7();
@@ -22176,8 +22178,8 @@ async fn retry_landing_resets_only_refused_records<S: WriteStore>(store: &S) {
                 .expect(CASE)
         ),
         vec![(run, refused.id)],
-        "{CASE}: the reset record holds no lease, so another owner takes it; the pending one is \
-         still under the first owner's live lease"
+        "{CASE}: the reset record is pending and takeable again; the pending one is still under \
+         the first owner's live lease"
     );
     assert_eq!(
         store.retry_landing(run).await.expect(CASE),
