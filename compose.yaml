@@ -1,8 +1,8 @@
 # Development Postgres for htui (MOD-6), and a separate server for the test suites.
 #
-# `postgres` holds the `htui` database the TUI points at (`htui --set-dsn`). Postgres 16 is the
-# minimum server ANA-9 §3 names, so developing against it keeps every query inside the supported
-# floor. Port 5439 on the host so a locally installed Postgres on 5432 never collides. Credentials
+# `postgres` holds the `htui` database the TUI points at (`htui --set-dsn`). Postgres 18 is the one
+# server htui supports (raised from ANA-9 §3's 16 on 2026-11-15), so the dev database, the suites
+# and the hr sandboxes all run it. Port 5439 on the host so a locally installed Postgres on 5432 never collides. Credentials
 # are development-only; the real DSN lives in the OS keyring (R-STO-1).
 #
 # `postgres-test` is what the suites run against: Postgres 18, data in RAM, durability off.
@@ -15,7 +15,7 @@
 
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     container_name: htui-postgres
     restart: unless-stopped
     environment:
@@ -44,8 +44,10 @@ services:
     # days of normal work here. The setting below stays: it is cheap and it is correct for the
     # symptom it was written for.
     shm_size: 1gb
+    # The 18 image keeps its cluster under /var/lib/postgresql/18/docker and wants the parent
+    # mounted; a 16 data dir does not start on 18, hence a fresh volume rather than `htui-pgdata`.
     volumes:
-      - htui-pgdata:/var/lib/postgresql/data
+      - htui-pgdata-18:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d htui"]
       interval: 5s
@@ -55,7 +57,7 @@ services:
   postgres-test:
     # The suites' server, kept apart from `postgres` so its settings can never cost the dev data.
     # Every store test copies a template into a new `htui_test_*` database and drops it on its last
-    # line, and on 16 and 18 alike every DROP DATABASE waits for a checkpoint. Measured on this box
+    # line, and every DROP DATABASE waits for a checkpoint. Measured on this box
     # (2026-11-14, htui-store minus the live Qdrant cases, 542 tests): 184 s against
     # `postgres` above, 28 s on 16 with the settings below, 27 s on 18. pg_conformance's shards went
     # from 113 s to 21 s each. Durability off is only safe because nothing here outlives a test:
@@ -65,9 +67,8 @@ services:
     #   max_connections 300: twelve test processes with a pool each, plus the template builds.
     # Settings that measured no gain on top (2026-11-14): wal_level=minimal, shared_buffers=1GB,
     # max_wal_size=8GB, checkpoint_timeout=1h, autovacuum and jit off.
-    # 18, not 16: tests run on a current server, and ON DELETE RESTRICT reports SQLSTATE 23001 there
-    # (23503 on 16 and 17); htui-store maps the whole class 23 either way. The 16 floor stays what
-    # `postgres` above develops against.
+    # ON DELETE RESTRICT reports SQLSTATE 23001 on 18 (23503 on 17 and older); htui-store maps the
+    # whole class 23 either way.
     image: postgres:18
     container_name: htui-postgres-test
     restart: unless-stopped
@@ -92,7 +93,7 @@ services:
       retries: 30
 
   qdrant:
-    # MOD-34 D5: pinned to the server matching `qdrant-client 1.19`, as Postgres is pinned to 16.
+    # MOD-34 D5: pinned to the server matching `qdrant-client 1.19`, as Postgres is pinned to 18.
     image: qdrant/qdrant:v1.19.1
     container_name: htui-qdrant
     restart: unless-stopped
@@ -103,5 +104,5 @@ services:
       - htui-qdrant-data:/qdrant/storage
 
 volumes:
-  htui-pgdata:
+  htui-pgdata-18:
   htui-qdrant-data:

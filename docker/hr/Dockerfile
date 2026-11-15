@@ -13,14 +13,15 @@ ARG HR_GID=1000
 ARG HR_HOME=/home/mluigi
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
 # libdbus-1-dev: keyring -> dbus-secret-service; libssl-dev: native-tls (sentry -> reqwest).
-# postgresql-client-16 is in noble/main; no PGDG repo needed. PGDG alternative, only if a newer
-# 16.x minor is ever wanted:
-#   install -d /usr/share/postgresql-common/pgdg && curl -fsSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
-#   echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" >/etc/apt/sources.list.d/pgdg.list
+# postgresql-client-18 matches the sandbox's Postgres 18 (the only server htui supports); noble/main
+# carries only 16, so it comes from the PGDG repo.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq less procps ripgrep \
       build-essential pkg-config libdbus-1-dev libssl-dev \
-      postgresql-client-16 \
+ && install -d /usr/share/postgresql-common/pgdg \
+ && curl -fsSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" >/etc/apt/sources.list.d/pgdg.list \
+ && apt-get update && apt-get install -y --no-install-recommends postgresql-client-18 \
  && rm -rf /var/lib/apt/lists/*
 # ubuntu:24.04 ships user `ubuntu` at 1000:1000, which collides with the host uid. Bind points under
 # $HOME are pre-created user-owned, otherwise Docker creates them as root.

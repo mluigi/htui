@@ -21,7 +21,7 @@ now covers the enrolled kind only. **MOD-125 is done** (`docs/decisions/mod/mod-
 main): `htui stop [--force] <workspace>` and `htui resume <workspace>` stop every run of a workspace (graceful at
 the turn boundary, forced mid-turn) and resume each on its box through its saved session, confirmed by a prompt
 (`--yes`), with a report of how each run resumes. Migration `0037_stopped_run_index` (`0036` on the branch, renumbered behind MOD-122 M3's at the merge). Owed on the host: after the
-merge reinstall the MCP relay and `htui claude emit --force` on each box; the Postgres gate (16 and 18), the
+merge reinstall the MCP relay and `htui claude emit --force` on each box; the Postgres gate, the
 live-Qdrant suites and M3's live probes (`cli_live` 12-13, `isolation_live` `reopen`).
 **MOD-122 is done** (`docs/decisions/mod/mod-122.md`; merged on main): the Logs tab shows htui's own log (always in memory) and every worker's shipped log,
 and the activity panel fills the Backlog's activity slot (default preset `ide_activity`) with every wait and failure
@@ -437,7 +437,7 @@ items it follows are done.
   delete refused while in use (Pg item writers and setters read the target `FOR SHARE`); the item target is a spec field;
   `R-NF-2` amended (`6ed37436`). Plan `.claude/plans/mod-130-m1-targets-and-child-boxes.plan.md`. Next: M2 (resolver,
   `enqueue` snapshots target and source, run-start refusals). Renumbered behind MOD-125 M4's `0037`, MOD-159 M1's `0038` and
-  MOD-133 M1's `0039` (cache behind `0013_integration`) at the merge. Owed on the host: the merged-tree Postgres gate (PG 16), the live-Qdrant suites
+  MOD-133 M1's `0039` (cache behind `0013_integration`) at the merge. Owed on the host: the merged-tree Postgres gate, the live-Qdrant suites
   (`qdrant_worker.rs` gained one literal, compiled only), the Windows build.
 - [ ] **MOD-131 - Driven targets: ssh and docker exec launch, MCP relay tunnel, remote bootstrap**
   (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; §8 accepted 2026-11-14). `R-ORCH-15`, `R-AGT-11`,

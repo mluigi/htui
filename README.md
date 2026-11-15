@@ -114,11 +114,11 @@ checkable is the one everybody actually builds with. Keep all three in step when
 
 ## Connecting to your database
 
-`htui` needs **Postgres 16 or newer**.
+`htui` needs **Postgres 18 or newer**.
 
 ### Run a local server
 
-The repository includes a `compose.yaml` that starts Postgres 16 on port **5439**, so it does not
+The repository includes a `compose.yaml` that starts Postgres 18 on port **5439**, so it does not
 clash with a Postgres you may already have on 5432:
 
 ```
