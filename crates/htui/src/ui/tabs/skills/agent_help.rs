@@ -863,6 +863,8 @@ pub(super) mod fixtures {
                 usage: false,
                 usage_mid_turn: false,
                 authenticate: false,
+                mcp_stdio: false,
+                mcp_http: false,
             },
             prompts: false,
         }

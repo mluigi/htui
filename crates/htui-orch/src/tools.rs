@@ -257,6 +257,7 @@ mod tests {
                 ),
                 ("HTUI_MCP_TOKEN".to_owned(), SECRET.to_owned()),
             ]),
+            ..McpServerSpec::default()
         }
     }
 

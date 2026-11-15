@@ -141,6 +141,7 @@ mod tests {
                 "HTUI_MCP_TOKEN".to_owned(),
                 "planted-mod79-token".to_owned(),
             )]),
+            ..McpServerSpec::default()
         }
     }
 

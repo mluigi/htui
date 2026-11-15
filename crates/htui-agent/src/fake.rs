@@ -211,6 +211,10 @@ impl FakeDriver {
             // D10). A fake that claimed a login it does not perform would make the contract
             // case that compares predicate against operation pass for the wrong reason.
             authenticate: false,
+            // The fake launches no server, so it declares none (MOD-127 M2 D7): a test that wants
+            // the "agent can use servers" case turns the two on with `..full_caps()`.
+            mcp_stdio: false,
+            mcp_http: false,
         }
     }
 }
@@ -850,6 +854,7 @@ mod tests {
                 command: "/abs/htui".to_owned(),
                 args: vec!["mcp".to_owned()],
                 env: BTreeMap::from([("HTUI_MCP_TOKEN".to_owned(), "token".to_owned())]),
+                ..McpServerSpec::default()
             }],
             permission: PermissionPolicy::default(),
             retain_raw: false,

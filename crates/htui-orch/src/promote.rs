@@ -296,6 +296,8 @@ mod tests {
             usage: true,
             usage_mid_turn: true,
             authenticate: true,
+            mcp_stdio: true,
+            mcp_http: false,
         }
     }
 

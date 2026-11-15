@@ -51,9 +51,10 @@ use htui_agent::prompt_bridge::{PROMPT_TOOL, bridge};
 use htui_agent::prompt_bridge::{PromptAsk, PromptCall, PromptClosed, PromptVerdict};
 #[cfg(unix)]
 use htui_agent::registry::DriverFactory;
+use htui_core::model::mcp::McpTransport;
 #[cfg(unix)]
-use htui_core::model::{Agent as AgentRow, Billing, Transport};
-use htui_core::model::{AgentId, StepId};
+use htui_core::model::{Agent as AgentRow, Billing};
+use htui_core::model::{AgentId, StepId, Transport};
 #[cfg(unix)]
 use serde_json::json;
 
@@ -507,18 +508,18 @@ fn a_default_exposure_adds_no_flag() {
 const CONFIG_PATH: &str = "/run/htui-cli-1-abcd/mcp.json";
 
 fn htui_server() -> McpServerSpec {
-    McpServerSpec {
-        name: "htui".to_owned(),
-        command: "/abs/htui".to_owned(),
-        args: vec!["mcp".to_owned()],
-        env: BTreeMap::from([
+    McpServerSpec::new(
+        "htui",
+        "/abs/htui",
+        vec!["mcp".to_owned()],
+        BTreeMap::from([
             ("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned()),
             (
                 "HTUI_MCP_ADDR".to_owned(),
                 "/run/htui-mcp-1-abcd/s".to_owned(),
             ),
         ]),
-    }
+    )
 }
 
 /// A spec that sets every field `argv` reads: model, directories, budget and a narrowing.
@@ -700,6 +701,165 @@ fn the_mcp_config_is_the_clis_stdio_shape() {
             "{secret} stays off the argv: {args:?}"
         );
     }
+}
+
+/// MOD-127 M2 D8: an Http server is the CLI's own `{"type":"http","url","headers"}` entry, with no
+/// `command`, `args` or `env`, and stays beside a stdio one in the same file.
+#[test]
+fn an_http_server_renders_the_clis_http_shape() {
+    let remote = McpServerSpec {
+        transport: McpTransport::Http,
+        url: Some("https://mcp.example.test/v1".to_owned()),
+        headers: BTreeMap::from([
+            ("X-Zone".to_owned(), "eu".to_owned()),
+            (
+                "Authorization".to_owned(),
+                "Bearer planted-header".to_owned(),
+            ),
+        ]),
+        ..McpServerSpec::new("docs", "", Vec::new(), BTreeMap::new())
+    };
+    let config = htui_agent::cli::mcp_config(&[htui_server(), remote]).expect("two servers");
+    let parsed: serde_json::Value = serde_json::from_str(&config).expect("the config is JSON");
+    assert_eq!(
+        parsed["mcpServers"]["docs"],
+        json!({
+            "type": "http",
+            "url": "https://mcp.example.test/v1",
+            "headers": {
+                "Authorization": "Bearer planted-header",
+                "X-Zone": "eu",
+            },
+        }),
+        "{config}"
+    );
+    assert_eq!(parsed["mcpServers"]["htui"]["type"], "stdio", "{config}");
+    assert!(
+        config.find("Authorization") < config.find("X-Zone"),
+        "headers in key order: {config}"
+    );
+}
+
+/// MOD-127 M2 D8: a header value is a credential like an `env` value, so `Debug` prints the name
+/// and never the value, on the spec and on the session spec around it.
+#[test]
+fn headers_never_reach_debug() {
+    let remote = McpServerSpec {
+        transport: McpTransport::Http,
+        url: Some("https://mcp.example.test/v1".to_owned()),
+        headers: BTreeMap::from([(
+            "Authorization".to_owned(),
+            "Bearer planted-header".to_owned(),
+        )]),
+        ..McpServerSpec::new("docs", "", Vec::new(), BTreeMap::new())
+    };
+    let text = format!("{remote:?}");
+    assert!(text.contains("Authorization"), "names stay: {text}");
+    assert!(!text.contains("planted-header"), "{text}");
+
+    let mut session = spec(PathBuf::from("/scratch"));
+    session.mcp = vec![remote];
+    let text = format!("{session:?}");
+    assert!(!text.contains("planted-header"), "{text}");
+}
+
+/// MOD-127 M2 D8: a spec serialised before `transport` existed still decodes, as stdio, and a
+/// stdio spec round-trips to the same value.
+#[test]
+fn a_stdio_spec_json_without_transport_still_decodes() {
+    let old = json!({
+        "name": "htui",
+        "command": "/abs/htui",
+        "args": ["mcp"],
+        "env": { "HTUI_MCP_TOKEN": "token-value" },
+    });
+    let decoded: McpServerSpec = serde_json::from_value(old).expect("the old shape decodes");
+    assert_eq!(
+        decoded,
+        McpServerSpec::new(
+            "htui",
+            "/abs/htui",
+            vec!["mcp".to_owned()],
+            BTreeMap::from([("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned())]),
+        )
+    );
+    assert_eq!(decoded.transport, McpTransport::Stdio);
+    assert_eq!(decoded.url, None);
+    assert!(decoded.headers.is_empty());
+    let again: McpServerSpec =
+        serde_json::from_value(serde_json::to_value(&decoded).expect("serialises"))
+            .expect("round-trips");
+    assert_eq!(again, decoded);
+}
+
+/// MOD-127 M2 D7: the profile per transport: every CLI row takes stdio and http servers, an ACP row
+/// stdio only, and a transport that declares nothing (the fake, [`DriverCaps::default`]) neither.
+#[test]
+fn caps_say_cli_stdio_http_acp_stdio_other_none() {
+    let rows = htui_core::model::agent::seed_rows(chrono::DateTime::UNIX_EPOCH);
+    let mut cli = 0;
+    let mut acp = 0;
+    for row in &rows {
+        let caps = htui_agent::registry::caps_for(row);
+        match row.transport {
+            Transport::Cli => {
+                cli += 1;
+                assert!(
+                    (caps.mcp_stdio, caps.mcp_http) == (true, true),
+                    "{}",
+                    row.name
+                );
+            }
+            Transport::Acp => {
+                acp += 1;
+                assert!(
+                    (caps.mcp_stdio, caps.mcp_http) == (true, false),
+                    "{}",
+                    row.name
+                );
+            }
+        }
+    }
+    assert!(cli > 0 && acp > 0, "the seed rows hold both transports");
+    let none = DriverCaps::default();
+    assert!(!none.mcp_stdio && !none.mcp_http);
+    let fake = htui_agent::fake::FakeDriver::full_caps();
+    assert!(
+        !fake.mcp_stdio && !fake.mcp_http,
+        "the fake offers none unless a test says so"
+    );
+}
+
+/// MOD-127 M2 D9: an MCP server's `deny` entries ride in `tools.deny` and reach
+/// `--disallowedTools`; its `allow` entries never reach `--allowedTools` or `--tools` (an
+/// allow-list entry widens, it does not narrow).
+#[test]
+fn deny_entries_in_tools_deny_become_disallowed_tools() {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.mcp = vec![htui_server()];
+    spec.tools.deny = vec![
+        "mcp__docs__delete_page".to_owned(),
+        "mcp__docs__drop_space".to_owned(),
+    ];
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &spec,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg == "--disallowedTools=mcp__docs__delete_page,mcp__docs__drop_space"),
+        "{args:?}"
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("--allowedTools") || arg.starts_with("--tools")),
+        "{args:?}"
+    );
 }
 
 /// D8: the operator's `extra_args` still come last, so a repeated flag is theirs.

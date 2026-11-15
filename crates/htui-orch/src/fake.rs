@@ -2174,6 +2174,7 @@ impl ToolHost for FakeToolHost {
                 (FAKE_ADDR_ENV.to_owned(), "/fake/htui-mcp/s".to_owned()),
                 (FAKE_TOKEN_ENV.to_owned(), token),
             ]),
+            ..McpServerSpec::default()
         };
         let advertised = self
             .advertised
