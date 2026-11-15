@@ -1686,6 +1686,8 @@ impl LibraryView {
                 (Some(_), _) => {}
                 (None, _) => self.gone(),
             },
+            // The MCP servers view's write (MOD-127 M2 T8); no Skills editor holds one.
+            StaleWhat::McpServer(_) => {}
             StaleWhat::Binding(_) => {
                 if let Some(pane) = &mut self.attach {
                     pane.on_stale(snapshot);
@@ -4030,6 +4032,7 @@ mod tests {
                 field: TextField::new(),
             },
             snapshot: Some(SkillsSnapshot {
+                mcp_servers: Vec::new(),
                 skills: Vec::new(),
                 global: Vec::new(),
                 workspaces: Vec::new(),
@@ -4210,6 +4213,7 @@ mod tests {
         );
         let empty = LibraryView {
             snapshot: Some(SkillsSnapshot {
+                mcp_servers: Vec::new(),
                 skills: Vec::new(),
                 global: Vec::new(),
                 workspaces: Vec::new(),

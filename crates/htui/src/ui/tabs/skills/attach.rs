@@ -1520,6 +1520,7 @@ mod tests {
     /// A snapshot with an empty library and no project: the pane shows only the `global` row.
     fn no_projects() -> SkillsSnapshot {
         SkillsSnapshot {
+            mcp_servers: Vec::new(),
             skills: Vec::new(),
             global: Vec::new(),
             workspaces: Vec::new(),
@@ -1639,6 +1640,7 @@ mod tests {
     fn the_attachment_cursor_is_the_gutter_and_band() {
         let project = htui_core::fixtures::ids::PROJECT_VULKAN;
         let snapshot = SkillsSnapshot {
+            mcp_servers: Vec::new(),
             projects: vec![ProjectSkills {
                 project,
                 bindings: Vec::new(),
@@ -1668,6 +1670,7 @@ mod tests {
     fn the_repo_picker_cursor_is_the_gutter_and_band() {
         let project = htui_core::fixtures::ids::PROJECT_VULKAN;
         let snapshot = SkillsSnapshot {
+            mcp_servers: Vec::new(),
             projects: vec![ProjectSkills {
                 project,
                 bindings: Vec::new(),
@@ -1742,6 +1745,7 @@ mod tests {
         let kind = kind_of(ids::PROJECT_VULKAN, "MOD");
         let id = kind.id;
         let snapshot = SkillsSnapshot {
+            mcp_servers: Vec::new(),
             workspaces: vec![WorkspaceSkills {
                 workspace: ids::WORKSPACE_GRAPHICS,
                 name: "Graphics".to_owned(),

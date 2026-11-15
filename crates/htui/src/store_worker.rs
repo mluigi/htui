@@ -26,12 +26,12 @@ use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BindingKey, BoxEdit,
     BoxId, BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
     FollowUpText, GraphBody, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSpec,
-    ItemSummary, KeyQualifier, LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona,
-    PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, ProjectRef,
-    ProjectType, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunCommandId,
-    RunStatus, RunSummary, Scope, SessionEvent, SkillId, SkillPatch, SpecChanges, StepGraphId,
-    StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId,
-    WorkspacePatch, WorkspaceSummary,
+    ItemSummary, KeyQualifier, LinkGraph, McpServerId, McpServerPatch, NewFollowUp, NewPersona,
+    Note, PermissionId, Persona, PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId,
+    ProjectPatch, ProjectRef, ProjectType, RelayView, RepoId, RepoPatch, RequirementAreaId,
+    RequirementId, RunCommandId, RunStatus, RunSummary, Scope, SessionEvent, SkillId, SkillPatch,
+    SpecChanges, StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount,
+    WaitingPermission, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::model::{
     LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, OwnerDocument,
@@ -77,7 +77,7 @@ use crate::requirements::{
 use crate::run_worker::{LiveChats, RunRuntime, RunServed, TuiRuns as _};
 use crate::secrets_settings::{self, IdentityEntry, Redacted, SecretCheck, SecretsSnapshot};
 use crate::skill_import::SkillImports;
-use crate::skills::{self, SkillWrite, SkillsSnapshot, StaleWhat};
+use crate::skills::{self, McpServerDraft, McpServerWrite, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -943,6 +943,38 @@ pub enum StoreRequest {
         /// Attach or detach.
         change: BindingChange,
     },
+    /// `create_mcp_server`: one `mcp_server` row (MOD-127 M2 D2). The worker mints the id and fills
+    /// `created_by`. Answered with [`StoreReply::McpServerWritten`] when it applied; a refusal
+    /// (a bad or taken name, a shape the transport forbids, a literal under a secret-looking key)
+    /// is [`StoreReply::Failed`] with the store's sentence.
+    CreateMcpServer {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// What to create (boxed: it would be the largest request by far).
+        draft: Box<McpServerDraft>,
+    },
+    /// `update_mcp_server` under CAS on `mcp_server.updated_at`: answered with
+    /// [`StoreReply::McpServerWritten`] when it applied and [`StoreReply::SkillsStale`] (naming
+    /// [`StaleWhat::McpServer`]) when the token was spent or the server is gone.
+    EditMcpServer {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// Which server.
+        id: McpServerId,
+        /// `mcp_server.updated_at` the form opened on: the CAS token.
+        expected: DateTime<Utc>,
+        /// The edit; `None` leaves a column (boxed, as `draft`).
+        patch: Box<McpServerPatch>,
+    },
+    /// `delete_mcp_server`: the row and every attachment naming it. Answered with
+    /// [`StoreReply::McpServerWritten`] when it applied and [`StoreReply::SkillsStale`] when the
+    /// server is already gone.
+    DeleteMcpServer {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// Which server.
+        id: McpServerId,
+    },
     /// Imports `SKILL.md` and rules files from the paths named, each a file or a directory (MOD-9
     /// milestone 4, import plan D97). The **worker** reads the filesystem: `R-NF-3` keeps the walk
     /// off the UI task, and the view types a path and nothing else. Writes `skill` and
@@ -1509,6 +1541,10 @@ impl StoreRequest {
             Self::SaveSkillVersion { .. } => "save_skill_version",
             Self::SetSkillBinding { .. } => "set_skill_binding",
             Self::ImportSkills { .. } => "import_skills",
+            // The three of `skills::MCP_REQUEST_NAMES`, in that order (MOD-127 M2 T7).
+            Self::CreateMcpServer { .. } => "create_mcp_server",
+            Self::EditMcpServer { .. } => "edit_mcp_server",
+            Self::DeleteMcpServer { .. } => "delete_mcp_server",
             // The four of `connection::REQUEST_NAMES`, in that order (MOD-15 M6 D4).
             Self::ConnectionInfo => "connection_info",
             Self::SetDsn(_) => "set_dsn",
@@ -1828,6 +1864,16 @@ pub enum StoreReply {
         snapshot: Result<Box<SkillsSnapshot>, String>,
         /// What the write did.
         outcome: SkillWrite,
+    },
+    /// The answer to every MCP server write that applied (MOD-127 M2 T7): the snapshot re-read
+    /// after it, and what the write did, as [`StoreReply::SkillWritten`] is for a skill. A stale
+    /// write answers [`StoreReply::SkillsStale`] with [`StaleWhat::McpServer`].
+    McpServerWritten {
+        /// The snapshot as it is now; or, when only the re-read failed, its `StoreError` rendered
+        /// through `Display`. The write landed either way.
+        snapshot: Result<Box<SkillsSnapshot>, String>,
+        /// What the write did.
+        outcome: McpServerWrite,
     },
     /// The library after an import, and what happened to every file it touched
     /// ([`StoreRequest::ImportSkills`], MOD-9 import plan D97). One variant and not two: a file
@@ -2675,7 +2721,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::EditSkill { .. }
         | StoreRequest::SaveSkillVersion { .. }
         | StoreRequest::SetSkillBinding { .. }
-        | StoreRequest::ImportSkills { .. } => skills::serve(backend, request).await?,
+        | StoreRequest::ImportSkills { .. }
+        | StoreRequest::CreateMcpServer { .. }
+        | StoreRequest::EditMcpServer { .. }
+        | StoreRequest::DeleteMcpServer { .. } => skills::serve(backend, request).await?,
         // The four connection requests, or-ed for the same reason the twenty-eight above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
