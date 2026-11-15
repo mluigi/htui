@@ -7,6 +7,7 @@ pub mod registry;
 pub mod requirements;
 pub mod settings;
 pub mod skills;
+pub mod workspaces;
 
 pub use backlog::BacklogTab;
 pub use chat::ChatTab;
@@ -15,3 +16,4 @@ pub use registry::{Tab, TabId, TabRegistry};
 pub use requirements::RequirementsTab;
 pub use settings::SettingsTab;
 pub use skills::SkillsTab;
+pub use workspaces::WorkspacesTab;

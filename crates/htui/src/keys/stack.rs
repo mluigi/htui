@@ -382,6 +382,9 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     // MOD-122 M3 D10: the shell's activity panel, appended so every first-reported phrase is
     // unchanged.
     ("in the activity panel", views::ACTIVITY_BROWSE),
+    // MOD-116 M1 D10: the Workspaces tab, appended so every first-reported phrase is unchanged
+    // (T4 moves it into the switcher's slot).
+    ("in Workspaces", views::WORKSPACES_BROWSE),
 ];
 
 impl Keys {
@@ -476,11 +479,13 @@ mod tests {
         // Logging's before it.
         // MOD-141 D12: the graph editor's six; M2 D14: its part form's.
         // MOD-147 M3 D9: the owner documents pane's three; MOD-122 M3 D10: the activity panel.
-        assert_eq!(DECLARED.len(), 102);
+        // MOD-116 M1 D10: the Workspaces tab's, appended after it.
+        assert_eq!(DECLARED.len(), 103);
         assert_eq!(
             DECLARED[101],
             ("in the activity panel", views::ACTIVITY_BROWSE)
         );
+        assert_eq!(DECLARED[102], ("in Workspaces", views::WORKSPACES_BROWSE));
         assert_eq!(DECLARED[83], ("in the leave dialog", views::LEAVE));
         // MOD-122 D4: the Logs tab, appended after it.
         assert_eq!(DECLARED[84], ("in Logs", views::LOGS_BROWSE));

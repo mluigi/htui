@@ -49,7 +49,7 @@ use Context::{
     Overlay, Pane, Picker, Queue, Requirements, Settings, SettingsAgents, SettingsBoxes,
     SettingsConnection, SettingsDocuments, SettingsHierarchy, SettingsKinds, SettingsMemory,
     SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills, SkillsAttach, SkillsHelp,
-    SkillsLibrary, SkillsTemplates, Switcher, Waiting,
+    SkillsLibrary, SkillsTemplates, Switcher, Waiting, Workspaces,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
@@ -183,6 +183,9 @@ pub enum Context {
     Choice,
     /// `[answer]`: a parked request's numbered options (MOD-115 M2 D7), in Runs and in Chat.
     Answer,
+    /// `[workspaces]`: the Workspaces tab (MOD-116 M1 D10). Appended last while the switcher
+    /// still exists; T4 moves it into the switcher's slot.
+    Workspaces,
 }
 
 impl Context {
@@ -245,6 +248,7 @@ impl Context {
         Self::Field,
         Self::Choice,
         Self::Answer,
+        Self::Workspaces,
     ];
 
     /// The TOML table name: `global`, `overlay`, `list`, ..., `settings.agents`, `concepts`.
@@ -307,6 +311,7 @@ impl Context {
             Self::Field => "field",
             Self::Choice => "choice",
             Self::Answer => "answer",
+            Self::Workspaces => "workspaces",
         }
     }
 
@@ -371,6 +376,7 @@ impl Context {
             Self::Field => "Text field",
             Self::Choice => "Choice",
             Self::Answer => "Answer",
+            Self::Workspaces => "Workspaces",
         }
     }
 
@@ -423,6 +429,7 @@ impl Context {
                 | Self::Queue
                 | Self::Picker
                 | Self::Leave
+                | Self::Workspaces
         )
     }
 
@@ -960,6 +967,8 @@ pub enum Act {
     LinksClose,
     /// `settings.kinds.editor`: open the graph editor on the row's graph (MOD-141 D3).
     KindsEditor,
+    /// `workspaces.open`: open the selected workspace (MOD-116 M1 D9).
+    WorkspacesOpen,
 }
 
 impl Act {
@@ -2572,6 +2581,15 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::AnswerOption7, Answer, "option_7", &["7"], "answer").since(2),
     row(Act::AnswerOption8, Answer, "option_8", &["8"], "answer").since(2),
     row(Act::AnswerOption9, Answer, "option_9", &["9"], "answer").since(2),
+    // [workspaces] (MOD-116 M1 D10): the Workspaces tab. `j`/`k`/`g`/`G`/`enter` are `list.*`.
+    // ui/tabs/workspaces/mod.rs: on_key.
+    row(
+        Act::WorkspacesOpen,
+        Workspaces,
+        "open",
+        &["o"],
+        "open workspace",
+    ),
 ];
 
 /// Extra default chords a view adds to a shared act, on top of whatever the shared row resolves
@@ -2788,13 +2806,15 @@ mod tests {
             Context::Field => 53,
             Context::Choice => 54,
             Context::Answer => 55,
+            Context::Workspaces => 56,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
         // MOD-147 M3 D9: `settings.documents`, 55; MOD-122 M3 D10: `activity`, 56.
-        assert_eq!(Context::ALL.len(), 56);
+        // MOD-116 M1 D10: `workspaces`, 57.
+        assert_eq!(Context::ALL.len(), 57);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -3086,6 +3106,7 @@ mod tests {
         Act::DocumentsNewVersion,
         Act::ActivityOpen,
         Act::ActivityFilter,
+        Act::WorkspacesOpen,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3344,6 +3365,7 @@ mod tests {
             Act::DocumentsNewVersion => 249,
             Act::ActivityOpen => 250,
             Act::ActivityFilter => 251,
+            Act::WorkspacesOpen => 252,
         }
     }
 
@@ -3380,7 +3402,8 @@ mod tests {
         // MOD-122 M2 D11: `settings.boxes.log_level`, 247.
         // MOD-147 M3 D9: `settings.hierarchy.documents` and the documents pane's two, 250.
         // MOD-122 M3 D10: `activity.open` and `activity.filter`, 252.
-        assert_eq!(CATALOGUE.len(), 252);
+        // MOD-116 M1 D10: `workspaces.open`, 253.
+        assert_eq!(CATALOGUE.len(), 253);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -3731,6 +3754,7 @@ mod tests {
             (Context::Field, "field", "Text field"),
             (Context::Choice, "choice", "Choice"),
             (Context::Answer, "answer", "Answer"),
+            (Context::Workspaces, "workspaces", "Workspaces"),
         ];
         assert_eq!(table.len(), Context::ALL.len());
         for (context, name, heading) in table {
@@ -3785,6 +3809,8 @@ mod tests {
             Context::Logs,
             // MOD-122 M3 D10: the shell's activity panel's.
             Context::Activity,
+            // MOD-116 M1 D10: the Workspaces tab's own context.
+            Context::Workspaces,
         ] {
             assert!(context.is_view() && !context.is_shared(), "{context:?}");
         }

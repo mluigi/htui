@@ -252,7 +252,8 @@ mod binary {
                      skills.templates, skills.attach, skills.help, requirements, backlog, \
                      backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
                      backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
-                     logs, activity, queue, picker, layout, history, leave, field, choice, answer"
+                     logs, activity, queue, picker, layout, history, leave, field, choice, answer, \
+                     workspaces"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \

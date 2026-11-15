@@ -11,7 +11,7 @@ use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
     Activation, Billing, CitationKind, CommandQueue, Gate, GateOutcome, Isolation, LinkKind,
     OsFamily, Priority, RequirementState, Resolution, RunKind, RunMode, RunStatus, SkillLevel,
-    StepStatus, Transport,
+    StepStatus, Transport, WorkspaceLifecycle,
 };
 use htui_core::prompt::BudgetSource;
 use ratatui::style::Style;
@@ -341,6 +341,20 @@ pub const fn skill_level(level: SkillLevel) -> &'static str {
         SkillLevel::Project => "project",
         SkillLevel::Phase => "phase",
     }
+}
+
+/// A workspace's state on the Workspaces tab (MOD-116 M1 D2): `● open`, `◐ background`,
+/// `◌ stopping…`, `○ stopped`, the glyph and the word from [`WorkspaceLifecycle`] itself. The
+/// counts (`· 2 running`, `· 1 held`) are the caller's, drawn after it in the dim role.
+#[must_use]
+pub const fn workspace_lifecycle(state: WorkspaceLifecycle) -> Mark {
+    let tone = match state {
+        WorkspaceLifecycle::Open { .. } => Tone::Done,
+        WorkspaceLifecycle::Background { .. } => Tone::Running,
+        WorkspaceLifecycle::Stopping { .. } => Tone::NeedsYou,
+        WorkspaceLifecycle::Stopped { .. } => Tone::Idle,
+    };
+    mark(state.glyph(), state.word(), tone)
 }
 
 /// A count with its noun: `1 option`, `0 options`, `3 options`. Never `option(s)`.
@@ -882,6 +896,45 @@ mod tests {
         ] {
             let style = tone_style(tone, &theme);
             assert_eq!((style.fg, style.bg), (None, None), "{tone:?}");
+        }
+    }
+
+    /// MOD-116 M1 D2: glyph and word from the state, status never by colour alone.
+    #[test]
+    fn a_workspace_lifecycle_reads_as_glyph_word_and_tone() {
+        let cases = [
+            (
+                WorkspaceLifecycle::Open { running: 2 },
+                "●",
+                "open",
+                Tone::Done,
+            ),
+            (
+                WorkspaceLifecycle::Background { running: 0 },
+                "◐",
+                "background",
+                Tone::Running,
+            ),
+            (
+                WorkspaceLifecycle::Stopping { running: 1 },
+                "◌",
+                "stopping…",
+                Tone::NeedsYou,
+            ),
+            (
+                WorkspaceLifecycle::Stopped { held: 1 },
+                "○",
+                "stopped",
+                Tone::Idle,
+            ),
+        ];
+        for (state, glyph, word, tone) in cases {
+            assert_eq!(
+                workspace_lifecycle(state),
+                Mark { glyph, word, tone },
+                "{state:?}"
+            );
+            assert_eq!(cell_width(glyph), 1, "{state:?}");
         }
     }
 

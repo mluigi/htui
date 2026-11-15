@@ -1227,6 +1227,17 @@ pub const LOGS_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
+/// The Workspaces tab (MOD-116 M1 D10): its own verb, every list act (the moves and the fold),
+/// the pane scroll, then the layout and history layers of a list + detail tab.
+pub const WORKSPACES_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Workspaces, &[Act::WorkspacesOpen]),
+    LIST_ALL,
+    PANE_SCROLL,
+    LAYOUT,
+    HISTORY,
+    GLOBAL,
+]);
+
 /// The shell's activity panel while it holds the keys (MOD-122 M3 D10): its own verbs, the
 /// list moves **with** `list.bottom` (blueprint F8: no layer here binds `G`), then the layout and
 /// history layers of a list + detail tab. No `list.fold` and no `backlog` layer, so `enter` and
@@ -1363,6 +1374,7 @@ mod tests {
         source!("ui/tabs/backlog/detail/runs.rs"),
         source!("ui/tabs/chat/mod.rs"),
         source!("ui/tabs/logs/mod.rs"),
+        source!("ui/tabs/workspaces/mod.rs"),
         source!("ui/shell/activity.rs"),
     ];
 
@@ -1515,6 +1527,7 @@ mod tests {
         CHAT_LIVE,
         CHAT_REPLAY,
         LOGS_BROWSE,
+        WORKSPACES_BROWSE,
         ACTIVITY_BROWSE,
         QUEUE_OVERLAY,
         HIERARCHY_PICKER,
@@ -1960,6 +1973,15 @@ mod tests {
         assert_eq!(resolve(LOGS_BROWSE, "end"), []);
         assert_eq!(resolve(LOGS_BROWSE, "k"), [Act::ListUp]);
         assert_eq!(resolve(LOGS_BROWSE, "K"), [Act::PaneScrollUp]);
+        // MOD-116 M1 D10: the Workspaces tab opens on `o`, folds on `enter` (the whole `list`
+        // layer), scrolls the detail on `J`/`K`, and keeps `w` (now the tab's own offer).
+        assert_eq!(resolve(WORKSPACES_BROWSE, "o"), [Act::WorkspacesOpen]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "j"), [Act::ListDown]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "enter"), [Act::ListFold]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "G"), [Act::ListBottom]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "J"), [Act::PaneScrollDown]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "w"), [Act::Workspaces]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "backspace"), [Act::HistoryBack]);
         // MOD-122 M3 D10: the activity panel's `enter` and `f` are its own (no `list.fold`, no
         // `backlog` layer), its `G` is `list.bottom` (F8), and it has no pane scroll.
         assert_eq!(resolve(ACTIVITY_BROWSE, "enter"), [Act::ActivityOpen]);
@@ -2238,8 +2260,8 @@ mod tests {
         // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
         // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
         // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94; MOD-122
-        // M3 D10: the activity panel's, 95.
-        assert_eq!(views.len(), 95);
+        // M3 D10: the activity panel's, 95; MOD-116 M1 D10: the Workspaces tab's, 96.
+        assert_eq!(views.len(), 96);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

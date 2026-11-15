@@ -215,7 +215,10 @@ close = []  # close; Esc always"#;
                        option_6 = [\"6\"]  # answer\n\
                        option_7 = [\"7\"]  # answer\n\
                        option_8 = [\"8\"]  # answer\n\
-                       option_9 = [\"9\"]  # answer\n"
+                       option_9 = [\"9\"]  # answer\n\
+                       \n\
+                       [workspaces]\n\
+                       open = [\"o\"]  # open workspace\n"
             ),
             "{printed}"
         );

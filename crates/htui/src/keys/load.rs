@@ -547,7 +547,8 @@ mod tests {
                           skills.templates, skills.attach, skills.help, requirements, backlog, \
                           backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
                           backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
-                          logs, activity, queue, picker, layout, history, leave, field, choice, answer";
+                          logs, activity, queue, picker, layout, history, leave, field, choice, answer, \
+                          workspaces";
 
     #[test]
     fn an_empty_file_is_the_defaults() {

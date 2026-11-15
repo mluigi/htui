@@ -424,4 +424,7 @@ option_6 = ["6"]  # answer
 option_7 = ["7"]  # answer
 option_8 = ["8"]  # answer
 option_9 = ["9"]  # answer
+
+[workspaces]
+open = ["o"]  # open workspace
 ```
