@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-130-execution-targets.prd.md`
 **Selected Milestone**: 4 — Where a run runs is visible
 **Complexity**: Medium
-**Status**: planned (2026-11-15); fact-check pending (step 3.5 of `/handoff-run`).
+**Status**: planned and fact-checked (2026-11-15); implementation not started.
 **Routing**: plan path (PRD exists; M4 is its last milestone), no ultracode, lane shape (4 serial tasks, more than
 five files) (`/handoff-run` in the `hr/MOD-130` sandbox, 2026-11-15). The plan runs without a confirm gate. No
 architect: M4 adds no module seam; it widens one read model (`RunSummary`) and edits three render sites.
@@ -68,18 +68,19 @@ Every task's brief carries this section.
   machine, then its children (by hostname, then id), machines in the order the store gave. A child whose parent is
   not in the list (a read race, or a parent of another user) is listed after every machine, still with the
   indent, and the detail's `parent` row reads `(not listed)`. The list label of a child is prefixed
-  `\u{2514} ` (`└ `), clipped as the hostname already is. Detail rows: `kind` (`machine` / `container`, from
-  `BoxKind`'s label) after `host`, and `parent` (the parent's hostname, or `(not listed)`) for a child only.
+  `\u{2514} ` (`└ `), clipped as the hostname already is. Detail rows: `kind` (`machine` / `container`, `BoxKind::as_str`) after `host`, and `parent` (the parent's hostname, or `(not listed)`) for a child only.
 - **P5 — surfaces left alone.** `htui stop`'s report keeps printing the driving box (it prints
   `COALESCE(executing, target)` already); the queue overview and `htui state` use `EntryState`'s `Display`,
   unchanged (P3); the execution-graph canvas draws steps, not placement. The Backlog's "runs on …" line is MOD-119
   and the setters are MOD-123/116/124 (PRD out of scope).
 - **P6 — every struct-literal site of `RunSummary` is the foundation task's.** `RunSummary` has no `Default`.
-  T1 owns each literal site (the usages list is long: `crates/htui-core/src/model/run.rs` tests,
-  `crates/htui-orch/src/closeout.rs`, `crates/htui-orch/src/command.rs` tests,
-  `crates/htui/src/ui/tabs/backlog/detail/runs.rs` tests, `.../runs/execution_graph.rs`,
-  `crates/htui-store/tests/it/cache.rs`, and whatever `cargo check --workspace --all-targets --all-features`
-  names) so the lane never halts at a later task's first workspace check.
+  Fact-checked sites (2026-11-15): `crates/htui-core/src/model/run.rs:2170` (a test), `crates/htui-core/src/store/mem.rs:2410`,
+  `crates/htui-orch/src/closeout.rs:434`, `crates/htui-orch/src/command.rs:3039` (a test),
+  `crates/htui-store/src/cache/read.rs:917`, `crates/htui-store/src/pg/rows.rs:76`,
+  `crates/htui/src/ui/tabs/backlog/detail/runs.rs:3414, :3459, :7734` (tests; `copied_run` and `stepless_run` are
+  helpers to re-read) and `.../runs/execution_graph.rs:845`. T1 owns all of them and ends on
+  `cargo check --workspace --all-targets --all-features`, so a site this list missed is found there and not by a
+  later task.
 - **P7 — `.sqlx`.** `PgStore::runs`'s `query_as!` text changes, so its `.sqlx` entry is replaced. Run
   `cargo sqlx prepare` against a **migrated scratch database** on `localhost:5439` (the sandbox's), per
   `docs/hr-sandbox.md`; the empty `htui` database cannot prepare. The old entry is deleted, the new one added.
@@ -109,8 +110,8 @@ read-only verifier. T2–T4 go to the gate and the review unverified.
   `crates/htui-store/.sqlx/` (one entry replaced), the conformance count pins in
   `crates/htui-core/tests/it/mem_store.rs` and `crates/htui-store/tests/it/pg_conformance.rs`,
   `crates/htui-store/tests/it/cache.rs`, and the literal sites of P6
-  (`crates/htui-orch/src/closeout.rs`, `crates/htui-orch/src/command.rs`,
-  `crates/htui/src/ui/tabs/backlog/detail/runs.rs`, `.../runs/execution_graph.rs`, others the compiler names).
+  (P6: `crates/htui-orch/src/closeout.rs`, `crates/htui-orch/src/command.rs`,
+  `crates/htui/src/ui/tabs/backlog/detail/runs.rs` (tests only), `.../runs/execution_graph.rs`, others the compiler names).
 - **Types.** `RunSummary` gains, after `target_box_id`:
   `target_id: Option<TargetId>`, `target_name: Option<String>`, `target_source: Option<TargetSource>`, each
   documented (`run.target_id`, `target.name` or `None`, `run.target_source`). `RunRow` gains the same three
@@ -202,19 +203,19 @@ read-only verifier. T2–T4 go to the gate and the review unverified.
 | `crates/htui/src/ui/overlay/queue.rs`, `crates/htui-core/src/model/queue.rs` | UPDATE | pinning tests, doc comments (T4) |
 | `crates/htui/tests/it/snapshots/*.snap` | UPDATE | new snapshots for T2 and T3 only |
 
-## Claims for the fact-check (step 3.5)
+## Verified claims (step 3.5, 2026-11-15)
 
-| Claim | How |
-|---|---|
-| `run.target_id` and `run.target_source` exist in Pg and in the cache mirror, and `target` is mirrored with a `name` column | read `0040_execution_targets.sql`, `cache_migrations/0014_*`, `MIRRORED_TABLES` |
-| `RunSummary` has no `Default` and its literal sites are those listed (P6) | `cargo check --workspace --all-targets --all-features` after adding the fields |
-| No existing run snapshot moves (P1) | full insta run on `htui` after T2 |
-| The current conformance count pin is 358 on this branch (post-merge of MOD-133) | read both pin files |
-| `EntryState::Elsewhere.hostname` is the driver's (P3) | `classify_entry` at `crates/htui-core/src/model/queue.rs:478` (read: `run.driver_hostname`) |
-| `BoxKind` has a label function and `BoxRow.kind`/`parent_box_id` exist | `crates/htui-core/src/model/box_.rs:38` (read: both fields present) |
-| `BoxesSnapshot` is assembled in one place | search `BoxesSnapshot {` |
-| The sandbox can `cargo sqlx prepare` against `localhost:5439` | `docs/hr-sandbox.md` recipe |
-| Independence: T1, T2, T3 and T4 file sets are pairwise disjoint apart from the snapshots directory and `run.rs` (T1 and T4) | intersect the lists above; T1 and T4 both touch `model/run.rs`, so T4 runs after T1 (serial lane) |
+| Claim | Verdict | Evidence |
+|---|---|---|
+| `run.target_id` / `run.target_source` exist in Pg and the cache; `target.name` exists in both | confirmed | `0040_execution_targets.sql:25-27, :63-66`; `cache_migrations/0014_execution_targets.sql:10-17` (cache `target` has `name`) |
+| `target` is a mirrored table (no cache migration needed) | confirmed | `MIRRORED_TABLES` (25 entries) lists `"target"`, `cache/mod.rs:51` doc |
+| `RunSummary` has no `Default`; its literal sites are those of P6 | amended | The first draft listed `htui-store/tests/it/cache.rs:546` as a literal site; it is a reference, not a literal (struck). `closeout.rs:434`, `mem.rs:2410`, `rows.rs:76`, `cache/read.rs:917`, `command.rs:3039`, `run.rs:2170`, `runs.rs:3414/:3459/:7734`, `execution_graph.rs:845` confirmed by search; T1's workspace `cargo check` is the backstop |
+| The conformance count pin is 358 on this branch | confirmed | `crates/htui-core/tests/it/mem_store.rs:65`, `crates/htui-store/tests/it/pg_conformance.rs:82` (`EXPECTED_CASES`). T1's new case moves both to 359 |
+| `EntryState::Elsewhere.hostname` is the driver's (P3) | confirmed | `classify_entry` (`model/queue.rs:478`) builds `hostname: run.driver_hostname.clone()`; `sentence` prints it (`ui/overlay/queue.rs:295`) |
+| `BoxRow.kind` / `parent_box_id` exist; `BoxKind` is `machine`/`container` | confirmed | `model/box_.rs:27-31` and the `BoxRow` fields; no kit label function exists, so P4 uses `BoxKind::as_str` (amended) |
+| `BoxesSnapshot` is assembled in one place | confirmed | the only non-test literal is `crates/htui/src/box_settings.rs:74`; `settings/boxes.rs:1522` is a test helper; the `tests/it/box_settings.rs` snapshots hold no child box |
+| The sandbox can run `cargo sqlx prepare` | confirmed | `docs/hr-sandbox.md:227-236` (`CREATE DATABASE htui_sqlx`, `migrate run --source migrations` from `crates/htui-store`, `prepare -- --all-targets --all-features`) |
+| Task independence | confirmed serial | T1 and T2 both touch `runs.rs` (T1 its test literals), T1 and T4 both touch `model/run.rs`, T2 and T3 share the snapshots directory: no task is marked parallel, the lane is serial |
 
 ## Validation
 
