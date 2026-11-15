@@ -15660,3 +15660,139 @@ async fn a_container_attached_under_another_machine_is_refused() {
     );
     db.drop_db().await;
 }
+
+/// MOD-130 M2 P4: the worker's `target_binding` on Postgres answers the target row, the child box
+/// its `box_id` names, and the machine that child runs on; an unbound target has neither box, and
+/// an unknown id is `None`. There is no `WorkerStore` conformance path (C12), so it is pinned here.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_target_binding_reads_the_target_its_box_and_its_machine() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let docker = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "bound docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create");
+    let child = BoxId::new();
+    db.store
+        .attach_child_box(NewChildBox {
+            id: child,
+            parent: ids::BOX,
+            hostname: "dev-rust".to_owned(),
+            target: docker.id,
+        })
+        .await
+        .expect("attach under the fixture machine");
+
+    let binding = htui_core::store::WorkerStore::target_binding(&db.store, docker.id)
+        .await
+        .expect("read must not fail")
+        .expect("the target exists");
+    assert_eq!(
+        binding.target,
+        db.store.target(docker.id).await.expect("the target row"),
+        "the target row, as the read store has it"
+    );
+    let bound = binding.bound.expect("the child box is read");
+    assert_eq!(bound.id, child);
+    assert_eq!(
+        Some(bound),
+        db.store.box_row(child).await.expect("the child row"),
+        "the bound row is the box row"
+    );
+    assert_eq!(
+        binding.host,
+        db.store.box_row(ids::BOX).await.expect("the machine row"),
+        "a container's host is its parent machine"
+    );
+    assert!(binding.host.is_some(), "the fixture machine exists");
+
+    let spare = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "spare ssh".to_owned(),
+            kind: TargetKind::Ssh,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create");
+    let unbound = htui_core::store::WorkerStore::target_binding(&db.store, spare.id)
+        .await
+        .expect("read must not fail")
+        .expect("the target exists");
+    assert_eq!(unbound.target, spare);
+    assert_eq!(
+        (unbound.bound, unbound.host),
+        (None, None),
+        "an unbound target"
+    );
+
+    let local =
+        htui_core::store::WorkerStore::target_binding(&db.store, htui_core::seed::LOCAL_TARGET_ID)
+            .await
+            .expect("read must not fail")
+            .expect("the seeded local target exists");
+    assert_eq!(local.target.kind, TargetKind::Local);
+    assert_eq!(
+        (local.bound, local.host),
+        (None, None),
+        "local binds no box"
+    );
+
+    assert_eq!(
+        htui_core::store::WorkerStore::target_binding(&db.store, TargetId::new())
+            .await
+            .expect("read must not fail"),
+        None,
+        "an unknown id"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-130 M2 P4: the worker's `scope_project` on Postgres answers as the `ReadStore` one: a
+/// workspace's scope row, and `None` for an unknown workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_scope_project_answers_as_the_read_store() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let workspace = db
+        .store
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "scoped".to_owned(),
+            name: "Scoped".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the workspace is created")
+        .id;
+    for id in [workspace, WorkspaceId::new()] {
+        assert_eq!(
+            htui_core::store::WorkerStore::scope_project(&db.store, id)
+                .await
+                .expect("read must not fail"),
+            db.store
+                .scope_project(id)
+                .await
+                .expect("read must not fail"),
+            "workspace {id}"
+        );
+    }
+    assert!(
+        htui_core::store::WorkerStore::scope_project(&db.store, workspace)
+            .await
+            .expect("read must not fail")
+            .is_some(),
+        "a workspace has its scope row"
+    );
+    db.drop_db().await;
+}

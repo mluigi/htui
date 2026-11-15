@@ -27,8 +27,8 @@ use htui_core::model::{
     StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId,
     WorkspaceStop, WorkspaceSummary,
 };
-use htui_core::model::{Integration, LandOutcome};
-use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
+use htui_core::model::{Integration, LandOutcome, TargetBinding, TargetId};
+use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, StoreError, WriteStore};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -536,6 +536,32 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
         PgStore::run_batch_spend(self, run).await
+    }
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        ReadStore::scope_project(self, workspace).await
+    }
+    /// MOD-130 M2 P4: [`ReadStore::target`]'s one statement, then [`PgStore::box_row`] for the
+    /// bound box and, for a container, its parent machine. No locks: `create_run` reads the
+    /// target `FOR SHARE` itself (P8).
+    async fn target_binding(&self, id: TargetId) -> Result<Option<TargetBinding>> {
+        let target = match ReadStore::target(self, id).await {
+            Ok(target) => target,
+            Err(StoreError::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let bound = match target.box_id {
+            Some(id) => PgStore::box_row(self, id).await?,
+            None => None,
+        };
+        let host = match bound.as_ref().and_then(|row| row.parent_box_id) {
+            Some(parent) => PgStore::box_row(self, parent).await?,
+            None => bound.clone(),
+        };
+        Ok(Some(TargetBinding {
+            target,
+            bound,
+            host,
+        }))
     }
 }
 
@@ -1128,6 +1154,15 @@ impl htui_core::store::WorkerStore for Writer {
         match self {
             Self::Memory(store) => store.run_batch_spend(run).await,
             Self::Online(pg) => pg.run_batch_spend(run).await,
+        }
+    }
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        ReadStore::scope_project(self, workspace).await
+    }
+    async fn target_binding(&self, id: TargetId) -> Result<Option<TargetBinding>> {
+        match self {
+            Self::Memory(store) => htui_core::store::WorkerStore::target_binding(store, id).await,
+            Self::Online(pg) => htui_core::store::WorkerStore::target_binding(pg, id).await,
         }
     }
 }
