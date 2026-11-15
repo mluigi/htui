@@ -384,6 +384,11 @@ items it follows are done.
   agent in a container that does not share the host's `/proc` cannot start, and the socket must be
   bind-mounted into the container. A container launch needs a relay binary inside the image and the
   socket directory mounted, or a relay over the `docker exec -i` stream (PRD OQ-1).
+  **From MOD-130 M3 (2026-11-15, maintainer Q2; plan `.claude/plans/mod-130-m3-queue-keys-on-the-driver.plan.md` P8):**
+  enqueue and claim already check tags on the run's target box, but the pre-enqueue tag filters (`ready_items`,
+  `missing_tags`, `missing_tags_of`, the Backlog's missing-tags hint) and the walk's own reads of
+  `EngineParts.box_id` (the `agent_boxes` read at selection, paths, agent rows and command records) still read this box.
+  Switch them to the resolved target box when a container run can start. Lease, adoption and resume stay on the driver.
 - [ ] **MOD-46 - Live streaming via `NOTIFY` (optional)** (from ANA-16, §8 item 7). `R-HIS-1`,
   `R-NF-3`. Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded
   by durable `session_event` rows. Start only if 16 KiB flush bursts prove unusable; replaced by
@@ -449,6 +454,19 @@ items it follows are done.
   shared level naming one blocks every item the queue tries. Sandbox gate green except the known load flake
   `cache::the_spawned_refresher_passes_and_follows_the_scope` (base 2/4, HEAD 2/4 alone). Owed on the host: the merged-tree
   Postgres gate.
+  **Phase M3 landed (`cf55f77f`..`d5030c43`, 2026-11-15, on `hr/MOD-130`):** the queue keys on the driver,
+  `COALESCE(executing_box_id, target_box_id)`, in both stores' `claim_run`, `queued_runs_on_box` and `queue_rows`, and in
+  `classify_entry` (`Elsewhere` names the driving box; `QueueRunFact` gains `driver_box_id`/`driver_hostname`).
+  `NewRun.executing_box_id` and `driver_of`: `enqueue` writes the driver only when the work runs on another box; a local
+  run keeps `NULL` and an enrolled one waits for its own worker (maintainer Q1, 2026-11-15). Enqueue and claim check tags,
+  and enqueue resolves rung 3, on the target box (D9); slots and overlap stay on the driver. Pg `claim_run` reads the
+  target box `FOR SHARE` after the claiming box when the two differ (maintainer, 2026-11-15; no writer locks a child
+  before its parent). `enqueue_with` reads the graph once and refuses the target before tags. No migration; conformance
+  `CASES` 350. Plan `.claude/plans/mod-130-m3-queue-keys-on-the-driver.plan.md`. Handed to MOD-44 (maintainer Q2): the
+  pre-enqueue tag filters (`ready_items`, `missing_tags`, `missing_tags_of`, the Backlog) and the walk-time box reads
+  stay on this box until a container run can start. Next: M4 (where a run runs is visible). Sandbox gate green but for
+  the known load flake above (alone 2/4, as at M2's base); `worker_crash_pg::a_cancel_picked_but_not_applied_survives_the_kill`
+  failed once under the gate's load and passed alone 5/5. Owed on the host: the merged-tree Postgres gate.
 - [ ] **MOD-131 - Driven targets: ssh and docker exec launch, MCP relay tunnel, remote bootstrap**
   (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; §8 accepted 2026-11-14). `R-ORCH-15`, `R-AGT-11`,
   `R-AGT-5`, `R-SEC-2`, `R-BOX-4`. The `TargetTransport` launch decorator under `TransportBuilder` for

@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-130-execution-targets.prd.md`
 **Selected Milestone**: 3 — The queue keys on the driver
 **Complexity**: Medium
-**Status**: in progress (planned 2026-11-15)
+**Status**: complete (`cf55f77f`..`d5030c43`, 2026-11-15); review fix round R1 applied (`9c53e272`, `d5030c43`); sandbox gate green but for the known load flake `cache::the_spawned_refresher_passes_and_follows_the_scope`.
 **Routing**: PRD path, ultracode for implement (C2, C4) (`/handoff-run` in the `hr/MOD-130` sandbox,
 2026-11-15). The plan runs without a confirm gate (handoff-run step 3). No architect: M3 adds no module
 seam. It re-keys four existing reads and one writer, and moves two checks to another box id.
@@ -639,9 +639,9 @@ Fact-check 2026-11-15 (handoff-run step 3.5): 23 verified, 8 amended (plan text 
 
 ## Acceptance
 
-- [ ] T0–T4 complete, each commit green on its own check
-- [ ] No existing claim, worker, queue or engine assertion edited (only count pins and mechanical literal fields)
-- [ ] Gate passes on the joined lanes
-- [ ] Reviewer (`rust-reviewer`) findings applied or deferred with the maintainer
-- [ ] PRD milestone 3 row updated; HANDOFF phase note written (Q1/Q2 outcome, and MOD-44's ownership of the
+- [x] T0–T4 complete, each commit green on its own check
+- [x] No existing claim, worker, queue or engine assertion edited (only count pins and mechanical literal fields; T3 added one `driver_hostname = None` statement beside the cleared `target_hostname` in `a_live_run_elsewhere_beats_everything`, assertions unchanged)
+- [x] Gate passes on the joined lanes
+- [x] Reviewer (`rust-reviewer`) findings applied or deferred with the maintainer
+- [x] PRD milestone 3 row updated; HANDOFF phase note written (Q1/Q2 outcome, and MOD-44's ownership of the
       pre-enqueue tag filters and the walk-time box reads); validator green
