@@ -54,9 +54,9 @@ WORKFLOW_SKIP_HOOK, --no-verify, pushing. Never kill cargo processes you did not
 Tests: run ONLY this task's check, not the workspace gate (the main thread runs the gate once for the lane):
   ${t.test}
 plus clippy and rustfmt on the crates you touched. \`--no-fail-fast\` goes BEFORE the \`--\`.
-In an hr sandbox (HR_SANDBOX=1 is set): never run a live Qdrant test (qdrant_live, qdrant_worker, live_qdrant_*;
-the sandbox Qdrant times out), and prefix every cargo command with \`env -u HTUI_TEST_QDRANT_URL\` so a filter that
-matches one returns early. Compile a new live test with \`--no-run\` only and report it as owed on the host.
+Live Qdrant tests (qdrant_live, qdrant_worker, live_qdrant_*) run in an hr sandbox too. Only if one fails with
+"create collection: ... Timeout expired" (a run whose Qdrant predates its tmpfs): stop running them, prefix every
+cargo command with \`env -u HTUI_TEST_QDRANT_URL\`, and report the live cases as owed on the host.
 Keep every single command under 4 minutes of wall time: a longer one must run in the background and be checked at
 intervals under 4 minutes, because an agent idle for 5 minutes pays to reload its whole context.
 Report every commit hash. Keep the report short: what changed, what is owed, nothing the diff already says.`
