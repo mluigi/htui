@@ -1525,7 +1525,9 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                 &BindingFacts {
                     key: SkillBindingKey {
                         skill: binding.skill_id,
+                        workspace: None,
                         project: Some(item.project_id),
+                        item_kind: None,
                         phase: binding.phase_id,
                     },
                     phase_project: Some(item.project_id),
@@ -1704,11 +1706,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
         let Some(&(_, phase)) = cloned.iter().find(|(old, _)| *old == source) else {
             continue;
         };
-        let key = SkillBindingKey {
-            skill: binding.skill_id,
-            project: Some(item.project_id),
-            phase: Some(phase),
-        };
+        let key = SkillBindingKey::phase(binding.skill_id, item.project_id, phase);
         let copy = BindingChange::Attach(Attachment::of(binding));
         if let CasOutcome::Stale(_) = store.set_skill_binding(key, None, copy).await? {
             // A fresh phase id has no row; a `Stale` here is a store bug, said rather than hidden.

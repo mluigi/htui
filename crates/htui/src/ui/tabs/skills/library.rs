@@ -2450,11 +2450,7 @@ mod tests {
         assert_eq!(
             (*written, *expected),
             (
-                SkillBindingKey {
-                    skill: ids::SKILL_RUST_STYLE,
-                    project: Some(ids::PROJECT_VULKAN),
-                    phase: None,
-                },
+                SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN),
                 None
             )
         );
@@ -2512,11 +2508,7 @@ mod tests {
         let mut view = LibraryView::default();
         let untouched = serve(&backend, &StoreRequest::Skills(scope.clone())).await;
         view.on_reply(&untouched, &mut ctx);
-        let written = SkillBindingKey {
-            skill: ids::SKILL_RUST_STYLE,
-            project: Some(ids::PROJECT_VULKAN),
-            phase: None,
-        };
+        let written = SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
 
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`).
         view.on_key(key(KeyCode::Char('a')), &mut ctx);
@@ -2827,11 +2819,7 @@ mod tests {
         let mut view = LibraryView::default();
         let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
         view.on_reply(&read, &mut ctx);
-        let written = SkillBindingKey {
-            skill: ids::SKILL_RUST_STYLE,
-            project: Some(ids::PROJECT_VULKAN),
-            phase: None,
-        };
+        let written = SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
 
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`);
         // `Space` twice while the save is in flight: `always` becomes `off`.

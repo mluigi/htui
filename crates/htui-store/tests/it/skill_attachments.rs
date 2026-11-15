@@ -137,7 +137,9 @@ fn mem_with(house: Option<SkillId>, attachments: &[Attachment]) -> MemStore {
         data.skill_bindings.push(SkillBinding {
             id: SkillBindingId::new(),
             skill_id,
+            workspace_id: None,
             project_id: *project_id,
+            item_kind_id: None,
             phase_id: *phase_id,
             pinned_version: None,
             position: *position,

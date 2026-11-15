@@ -22765,11 +22765,7 @@ mod tests {
             .expect("a new skill");
         let outcome = store
             .set_skill_binding(
-                SkillBindingKey {
-                    skill: skill.id,
-                    project: Some(ids::PROJECT_HTUI),
-                    phase: None,
-                },
+                SkillBindingKey::project(skill.id, ids::PROJECT_HTUI),
                 None,
                 BindingChange::Attach(Attachment {
                     pinned_version: None,
@@ -23689,11 +23685,7 @@ mod tests {
         };
         let global = store
             .set_skill_binding(
-                SkillBindingKey {
-                    skill: skill.id,
-                    project: None,
-                    phase: None,
-                },
+                SkillBindingKey::global(skill.id),
                 None,
                 attach(Activation::Always),
             )
@@ -23702,11 +23694,7 @@ mod tests {
         assert!(matches!(global, CasOutcome::Applied(Some(_))), "{global:?}");
         let off = store
             .set_skill_binding(
-                SkillBindingKey {
-                    skill: skill.id,
-                    project: Some(ids::PROJECT_HTUI),
-                    phase: Some(ids::PHASE_HTUI_IMPLEMENT),
-                },
+                SkillBindingKey::phase(skill.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
                 None,
                 attach(Activation::Off),
             )

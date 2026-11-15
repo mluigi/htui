@@ -707,11 +707,7 @@ async fn the_winning_row_is_starred_per_project() {
 
     set_binding(
         &store,
-        SkillBindingKey {
-            skill: ids::SKILL_RUST_STYLE,
-            project: None,
-            phase: None,
-        },
+        SkillBindingKey::global(ids::SKILL_RUST_STYLE),
         None,
         BindingChange::Attach(always()),
     )

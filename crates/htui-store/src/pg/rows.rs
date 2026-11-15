@@ -271,6 +271,52 @@ impl UpstreamRow {
     }
 }
 
+/// The `skill_binding` columns the table had before MOD-127 M1 (no workspace, no item kind), as
+/// the queries that still select them return them. T2's migration and SQL rewrite replace this
+/// with the full row and delete it.
+#[derive(Debug, Clone)]
+pub(crate) struct SkillBindingColumns {
+    /// `skill_binding.id`.
+    pub(crate) id: SkillBindingId,
+    /// `skill_binding.skill_id`.
+    pub(crate) skill_id: SkillId,
+    /// `skill_binding.project_id`.
+    pub(crate) project_id: Option<ProjectId>,
+    /// `skill_binding.phase_id`.
+    pub(crate) phase_id: Option<PhaseId>,
+    /// `skill_binding.pinned_version`.
+    pub(crate) pinned_version: Option<i32>,
+    /// `skill_binding.position`.
+    pub(crate) position: i32,
+    /// `skill_binding.activation`.
+    pub(crate) activation: Activation,
+    /// `skill_binding.globs`.
+    pub(crate) globs: Vec<String>,
+    /// `skill_binding.languages`.
+    pub(crate) languages: Vec<String>,
+    /// `skill_binding.updated_at`.
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+impl From<SkillBindingColumns> for SkillBinding {
+    fn from(row: SkillBindingColumns) -> Self {
+        Self {
+            id: row.id,
+            skill_id: row.skill_id,
+            workspace_id: None,
+            project_id: row.project_id,
+            item_kind_id: None,
+            phase_id: row.phase_id,
+            pinned_version: row.pinned_version,
+            position: row.position,
+            activation: row.activation,
+            globs: row.globs,
+            languages: row.languages,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
 /// One `skill_binding` row with `skill.name` joined: one attachment
 /// [`PgStore::bound_skills`](crate::PgStore::bound_skills) hands to
 /// `htui_core::model::skill::resolve`.
@@ -312,7 +358,9 @@ impl SkillBindingRow {
             SkillBinding {
                 id: self.id,
                 skill_id: self.skill_id,
+                workspace_id: None,
                 project_id: self.project_id,
+                item_kind_id: None,
                 phase_id: self.phase_id,
                 pinned_version: self.pinned_version,
                 position: self.position,

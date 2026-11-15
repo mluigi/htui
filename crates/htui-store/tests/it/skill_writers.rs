@@ -137,11 +137,7 @@ async fn two_attaches_of_one_key_write_one_row() {
     let Some(db) = common::demo_db().await else {
         return; // `common` printed the skip line already (plan D13).
     };
-    let key = SkillBindingKey {
-        skill: ids::SKILL_TESTS,
-        project: None,
-        phase: None,
-    };
+    let key = SkillBindingKey::global(ids::SKILL_TESTS);
 
     // The winner: a global attachment of `tests`, not committed yet.
     let winner_id = SkillBindingId::new();

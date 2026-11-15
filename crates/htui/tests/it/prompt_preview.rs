@@ -357,11 +357,7 @@ async fn the_preview_fires_a_glob_skill_over_repo_box_path() {
         .expect("a new skill");
     let outcome = store
         .set_skill_binding(
-            SkillBindingKey {
-                skill: skill.id,
-                project: Some(ids::PROJECT_HTUI),
-                phase: None,
-            },
+            SkillBindingKey::project(skill.id, ids::PROJECT_HTUI),
             None,
             BindingChange::Attach(Attachment {
                 pinned_version: None,

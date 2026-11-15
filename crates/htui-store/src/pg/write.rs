@@ -125,7 +125,7 @@ use uuid::Uuid;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
 use crate::pg::read::{StepGraphRow, graph_body_on, graph_edges_on, phase_parts_on, phase_rows_on};
-use crate::pg::rows::{MemoryEntryRow, PersonaRow};
+use crate::pg::rows::{MemoryEntryRow, PersonaRow, SkillBindingColumns};
 use htui_core::model::{
     CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemoryEvidence, MemorySource, NewRunMemory, RunMemoryWrite,
 };
@@ -6889,7 +6889,7 @@ impl WriteStore for PgStore {
 
         let written = match &current {
             None => sqlx::query_as!(
-                SkillBinding,
+                SkillBindingColumns,
                 r#"
                 INSERT INTO skill_binding
                        (id, skill_id, project_id, phase_id, pinned_version, position, activation,
@@ -6919,9 +6919,10 @@ impl WriteStore for PgStore {
             )
             .fetch_optional(&self.pool)
             .await
-            .map_err(map_sqlx)?,
+            .map_err(map_sqlx)?
+            .map(SkillBinding::from),
             Some(row) => sqlx::query_as!(
-                SkillBinding,
+                SkillBindingColumns,
                 r#"
                 UPDATE skill_binding SET
                     pinned_version = $3,
@@ -6951,7 +6952,8 @@ impl WriteStore for PgStore {
             )
             .fetch_optional(&self.pool)
             .await
-            .map_err(map_sqlx)?,
+            .map_err(map_sqlx)?
+            .map(SkillBinding::from),
         };
         match written {
             Some(row) => Ok(CasOutcome::Applied(Some(row))),

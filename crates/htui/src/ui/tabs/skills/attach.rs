@@ -758,9 +758,9 @@ impl AttachPane {
             }
         };
         SkillBindingKey {
-            skill: self.skill,
             project,
             phase,
+            ..SkillBindingKey::global(self.skill)
         }
     }
 
@@ -980,6 +980,9 @@ impl AttachPane {
                     (SkillLevel::Project, _) => ARow::Project { p },
                     (SkillLevel::Phase, Some((g, i, _))) => ARow::Phase { p, g, i },
                     (SkillLevel::Phase, None) => continue,
+                    // No pane row writes at these levels yet (MOD-127 M1 T4 adds them), so no
+                    // winner can sit there.
+                    (SkillLevel::Workspace | SkillLevel::ItemKind, _) => continue,
                 };
                 if !winners.contains(&row) {
                     winners.push(row);
@@ -1292,11 +1295,7 @@ mod tests {
     /// A form over the global row, focus on the activation.
     fn activation_form(activation: Activation) -> Form {
         Form {
-            key: SkillBindingKey {
-                skill: SkillId::new(),
-                project: None,
-                phase: None,
-            },
+            key: SkillBindingKey::global(SkillId::new()),
             target: "global".to_owned(),
             token: None,
             activation,

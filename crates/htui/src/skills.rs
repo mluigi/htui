@@ -604,11 +604,11 @@ mod tests {
 
     /// The demo's phase-level attachment: `rust-style` on `htui`'s `implement` phase.
     fn demo_phase_key() -> SkillBindingKey {
-        SkillBindingKey {
-            skill: ids::SKILL_RUST_STYLE,
-            project: Some(ids::PROJECT_HTUI),
-            phase: Some(ids::PHASE_HTUI_IMPLEMENT),
-        }
+        SkillBindingKey::phase(
+            ids::SKILL_RUST_STYLE,
+            ids::PROJECT_HTUI,
+            ids::PHASE_HTUI_IMPLEMENT,
+        )
     }
 
     /// F-K: the demo with one override graph on `htui` and repo `core`, so the snapshot has an
@@ -870,11 +870,7 @@ mod tests {
             }
         );
 
-        let key = SkillBindingKey {
-            skill: id,
-            project: None,
-            phase: None,
-        };
+        let key = SkillBindingKey::global(id);
         let (attached, outcome) = applied(
             &backend,
             &bind(&scope, key, None, BindingChange::Attach(always())),

@@ -338,7 +338,9 @@ pub const fn activation(activation: Activation) -> &'static str {
 pub const fn skill_level(level: SkillLevel) -> &'static str {
     match level {
         SkillLevel::Global => "global",
+        SkillLevel::Workspace => "workspace",
         SkillLevel::Project => "project",
+        SkillLevel::ItemKind => "item kind",
         SkillLevel::Phase => "phase",
     }
 }
@@ -380,14 +382,21 @@ mod tests {
 
     /// `SkillLevel` is a plain enum without a generated `ALL`, so this list is by hand, checked
     /// against [`skill_level_after`] as [`BUDGET_SOURCES`] is.
-    const SKILL_LEVELS: [SkillLevel; 3] =
-        [SkillLevel::Global, SkillLevel::Project, SkillLevel::Phase];
+    const SKILL_LEVELS: [SkillLevel; 5] = [
+        SkillLevel::Global,
+        SkillLevel::Workspace,
+        SkillLevel::Project,
+        SkillLevel::ItemKind,
+        SkillLevel::Phase,
+    ];
 
     /// The level after `level`, in specificity order; a new variant needs an arm here.
     const fn skill_level_after(level: SkillLevel) -> Option<SkillLevel> {
         match level {
-            SkillLevel::Global => Some(SkillLevel::Project),
-            SkillLevel::Project => Some(SkillLevel::Phase),
+            SkillLevel::Global => Some(SkillLevel::Workspace),
+            SkillLevel::Workspace => Some(SkillLevel::Project),
+            SkillLevel::Project => Some(SkillLevel::ItemKind),
+            SkillLevel::ItemKind => Some(SkillLevel::Phase),
             SkillLevel::Phase => None,
         }
     }
@@ -831,7 +840,7 @@ mod tests {
         );
         assert_eq!(
             labels(&words(&SKILL_LEVELS, SkillLevel::as_str, skill_level)),
-            ["global", "project", "phase"]
+            ["global", "workspace", "project", "item kind", "phase"]
         );
     }
 
