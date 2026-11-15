@@ -3957,6 +3957,11 @@ where
                     "integration landed: repo `{repo}` {target} at {}",
                     land::short_hash(hash)
                 ),
+                LandOutcome::Pushed { hash } => format!(
+                    "integration pushed: repo `{repo}` run branch `the run branch` at {}; its \
+                     pull request against {target} waits for MOD-134",
+                    land::short_hash(hash)
+                ),
                 LandOutcome::Refused { reason } => format!(
                     "integration refused for repo `{repo}` ({} to {target}): {reason}; the run's \
                      work has not landed",

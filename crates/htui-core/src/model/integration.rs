@@ -22,7 +22,11 @@ str_enum!(
         Local => "local",
         /// The executing box fast-forwards the remote's target branch with its own credentials.
         Push => "push",
-        /// A run branch is pushed and a pull request opened (MOD-133 milestone 3, MOD-134).
+        /// The run's steps reconcile into a run branch ([`run_branch_name`]) in the primary
+        /// repository instead of its checked-out branch; after `done` the executing box pushes
+        /// that branch (never forced) and the record stays `pending` with the pushed head in
+        /// `landed_hash` (MOD-133 milestone 3). The pull request against the target branch waits
+        /// for the forge adapter (MOD-134).
         PullRequest => "pull_request",
     }
 );
@@ -127,7 +131,8 @@ pub struct Integration {
     pub state: IntegrationState,
     /// `integration.refusal`: the typed reason, `Some` exactly when `state` is `refused`.
     pub refusal: Option<String>,
-    /// `integration.landed_hash`: the target branch's tip the landing pushed (or found there).
+    /// `integration.landed_hash`: the target branch's tip the landing pushed (or found there);
+    /// for a `pull_request` record, the run branch's pushed head ([`LandOutcome::Pushed`]).
     pub landed_hash: Option<String>,
     /// `integration.pr_ref` (MOD-134).
     pub pr_ref: Option<String>,
@@ -139,6 +144,37 @@ pub struct Integration {
     pub updated_at: DateTime<Utc>,
 }
 
+/// MOD-133 M3 D1: the run branch a `pull_request` run of the item keyed `key` reconciles into
+/// and pushes: `htui/item/<key>`. It cannot collide with the `htui/<step-uuid>` step labels. Two
+/// projects that share one checkout and have equal item keys share the branch, which is accepted.
+///
+/// A guard only: real keys (an uppercase prefix, a dash and a number) always pass.
+///
+/// # Errors
+/// Why `key` makes no branch name: it is empty, holds a character outside `[A-Za-z0-9._-]`, holds
+/// `..`, starts or ends with `.`, or ends with `.lock` (the last three are what `git
+/// check-ref-format` refuses of a ref component).
+pub fn run_branch_name(key: &str) -> Result<String, String> {
+    if key.is_empty() {
+        return Err("an empty item key makes no branch name".to_owned());
+    }
+    if let Some(bad) = key
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Err(format!(
+            "item key `{key}` holds `{bad}`, which a branch name does not allow"
+        ));
+    }
+    if key.contains("..") || key.starts_with('.') || key.ends_with('.') || key.ends_with(".lock") {
+        return Err(format!(
+            "item key `{key}` holds `..`, starts or ends with `.`, or ends with `.lock`, which a \
+             branch name does not allow"
+        ));
+    }
+    Ok(format!("htui/item/{key}"))
+}
+
 /// What landing one [`Integration`] answered (MOD-133 D6, D8), settled by
 /// [`WriteStore::settle_integration`](crate::store::WriteStore::settle_integration).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +182,14 @@ pub enum LandOutcome {
     /// The remote's target branch is at `hash`: `pending -> landed`.
     Landed {
         /// The target branch's tip, `integration.landed_hash`.
+        hash: String,
+    },
+    /// MOD-133 M3 D5: a `pull_request` record's run branch is on the remote at `hash`. The record
+    /// stays `pending` with `landed_hash` set, so it is not landed (its dependents keep waiting)
+    /// and no sweep takes it again until MOD-134 opens the pull request. Settling it on a record
+    /// whose mode is not [`IntegrateMode::PullRequest`] answers `false`.
+    Pushed {
+        /// The run branch's pushed head, `integration.landed_hash`.
         hash: String,
     },
     /// Landing was refused: `pending -> refused`.
@@ -159,7 +203,41 @@ pub enum LandOutcome {
 mod tests {
     use serde_json::json;
 
-    use super::{IntegrateMode, IntegrationState};
+    use super::{IntegrateMode, IntegrationState, run_branch_name};
+
+    /// MOD-133 M3 D1: a real item key is its run branch's last component.
+    #[test]
+    fn run_branch_name_accepts_real_keys() {
+        for (key, branch) in [
+            ("MOD-7", "htui/item/MOD-7"),
+            ("AB12-300", "htui/item/AB12-300"),
+            ("a.b_c-9", "htui/item/a.b_c-9"),
+        ] {
+            assert_eq!(run_branch_name(key).as_deref(), Ok(branch), "{key}");
+        }
+    }
+
+    /// MOD-133 M3 D1: a key that would not make a branch name is refused, never mangled.
+    #[test]
+    fn run_branch_name_refuses_what_is_not_a_branch_name() {
+        for key in [
+            "a/b",
+            "a..b",
+            "a b",
+            "a@{b",
+            "",
+            ".hidden",
+            "trailing.",
+            "x.lock",
+            "a~1",
+            "a^",
+            "a:b",
+            "a\\b",
+            "é",
+        ] {
+            assert!(run_branch_name(key).is_err(), "{key:?} is refused");
+        }
+    }
 
     /// MOD-133 D2: absent and `null` are `local`; each wire name is its mode.
     #[test]

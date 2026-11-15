@@ -185,6 +185,7 @@ impl Harness {
                 mode: IntegrateMode::Push,
                 remote: REMOTE.to_owned(),
                 target_branch: "main".to_owned(),
+                run_branch: None,
             },
         );
         let at = Utc::now();

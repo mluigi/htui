@@ -8848,7 +8848,8 @@ impl State {
         }
     }
 
-    /// MOD-133 D6: leases every takeable `pending` record of a run executing on `box_id`.
+    /// MOD-133 D6: leases every takeable `pending` record of a run executing on `box_id`; a
+    /// pushed `pull_request` record (M3 D5: `landed_hash` set) waits for MOD-134 and is skipped.
     fn take_integrations(
         &mut self,
         box_id: BoxId,
@@ -8867,6 +8868,8 @@ impl State {
             .iter()
             .filter(|((id, _), record)| {
                 record.row.state == IntegrationState::Pending
+                    && !(record.row.mode == IntegrateMode::PullRequest
+                        && record.row.landed_hash.is_some())
                     && run.is_none_or(|wanted| wanted == *id)
                     && (record.lease_owner.is_none_or(|held| held == owner)
                         || record.lease_expires_at.is_none_or(|until| until <= now))
@@ -8887,7 +8890,8 @@ impl State {
             .collect()
     }
 
-    /// MOD-133 D6: settles `owner`'s `pending` record; `false` writes nothing.
+    /// MOD-133 D6: settles `owner`'s `pending` record; `false` writes nothing. M3 D5: `Pushed`
+    /// settles a `pull_request` record only, and keeps it `pending`.
     fn settle_integration(
         &mut self,
         run: RunId,
@@ -8902,9 +8906,17 @@ impl State {
         if record.row.state != IntegrationState::Pending || record.lease_owner != Some(owner) {
             return false;
         }
+        if matches!(outcome, LandOutcome::Pushed { .. })
+            && record.row.mode != IntegrateMode::PullRequest
+        {
+            return false;
+        }
         match outcome {
             LandOutcome::Landed { hash } => {
                 record.row.state = IntegrationState::Landed;
+                record.row.landed_hash = Some(hash.clone());
+            }
+            LandOutcome::Pushed { hash } => {
                 record.row.landed_hash = Some(hash.clone());
             }
             LandOutcome::Refused { reason } => {

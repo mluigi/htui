@@ -579,6 +579,7 @@ async fn frozen_integrate<S: htui_core::store::WorkerStore>(
                 mode,
                 remote: remote.to_owned(),
                 target_branch: repo.default_branch.clone(),
+                run_branch: None,
             },
         );
     }
