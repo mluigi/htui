@@ -1226,9 +1226,9 @@ pub const LOGS_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
-/// The Workspaces tab (MOD-116 M1 D10): its own verbs (open, and MOD-116 M2 D6's stop and
-/// resume), every list act (the moves and the fold), the pane scroll, then the layout and history
-/// layers of a list + detail tab.
+/// The Workspaces tab (MOD-116 M1 D10): its own verbs (open, MOD-116 M2 D6's stop and resume,
+/// M3 D1's new), every list act (the moves and the fold), the pane scroll, then the layout and
+/// history layers of a list + detail tab.
 pub const WORKSPACES_BROWSE: Stack<'static> = Stack::new(&[
     Layer::view(
         Context::Workspaces,
@@ -1236,6 +1236,7 @@ pub const WORKSPACES_BROWSE: Stack<'static> = Stack::new(&[
             Act::WorkspacesOpen,
             Act::WorkspacesStop,
             Act::WorkspacesResume,
+            Act::WorkspacesNew,
         ],
     ),
     LIST_ALL,
@@ -1243,6 +1244,22 @@ pub const WORKSPACES_BROWSE: Stack<'static> = Stack::new(&[
     LAYOUT,
     HISTORY,
     GLOBAL,
+]);
+
+/// The Workspaces tab's chooser (MOD-116 M3 D1, D14): `j`/`k` move, `y` (or `Enter`, the
+/// `[workspaces]` view default) chooses, `n`/`Esc` closes.
+pub const WORKSPACES_PICK: Stack<'static> =
+    Stack::new(&[Layer::view(Context::Workspaces, &[]), CONFIRM, LIST, MODAL]);
+
+/// The Workspaces tab's forms (MOD-116 M3 D14): the focused field first, the source choice's
+/// `h`/`l`, then the form's own `Tab`/`Down` moves (`ITEM_FORM`'s shape, with no save chord and
+/// no external editor).
+pub const WORKSPACES_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Workspaces, &[]),
+    FIELD,
+    PICK,
+    FORM_FIELDS,
+    MODAL,
 ]);
 
 /// The shell's activity panel while it holds the keys (MOD-122 M3 D10): its own verbs, the
@@ -1381,6 +1398,8 @@ mod tests {
         source!("ui/tabs/chat/mod.rs"),
         source!("ui/tabs/logs/mod.rs"),
         source!("ui/tabs/workspaces/mod.rs"),
+        source!("ui/tabs/workspaces/chooser.rs"),
+        source!("ui/tabs/workspaces/forms.rs"),
         source!("ui/shell/activity.rs"),
     ];
 
@@ -1534,6 +1553,8 @@ mod tests {
         LOGS_BROWSE,
         WORKSPACES_BROWSE,
         WORKSPACES_CONFIRM,
+        WORKSPACES_PICK,
+        WORKSPACES_FORM,
         ACTIVITY_BROWSE,
         QUEUE_OVERLAY,
         HIERARCHY_PICKER,
@@ -1998,6 +2019,28 @@ mod tests {
         assert_eq!(resolve(WORKSPACES_CONFIRM, "n"), [Act::ConfirmNo]);
         assert_eq!(resolve(WORKSPACES_CONFIRM, "esc"), [Act::ConfirmNo]);
         assert_eq!(resolve(WORKSPACES_CONFIRM, "j"), []);
+        // MOD-116 M3 D14: `N` opens the chooser, which moves on `j`/`k` and answers
+        // `y`/`enter` and `n`/`esc`; the forms capture text, `tab`/`down` move, `h`/`l` cycle
+        // the source and `enter` submits.
+        assert_eq!(resolve(WORKSPACES_BROWSE, "N"), [Act::WorkspacesNew]);
+        assert_eq!(resolve(WORKSPACES_PICK, "j"), [Act::ListDown]);
+        assert_eq!(resolve(WORKSPACES_PICK, "k"), [Act::ListUp]);
+        assert_eq!(resolve(WORKSPACES_PICK, "enter"), [Act::ConfirmYes]);
+        assert_eq!(resolve(WORKSPACES_PICK, "y"), [Act::ConfirmYes]);
+        assert_eq!(resolve(WORKSPACES_PICK, "esc"), [Act::ConfirmNo]);
+        assert_eq!(resolve(WORKSPACES_PICK, "n"), [Act::ConfirmNo]);
+        assert_eq!(resolve(WORKSPACES_PICK, "q"), []);
+        assert_eq!(resolve(WORKSPACES_FORM, "tab"), [Act::FormNextField]);
+        assert_eq!(
+            resolve(WORKSPACES_FORM, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(WORKSPACES_FORM, "l"), [Act::ChoiceNext]);
+        assert_eq!(resolve(WORKSPACES_FORM, "h"), [Act::ChoicePrev]);
+        assert_eq!(resolve(WORKSPACES_FORM, "enter"), [Act::FieldSubmit]);
+        assert_eq!(resolve(WORKSPACES_FORM, "esc"), [Act::FieldCancel]);
+        assert_eq!(resolve(WORKSPACES_FORM, "q"), []);
+        assert_eq!(resolve(WORKSPACES_FORM, "f1"), [Act::Help]);
         // MOD-122 M3 D10: the activity panel's `enter` and `f` are its own (no `list.fold`, no
         // `backlog` layer), its `G` is `list.bottom` (F8), and it has no pane scroll.
         assert_eq!(resolve(ACTIVITY_BROWSE, "enter"), [Act::ActivityOpen]);
@@ -2196,6 +2239,7 @@ mod tests {
                 "NOTES_COMPOSE",
                 "BACKLOG_FILTER",
                 "ITEM_FORM",
+                "WORKSPACES_FORM",
             ]
         );
         for &(phrase, stack) in DECLARED {
@@ -2277,8 +2321,9 @@ mod tests {
         // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
         // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94; MOD-122
         // M3 D10: the activity panel's, 95; MOD-116 M1 D10: the Workspaces tab's took the retired
-        // switcher's place, still 95; MOD-116 M2 D6: its question's, 96.
-        assert_eq!(views.len(), 96);
+        // switcher's place, still 95; MOD-116 M2 D6: its question's, 96; MOD-116 M3 D14: its
+        // chooser's and forms', 98.
+        assert_eq!(views.len(), 98);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

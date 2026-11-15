@@ -220,15 +220,18 @@ close = []  # close; Esc always"#;
             "{printed}"
         );
         // MOD-116 M1 D10: `[workspaces]` sits where the retired `[switcher]` did; M2 D6 adds
-        // stop, resume and the question's `enter`.
+        // stop, resume and the question's `enter`; M3 D14 new and the forms' `down`/`up`.
         assert!(
             printed.contains("[concepts]")
                 && printed.contains(
                     "\n[workspaces]\n\
-                     open   = [\"o\"]           # open workspace\n\
-                     stop   = [\"s\"]           # stop runs\n\
-                     resume = [\"r\"]           # resume runs\n\
-                     yes    = [\"y\", \"enter\"]  # yes\n\
+                     open       = [\"o\"]              # open workspace\n\
+                     stop       = [\"s\"]              # stop runs\n\
+                     resume     = [\"r\"]              # resume runs\n\
+                     new        = [\"N\"]              # new workspace or project\n\
+                     yes        = [\"y\", \"enter\"]     # yes\n\
+                     next_field = [\"tab\", \"down\"]    # next field\n\
+                     prev_field = [\"backtab\", \"up\"]  # previous field\n\
                      \n[migration]\n"
                 )
                 && !printed.contains("[switcher]"),

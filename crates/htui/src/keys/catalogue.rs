@@ -617,6 +617,9 @@ pub enum Act {
     WorkspacesStop,
     /// `workspaces.resume`: resume the selected workspace's stopped runs (MOD-116 M2 D6).
     WorkspacesResume,
+    /// `workspaces.new`: create a workspace, or a project in the selected row's workspace
+    /// (MOD-116 M3 D1).
+    WorkspacesNew,
     /// `waiting.open`: open the selected waiting step.
     WaitingOpen,
     /// `skills.switch_view`: toggle between the Library and Templates views.
@@ -1824,6 +1827,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["r"],
         "resume runs",
     ),
+    // MOD-116 M3 D1: ui/tabs/workspaces/mod.rs: on_key, the chooser or the workspace form.
+    row(
+        Act::WorkspacesNew,
+        Workspaces,
+        "new",
+        &["N"],
+        "new workspace or project",
+    ),
     // [waiting]
     // waiting_list.rs:284.
     row(Act::WaitingOpen, Waiting, "open", &["enter"], "open step"),
@@ -2640,6 +2651,9 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
     // MOD-116 M2 D6: ui/tabs/workspaces/mod.rs: on_key: `Enter` answers a stop or resume
     // question yes, as `y` does.
     (Workspaces, Act::ConfirmYes, &["enter"]),
+    // MOD-116 M3 D14: the tab's forms move on `Down`/`Up`, as every Settings form does.
+    (Workspaces, Act::FormNextField, &["down"]),
+    (Workspaces, Act::FormPrevField, &["up"]),
     // migration_prompt.rs:92, :97: the capitals answer too.
     (Context::Migration, Act::ConfirmYes, &["Y"]),
     (Context::Migration, Act::ConfirmNo, &["N"]),
@@ -3120,6 +3134,7 @@ mod tests {
         Act::WorkspacesStop,
         Act::WorkspacesResume,
         Act::LeaveStop,
+        Act::WorkspacesNew,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3381,6 +3396,7 @@ mod tests {
             Act::WorkspacesStop => 252,
             Act::WorkspacesResume => 253,
             Act::LeaveStop => 254,
+            Act::WorkspacesNew => 255,
         }
     }
 
@@ -3419,7 +3435,8 @@ mod tests {
         // MOD-122 M3 D10: `activity.open` and `activity.filter`, 252.
         // MOD-116 M1 D10: `workspaces.open` took the retired `switcher.switch`'s row, still 252.
         // MOD-116 M2 D10: `workspaces.stop` and `workspaces.resume`, 254; `leave.stop`, 255.
-        assert_eq!(CATALOGUE.len(), 255);
+        // MOD-116 M3 D14: `workspaces.new`, 256.
+        assert_eq!(CATALOGUE.len(), 256);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {

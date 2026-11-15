@@ -89,13 +89,14 @@ const LOGS: About = About {
     ],
 };
 
-/// The Workspaces tab (MOD-116 M1; M2 D6 stops and resumes).
+/// The Workspaces tab (MOD-116 M1; M2 D6 stops and resumes; M3 D1 creates).
 const WORKSPACES: About = About {
     purpose: "Every workspace and what it is doing: open one; the others keep running in the background.",
     actions: &[
         (Act::WorkspacesOpen, "open"),
         (Act::WorkspacesStop, "stop"),
         (Act::WorkspacesResume, "resume"),
+        (Act::WorkspacesNew, "new"),
         (Act::ListFold, "fold"),
     ],
 };

@@ -387,6 +387,10 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     // MOD-116 M2 D6: the Workspaces tab's stop or resume question, appended so every
     // first-reported phrase is unchanged.
     ("in a Workspaces question", views::WORKSPACES_CONFIRM),
+    // MOD-116 M3 D14: the Workspaces tab's chooser and forms, appended so every first-reported
+    // phrase is unchanged.
+    ("in a Workspaces picker", views::WORKSPACES_PICK),
+    ("in a Workspaces form", views::WORKSPACES_FORM),
 ];
 
 impl Keys {
@@ -483,7 +487,8 @@ mod tests {
         // MOD-147 M3 D9: the owner documents pane's three; MOD-122 M3 D10: the activity panel.
         // MOD-116 M1 D10: the Workspaces tab's took the retired switcher's slot, still 102.
         // MOD-116 M2 D6: the Workspaces tab's question, 103.
-        assert_eq!(DECLARED.len(), 103);
+        // MOD-116 M3 D14: its chooser and forms, 105.
+        assert_eq!(DECLARED.len(), 105);
         assert_eq!(
             DECLARED[101],
             ("in the activity panel", views::ACTIVITY_BROWSE)
@@ -491,6 +496,14 @@ mod tests {
         assert_eq!(
             DECLARED[102],
             ("in a Workspaces question", views::WORKSPACES_CONFIRM)
+        );
+        assert_eq!(
+            DECLARED[103],
+            ("in a Workspaces picker", views::WORKSPACES_PICK)
+        );
+        assert_eq!(
+            DECLARED[104],
+            ("in a Workspaces form", views::WORKSPACES_FORM)
         );
         assert_eq!(
             DECLARED

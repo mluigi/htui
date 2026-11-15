@@ -215,10 +215,13 @@ down      = ["down"]    # next hit
 why       = ["ctrl-e"]  # why search is unavailable
 
 [workspaces]
-open   = ["o"]           # open workspace
-stop   = ["s"]           # stop runs
-resume = ["r"]           # resume runs
-yes    = ["y", "enter"]  # yes
+open       = ["o"]              # open workspace
+stop       = ["s"]              # stop runs
+resume     = ["r"]              # resume runs
+new        = ["N"]              # new workspace or project
+yes        = ["y", "enter"]     # yes
+next_field = ["tab", "down"]    # next field
+prev_field = ["backtab", "up"]  # previous field
 
 [migration]
 yes = ["y", "Y"]  # yes

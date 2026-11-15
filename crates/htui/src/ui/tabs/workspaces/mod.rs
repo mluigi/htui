@@ -32,17 +32,31 @@
 //! state carries its stop (`● open · 1 running · stopping…`, D7); the hint row offers what the
 //! selected workspace's state allows (D8). Offline the detail shows no state the counts cannot
 //! vouch for, and no Runs section (D7).
+//!
+//! MOD-116 M3 (`R-TUI-14`, `R-ENT-2`): `N` ([`Act::WorkspacesNew`]) opens a chooser over the tab,
+//! `workspace` or `project in <name>` for the selected row's workspace (D1), or the workspace form
+//! at once when none is listed. Each form takes the detail pane's place (the list's, when the
+//! layout hides the detail) and previews what it writes; paths are shown under `~` and sent
+//! absolute (D3), and the worker (`crate::workspace_setup`) does every disk step. A new
+//! workspace is listed stopped and not opened, unless the shell's scope names none the tab lists
+//! (D4); a new project is listed and selected, and the open workspace's scope follows the list
+//! (D11). A clone may take minutes: the form counts the seconds, `Esc` closes it while the
+//! request finishes, and the outcome is told then (D7, D13).
 
+mod chooser;
+mod forms;
 mod overview;
 mod question;
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use core::cell::Cell;
 use crossterm::event::KeyEvent;
 use htui_core::model::{
-    ProjectId, RunStatus, Scope, StopMode, WorkspaceId, WorkspaceLifecycle, WorkspaceRunCounts,
-    WorkspaceStop, WorkspaceSummary,
+    ProjectId, ProjectRef, RunStatus, Scope, StopMode, WorkspaceId, WorkspaceLifecycle,
+    WorkspaceRunCounts, WorkspaceStop, WorkspaceSummary,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -63,7 +77,10 @@ use crate::ui::kit::pane::{Focus, Pane};
 use crate::ui::kit::scroll::{Scroll, Step, window};
 use crate::ui::shell::{PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
+use crate::workspace_setup;
 use crate::workspaces::WorkspaceOverview;
+use chooser::{ChoiceRow, Chooser, ChooserOutcome};
+use forms::{FormOutcome, ProjectForm, WorkspaceForm, shown};
 
 /// The Workspaces tab's default layout: the shell's list + detail default.
 pub const WORKSPACES_LAYOUT: TabLayout = TabLayout::DEFAULT;
@@ -81,9 +98,53 @@ const STOP_WORKSPACES: &str = "stop_workspaces";
 /// [`StoreRequest::ResumeWorkspace`]'s name, whose refusal the tab tells in its box (D6).
 const RESUME_WORKSPACE: &str = "resume_workspace";
 
+/// [`StoreRequest::NewWorkspace`]'s name (MOD-116 M3 D15).
+const NEW_WORKSPACE: &str = workspace_setup::REQUEST_NAMES[0];
+
+/// [`StoreRequest::NewProject`]'s name (MOD-116 M3 D15).
+const NEW_PROJECT: &str = workspace_setup::REQUEST_NAMES[2];
+
+/// The chooser's title (MOD-116 M3 D1).
+const NEW_TITLE: &str = "New";
+
+/// The workspace form's title, and its told boxes'.
+const NEW_WORKSPACE_TITLE: &str = "New workspace";
+
+/// A told box about a project being created (D7, D13).
+const NEW_PROJECT_TITLE: &str = "New project";
+
+/// `N` → project while one is out (D7: the shell's staleness gate would drop the first reply).
+const STILL_CREATING: &str = "a project is still being created";
+
+/// `Esc` while a project is out (D7).
+const TOLD_WHEN_IT_LANDS: &str = "the project is still being created; you are told when it lands";
+
+/// The chooser's keys on its border (D1).
+const CHOOSER_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::ConfirmYes, "choose"),
+    Hint::One(Act::ConfirmNo, "close"),
+];
+
+/// The workspace form's keys on its pane's border.
+const WORKSPACE_FORM_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "create"),
+    Hint::One(Act::FieldCancel, "cancel"),
+    Hint::One(Act::FormNextField, "field"),
+];
+
+/// The project form's keys on its pane's border: the workspace form's and the source choice's.
+const PROJECT_FORM_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "create"),
+    Hint::One(Act::FieldCancel, "cancel"),
+    Hint::One(Act::FormNextField, "field"),
+    Hint::Pair(Act::ChoicePrev, Act::ChoiceNext, "source"),
+];
+
 /// The hint row of a workspace with nothing to stop or resume (M1's).
 const HINT_IDLE: HintSpec = &[
     Hint::One(Act::WorkspacesOpen, "open"),
+    Hint::One(Act::WorkspacesNew, "new"),
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::ListFold, "fold"),
 ];
@@ -92,6 +153,7 @@ const HINT_IDLE: HintSpec = &[
 const HINT_STOP: HintSpec = &[
     Hint::One(Act::WorkspacesOpen, "open"),
     Hint::One(Act::WorkspacesStop, "stop"),
+    Hint::One(Act::WorkspacesNew, "new"),
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::ListFold, "fold"),
 ];
@@ -101,6 +163,7 @@ const HINT_FORCE: HintSpec = &[
     Hint::One(Act::WorkspacesOpen, "open"),
     Hint::One(Act::WorkspacesStop, "force stop"),
     Hint::One(Act::WorkspacesResume, "resume"),
+    Hint::One(Act::WorkspacesNew, "new"),
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::ListFold, "fold"),
 ];
@@ -109,6 +172,7 @@ const HINT_FORCE: HintSpec = &[
 const HINT_RESUME: HintSpec = &[
     Hint::One(Act::WorkspacesOpen, "open"),
     Hint::One(Act::WorkspacesResume, "resume"),
+    Hint::One(Act::WorkspacesNew, "new"),
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::ListFold, "fold"),
 ];
@@ -280,6 +344,36 @@ enum Question {
     },
 }
 
+/// What `N`'s chooser offers (MOD-116 M3 D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewWhat {
+    /// A new workspace.
+    Workspace,
+    /// A new project in this workspace.
+    Project(WorkspaceId),
+}
+
+/// What the tab is doing besides browsing (MOD-116 M3).
+#[derive(Debug, Default)]
+enum Mode {
+    /// The list and the detail.
+    #[default]
+    Browse,
+    /// `N`'s chooser over the tab.
+    Choosing(Chooser<NewWhat>),
+    /// The new-workspace form in the detail pane.
+    Workspace(Box<WorkspaceForm>),
+    /// The new-project form in the detail pane.
+    Project(Box<ProjectForm>),
+}
+
+impl Mode {
+    /// Whether a form is up.
+    const fn has_form(&self) -> bool {
+        matches!(self, Self::Workspace(_) | Self::Project(_))
+    }
+}
+
 /// The Workspaces tab (MOD-116 M1 D8).
 #[derive(Debug, Default)]
 pub struct WorkspacesTab {
@@ -314,16 +408,35 @@ pub struct WorkspacesTab {
     pending: Option<(WorkspaceId, Asked)>,
     /// MOD-116 M2 D6: the question or told box over the tab; it holds the keys while up.
     question: Option<Question>,
+    /// MOD-116 M3 D3: the home directory paths are shown under (`~`), read once.
+    home: Option<PathBuf>,
+    /// MOD-116 M3: the chooser or a form, else browsing.
+    mode: Mode,
+    /// MOD-116 M3 D7: the slug of the `NewProject` out; one at a time.
+    creating: Option<String>,
+    /// MOD-116 M3 D13: the row a create lands the cursor on once the list holds it.
+    land_on: Option<Entry>,
 }
 
 impl WorkspacesTab {
     /// The tab's id; the theme's amber `workspaces` accent is keyed by it.
     pub const ID: TabId = TabId("workspaces");
 
-    /// The tab before its first reply.
+    /// The tab before its first reply, its paths shown under this user's home (D3).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            home: dirs::home_dir(),
+            ..Self::default()
+        }
+    }
+
+    /// This tab with `home` as the directory `~` names (MOD-116 M3 D3): a test's temp home, so
+    /// a default folder lands under it and never under the real `~/workspaces`.
+    #[must_use]
+    pub fn with_home(mut self, home: Option<&Path>) -> Self {
+        self.home = home.map(Path::to_path_buf);
+        self
     }
 
     /// The summary of `workspace`, if listed.
@@ -652,9 +765,10 @@ impl WorkspacesTab {
             .filter(|_| !ctx.top_bar.offline())
     }
 
-    /// The browse hint row (D8), or none while a question is up (its box carries its keys).
+    /// The browse hint row (D8), or none while a question, the chooser or a form is up (its box
+    /// or its pane carries its keys).
     fn browse_hints(&self, ctx: &Ctx<'_>) -> Option<Line<'static>> {
-        if self.question.is_some() {
+        if self.question.is_some() || !matches!(self.mode, Mode::Browse) {
             return None;
         }
         let spec = hint_for(self.selected_counts(ctx));
@@ -776,18 +890,18 @@ impl WorkspacesTab {
         pane.render(frame, area, theme);
     }
 
-    /// What the list says with no row, and its next step: reading, or no workspace and how to
-    /// create one (the key `Settings › Hierarchy` binds, as the switcher said).
+    /// What the list says with no row, and its next step: reading, or no workspace and the key
+    /// that creates one here (MOD-116 M3 D1).
     fn empty_state(&self, ctx: &Ctx<'_>) -> (&'static str, String) {
         if !self.loaded {
             return (READING, READING_NEXT.to_owned());
         }
         let next = match ctx
             .keys()
-            .label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace)
+            .label(views::WORKSPACES_BROWSE, Act::WorkspacesNew)
         {
-            Some(new) => format!("`{new}` in Settings \u{203a} Hierarchy creates one"),
-            None => "create one in Settings \u{203a} Hierarchy".to_owned(),
+            Some(new) => format!("`{new}` creates one"),
+            None => "a workspace created elsewhere shows up here".to_owned(),
         };
         (EMPTY, next)
     }
@@ -854,7 +968,8 @@ impl WorkspacesTab {
                     (false, true) => Some(WorkspaceLifecycle::Open { running: 0 }),
                     (false, false) => None,
                 };
-                lines = overview::workspace_lines(overview, state, current, width, theme);
+                let overview = self.under_home(overview);
+                lines = overview::workspace_lines(&overview, state, current, width, theme);
             }
             (Some(_), Some(Held::Refused(message))) => {
                 let what = format!("{NEEDS_THE_DATABASE}: {message}");
@@ -885,6 +1000,238 @@ impl WorkspacesTab {
         pane.render(frame, area, theme);
     }
 
+    /// MOD-116 M3 D3: `overview` with its folder shown under `~` when it is under the home.
+    fn under_home<'o>(&self, overview: &'o WorkspaceOverview) -> Cow<'o, WorkspaceOverview> {
+        match (&overview.folder, self.home.as_deref()) {
+            (Some(folder), Some(home)) if folder.starts_with(home) => {
+                let mut under = overview.clone();
+                under.folder = Some(PathBuf::from(shown(folder, Some(home))));
+                Cow::Owned(under)
+            }
+            _ => Cow::Borrowed(overview),
+        }
+    }
+
+    /// MOD-116 M3 D1: `N`: the chooser, `workspace` then `project in <name>` for the selected
+    /// row's workspace; with no workspace listed, the workspace form at once.
+    fn begin_new(&mut self) {
+        if self.workspaces.is_empty() {
+            self.mode = Mode::Workspace(Box::new(WorkspaceForm::new(self.home.as_deref())));
+            return;
+        }
+        let mut rows = vec![ChoiceRow {
+            label: "workspace".to_owned(),
+            note: None,
+            enabled: true,
+            value: NewWhat::Workspace,
+        }];
+        if let Some(summary) = self
+            .cursor
+            .filter(|entry| self.holds(*entry))
+            .and_then(|entry| self.summary(entry.workspace()))
+        {
+            rows.push(ChoiceRow {
+                label: format!("project in {}", summary.name),
+                note: None,
+                enabled: true,
+                value: NewWhat::Project(summary.workspace_id),
+            });
+        }
+        self.mode = Mode::Choosing(Chooser::new(NEW_TITLE, rows, 0));
+    }
+
+    /// The chooser's answer: the form it names; a second project while one is out is told (D7).
+    fn chosen(&mut self, what: NewWhat) {
+        self.mode = match what {
+            NewWhat::Workspace => {
+                Mode::Workspace(Box::new(WorkspaceForm::new(self.home.as_deref())))
+            }
+            NewWhat::Project(_) if self.creating.is_some() => {
+                self.tell(NEW_PROJECT_TITLE, STILL_CREATING.to_owned());
+                Mode::Browse
+            }
+            NewWhat::Project(workspace) => {
+                let folder = match &self.overview {
+                    Some((of, Held::Read(overview))) if *of == workspace => overview.folder.clone(),
+                    _ => None,
+                };
+                Mode::Project(Box::new(ProjectForm::new(
+                    workspace,
+                    &self.name_of(workspace),
+                    folder,
+                    self.home.as_deref(),
+                )))
+            }
+        };
+    }
+
+    /// MOD-116 M3: a key while the chooser ([`views::WORKSPACES_PICK`]) or a form
+    /// ([`views::WORKSPACES_FORM`]) is up; `None` while browsing.
+    fn mode_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Option<Handled> {
+        let pressed = ctx.pressed(&key);
+        let keys = ctx.keys();
+        let outcome = match &mut self.mode {
+            Mode::Browse => return None,
+            Mode::Choosing(chooser) => {
+                let stack = views::WORKSPACES_PICK;
+                let act = keys.actions(stack, pressed).first().copied();
+                let Some(act @ (Act::ListDown | Act::ListUp | Act::ConfirmYes | Act::ConfirmNo)) =
+                    act
+                else {
+                    return Some(modal_rest(stack, pressed));
+                };
+                match chooser.on_act(act) {
+                    ChooserOutcome::Stay | ChooserOutcome::Disabled(_) => {}
+                    ChooserOutcome::Chosen(what) => self.chosen(what),
+                    ChooserOutcome::Closed => self.mode = Mode::Browse,
+                }
+                return Some(Handled::Consumed);
+            }
+            Mode::Workspace(form) => form.on_key(key, pressed, keys),
+            Mode::Project(form) => form.on_key(key, pressed, keys),
+        };
+        Some(self.form_outcome(outcome, ctx))
+    }
+
+    /// What a form's key does to the tab: a submit is sent (a project's slug held while it is
+    /// out, D7); `Esc` closes the form, and a project still out is told it is (D7).
+    fn form_outcome(&mut self, outcome: FormOutcome, ctx: &Ctx<'_>) -> Handled {
+        match outcome {
+            FormOutcome::Stay | FormOutcome::Refused => {}
+            FormOutcome::Submit(request) => {
+                if let StoreRequest::NewProject { slug, .. } = &request {
+                    self.creating = Some(slug.clone());
+                }
+                ctx.request(request);
+            }
+            FormOutcome::Cancel => {
+                let out = matches!(&self.mode, Mode::Project(form) if form.is_busy());
+                self.mode = Mode::Browse;
+                if out {
+                    self.tell(NEW_PROJECT_TITLE, TOLD_WHEN_IT_LANDS.to_owned());
+                }
+            }
+            FormOutcome::Pass => return Handled::Pass,
+        }
+        Handled::Consumed
+    }
+
+    /// MOD-116 M3 D4: the workspace exists: the form closes, the list is read again and the
+    /// cursor lands on its group. It is not opened, unless the shell's scope names no workspace
+    /// the tab lists (a first start), so the shell is never left without one.
+    fn workspace_created(&mut self, workspace: &WorkspaceSummary, ctx: &Ctx<'_>) {
+        if self.mode.has_form() && matches!(self.mode, Mode::Workspace(_)) {
+            self.mode = Mode::Browse;
+        }
+        self.land_on = Some(Entry::Workspace(workspace.workspace_id));
+        ctx.request(StoreRequest::Workspaces);
+        if self.summary(ctx.scope.workspace_id).is_none() {
+            ctx.emit(Action::SetScope {
+                workspace: workspace.clone(),
+            });
+        }
+    }
+
+    /// MOD-116 M3 D6, D13: the project exists: its form closes (or, closed already, the outcome
+    /// is told), the list and the overview are read again and the cursor lands on its row.
+    fn project_created(
+        &mut self,
+        workspace: WorkspaceId,
+        project: &ProjectRef,
+        repo_path: &str,
+        ctx: &Ctx<'_>,
+    ) {
+        self.creating = None;
+        let its_form = matches!(
+            &self.mode,
+            Mode::Project(form)
+                if form.workspace() == workspace && form.slug() == project.slug && form.is_busy()
+        );
+        if its_form {
+            self.mode = Mode::Browse;
+        } else {
+            let text = format!(
+                "Project `{}` is ready in {}: {}",
+                project.slug,
+                self.name_of(workspace),
+                shown(Path::new(repo_path), self.home.as_deref())
+            );
+            self.tell(NEW_PROJECT_TITLE, text);
+        }
+        self.land_on = Some(Entry::Project(workspace, project.project_id));
+        self.stale = true;
+        ctx.request(StoreRequest::Workspaces);
+    }
+
+    /// MOD-116 M3 D13: a create refused (a sentence) or failed (the store's message): under the
+    /// form while it is open and waiting, its text kept, else in the box.
+    fn setup_refused(&mut self, request: &str, why: &str) {
+        let project = request == NEW_PROJECT;
+        let slug = if project { self.creating.take() } else { None };
+        match &mut self.mode {
+            Mode::Workspace(form) if !project && form.is_busy() => {
+                form.refused(why);
+                return;
+            }
+            Mode::Project(form) if project && form.is_busy() => {
+                form.refused(why);
+                return;
+            }
+            _ => {}
+        }
+        if project {
+            let text = match slug {
+                Some(slug) => format!("Project `{slug}` was not created: {why}"),
+                None => format!("The project was not created: {why}"),
+            };
+            self.tell(NEW_PROJECT_TITLE, text);
+        } else {
+            self.tell(
+                NEW_WORKSPACE_TITLE,
+                format!("The workspace was not created: {why}"),
+            );
+        }
+    }
+
+    /// MOD-116 M3 D11 (Hierarchy's D11, mirrored): the open workspace's listed projects differ
+    /// from the scope's, so the scope follows the list (a project created here reaches the
+    /// Backlog). The shell refuses it while an in-pane editor is open.
+    fn follow_scope(&self, ctx: &Ctx<'_>) {
+        let Some(summary) = self.summary(ctx.scope.workspace_id) else {
+            return;
+        };
+        if Scope::from_workspace(summary).project_ids != ctx.scope.project_ids {
+            ctx.emit(Action::SetScope {
+                workspace: summary.clone(),
+            });
+        }
+    }
+
+    /// MOD-116 M3: the open form in `area`, titled for what it creates, its keys on the border.
+    fn render_form(&self, frame: &mut Frame<'_>, area: Rect, focus: Focus, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
+        let inner = Pane::inner(area);
+        let (title, lines, spec) = match &self.mode {
+            Mode::Workspace(form) => (
+                NEW_WORKSPACE_TITLE.to_owned(),
+                form.lines(inner.width, ctx),
+                WORKSPACE_FORM_HINT,
+            ),
+            Mode::Project(form) => (
+                format!("New project in {}", form.workspace_name()),
+                form.lines(inner.width, ctx),
+                PROJECT_FORM_HINT,
+            ),
+            Mode::Browse | Mode::Choosing(_) => return,
+        };
+        frame.render_widget(Paragraph::new(lines), inner);
+        let mut pane = Pane::new(&title).focus(focus).accent(ctx.accent());
+        if let Some(hints) = key_line(ctx.keys().hint(views::WORKSPACES_FORM, spec), theme) {
+            pane = pane.hints(hints);
+        }
+        pane.render(frame, area, theme);
+    }
+
     /// The detail pane's title: the workspace's name, or the project's.
     fn title_of(&self, entry: Entry) -> String {
         let Some(summary) = self.summary(entry.workspace()) else {
@@ -902,7 +1249,7 @@ impl WorkspacesTab {
 }
 
 /// `summary`'s projects in position order.
-fn projects_of(summary: &WorkspaceSummary) -> Vec<&htui_core::model::ProjectRef> {
+fn projects_of(summary: &WorkspaceSummary) -> Vec<&ProjectRef> {
     let mut projects: Vec<_> = summary.projects.iter().collect();
     projects.sort_by_key(|project| project.position);
     projects
@@ -1014,6 +1361,9 @@ impl Tab for WorkspacesTab {
         if let Some(question) = self.question.take() {
             return self.question_key(question, key, ctx);
         }
+        if let Some(handled) = self.mode_key(key, ctx) {
+            return handled;
+        }
         let chord = ctx.pressed(&key);
         let focus = ctx.focus();
         let rows = self.detail_rows.get();
@@ -1033,6 +1383,7 @@ impl Tab for WorkspacesTab {
                 Act::WorkspacesOpen => self.open(ctx),
                 Act::WorkspacesStop => self.ask(Asked::Stop, ctx),
                 Act::WorkspacesResume => self.ask(Asked::Resume, ctx),
+                Act::WorkspacesNew => self.begin_new(),
                 // A layout, history or global act: the shell's.
                 _ => continue,
             }
@@ -1055,6 +1406,14 @@ impl Tab for WorkspacesTab {
                     self.user_placed = false;
                     self.land(ctx.scope);
                 }
+                // MOD-116 M3 D13: a row just created is selected once the list holds it.
+                if let Some(entry) = self.land_on.filter(|entry| self.holds(*entry)) {
+                    self.land_on = None;
+                    self.folded.remove(&entry.workspace());
+                    self.user_placed = true;
+                    self.select(entry);
+                }
+                self.follow_scope(ctx);
                 self.read_if_due(ctx);
             }
             StoreReply::WorkspaceOverview {
@@ -1148,6 +1507,24 @@ impl Tab for WorkspacesTab {
             }
             // The shell has set the top bar from it already (D5); a moved row reads again.
             StoreReply::WorkspaceRunCounts(_) => self.read_if_due(ctx),
+            StoreReply::WorkspaceCreated { workspace, .. } => {
+                self.workspace_created(workspace, ctx)
+            }
+            StoreReply::ProjectCreated {
+                workspace,
+                project,
+                repo_path,
+            } => self.project_created(*workspace, project, repo_path, ctx),
+            StoreReply::SetupRefused { request, reason }
+                if [NEW_WORKSPACE, NEW_PROJECT].contains(request) =>
+            {
+                self.setup_refused(request, reason);
+            }
+            StoreReply::Failed { request, message }
+                if [NEW_WORKSPACE, NEW_PROJECT].contains(request) =>
+            {
+                self.setup_refused(request, message);
+            }
             _ => {}
         }
     }
@@ -1155,6 +1532,9 @@ impl Tab for WorkspacesTab {
     /// The detail pane says a refused overview itself; a refused counts read leaves the states
     /// as they were (the shell's own poll is absorbed too, D5); a refused stop or resume is told
     /// in the tab's box (MOD-116 M2 D6).
+    ///
+    /// MOD-116 M3 D13: every request of `workspace_setup::REQUEST_NAMES` too: a refused create is
+    /// said under its form, or in the box once the form is closed.
     fn absorbs_failure(&self, request: &str) -> bool {
         [
             WORKSPACE_OVERVIEW,
@@ -1163,33 +1543,67 @@ impl Tab for WorkspacesTab {
             RESUME_WORKSPACE,
         ]
         .contains(&request)
+            || workspace_setup::REQUEST_NAMES.contains(&request)
     }
 
-    /// D8's hint row; none while a question is up (its box carries its keys).
+    /// A bracketed paste: into the focused field of an open form (MOD-116 M3), else dropped.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        if self.question.is_some() {
+            return Handled::Pass;
+        }
+        match &mut self.mode {
+            Mode::Workspace(form) => form.on_paste(text),
+            Mode::Project(form) => form.on_paste(text),
+            Mode::Browse | Mode::Choosing(_) => return Handled::Pass,
+        }
+        Handled::Consumed
+    }
+
+    /// D8's hint row; none while a question, the chooser or a form is up (its box or its pane
+    /// carries its keys).
     fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         self.browse_hints(ctx)
     }
 
+    /// MOD-116 M3: a form takes the detail pane's place, or the list's when the layout hides the
+    /// detail; the chooser is a box over the tab, under any question.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let areas = ctx.split(area, WORKSPACES_LAYOUT);
         let hints = self.browse_hints(ctx);
+        let form = self.mode.has_form();
+        let detail = !areas.detail.is_empty();
         if let Some(list) = areas.list.filter(|rect| !rect.is_empty()) {
             let focus = ctx.pane_focus(PaneId::List);
-            self.render_list(frame, list, focus, hints.as_ref(), ctx);
+            if form && !detail {
+                self.render_form(frame, list, focus, ctx);
+            } else {
+                self.render_list(frame, list, focus, hints.as_ref(), ctx);
+            }
         }
-        if !areas.detail.is_empty() {
+        if detail {
             let focus = ctx.pane_focus(PaneId::Detail);
-            self.render_detail(frame, areas.detail, focus, hints.as_ref(), ctx);
+            if form {
+                self.render_form(frame, areas.detail, focus, ctx);
+            } else {
+                self.render_detail(frame, areas.detail, focus, hints.as_ref(), ctx);
+            }
+        }
+        if let Mode::Choosing(chooser) = &self.mode {
+            let hint = ctx.keys().hint(views::WORKSPACES_PICK, CHOOSER_HINT);
+            chooser.render(frame, area, &hint, ctx);
         }
         self.render_question(frame, area, ctx);
     }
 
-    /// [`views::WORKSPACES_CONFIRM`] while a question is up (D6), else the browse stack.
+    /// [`views::WORKSPACES_CONFIRM`] while a question is up (D6); MOD-116 M3:
+    /// [`views::WORKSPACES_PICK`] while the chooser is, [`views::WORKSPACES_FORM`] while a form
+    /// is; else the browse stack.
     fn key_stack(&self) -> Option<Stack<'static>> {
-        Some(if self.question.is_some() {
-            views::WORKSPACES_CONFIRM
-        } else {
-            views::WORKSPACES_BROWSE
+        Some(match (&self.question, &self.mode) {
+            (Some(_), _) => views::WORKSPACES_CONFIRM,
+            (None, Mode::Browse) => views::WORKSPACES_BROWSE,
+            (None, Mode::Choosing(_)) => views::WORKSPACES_PICK,
+            (None, Mode::Workspace(_) | Mode::Project(_)) => views::WORKSPACES_FORM,
         })
     }
 
@@ -1199,8 +1613,13 @@ impl Tab for WorkspacesTab {
     }
 
     /// D7: once a second while in front, a moved counts row reads the overview again, and a
-    /// refused one is asked again (R1 F3).
+    /// refused one is asked again (R1 F3). MOD-116 M3 D7: a busy form counts one second more.
     fn on_refresh(&mut self, ctx: &mut Ctx<'_>) {
+        match &mut self.mode {
+            Mode::Workspace(form) => form.tick(),
+            Mode::Project(form) => form.tick(),
+            Mode::Browse | Mode::Choosing(_) => {}
+        }
         self.read_if_due(ctx);
     }
 
