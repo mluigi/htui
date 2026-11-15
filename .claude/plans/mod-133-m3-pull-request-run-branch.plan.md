@@ -87,7 +87,9 @@ refuses `pull_request` when any phase isolates `local` or `shared_serialized`. S
   - **The landing sequence.** For a `worktree`/`copy` tree whose repo is in `onto`, `reconcile_isolated`
     (`real.rs:1199-1286`) runs this; steps 1-9 run under the admin guard it already holds, so no verb
     here takes the lock again (the tokio mutex is not reentrant):
-    1. tip ← `branch_target(local, branch)`; missing → refuse `` no_run_branch: `{branch}` ``;
+    1. tip ← `branch_target(local, branch)`; missing → refuse `` no_run_branch: `{branch}` ``; a branch
+       checked out in the checkout or any linked worktree (`checked_out_at`, which also reads a rebase or
+       bisect in progress) → refuse `run_branch_checked_out` (R1);
     2. `merge_of(local, tip, base_ref, after)`: refs and objects are shared, so D136 recovery works as
        is; found → answer it;
     3. ensure the landing tree `<scratch_root>/<run>/landing/<repo name>`: new
@@ -95,15 +97,17 @@ refuses `pull_request` when any phase isolates `local` or `shared_serialized`. S
        --detach <path> <tip>`, mirroring `add_worktree` `git.rs:589`, with a post-condition). A tree
        that is listed and present is reused; otherwise `remove_worktree` (which tolerates a missing tree,
        `git.rs:654-676`) and add again;
-    4. landing `HEAD` ≠ tip → `reset_hard` it to the tip (scratch tree, nothing to lose);
-    5. clean check; a dirty tree refuses a new `` dirty_landing_tree: {path} `` (never
+    4. landing `HEAD` ≠ tip, a merge in progress (`MERGE_HEAD`: a `git merge` killed with a conflicted
+       index and `HEAD` still at the tip) or a dirty tree → `abort_merge`, then `reset_hard` it to the tip
+       (scratch tree, nothing to lose) (R1);
+    5. a reset that fails, or leaves the tree dirty, refuses a new `` dirty_landing_tree: {path} `` (never
        `dirty_primary_tree`, which would blame the person's checkout);
     6. ancestry checks as today, but refusing a new `` run_branch_moved: `{branch}` is at {short} ``
        where today's code says `primary_moved`;
     7. `copy` → `copy_range` into `local` (the odb is shared with the landing tree);
     8. `merge_no_ff(landing, step, tip, after)` (`git.rs:784`): post-condition, hooks, abort on
        conflict and the `merge_conflict` park, unchanged;
-    9. move the ref: new gix `git::move_branch(repo, branch, from: &str, to: &str)` with
+    9. `checked_out_at` again (R1), then move the ref: new gix `git::move_branch(repo, branch, from: &str, to: &str)` with
        `PreviousValue::MustExistAndMatch` (probe: a mismatched compare-and-swap is refused). A failed CAS
        is `IsolateError::Git`, which parks the run; the next attempt merges again.
 
