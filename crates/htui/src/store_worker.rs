@@ -31,7 +31,7 @@ use htui_core::model::{
     ProjectType, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunCommandId,
     RunStatus, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges,
     StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission,
-    WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    WorkspaceId, WorkspacePatch, WorkspaceRunCounts, WorkspaceSummary,
 };
 use htui_core::model::{
     LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, OwnerDocument,
@@ -473,6 +473,11 @@ pub enum StoreRequest {
     /// writer: `project_type` is not mirrored, so offline it is refused with
     /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::ProjectTypes`].
     ProjectTypes,
+    /// MOD-116 M1 D6: every workspace's run counts and stop row
+    /// (`WriteStore::workspace_run_counts`), through the writer; offline `Unreachable`
+    /// (`workspace_stop` is not mirrored). Asked by the shell once a second and on a scope change
+    /// (D5). Answered with [`StoreReply::WorkspaceRunCounts`].
+    WorkspaceRunCounts,
     /// This user's headless workers' log lines (MOD-122 M2 D10): `id > after`, oldest first, at
     /// most 2 000; `after: None` is the newest 2 000. Served in `try_serve` through
     /// `Backend::worker_logs`, so offline it is answered empty rather than refused, and an
@@ -1450,6 +1455,7 @@ impl StoreRequest {
             Self::DeletePersona { .. } => "delete_persona",
             Self::ImportPersonas { .. } => "import_personas",
             Self::ProjectTypes => "project_types",
+            Self::WorkspaceRunCounts => "workspace_run_counts",
             Self::WorkerLogs { .. } => "worker_logs",
             Self::Activity { .. } => "activity",
             Self::SweepRetention => "sweep_retention",
@@ -1921,6 +1927,9 @@ pub enum StoreReply {
     /// The project type registry in slug order: the answer to [`StoreRequest::ProjectTypes`]
     /// (MOD-146 D8). Read-only; nothing writes a type yet.
     ProjectTypes(Vec<ProjectType>),
+    /// The answer to [`StoreRequest::WorkspaceRunCounts`] (MOD-116 M1 D6): one row per
+    /// workspace, zeros included, in workspace-id order.
+    WorkspaceRunCounts(Vec<WorkspaceRunCounts>),
     /// The answer to [`StoreRequest::WorkerLogs`] (MOD-122 M2 D10): rows oldest first, empty
     /// offline.
     WorkerLogs(Vec<WorkerLogLine>),
@@ -2714,6 +2723,14 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 .writer()
                 .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
             StoreReply::ProjectTypes(WriteStore::project_types(&writer).await?)
+        }
+        // MOD-116 M1 D6: the workspaces' run counts, through the writer as `ProjectTypes` is:
+        // `workspace_stop` is not mirrored, so offline it is refused before any read.
+        StoreRequest::WorkspaceRunCounts => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            StoreReply::WorkspaceRunCounts(WriteStore::workspace_run_counts(&writer).await?)
         }
         // MOD-122 M2 D10, blueprint F5/F11: one read, inline. Offline answers empty (the tab
         // merges it, adding nothing); the `?` keeps `go_offline` working for an `Unreachable`.
@@ -5817,6 +5834,62 @@ mod tests {
         cache.close().await;
     }
 
+    /// MOD-116 M1 D6: one row per demo workspace, through the writer, with its runs counted by
+    /// unfinished status (`fixtures.rs`: Platform's `RUN_4` running, a queued and a parked run;
+    /// Graphics' `RUN_8` stopped) and no stop row.
+    #[tokio::test]
+    async fn serve_workspace_run_counts_answers_every_demo_workspace() {
+        let reply = serve(&demo(), &StoreRequest::WorkspaceRunCounts).await;
+        let StoreReply::WorkspaceRunCounts(rows) = reply else {
+            panic!("expected the counts, got {reply:?}");
+        };
+        let counts = |workspace| {
+            let row = rows
+                .iter()
+                .find(|row| row.workspace_id == workspace)
+                .unwrap_or_else(|| panic!("a row for {workspace}: {rows:?}"));
+            (
+                row.queued,
+                row.running,
+                row.awaiting_approval,
+                row.stopped,
+                row.stop.clone(),
+            )
+        };
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(counts(ids::WORKSPACE_GRAPHICS), (0, 0, 0, 1, None));
+        assert_eq!(counts(ids::WORKSPACE_PLATFORM), (1, 1, 1, 0, None));
+    }
+
+    /// MOD-116 M1 D6: `workspace_stop` is not mirrored, so offline (and while connecting) the
+    /// counts are refused before any read, named `workspace_run_counts`; the shell absorbs it.
+    #[tokio::test]
+    async fn an_offline_backend_refuses_the_run_counts_read() {
+        let _keyring = htui_store::testkit::mock_keyring().await;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "run-counts-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        for since in [Some(Utc::now()), None] {
+            let backend = Backend::Offline {
+                cache: cache.clone(),
+                since,
+            };
+            let reply = serve(&backend, &StoreRequest::WorkspaceRunCounts).await;
+            assert!(
+                matches!(
+                    &reply,
+                    StoreReply::Failed {
+                        request: "workspace_run_counts",
+                        message,
+                    } if message.ends_with(DATABASE_UNREACHABLE)
+                ),
+                "since {since:?}: {reply:?}"
+            );
+        }
+        cache.close().await;
+    }
+
     /// An `Online` backend over a database nobody listens on, and its mirror.
     async fn unreachable_online(name: &str) -> (Backend, CacheStore, tempfile::TempDir) {
         let identity = Identity {
@@ -6773,6 +6846,10 @@ mod tests {
     #[test]
     fn name_arms_are_stable() {
         assert_eq!(StoreRequest::ProjectTypes.name(), "project_types");
+        assert_eq!(
+            StoreRequest::WorkspaceRunCounts.name(),
+            "workspace_run_counts"
+        );
         assert_eq!(
             StoreRequest::WorkerLogs { after: None }.name(),
             "worker_logs"

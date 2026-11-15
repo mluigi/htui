@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::mem::Discriminant;
 
-use htui_core::model::{ProjectRef, Scope, WorkspaceId};
+use htui_core::model::{InBackground, ProjectRef, Scope, WorkspaceId, WorkspaceRunCounts};
 use htui_worker::WaitingView;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -56,6 +56,11 @@ pub struct TopBarState {
     /// MOD-69 plan D6: the last `Waiting` reply, which the top bar counts and the overlay lists;
     /// `None` until the first one (blueprint A-6).
     pub waiting: Option<WaitingView>,
+    /// MOD-116 M1 D5: the last `WorkspaceRunCounts` answer, `None` until the first; a refusal
+    /// keeps it.
+    pub workspace_runs: Option<Vec<WorkspaceRunCounts>>,
+    /// MOD-116 M1 D4: the header's `+N in background ◐ n`, from `workspace_runs` and the scope.
+    pub background: InBackground,
 }
 
 /// The action sink handed to views.

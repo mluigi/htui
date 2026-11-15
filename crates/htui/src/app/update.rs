@@ -3,7 +3,7 @@
 //! Everything else in the crate produces [`Action`]s; this file is the only consumer. Adding a
 //! feature adds an arm here and a file under `ui/`, never an arm in the event loop.
 
-use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
+use htui_core::model::{InBackground, RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE;
 use htui_orch::Command;
 
@@ -390,6 +390,9 @@ impl App {
             if !self.scope.is_empty() {
                 let scope = self.scope.clone();
                 self.dispatch(Origin::App, StoreRequest::Waiting { scope });
+                // MOD-116 M1 D5: every workspace's counts, for the header's background chip
+                // and the Workspaces tab, which never polls them itself.
+                self.dispatch(Origin::App, StoreRequest::WorkspaceRunCounts);
             }
             self.poll_activity();
             self.sweep_retention();
@@ -450,7 +453,18 @@ impl App {
         self.activate_tab();
         // MOD-69 blueprint E9, H-10: the old workspace's rows never show under the new name.
         self.top_bar.waiting = None;
+        // MOD-116 M1 D5: the rows are every workspace's, so they stay; only which one is open
+        // moved, and the chip is recounted from them at once, before the fresh read lands.
+        self.recount_background();
         self.dispatch(Origin::App, StoreRequest::Waiting { scope });
+        self.dispatch(Origin::App, StoreRequest::WorkspaceRunCounts);
+    }
+
+    /// MOD-116 M1 D4: the header's background chip from the cached run counts and the scope.
+    fn recount_background(&mut self) {
+        if let Some(rows) = &self.top_bar.workspace_runs {
+            self.top_bar.background = InBackground::of(self.scope.workspace_id, rows);
+        }
     }
 
     /// Reopens a past step: focus the replay tab, then ask for its rows on that tab's behalf
@@ -582,9 +596,12 @@ impl App {
             // MOD-122 M3 D6, D8: the panel's poll and the retention sweep go on their own, once
             // a second and once an hour; a database that is down must not fill the line. The
             // panel keeps its rows (`on_app_reply` lets the next read go).
+            // MOD-116 M1 D5: so does the counts read, once a second; the top bar keeps the last
+            // rows.
             Origin::App
                 if request == StoreRequest::Activity { after: None }.name()
-                    || request == StoreRequest::SweepRetention.name() =>
+                    || request == StoreRequest::SweepRetention.name()
+                    || request == StoreRequest::WorkspaceRunCounts.name() =>
             {
                 true
             }
@@ -604,6 +621,12 @@ impl App {
                 }
             }
             StoreReply::BoxInfo(Some(info)) => self.top_bar.box_name = info.hostname.clone(),
+            // MOD-116 M1 D5: whatever its origin, as `Waiting`; the rows are every workspace's,
+            // so no scope check: the chip is counted against the scope in force now.
+            StoreReply::WorkspaceRunCounts(rows) => {
+                self.top_bar.workspace_runs = Some(rows.clone());
+                self.recount_background();
+            }
             // Review M1: the old scope's queued reply lands after `set_scope` (blueprint H-10). The
             // whole scope is compared, not its workspace: Settings re-scopes the same workspace
             // when a project is created, deleted or reordered (R2).
@@ -840,7 +863,8 @@ mod tests {
     };
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        ItemFilter, ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef, Status,
+        InBackground, ItemFilter, ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef,
+        RunStatus, Status, WorkspaceRunCounts,
     };
     use htui_orch::Command;
     use htui_worker::WaitingView;
@@ -1195,10 +1219,163 @@ mod tests {
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         // MOD-122 M3 D6: the first refresh also sweeps a store that is up; `activity_tests`
         // pins its schedule.
-        assert_eq!(requests.len(), 3, "one refresh per second, not per tick");
+        assert_eq!(requests.len(), 4, "one refresh per second, not per tick");
         assert!(matches!(requests[0].request, StoreRequest::StoreState));
         assert!(matches!(requests[1].request, StoreRequest::Waiting { .. }));
-        assert!(matches!(requests[2].request, StoreRequest::SweepRetention));
+        assert!(matches!(
+            requests[2].request,
+            StoreRequest::WorkspaceRunCounts
+        ));
+        assert!(matches!(requests[3].request, StoreRequest::SweepRetention));
+    }
+
+    /// `workspace`'s counts with `running` running runs and nothing else.
+    fn running_in(workspace: WorkspaceId, running: usize) -> WorkspaceRunCounts {
+        WorkspaceRunCounts::tally(workspace, vec![RunStatus::Running; running], None)
+    }
+
+    /// `name`'s summary under `workspace_id`, with [`workspace`]'s one project.
+    fn workspace_at(name: &str, workspace_id: WorkspaceId) -> WorkspaceSummary {
+        WorkspaceSummary {
+            workspace_id,
+            ..workspace(name)
+        }
+    }
+
+    /// MOD-116 M1 D5: the run counts reach the top bar whoever they are addressed to, as
+    /// `Waiting` does: an overlay's reply and an unsolicited one both set them.
+    #[test]
+    fn a_run_counts_reply_sets_the_background_whatever_its_origin() {
+        let (mut app, _rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace_at("Platform", ids::WORKSPACE_PLATFORM),
+        });
+        let rows = vec![
+            running_in(ids::WORKSPACE_PLATFORM, 1),
+            running_in(ids::WORKSPACE_GRAPHICS, 2),
+        ];
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::Overlay(WaitingList::ID),
+            reply: StoreReply::WorkspaceRunCounts(rows.clone()),
+        }));
+        assert_eq!(app.top_bar.workspace_runs.as_ref(), Some(&rows));
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 2
+            }
+        );
+
+        let fewer = vec![
+            running_in(ids::WORKSPACE_PLATFORM, 1),
+            running_in(ids::WORKSPACE_GRAPHICS, 3),
+        ];
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::App,
+            reply: StoreReply::WorkspaceRunCounts(fewer.clone()),
+        }));
+        assert_eq!(app.top_bar.workspace_runs, Some(fewer));
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 3
+            }
+        );
+    }
+
+    /// MOD-116 M1 D5: entering another workspace recounts the chip from the cached rows at once
+    /// (the one left becomes background, the one entered stops being so) and asks again.
+    #[test]
+    fn a_scope_change_recounts_the_background_and_rereads() {
+        let (mut app, mut rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace_at("Platform", ids::WORKSPACE_PLATFORM),
+        });
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::App,
+            reply: StoreReply::WorkspaceRunCounts(vec![
+                running_in(ids::WORKSPACE_PLATFORM, 1),
+                running_in(ids::WORKSPACE_GRAPHICS, 2),
+            ]),
+        }));
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 2
+            }
+        );
+        while rx.try_recv().is_ok() {}
+
+        app.update(Action::SetScope {
+            workspace: workspace_at("Graphics", ids::WORKSPACE_GRAPHICS),
+        });
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 1
+            },
+            "recounted before any reply"
+        );
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|envelope| envelope.request)
+            .collect();
+        let waiting = requests
+            .iter()
+            .position(|request| matches!(request, StoreRequest::Waiting { .. }))
+            .expect("the waiting list is re-read");
+        let counts = requests
+            .iter()
+            .position(|request| matches!(request, StoreRequest::WorkspaceRunCounts))
+            .expect("the counts are re-read");
+        assert!(waiting < counts, "after `Waiting`: {requests:?}");
+    }
+
+    /// MOD-116 M1 D5: the shell's once-a-second counts read goes on its own, so a database that
+    /// is down must not fill the status line; the last rows are kept.
+    #[test]
+    fn a_refused_run_counts_read_stays_off_the_status_line() {
+        let (mut app, mut rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace_at("Platform", ids::WORKSPACE_PLATFORM),
+        });
+        let rows = vec![running_in(ids::WORKSPACE_GRAPHICS, 2)];
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::App,
+            reply: StoreReply::WorkspaceRunCounts(rows.clone()),
+        }));
+        while rx.try_recv().is_ok() {}
+        for _ in 0..TICKS_PER_REFRESH {
+            app.update(Action::Tick);
+        }
+        let seq = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|envelope| matches!(envelope.request, StoreRequest::WorkspaceRunCounts))
+            .expect("the tick asked")
+            .seq;
+        app.update(Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::Failed {
+                request: StoreRequest::WorkspaceRunCounts.name(),
+                message: htui_store::DATABASE_UNREACHABLE.to_owned(),
+            },
+        }));
+        assert_eq!(app.status, None, "{:?}", app.status);
+        assert_eq!(app.top_bar.workspace_runs, Some(rows), "the last rows stay");
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 2
+            }
+        );
     }
 
     /// An overlay that counts the refresh ticks it is handed (MOD-12 M3 D9).

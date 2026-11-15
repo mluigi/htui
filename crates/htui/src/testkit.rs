@@ -925,6 +925,71 @@ mod tests {
         assert_eq!(harness.app().status, None, "and nothing failed");
     }
 
+    /// MOD-116 M1 D9: opening another workspace while a run of this one walks neither stops nor
+    /// restarts the walk (the executor is the process's, not the scope's), and the header counts
+    /// the workspace left behind while it has a `running` run: Platform's `RUN_4`, not the walk
+    /// that rested at its approval.
+    #[tokio::test]
+    async fn opening_another_workspace_leaves_its_runs_walking_and_counts_them() {
+        use crate::run_worker::OrchRequest;
+        use crate::run_worker::tests::{Fixture, only_run};
+        use htui_core::fixtures::ids;
+        use htui_core::model::{InBackground, RunMode, RunStatus};
+
+        let fixture = Fixture::new().await;
+        let workspaces = fixture.store.workspaces().await.expect("a memory read");
+        let named = |slug: &str| {
+            workspaces
+                .iter()
+                .find(|workspace| workspace.slug == slug)
+                .cloned()
+                .unwrap_or_else(|| panic!("the demo holds `{slug}`"))
+        };
+        let mut harness = Harness::over(fixture.store.clone()).with_run_runtime(fixture.runtime());
+        harness.drive().await;
+        harness.app().update(Action::SetScope {
+            workspace: named("platform"),
+        });
+        harness.drive().await;
+
+        harness
+            .app()
+            .update(Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                htui_orch::Command::StartRun {
+                    item: ids::HTUI_ANA_2,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                    workspace: Some(ids::WORKSPACE_PLATFORM),
+                },
+            ))));
+        harness.app().update(Action::SetScope {
+            workspace: named("graphics"),
+        });
+        harness.drive().await;
+
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::AwaitingApproval,
+            "the walk went on across the scope change"
+        );
+        assert_eq!(harness.app().status, None, "and nothing failed");
+        assert_eq!(harness.app().top_bar.workspace, "Graphics");
+        assert_eq!(
+            harness.app().top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 1
+            },
+            "Platform's running run, from the counts read the scope change asked for"
+        );
+        // No tab chips here: with `register_all`'s six the chip does not fit even at 160.
+        harness.resize(140, 30);
+        let frame = harness.render();
+        let header = frame.lines().next().unwrap_or_default();
+        assert!(header.contains("+1 in background \u{25d0} 1"), "{header}");
+    }
+
     /// Blueprint D183, D207: without a run runtime the stream and the verdicts still answer, so
     /// nothing reaches the status line; only a command is refused, by name.
     #[tokio::test]
