@@ -10,7 +10,7 @@
 conformance case and one `.sqlx` entry; two `StoreRequest`/`StoreReply` pairs; a new list + detail tab with its key
 context; the switcher overlay deleted; every tab digit moves by one, 46 snapshot files move and 3 are deleted
 (fact-check: the drafter's 49-line list counts the 3 deleted switcher files))
-**Status**: DRAFT
+**Status**: COMPLETE (2026-11-15; T1-T4 `01cdb979`..`db97562a`, review fix round R1 `dc559952`..`f8037cd8`). Fact-checked at `9b135537` (see "Verified claims")
 
 ## Summary
 

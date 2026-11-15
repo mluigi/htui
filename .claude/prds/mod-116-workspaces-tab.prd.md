@@ -139,7 +139,7 @@ Decided from the item and requirements (no question needed):
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | The tab, states and opening | Workspaces is tab 1; every workspace with its derived state, workspace and project overviews (state, folder, description, goals, projects with counts, default target, held runs); `o` opens and backgrounds; `w` jumps to the tab and the switcher overlay is gone; the header's `+N in background`; the last open workspace persists | in-progress | `.claude/plans/mod-116-m1-workspaces-tab.plan.md` |
+| 1 | The tab, states and opening | Workspaces is tab 1; every workspace with its derived state, workspace and project overviews (state, folder, description, goals, projects with counts, default target, held runs); `o` opens and backgrounds; `w` jumps to the tab and the switcher overlay is gone; the header's `+N in background`; the last open workspace persists | complete | `.claude/plans/mod-116-m1-workspaces-tab.plan.md` |
 | 2 | Stop, resume and leaving | `s`, `s` again and `r` from the tab, each confirmed with a per-run preview shared with `htui stop`; the overview lists held runs and how each resumes; the leave dialog lists every live workspace and offers "stop gracefully first" | pending | — |
 | 3 | Creating and editing | `N` chooser; new-workspace form with folder and preview, creating the folder; new-project form (existing git folder, git URL clone, new repo); workspace edit and delete on the tab, removed from Hierarchy; `T` sets the workspace's default target | pending | — |
 

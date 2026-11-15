@@ -98,7 +98,7 @@ MOD-70's were before), so a branch adding a migration renumbers at merge time an
 `htui-store/tests/migrations.rs`. MOD-163's `0026_trim_record_v5` became `0027` behind MOD-147's `0026_workspace_scope` at this merge. `0027`'s column
 comment keeps its own bytes ("written before 0026") and `MOD163_M2_COLUMN_COMMENTS` pins them (`8d69db61`); an applied
 migration's SQL is never edited to follow a rename. Items that still owe one include MOD-143
-and MOD-171. Pins: store conformance `CASES` 343 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
+and MOD-171. Pins: store conformance `CASES` 344 (MOD-116 M1; 343 on main until it is collected) (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
 `ACTIVITY_CASES` 12 (`htui-core/src/store/conformance.rs`, MOD-122 M3), `INDEXER_LEASE_CASES` 15 (MOD-159; 10 on main until M3 is collected), `INDEX_CHANGES_CASES` 7 (MOD-159 M2), `htui-orch` `CASES` 265
 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 60
 (`htui-store/tests/migrations.rs` `TABLES`).
@@ -939,6 +939,17 @@ items it follows are done.
   before it is registered (`R-ID-4`); the lifecycle states live on the `workspace` row or derive from
   runs, never on the scope row. MOD-115 is done (`docs/decisions/mod/mod-115.md`); the folder is MOD-147's
   (done, `docs/decisions/mod/mod-147.md`).
+  PRD `.claude/prds/mod-116-workspaces-tab.prd.md` (gate 2026-11-15: coordinator chats wait for MOD-136/MOD-121; a
+  plain folder is refused until MOD-145; the workspace row leaves Settings › Hierarchy, projects and repos stay until
+  MOD-123; an idle workspace reads `○ stopped` with no stop row; 3 milestones).
+  **Phase M1 landed (`01cdb979`..`f8037cd8`, 2026-11-15):** Workspaces is tab 1 (every other digit +1): each workspace
+  with its derived state (`● open`, `◐ background · n running`, `◌ stopping…`, `○ stopped · n held`; no column, no
+  migration), workspace and project overviews, `o` opens (runs keep walking), `w` jumps to the tab, the switcher
+  overlay is gone (a `keys.toml` `[switcher]` table loads with a notice), the header's `+N in background ◐ n`, the
+  last open workspace remembered in `ui-state.toml` (not under `--demo`). `WriteStore::workspace_run_counts`
+  (conformance `CASES` 344). Plan `.claude/plans/mod-116-m1-workspaces-tab.plan.md`; review fix round R1. Next: M2
+  (stop, resume, leave dialog). Owed on the host: the merged-tree Postgres gate (the sandbox gate's one red test was
+  the `cache::the_spawned_refresher_passes_and_follows_the_scope` load flake, untouched; 5 of 6 alone runs passed).
 - [ ] **MOD-117 - Workspace components: catalogue, compose, start and stop** (from the UI redesign
   review, `docs/ui-redesign-findings-2026-10-15.md` §4.1 Components). `R-ENT-17`, `R-SEC-5`, `R-TUI-14`. The catalogue in
   Postgres (types, kinds, images, versions, emulated services or clouds), seeded at first start and
