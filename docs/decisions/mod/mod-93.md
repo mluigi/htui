@@ -45,7 +45,9 @@ in Claude Code called them.
     renames in, removes the old copy; every failed rename rolls back; the target is classified
     again right before the swap, after the version probe.
   - **Exits:** 2 refused, 1 failed; no `EmitExit` reaches Sentry (sentences carry home paths).
-- **Skill `htui`** (`crates/htui/claude-plugin/htui/skills/htui/SKILL.md`): when to use it; `htui status|waiting --json` and
+- **Skill `htui`** (`crates/htui/claude-plugin/htui/skills/state/SKILL.md`; renamed `state` on
+  2026-11-15: Claude Code 2.1.325 refuses the mod's `/htui` beside a skill `/htui:htui`): when
+  to use it; `htui status|waiting --json` and
   `htui --search-items='<q>' --json`; the envelope, exit codes, "empty stdout is a failure",
   "ignore unknown fields and values"; reading `waiting` rows and search hits; hand-off rules (point
   the person at htui, never work an htui item inline, never write htui's store, never run

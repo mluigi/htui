@@ -184,7 +184,7 @@ macro_rules! embedded {
 const FILES: [Embedded; 7] = [
     embedded!(".claude-plugin/marketplace.json", Part::Always),
     embedded!("htui/.claude-plugin/plugin.json", Part::Always),
-    embedded!("htui/skills/htui/SKILL.md", Part::Always),
+    embedded!("htui/skills/state/SKILL.md", Part::Always),
     embedded!("htui/hooks/hooks.json", Part::Mod),
     embedded!("htui/hooks/register.tsx", Part::Mod),
     embedded!("htui/hooks/version.ts", Part::Mod),
@@ -222,7 +222,7 @@ enum Target {
     Absent,
     /// A directory with no entries.
     Empty,
-    /// An earlier emit: every file one of [`FILES`]' paths (the engine's types folder aside), a
+    /// An earlier emit: every file one of [`emitted_paths`] (the engine's types folder aside), a
     /// marketplace named `htui`, and not the source tree's placeholder version.
     Ours,
     /// Anything else that is a directory (or a link); why, for the refusal.
@@ -235,18 +235,27 @@ enum Target {
 /// the one thing an earlier emit may hold that `emit` did not write.
 const ENGINE_TYPES: &str = "htui/.claude-plugin/types";
 
-/// Whether `rel` is a directory an emit makes: a parent of one of [`FILES`]' paths.
+/// Paths an earlier htui wrote that this one no longer does. They still mark an earlier emit as
+/// ours, so `--force` replaces it (and so drops them) instead of refusing it as foreign. The skill
+/// was `htui` until Claude Code 2.1.325 refused the mod's `/htui` beside a skill `/htui:htui`.
+const RETIRED: [&str; 1] = ["htui/skills/htui/SKILL.md"];
+
+/// Every path an emit writes now or wrote before: [`FILES`]' and [`RETIRED`].
+fn emitted_paths() -> impl Iterator<Item = &'static str> {
+    FILES.iter().map(|file| file.path).chain(RETIRED)
+}
+
+/// Whether `rel` is a directory an emit makes or made: a parent of one of [`emitted_paths`].
 fn emitted_dir(rel: &str) -> bool {
-    FILES.iter().any(|file| {
-        file.path
-            .strip_prefix(rel)
+    emitted_paths().any(|path| {
+        path.strip_prefix(rel)
             .is_some_and(|rest| rest.starts_with('/'))
     })
 }
 
 /// The first entry under `dir` (at relative `/`-path `rel`) that no emit writes, in name order, as
-/// the refusal names it: a [`FILES`] path is a regular file, every directory is a parent of one,
-/// and nothing is a link. [`ENGINE_TYPES`] is not looked into.
+/// the refusal names it: an [`emitted_paths`] path is a regular file, every directory is a parent
+/// of one, and nothing is a link. [`ENGINE_TYPES`] is not looked into.
 fn first_foreign(
     dir: &Path,
     rel: &str,
@@ -281,7 +290,7 @@ fn first_foreign(
             if let Some(found) = first_foreign(&dir.join(&name), &path, unreadable)? {
                 return Ok(Some(found));
             }
-        } else if !(kind.is_file() && FILES.iter().any(|file| file.path == path)) {
+        } else if !(kind.is_file() && emitted_paths().any(|emitted| emitted == path)) {
             return Ok(Some(path));
         }
     }
@@ -975,7 +984,7 @@ mod tests {
             BTreeSet::from([
                 ".claude-plugin/marketplace.json",
                 PLUGIN_JSON,
-                "htui/skills/htui/SKILL.md",
+                "htui/skills/state/SKILL.md",
             ])
         );
         let mut source = manifest(FILES[1].body);
@@ -1061,6 +1070,32 @@ mod tests {
             "types/ is gone"
         );
         assert_eq!(files_of(&dir), written_files(Variant::SkillOnly));
+    }
+
+    /// An emit from before the skill's rename (`skills/htui/`, [`RETIRED`]) is still ours: refused
+    /// without `--force` as an earlier emit, and replaced with it, the old skill gone. Left in
+    /// place, `/htui:htui` would keep Claude Code refusing the mod's `/htui`.
+    #[test]
+    fn force_replaces_an_emit_holding_the_retired_skill_and_drops_it() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        emit(&dir, false, Variant::WithMod).expect("the first emit");
+        std::fs::rename(dir.join("htui/skills/state"), dir.join("htui/skills/htui"))
+            .expect("the skill under its old name");
+        assert_eq!(
+            refusal(emit(&dir, false, Variant::WithMod)),
+            format!(
+                "{} already holds the htui plugin; pass --force to replace it",
+                dir.display()
+            )
+        );
+        let report = emit(&dir, true, Variant::WithMod).expect("the forced emit");
+        assert!(report.replaced);
+        assert!(
+            !dir.join("htui/skills/htui").exists(),
+            "the old skill is gone"
+        );
+        assert_eq!(files_of(&dir), written_files(Variant::WithMod));
     }
 
     /// D4: a directory `emit` did not write is refused, `--force` or not, and left byte for byte
@@ -1569,8 +1604,8 @@ mod tests {
             ("htui/tests", &|dir| {
                 std::fs::create_dir(dir.join("htui/tests")).expect("the extra folder");
             }),
-            ("htui/skills/htui/notes.md", &|dir| {
-                std::fs::write(dir.join("htui/skills/htui/notes.md"), "mine\n")
+            ("htui/skills/state/notes.md", &|dir| {
+                std::fs::write(dir.join("htui/skills/state/notes.md"), "mine\n")
                     .expect("the extra skill file");
             }),
         ];

@@ -1,5 +1,5 @@
 ---
-name: htui
+name: state
 description: "Read htui's state with the htui CLI and hand work to htui instead of doing it inline. Use when the person mentions htui, asks what is waiting on me or what is waiting on them, asks what is htui doing or for htui's status, says hand this to htui or put this in htui's queue, or asks is there an htui item for something."
 ---
 

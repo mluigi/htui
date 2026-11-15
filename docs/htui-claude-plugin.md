@@ -330,8 +330,10 @@ The failure documents and their messages are in
 
 ## What the skill does
 
-Claude Code uses the skill `htui` when you mention htui, ask what waits on you or what htui is doing, ask to
-hand something to htui, or ask whether an htui item covers something. It tells Claude Code:
+Claude Code uses the skill `state` (listed as `/htui:state`) when you mention htui, ask what waits
+on you or what htui is doing, ask to hand something to htui, or ask whether an htui item covers
+something. It is not named `htui`: Claude Code refuses a plugin's `/htui` command while the plugin
+also holds a skill of that name (`/htui:htui`). It tells Claude Code:
 
 - to run `htui status --json`, `htui waiting --json` and `htui --search-items='<query>' --json`,
   and how to read their documents, exit codes and failures;

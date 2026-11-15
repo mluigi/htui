@@ -222,14 +222,16 @@ fn the_frontmatter_reader_rejects_a_block_scalar() {
 }
 
 /// T1: `claude plugin validate` never reads the skill's frontmatter, so it is checked here, in
-/// both emitted variants: `name: htui` and a description.
+/// both emitted variants: `name: state` and a description. Never `htui`: Claude Code (2.1.325)
+/// refuses the mod's `$.command.register` of `/htui` while the plugin holds a skill `/htui:htui`,
+/// and the throw skips the whole `session.start` hook (no band, no poll, `/htui` runs the skill).
 #[test]
-fn the_emitted_skill_names_itself_htui_and_describes_itself() {
+fn the_emitted_skill_names_itself_state_and_describes_itself() {
     let out = tempfile::tempdir().expect("a temp dir");
     for (folder, variant) in [("full", Variant::WithMod), ("skill", Variant::SkillOnly)] {
         let dir = out.path().join(folder);
         emit(&dir, variant);
-        let skill = std::fs::read_to_string(dir.join("htui/skills/htui/SKILL.md"))
+        let skill = std::fs::read_to_string(dir.join("htui/skills/state/SKILL.md"))
             .expect("the skill is written");
         let fields = frontmatter(&skill).unwrap_or_else(|error| panic!("{folder}: {error}"));
         let field = |key: &str| {
@@ -238,7 +240,11 @@ fn the_emitted_skill_names_itself_htui_and_describes_itself() {
                 .find(|(name, _)| name == key)
                 .map(|(_, value)| value.as_str())
         };
-        assert_eq!(field("name"), Some("htui"), "{folder}: {fields:?}");
+        assert_eq!(field("name"), Some("state"), "{folder}: {fields:?}");
+        assert!(
+            !dir.join("htui/skills/htui").exists(),
+            "{folder}: no skill shares the /htui command's name"
+        );
         assert!(
             field("description").is_some_and(|text| !text.trim().is_empty()),
             "{folder}: {fields:?}"
