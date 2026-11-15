@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use htui_orch::isolate::IsolateError;
 use htui_orch::isolate::git::testkit::{empty_repo, repo_with_one_commit};
-use htui_orch::isolate::git::{Cli, RepoFacts, head, repo_facts};
+use htui_orch::isolate::git::{Cli, RepoFacts, enclosing_repository, head, repo_facts};
 use htui_orch::skip_without_git;
 
 /// `git <args>` in `cwd`, failing the case on a non-zero exit; its stdout, trimmed.
@@ -96,6 +96,7 @@ async fn a_clone_of_a_local_bare_repo_lands_at_dest_with_its_head() {
             origin: Some(remote.to_string_lossy().into_owned()),
             head: Some(commit),
             bare: false,
+            workdir: Some(dest.clone()),
         }
     );
     assert!(dest.join("f").is_file(), "the tree is checked out");
@@ -303,10 +304,7 @@ fn recording_script(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     let ran = dir.join(format!("{name}.ran"));
     crate::write_executable::write_executable(
         &script,
-        format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\necho x\n",
-            ran.display()
-        ),
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\necho x\n", ran.display()),
     );
     (script, ran)
 }
@@ -391,4 +389,84 @@ async fn an_inherited_allow_protocol_does_not_let_ext_run_a_command() {
     assert!(reason.contains("transport 'ext' not allowed"), "{reason}");
     assert!(!marker.exists(), "the ext command ran");
     assert!(!dest.exists(), "nothing is left at {}", dest.display());
+}
+
+/// MOD-116 M3 R1a A8: the work tree a repository's facts name is the repository's own, whichever
+/// of its folders was typed: its top, its `.git` directory, or a linked worktree's git directory
+/// inside the main repository's `.git`.
+#[tokio::test]
+async fn repo_facts_name_the_work_tree_whichever_git_folder_is_typed() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let main = tmp.path().join("main");
+    std::fs::create_dir(&main).expect("the main checkout");
+    repo_with_one_commit(&main);
+    let linked = tmp.path().join("linked");
+    git_out(
+        &git,
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            &linked.to_string_lossy(),
+        ],
+    )
+    .await;
+    let canonical = |path: &Path| std::fs::canonicalize(path).expect("the path resolves");
+    let workdir = |typed: &Path| {
+        repo_facts(typed)
+            .expect("the facts read")
+            .expect("a repository")
+            .workdir
+            .map(|workdir| canonical(&workdir))
+    };
+
+    assert_eq!(workdir(&main), Some(canonical(&main)));
+    assert_eq!(workdir(&main.join(".git")), Some(canonical(&main)));
+    assert_eq!(workdir(&linked), Some(canonical(&linked)));
+    assert_eq!(
+        workdir(&main.join(".git").join("worktrees").join("linked")),
+        Some(canonical(&linked)),
+        "a linked worktree's git directory names that worktree, never a folder inside `.git`"
+    );
+}
+
+/// MOD-116 M3 R1a A3 (`R-ID-4`): a folder inside a work tree, inside a `.git` directory or inside
+/// a bare repository is enclosed by that repository; a plain folder, and a repository's own top,
+/// are not (the top is `repo_facts`' to name).
+#[tokio::test]
+async fn enclosing_repository_finds_the_repository_a_folder_is_inside() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let repo = tmp.path().join("api");
+    std::fs::create_dir(&repo).expect("the repo folder");
+    repo_with_one_commit(&repo);
+    let deep = repo.join("ws").join("deeper");
+    std::fs::create_dir_all(&deep).expect("folders inside the work tree");
+    let bare = bare_main(&git, tmp.path(), "bare").await;
+    let in_bare = bare.join("ws");
+    std::fs::create_dir(&in_bare).expect("a folder inside the bare repository");
+    let plain = tmp.path().join("plain").join("ws");
+    std::fs::create_dir_all(&plain).expect("a plain folder");
+
+    let enclosing = |path: &Path| enclosing_repository(path).expect("the ancestors read");
+    assert_eq!(enclosing(&repo.join("ws")), Some(repo.clone()));
+    assert_eq!(enclosing(&deep), Some(repo.clone()));
+    assert_eq!(
+        enclosing(&repo.join(".git").join("refs")),
+        Some(repo.join(".git"))
+    );
+    assert_eq!(enclosing(&in_bare), Some(bare));
+    assert_eq!(enclosing(&plain), None);
+    assert_eq!(
+        enclosing(&repo),
+        None,
+        "a repository's own top is not inside one"
+    );
 }

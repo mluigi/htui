@@ -1971,6 +1971,10 @@ pub struct RepoFacts {
     pub head: Option<String>,
     /// Whether the repository has no work tree.
     pub bare: bool,
+    /// MOD-116 M3 R1a A8: the repository's work tree as `gix` resolves it, whichever of its
+    /// folders was opened (its top, its `.git`, a linked worktree's git directory); `None` when
+    /// bare. Not canonical: the caller resolves it.
+    pub workdir: Option<PathBuf>,
 }
 
 /// MOD-116 M3 D8: [`RepoFacts`] of the repository at `path`. `None` when no repository is at
@@ -2016,12 +2020,40 @@ pub fn repo_facts(path: &Path) -> Result<Option<RepoFacts>, IsolateError> {
             )));
         }
     };
+    let workdir = repo.workdir().map(Path::to_path_buf);
     Ok(Some(RepoFacts {
         branch,
         origin,
         head,
-        bare: repo.workdir().is_none(),
+        bare: workdir.is_none(),
+        workdir,
     }))
+}
+
+/// MOD-116 M3 R1a A3 (`R-ID-4`): the nearest **proper** ancestor of `path` that opens as a git
+/// repository (a work tree's top, a `.git` directory, a bare repository), as that ancestor's
+/// path; `None` when no ancestor does. Beside [`repo_facts`], which never discovers upward: this
+/// is the walk a folder htui writes into is refused by when it lies inside a repository. `path`
+/// itself is not asked; pass a canonical path so `..` and links cannot hide an ancestor.
+///
+/// # Errors
+/// [`IsolateError::Git`] when an ancestor looks like a repository but cannot be opened.
+pub fn enclosing_repository(path: &Path) -> Result<Option<PathBuf>, IsolateError> {
+    // A relative path's last ancestor is the empty path, which would open the working directory.
+    let ancestors = path.ancestors().skip(1);
+    for ancestor in ancestors.filter(|ancestor| !ancestor.as_os_str().is_empty()) {
+        match gix::open(ancestor) {
+            Ok(_) => return Ok(Some(ancestor.to_path_buf())),
+            Err(gix::open::Error::NotARepository { .. }) => {}
+            Err(err) => {
+                return Err(IsolateError::Git(format!(
+                    "cannot open {}: {err}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Whether `path`'s object database holds `hex` as a commit (MOD-4 milestone 4 A-3, plan D74).
