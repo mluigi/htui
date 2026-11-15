@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_manage.rs
+expression: frame
+---
+Graphics   ¹Workspaces         0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ Scratch ──────────────────────────── overview ╮
+│ ▾ Graphics  ● open                             ││○ stopped                                       │
+│     overview                                   ││                                                │
+│     Vulkan Tutorials                           ││folder on this box  ~/scratch                   │
+│ ▾ Platform  ◐ background · 1 running           ││default target      inherits the Settings       │
+│     overview                                   ││                    default (this box)          │
+│     htui                                       ││held runs           none                        │
+│     agy                                        ││                                                │
+│▌▾ Scratch   ○ stopped                          ││Runs                                            │
+│     overview                                   ││no runs                                         │
+│            ╭ Delete workspace ───────────────────────────────────────────────────────╮           │
+│            │This deletes workspace `scratch`: 0 project links and 1 box root path.   │           │
+│            │Its projects survive and stay reachable from other workspaces. Gone for  │           │
+│            │good with it: 1 kind, 1 graph, 2 phases, 10 templates.                   │           │
+│            │Nothing here can be undone.                                              │           │
+│            │Its folder `~/scratch` stays on disk.                                    │           │
+│            │                                                                         │           │
+│            │Type `scratch` to confirm:                                               │           │
+│            ╰ Enter delete · Esc keep ────────────────────────────────────────────────╯           │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰────────────────────────────────────────────────╯╰────────────────────────────────────────────────╯

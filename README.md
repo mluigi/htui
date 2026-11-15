@@ -186,7 +186,7 @@ press `N` on the Workspaces tab to create one.
 
 | Tab | What it is for |
 |---|---|
-| **1 Workspaces** | Every workspace with its state (open, in the background, stopping, stopped) and an overview of each, its runs and its projects; `o` opens one, `s` stops its runs, `r` resumes them, `N` creates a workspace or a project (an existing git folder, a git URL it clones, or a new repo). |
+| **1 Workspaces** | Every workspace with its state (open, in the background, stopping, stopped) and an overview of each, its runs and its projects; `o` opens one, `s` stops its runs, `r` resumes them, `N` creates a workspace or a project (an existing git folder, a git URL it clones, or a new repo), `e` edits a workspace, `d` deletes it, `T` sets its default target. |
 | **2 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
 | **3 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
 | **4 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
