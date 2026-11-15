@@ -241,8 +241,9 @@ async fn pg_store_indexer_lease_conformance() {
 
     assert_eq!(
         conformance::INDEXER_LEASE_CASES.len(),
-        10,
-        "MOD-159 M1's ten indexer lease cases, as `mem_store.rs` pins them"
+        15,
+        "MOD-159 M1's ten indexer lease cases and M3's five pass-request cases, as `mem_store.rs` \
+         pins them"
     );
     for name in conformance::INDEXER_LEASE_CASES {
         let Some(db) = Box::pin(common::demo_db()).await else {

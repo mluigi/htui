@@ -6,6 +6,10 @@
 //! to its row): every expiry is `clock_timestamp()` plus the TTL in
 //! microseconds, judged by the same clock, and a compare-and-set that touches no row means "not
 //! ours". The owner token is written and compared, never selected.
+//!
+//! A pass request (MOD-159 M3 plan D1, D2) is `pass_requested_at`, stamped by `clock_timestamp()`
+//! under a live holder and cleared by the holder's claim. The take's upsert and both releases
+//! never name the column, so they keep a pending request.
 
 use chrono::TimeDelta;
 use htui_core::model::{BoxId, IndexedCollection, IndexerLease, LeaseTake};
@@ -170,5 +174,54 @@ impl IndexerLeaseStore for PgStore {
             expires_at: row.lease_expires_at,
             live: row.live,
         }))
+    }
+
+    async fn request_indexer_pass(
+        &self,
+        collection: &IndexedCollection,
+    ) -> Result<Option<IndexerLease>> {
+        // One statement: the stamp and the holder it answers are the same row version, so a
+        // holder that let go concurrently is either asked (and keeps the request) or not stamped.
+        let row = sqlx::query!(
+            r#"
+            WITH asked AS (
+                UPDATE indexer_lease SET pass_requested_at = clock_timestamp()
+                 WHERE collection = $1 AND lease_owner IS NOT NULL
+                   AND lease_expires_at > clock_timestamp()
+                RETURNING collection, lease_box_id, lease_expires_at)
+            SELECT a.collection AS "collection!", a.lease_box_id, b.hostname AS "box_name?",
+                   a.lease_expires_at
+              FROM asked a LEFT JOIN box b ON b.id = a.lease_box_id
+            "#,
+            collection.name(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(|row| IndexerLease {
+            collection: row.collection,
+            box_id: row.lease_box_id.map(BoxId::from_uuid),
+            box_name: row.box_name,
+            expires_at: row.lease_expires_at,
+            live: true,
+        }))
+    }
+
+    async fn claim_indexer_pass(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> Result<bool> {
+        let claimed = sqlx::query!(
+            "UPDATE indexer_lease SET pass_requested_at = NULL \
+              WHERE collection = $1 AND lease_owner = $2 AND pass_requested_at IS NOT NULL",
+            collection.name(),
+            owner,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        Ok(claimed == 1)
     }
 }
