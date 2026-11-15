@@ -954,6 +954,7 @@ async fn dependent_of_feat_3(orch: &FakeOrchestrator, snapshot: GraphSnapshot) -
             item_id: item,
             mode: RunMode::Manual,
             target_box_id: orch.box_id(),
+            executing_box_id: None,
             started_by: user,
             graph_snapshot: snapshot,
             repo_scope: Vec::new(),
