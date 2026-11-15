@@ -348,7 +348,9 @@ mod tests {
         let cases = [
             (ItemState::NeedsYou, theme.warning),
             (ItemState::Failed, theme.error),
+            (ItemState::LandRefused, theme.error),
             (ItemState::Running, theme.running),
+            (ItemState::Landing, theme.running),
             (ItemState::Stopped, theme.base),
             (ItemState::Blocked, theme.error),
             (ItemState::Queued, theme.base),

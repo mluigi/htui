@@ -25,7 +25,7 @@ pub mod runs;
 
 use std::cell::Cell;
 
-use htui_core::model::{ItemId, ItemSummary, RunId, StepId};
+use htui_core::model::{ItemId, ItemSummary, RunId, RunLanding, StepId};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -417,6 +417,10 @@ pub struct Framing {
     pub focus: Focus,
     /// The list's [`ListCue`].
     pub list: ListCue,
+    /// MOD-133 M2 E2: the [`RunLanding`] of the selected item's latest graph run, from the list's
+    /// summary ([`ItemSummary::latest_run_landing`]): what the Body pane reads the `landing` and
+    /// `landing refused` states from, with no store read of its own.
+    pub landing: Option<RunLanding>,
 }
 
 /// The last [`Framing`] a sub-tab was told; nothing on a bench that renders a sub-tab alone.
@@ -445,6 +449,12 @@ impl Told {
     #[must_use]
     pub fn list(&self) -> ListCue {
         self.0.get().map(|framing| framing.list).unwrap_or_default()
+    }
+
+    /// The landing of the selected item's latest graph run, `None` until told (MOD-133 M2 E2).
+    #[must_use]
+    pub fn landing(&self) -> Option<RunLanding> {
+        self.0.get().and_then(|framing| framing.landing)
     }
 }
 
@@ -482,6 +492,7 @@ pub fn render(
             tab.framing(Framing {
                 focus: chrome.focus,
                 list: cue,
+                landing: item.and_then(|summary| summary.latest_run_landing),
             });
             tab.render(frame, inner, ctx);
         }
@@ -1021,6 +1032,7 @@ mod tests {
     fn told_keeps_the_last_framing() {
         use super::{Framing, ListCue, Told};
         use crate::ui::kit::pane::Focus;
+        use htui_core::model::RunLanding;
 
         let told = Told::new();
         assert_eq!(told.focus(), None);
@@ -1029,11 +1041,14 @@ mod tests {
             filter_open: true,
             no_items: false,
         };
+        assert_eq!(told.landing(), None);
         told.set(Framing {
             focus: Focus::Unfocused,
             list,
+            landing: Some(RunLanding::Refused),
         });
         assert_eq!(told.focus(), Some(Focus::Unfocused));
         assert_eq!(told.list(), list);
+        assert_eq!(told.landing(), Some(RunLanding::Refused));
     }
 }

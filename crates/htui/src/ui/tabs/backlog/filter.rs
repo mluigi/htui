@@ -860,7 +860,14 @@ mod tests {
     #[test]
     fn space_toggles_a_state_in_all_order() {
         let mut form = open();
-        for _ in 0..7 {
+        // `Done` is ninth after `NeedsYou` in `ItemState::ALL` (MOD-133 M2 E2 added `LandRefused`
+        // and `Landing` ahead of it).
+        let done = ItemState::ALL
+            .iter()
+            .position(|state| *state == ItemState::Done)
+            .expect("`Done` is a state");
+        assert_eq!(done, 9);
+        for _ in 0..done {
             form.on_key(key(KeyCode::Char('l')), Keys::compiled());
         }
         form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
