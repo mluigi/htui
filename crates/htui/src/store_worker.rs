@@ -3401,6 +3401,33 @@ where
     Ok(StoreReply::DirListing(listing))
 }
 
+/// MOD-116 M3 D7: `serve` answered from a task of its own, at `seq`'s address. R1a A6: the
+/// answer is awaited through the serving task's `JoinHandle`, so a task that panics (or is
+/// cancelled) is still answered, `Failed` under `request`: the asking view hears back exactly
+/// once, and a gate it holds until then (the tab's "a project is still being created") lifts.
+fn answer_from_own_task<F>(
+    tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+    seq: Seq,
+    origin: Origin,
+    request: &'static str,
+    serve: F,
+) where
+    F: Future<Output = Result<StoreReply, StoreError>> + Send + 'static,
+{
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let reply = match tokio::spawn(serve).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => failed(request, &err),
+            Err(ended) => failed(
+                request,
+                &StoreError::Backend(format!("its task ended without an answer: {ended}")),
+            ),
+        };
+        let _ = tx.send(ReplyEnvelope { seq, origin, reply });
+    });
+}
+
 /// Renders a store error into the reply the asking view receives.
 fn failed(request: &'static str, err: &StoreError) -> StoreReply {
     StoreReply::Failed {
@@ -4042,14 +4069,10 @@ pub(crate) fn spawn_with_concepts(
                         // read that meets a lost server drops the backend as usual.
                         request @ StoreRequest::NewProject { .. } => {
                             let (request, backend) = (request.clone(), backend.clone());
-                            let (seq, origin, tx) = (envelope.seq, envelope.origin.clone(), tx.clone());
-                            tokio::spawn(async move {
-                                let reply = match workspace_setup::serve(&backend, &request).await {
-                                    Ok(reply) => reply,
-                                    Err(err) => failed(request.name(), &err),
-                                };
-                                let _ = tx.send(ReplyEnvelope { seq, origin, reply });
-                            });
+                            let (seq, origin) = (envelope.seq, envelope.origin.clone());
+                            let name = request.name();
+                            let serve = async move { workspace_setup::serve(&backend, &request).await };
+                            answer_from_own_task(&tx, seq, origin, name, serve);
                             continue;
                         }
                         other => {
@@ -8113,9 +8136,48 @@ mod tests {
         assert_eq!(lost_the_store(&stops(None)), None);
     }
 
-    /// MOD-116 M3 D7: the loop answers a new project from its own task, at the request's own
-    /// address, and serves the request after it meanwhile. The loop serves the real home, so
-    /// Platform first gets a folder row on the memory store's box pointing at a temp dir.
+    /// A local http server whose first connection is held open with no answer until `release`
+    /// is sent (or dropped); `accepted` hears when it arrives. Later connections are closed at
+    /// once. The URL of a repository on it.
+    fn hanging_server() -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let port = listener.local_addr().expect("its address").port();
+        let (accepted_tx, accepted) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let Ok((held, _)) = listener.accept() else {
+                return;
+            };
+            let _ = accepted_tx.send(());
+            let _ = released.recv();
+            drop(held);
+            listener
+                .set_nonblocking(true)
+                .expect("the listener goes non-blocking");
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < until {
+                match listener.accept() {
+                    Ok((stream, _)) => drop(stream),
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        });
+        (
+            format!("http://127.0.0.1:{port}/api.git"),
+            accepted,
+            release,
+        )
+    }
+
+    /// MOD-116 M3 D7, R1a A9: the loop answers a new project from its own task, at the request's
+    /// own address, and serves the request after it meanwhile: the clone's remote holds the
+    /// connection and answers nothing, and the listing sent after it is answered first. The loop
+    /// serves the real home, so Platform first gets a folder row on the memory store's box
+    /// pointing at a temp dir.
     #[tokio::test]
     async fn a_new_project_is_answered_from_its_own_task() {
         let Some(_git) = htui_orch::skip_without_git!() else {
@@ -8141,59 +8203,94 @@ mod tests {
             })
             .await
             .expect("the folder row is written");
+        let (url, accepted, release) = hanging_server();
         let (tx, mut rx, _worker) = detached(backend);
-        for (seq, request) in [
-            (
-                3,
-                StoreRequest::NewProject {
-                    workspace: ids::WORKSPACE_PLATFORM,
-                    slug: "fresh".to_owned(),
-                    name: "Fresh".to_owned(),
-                    description: String::new(),
-                    source: ProjectSource::NewRepo,
-                },
-            ),
-            (4, StoreRequest::Workspaces),
-        ] {
+        let send = |seq, request| {
             tx.send(RequestEnvelope {
                 seq,
                 origin: Origin::App,
                 request,
             })
             .expect("the worker is alive");
-        }
+        };
+        let within = std::time::Duration::from_secs(30);
 
-        let mut replies = Vec::new();
-        for _ in 0..2 {
-            replies.push(rx.recv().await.expect("the worker answers"));
-        }
-        replies.sort_by_key(|reply| reply.seq);
+        send(
+            3,
+            StoreRequest::NewProject {
+                workspace: ids::WORKSPACE_PLATFORM,
+                slug: "fresh".to_owned(),
+                name: "Fresh".to_owned(),
+                description: String::new(),
+                source: ProjectSource::Clone { url },
+            },
+        );
+        tokio::task::spawn_blocking(move || accepted.recv_timeout(within))
+            .await
+            .expect("the wait joins")
+            .expect("the clone reaches its remote, which answers nothing");
+        send(4, StoreRequest::Workspaces);
+
+        let first = tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("the listing is answered while the clone hangs")
+            .expect("the worker answers");
+        assert!(
+            matches!(
+                &first,
+                ReplyEnvelope {
+                    seq: 4,
+                    origin: Origin::App,
+                    reply: StoreReply::Workspaces(_),
+                }
+            ),
+            "{first:?}"
+        );
+
+        release.send(()).expect("the server holds the connection");
+        let second = tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("the new project is answered once its remote lets go")
+            .expect("the worker answers");
         let ReplyEnvelope {
             seq: 3,
             origin: Origin::App,
-            reply:
-                StoreReply::ProjectCreated {
-                    workspace,
-                    project,
-                    repo_path,
-                },
-        } = &replies[0]
+            reply: StoreReply::SetupRefused { request, reason },
+        } = &second
         else {
-            panic!(
-                "the project is created at its own address: {:?}",
-                replies[0]
-            );
+            panic!("the clone fails at its own address: {second:?}");
         };
-        assert_eq!(*workspace, ids::WORKSPACE_PLATFORM);
-        assert_eq!(project.slug, "fresh");
-        assert_eq!(
-            std::path::PathBuf::from(repo_path),
-            canonical.join("projects").join("fresh")
-        );
+        assert_eq!(*request, "new_project");
+        assert!(reason.starts_with("git clone: "), "{reason}");
+        assert!(!canonical.join("projects").join("fresh").exists());
+    }
+
+    /// MOD-116 M3 R1a A6: a new project's task that panics is still answered, `Failed` under the
+    /// request's own name at its own address, so the tab's "a project is still being created"
+    /// gate is lifted.
+    #[tokio::test]
+    async fn a_new_project_task_that_panics_is_still_answered() {
+        async fn panics() -> Result<StoreReply, StoreError> {
+            panic!("a seam that panics")
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        answer_from_own_task(&tx, 7, Origin::App, "new_project", panics());
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the panic is answered")
+            .expect("the sender lives");
         assert!(
-            matches!(&replies[1].reply, StoreReply::Workspaces(_)),
-            "{:?}",
-            replies[1]
+            matches!(
+                &reply,
+                ReplyEnvelope {
+                    seq: 7,
+                    origin: Origin::App,
+                    reply: StoreReply::Failed { request: "new_project", message },
+                } if message.contains("panicked")
+            ),
+            "{reply:?}"
         );
     }
 
