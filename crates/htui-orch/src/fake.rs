@@ -1236,8 +1236,10 @@ impl Isolator for FakeIsolator {
         })
     }
 
-    /// MOD-133 M3 D1: logged, then [`base`](Isolator::base)'s synthetic tip per repo: the fake
-    /// keeps no branch, so the run branch is always "at `HEAD`".
+    /// MOD-133 M3 D1: logged, then `fake:run-branch:<repo>` per repo: stable, and apart from
+    /// [`base`](Isolator::base)'s `fake:group-base:<repo>`, so a case can tell a step that
+    /// started from the run branch (D2) from one that started from `HEAD`. Only a
+    /// `pull_request` run calls it.
     fn run_branches<'a>(
         &'a self,
         branches: &'a BTreeMap<RepoId, String>,
@@ -1246,7 +1248,7 @@ impl Isolator for FakeIsolator {
             self.log(IsolatorCall::RunBranches);
             Ok(branches
                 .keys()
-                .map(|repo| (*repo, format!("fake:group-base:{repo}")))
+                .map(|repo| (*repo, format!("fake:run-branch:{repo}")))
                 .collect())
         })
     }
@@ -5079,7 +5081,7 @@ mod tests {
         assert_eq!(isolator.in_place_overlaps(), 1, "alone, no overlap");
     }
 
-    /// MOD-133 M3 D1, D3: `run_branches` is logged and answers `base`'s synthetic tips; a plain
+    /// MOD-133 M3 D1, D3: `run_branches` is logged and answers its own synthetic tips; a plain
     /// `reconcile` and a `reconcile_onto` both log `Reconcile`, and only the onto log tells them
     /// apart.
     #[tokio::test]
@@ -5094,7 +5096,7 @@ mod tests {
                 .run_branches(&branches)
                 .await
                 .expect("the fake ensures"),
-            isolator.base(&[repo]).await.expect("the fake reads a base")
+            BTreeMap::from([(repo, format!("fake:run-branch:{repo}"))])
         );
         isolator
             .reconcile(step, &[], &[])

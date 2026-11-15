@@ -652,9 +652,11 @@ async fn bases_of(orch: &FakeOrchestrator, run: RunId) -> Vec<String> {
         .collect()
 }
 
-/// The fake's tip of `repo`'s run branch ([`htui_orch::isolate::Isolator::run_branches`]).
+/// The fake's tip of `repo`'s run branch ([`htui_orch::isolate::Isolator::run_branches`]),
+/// apart from its `base` (`fake:group-base:<repo>`), so a step that starts from it started from
+/// the run branch.
 fn fake_tip(repo: RepoId) -> String {
-    format!("fake:group-base:{repo}")
+    format!("fake:run-branch:{repo}")
 }
 
 /// D2, D3: a `pull_request` run ensures its run branch before every step that prepares the scope,

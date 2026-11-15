@@ -406,6 +406,23 @@ async fn a_pull_request_run_lands_on_its_run_branch_and_pushes_it() {
         Some(tip.as_str()),
         "the tip is a merge"
     );
+    // D2: `implement` started from `prd`'s merge on the run branch, not from the primary's HEAD.
+    let first = merges.lines().nth(1).expect("the older merge is prd's");
+    let mut implement = Vec::new();
+    for step in fix.orch.steps(run).await {
+        if step.phase_name == "implement" {
+            implement.extend(
+                fix.orch
+                    .store
+                    .step_trees(step.id)
+                    .await
+                    .expect("MemStore never fails a read")
+                    .into_iter()
+                    .map(|tree| tree.base_ref),
+            );
+        }
+    }
+    assert_eq!(implement, [first], "implement starts from prd's merge");
     let files = git_out(&git, &fix.path, &["ls-tree", "--name-only", RUN_BRANCH]).await;
     assert_eq!(
         files.lines().collect::<Vec<_>>(),
