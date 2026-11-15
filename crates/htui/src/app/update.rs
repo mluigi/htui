@@ -390,8 +390,11 @@ impl App {
             if !self.scope.is_empty() {
                 let scope = self.scope.clone();
                 self.dispatch(Origin::App, StoreRequest::Waiting { scope });
-                // MOD-116 M1 D5: every workspace's counts, for the header's background chip
-                // and the Workspaces tab, which never polls them itself.
+            }
+            // MOD-116 M1 D5: every workspace's counts, for the header's background chip and the
+            // Workspaces tab, which never polls them itself; M3 D16: once the scope names a
+            // workspace, with a project or not (a new workspace starts with none).
+            if self.scope.workspace_id != WorkspaceId::default() {
                 self.dispatch(Origin::App, StoreRequest::WorkspaceRunCounts);
             }
             self.poll_activity();
@@ -1449,6 +1452,34 @@ mod tests {
             StoreRequest::WorkspaceRunCounts
         ));
         assert!(matches!(requests[3].request, StoreRequest::SweepRetention));
+    }
+
+    /// MOD-116 M3 D16: a workspace with no project (every one the Workspaces tab creates starts
+    /// so) still reads its counts once a second, or its state and the background chip would
+    /// freeze; `Waiting` keeps its project gate.
+    #[test]
+    fn a_workspace_with_no_project_still_reads_its_counts() {
+        let (mut app, mut rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: WorkspaceSummary {
+                projects: Vec::new(),
+                ..workspace("Mobile App")
+            },
+        });
+        assert!(app.scope.is_empty(), "a scope with no project");
+        app.top_bar.store = "online".to_owned();
+        while rx.try_recv().is_ok() {}
+        for _ in 0..TICKS_PER_REFRESH {
+            app.update(Action::Tick);
+        }
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(matches!(requests[0].request, StoreRequest::StoreState));
+        assert!(matches!(
+            requests[1].request,
+            StoreRequest::WorkspaceRunCounts
+        ));
+        assert!(matches!(requests[2].request, StoreRequest::SweepRetention));
     }
 
     /// `workspace`'s counts with `running` running runs and nothing else.
