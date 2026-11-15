@@ -335,34 +335,18 @@ pub async fn serve_with_home(
             description,
         } => {
             let created_by = backend.this_user().await?;
-            let project = writer
-                .create_project(NewProject {
+            let project = create_linked_project(
+                &writer,
+                *workspace,
+                NewProject {
                     id: ProjectId::new(),
                     slug: slug.clone(),
                     name: name.clone(),
                     description: description.clone(),
                     created_by,
-                })
-                .await?;
-            // Two seam calls rather than one transaction: `upsert_workspace_project` is the seam's
-            // linker and this milestone adds no seam method, so a failure between them leaves an
-            // unlinked project the editor's `Failed` reports and `r` does not show.
-            let links = writer.workspace_projects(*workspace).await?;
-            // One past the highest, not the count: a middle project that was deleted leaves
-            // `[0, 2]`, where `links.len()` is `2` and `workspace_project` has no unique on
-            // `position` to catch the collision (`0001_init.sql:161-166`).
-            let position = links
-                .iter()
-                .map(|link| link.position)
-                .max()
-                .map_or(0, |highest| highest.saturating_add(1));
-            writer
-                .upsert_workspace_project(&WorkspaceProject {
-                    workspace_id: *workspace,
-                    project_id: project.id,
-                    position,
-                })
-                .await?;
+                },
+            )
+            .await?;
             // MOD-147 D6: a prefix the new project shares with the workspace's own kinds is a
             // notice, not a refusal (ANA-35 §7.5): keys then print qualified.
             let shared_prefixes = prefixes_shared_with(&writer, *workspace, project.id).await?;
@@ -488,6 +472,39 @@ pub async fn serve_with_home(
     }
 }
 
+/// `new`, created and linked into `workspace` one past its highest position (factored out of
+/// `CreateProject`'s arm for MOD-116 M3 D6, which registers a project the same way).
+///
+/// # Errors
+/// Whatever the seam reports. Two seam calls rather than one transaction:
+/// `upsert_workspace_project` is the seam's linker and this milestone adds no seam method, so a
+/// failure between them leaves an unlinked project; a caller that must not keep it deletes
+/// `new.id` (MOD-116 M3 does).
+pub(crate) async fn create_linked_project(
+    writer: &Writer,
+    workspace: WorkspaceId,
+    new: NewProject,
+) -> Result<Project> {
+    let project = writer.create_project(new).await?;
+    let links = writer.workspace_projects(workspace).await?;
+    // One past the highest, not the count: a middle project that was deleted leaves `[0, 2]`,
+    // where `links.len()` is `2` and `workspace_project` has no unique on `position` to catch the
+    // collision (`0001_init.sql:161-166`).
+    let position = links
+        .iter()
+        .map(|link| link.position)
+        .max()
+        .map_or(0, |highest| highest.saturating_add(1));
+    writer
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace,
+            project_id: project.id,
+            position,
+        })
+        .await?;
+    Ok(project)
+}
+
 /// MOD-147 D6: `project`'s kind prefixes that a kind of `workspace`'s scope row also uses, in
 /// `project`'s kind order; empty when the workspace has no scope row.
 async fn prefixes_shared_with(
@@ -557,7 +574,7 @@ async fn fresh_tree(
 }
 
 /// This box's id, or the refusal a path write gets on a box with no row.
-fn box_id(this_box: Option<BoxId>) -> Result<BoxId> {
+pub(crate) fn box_id(this_box: Option<BoxId>) -> Result<BoxId> {
     this_box.ok_or_else(|| StoreError::NotFound {
         entity: "box",
         id: "(this box)".to_owned(),
@@ -574,7 +591,7 @@ fn box_id(this_box: Option<BoxId>) -> Result<BoxId> {
 /// `to_string_lossy` that stores a string naming nothing on disk. What was typed is a `String` and
 /// so always UTF-8; only what a link resolves to can get here, and the sentence names the path as
 /// typed — never the target (`R-BOX-4`).
-async fn canonical(path: &str) -> Result<String> {
+pub(crate) async fn canonical(path: &str) -> Result<String> {
     let typed = path.to_owned();
     let resolved = tokio::task::spawn_blocking({
         let typed = typed.clone();
@@ -594,7 +611,7 @@ async fn canonical(path: &str) -> Result<String> {
 ///
 /// The rows are gone before this runs, so a failed rebuild is reported *inside* a successful
 /// reply rather than turning the delete into a `Failed` that claims nothing happened.
-async fn rebuild_mirror(backend: &Backend) -> MirrorAfterDelete {
+pub(crate) async fn rebuild_mirror(backend: &Backend) -> MirrorAfterDelete {
     match backend.cache() {
         Some(cache) => match cache.rebuild().await {
             Ok(()) => MirrorAfterDelete::Rebuilt,
