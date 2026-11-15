@@ -15,7 +15,8 @@
 //! target re-read against the stop row its question was decided on
 //! ([`stop_report::write_stop`], [`stop_report::write_resume`]); offline they are refused before
 //! any write. A stop target whose write fails is told as [`StopWrite::Failed`] and the next one
-//! is still written (R1 F1).
+//! is still written (R1 F1), unless the store was lost: then it and every untried target are
+//! `Failed` and the reply carries the loss (MOD-116 M3 T2).
 
 use std::path::{Path, PathBuf};
 
@@ -136,24 +137,41 @@ pub async fn serve_with_home(
             // Taken when the request is served: after the question was answered (M4 R1).
             let at = Utc::now();
             let mut outcomes = Vec::with_capacity(targets.len());
+            let mut lost: Option<StoreError> = None;
             // R1 F1: a target whose write fails is its outcome, and the next target is still
             // written, so the answer tells every target: the ones written before it stand.
+            // M3 T2 (M2 R1 carried): a lost connection ends the batch instead: that target and
+            // every untried one are `Failed` in its words, and the loss rides beside the outcomes
+            // so `lost_the_store` still drops the backend onto the mirror.
             for target in targets {
-                let outcome = stop_report::write_stop(
-                    &writer,
-                    target.workspace,
-                    *mode,
-                    target.decided_on.as_ref(),
-                    user,
-                    at,
-                )
-                .await
-                .unwrap_or_else(|err| StopWrite::Failed(err.to_string()));
+                let outcome = match &lost {
+                    Some(err) => StopWrite::Failed(err.to_string()),
+                    None => match stop_report::write_stop(
+                        &writer,
+                        target.workspace,
+                        *mode,
+                        target.decided_on.as_ref(),
+                        user,
+                        at,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            let failed = StopWrite::Failed(err.to_string());
+                            if matches!(err, StoreError::Unreachable(_)) {
+                                lost = Some(err);
+                            }
+                            failed
+                        }
+                    },
+                };
                 outcomes.push((target.workspace, outcome));
             }
             Ok(StoreReply::StopsWritten {
                 mode: *mode,
                 outcomes,
+                lost,
             })
         }
         StoreRequest::ResumeWorkspace {
@@ -280,11 +298,19 @@ async fn default_target(writer: &Writer, tree: &HierarchySnapshot) -> Result<Tar
             ReadStore::target(writer, target).await?.name,
         ));
     }
-    let name = match WriteStore::default_target(writer).await? {
+    Ok(TargetLine::Inherits(settings_default_name(writer).await?))
+}
+
+/// The Settings default target's name: the `app_setting` row's target, else the seeded local
+/// target (`this box`). Shared with MOD-116 M3 D9's `TargetChoices`.
+///
+/// # Errors
+/// Whatever the store reports.
+pub(crate) async fn settings_default_name(writer: &Writer) -> Result<String> {
+    Ok(match WriteStore::default_target(writer).await? {
         Some(default) => ReadStore::target(writer, default.target).await?.name,
         None => seed::LOCAL_TARGET_NAME.to_owned(),
-    };
-    Ok(TargetLine::Inherits(name))
+    })
 }
 
 #[cfg(test)]
@@ -627,7 +653,12 @@ mod tests {
         };
         let before = Utc::now();
         let reply = crate::store_worker::serve(&backend, &request).await;
-        let StoreReply::StopsWritten { mode, outcomes } = reply else {
+        let StoreReply::StopsWritten {
+            mode,
+            outcomes,
+            lost: None,
+        } = reply
+        else {
             panic!("expected the stops written, got {reply:?}");
         };
         assert_eq!(mode, StopMode::Graceful);
@@ -684,6 +715,56 @@ mod tests {
         }
     }
 
+    /// MOD-116 M3 T2 (M2 R1 carried): a lost connection ends the batch. The target it struck and
+    /// every untried one are `Failed` in the loss's words, and the reply carries the loss itself
+    /// so the store worker's `lost_the_store` still drops the backend onto the mirror.
+    #[tokio::test]
+    async fn a_lost_connection_ends_the_batch_and_rides_in_the_reply() {
+        let identity = htui_store::Identity {
+            box_id: htui_core::model::BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = htui_store::PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "stop-lost", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let backend = Backend::Online {
+            pg,
+            cache: cache.clone(),
+        };
+        let request = StoreRequest::StopWorkspaces {
+            mode: StopMode::Graceful,
+            targets: [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS]
+                .into_iter()
+                .map(|workspace| StopTarget {
+                    workspace,
+                    decided_on: None,
+                })
+                .collect(),
+        };
+        let reply = serve(&backend, &request).await.expect("served as a reply");
+        let StoreReply::StopsWritten { outcomes, lost, .. } = reply else {
+            panic!("expected the stops written, got {reply:?}");
+        };
+        let Some(lost @ StoreError::Unreachable(_)) = lost else {
+            panic!("the loss rides in the reply: {lost:?}");
+        };
+        assert_eq!(
+            outcomes,
+            [
+                (ids::WORKSPACE_PLATFORM, StopWrite::Failed(lost.to_string())),
+                (ids::WORKSPACE_GRAPHICS, StopWrite::Failed(lost.to_string())),
+            ]
+        );
+        cache.close().await;
+    }
+
     /// MOD-116 M2 D3/D4: a target decided on no stop row, when one was written meanwhile, writes
     /// nothing.
     #[tokio::test]
@@ -714,7 +795,7 @@ mod tests {
         assert!(
             matches!(
                 &reply,
-                StoreReply::StopsWritten { mode: StopMode::Forced, outcomes }
+                StoreReply::StopsWritten { mode: StopMode::Forced, outcomes, lost: None }
                     if outcomes == &[(ids::WORKSPACE_PLATFORM, StopWrite::Changed)]
             ),
             "{reply:?}"

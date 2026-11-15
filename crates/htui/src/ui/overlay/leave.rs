@@ -1175,6 +1175,7 @@ mod tests {
             StoreReply::StopsWritten {
                 mode: StopMode::Graceful,
                 outcomes,
+                lost: None,
             },
         );
         dialog
@@ -1482,6 +1483,7 @@ mod tests {
             StoreReply::StopsWritten {
                 mode: StopMode::Graceful,
                 outcomes: vec![(world.platform, StopWrite::Written)],
+                lost: None,
             },
         );
         let _ = bench.emit.take();
@@ -1608,6 +1610,7 @@ mod tests {
             StoreReply::StopsWritten {
                 mode: StopMode::Graceful,
                 outcomes: vec![(world.platform, StopWrite::Failed("no".to_owned()))],
+                lost: None,
             },
         );
         assert!(bench.emit.is_empty(), "{:?}", bench.emit.take());
