@@ -1765,6 +1765,60 @@ mod tests {
         }
     }
 
+    /// MOD-127 M2 D6: `snapshot_of` hands the frozen toolbox and each row's picks back as stored,
+    /// and a run made before M2, with neither key, reads as a run that froze nothing.
+    #[test]
+    fn snapshot_of_reads_the_frozen_toolbox_and_a_pre_m2_run_has_none() {
+        use htui_core::model::{
+            BindingLevel, McpPick, McpServerId, McpTransport, SnapshotMcpServer, SnapshotToolbox,
+        };
+
+        let run = demo_data()
+            .runs
+            .into_iter()
+            .find(|row| row.id == ids::RUN_1)
+            .expect("the fixture holds RUN_1");
+        let mut stored: GraphSnapshot =
+            serde_json::from_value(run.graph_snapshot.clone().expect("RUN_1 carries one"))
+                .expect("the fixture snapshot decodes");
+        assert_eq!(stored.toolbox, None, "the fixture run predates M2");
+        let before = super::snapshot_of(&run).expect("a pre-M2 snapshot reads");
+        assert_eq!(before.toolbox, None, "it freezes nothing");
+        assert!(before.phases.iter().all(|phase| phase.mcp.is_empty()));
+
+        // A v2 snapshot is handed back as stored; a v1 one is lifted.
+        stored.v = GraphSnapshot::V;
+        stored.toolbox = Some(SnapshotToolbox {
+            servers: vec![SnapshotMcpServer {
+                id: McpServerId::new(),
+                name: "docs".to_owned(),
+                description: String::new(),
+                transport: McpTransport::Stdio,
+                command: "mcp-docs".to_owned(),
+                args: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                env: Vec::new(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+            }],
+        });
+        stored.phases[0].mcp = vec![McpPick {
+            server: 0,
+            level: BindingLevel::Project,
+            active: true,
+        }];
+        let frozen = Run {
+            graph_snapshot: Some(serde_json::to_value(&stored).expect("encodes")),
+            ..run
+        };
+        assert_eq!(
+            super::snapshot_of(&frozen).expect("a frozen snapshot reads"),
+            stored,
+            "the toolbox and the picks come back as stored"
+        );
+    }
+
     /// ANA-2 §12 criterion 5 (`docs/ANA-2.md:2096`) is a rule about rows, so it is testable without
     /// a store: the guard refuses, names the kind, and could not have written anything if it tried.
     #[test]

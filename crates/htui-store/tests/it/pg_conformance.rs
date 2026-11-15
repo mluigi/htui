@@ -959,6 +959,7 @@ async fn claim_run_holds_the_target_box_against_a_re_probe() {
             source: None,
             edges: Vec::new(),
             integrate: std::collections::BTreeMap::new(),
+            toolbox: None,
         },
         repo_scope: Vec::new(),
         queued_at: at,

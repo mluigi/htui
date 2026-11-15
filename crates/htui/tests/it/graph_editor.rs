@@ -367,6 +367,7 @@ async fn the_reference_graph_is_built_in_the_tui_and_resolves() {
         &BTreeMap::new(),
         None,
         ids::BOX,
+        None,
     )
     .await
     .unwrap_or_else(|refusal| panic!("the reference graph resolves: {refusal}"))
@@ -1353,9 +1354,18 @@ async fn resolved(store: &MemStore) -> Result<GraphSnapshot, ResolveError> {
         .app_settings()
         .await
         .expect("a memory read never fails");
-    htui_orch::graph::resolve(store, store, &item, RunMode::Manual, &app, None, ids::BOX)
-        .await
-        .map(|resolved| resolved.snapshot)
+    htui_orch::graph::resolve(
+        store,
+        store,
+        &item,
+        RunMode::Manual,
+        &app,
+        None,
+        ids::BOX,
+        None,
+    )
+    .await
+    .map(|resolved| resolved.snapshot)
 }
 
 /// Gives research and verdict one candidate each, the first (agent, model) pair, one write

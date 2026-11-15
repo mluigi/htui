@@ -3636,6 +3636,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             ids::BOX,
+            None,
         )
         .await
     }

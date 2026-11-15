@@ -17,11 +17,11 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, Binding, BindingChange, BindingKey, BindingRef, BoundMcp,
     BoundSkill, BoxId, CapError, EdgeId, Gate, GraphBody, GraphSnapshot, Isolation, Item, ItemId,
-    ItemPatch, NewStepGraph, NodeBody, PhaseAgent, PhaseId, PhasePart, Project, ProjectCaps,
-    ProjectId, ProjectSettings, PromptTemplate, RepoId, ResolveScope, ResolvedGraph, ResolvedPhase,
-    RunMode, RuntimeChanges, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
-    SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId,
-    StepGraphPhase,
+    ItemPatch, McpPick, NewStepGraph, NodeBody, PhaseAgent, PhaseId, PhasePart, Project,
+    ProjectCaps, ProjectId, ProjectSettings, PromptTemplate, RepoId, ResolveScope, ResolvedGraph,
+    ResolvedPhase, RunMode, RuntimeChanges, SnapshotCandidate, SnapshotGraph, SnapshotJudge,
+    SnapshotMcpServer, SnapshotPersona, SnapshotPhase, SnapshotSettings, SnapshotTemplate,
+    SnapshotToolbox, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
 };
 use htui_core::model::{
     EdgeKind, GraphScope, ItemFilter, NodeRole, PLAN_SUFFIX, Scope, SnapshotDivide, SnapshotEdge,
@@ -424,7 +424,8 @@ pub enum NotRunnable {
 ///
 /// ANA-2 defines the hash as "over the canonical serialisation of `phases[]`" (`:1479`) and never
 /// defines "canonical", so this is where it is defined: the envelope (`v`, `graph`, `mode`,
-/// `settings`, `scope`, `personas`, `memory`) is excluded, field order is [`SnapshotPhase`]'s
+/// `settings`, `scope`, `personas`, `memory`, `toolbox`) is excluded, as are the nodes' frozen
+/// MCP picks (`SnapshotPhase::mcp`, MOD-127 M2 D6), field order is [`SnapshotPhase`]'s
 /// declaration order and nulls are emitted, **except `persona`** (MOD-26 D9), which is skipped
 /// when `None`, so a persona-less phase serialises exactly as before and only a bound phase's
 /// digest names its persona. Any other field added to `SnapshotPhase` changes every digest and is a
@@ -443,7 +444,7 @@ pub enum NotRunnable {
 /// panic on a production path, and a field added to `SnapshotPhase` later is exactly the change
 /// that would reach it.
 pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, ResolveError> {
-    let json = serde_json::to_string(phases).map_err(|err| {
+    let json = serde_json::to_string(&*without_picks(phases)).map_err(|err| {
         ResolveError::Store(StoreError::Constraint(format!(
             "the graph's phases do not serialise: {err}"
         )))
@@ -452,6 +453,26 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
         "sha256:{}",
         htui_core::prompt::digest::sha256_hex(&json)
     ))
+}
+
+/// MOD-127 M2 D6: `phases` as the digests read them, with each node's frozen MCP picks left out:
+/// editing a server never parks a run, and a snapshot's own digest is recomputed over phases that
+/// carry their picks (`resume_window`), so the picks must not be hashed. Borrowed when no node
+/// holds a pick, which is every snapshot written before M2 and every run with no server.
+fn without_picks(phases: &[SnapshotPhase]) -> std::borrow::Cow<'_, [SnapshotPhase]> {
+    if phases.iter().all(|phase| phase.mcp.is_empty()) {
+        return std::borrow::Cow::Borrowed(phases);
+    }
+    std::borrow::Cow::Owned(
+        phases
+            .iter()
+            .cloned()
+            .map(|mut phase| {
+                phase.mcp.clear();
+                phase
+            })
+            .collect(),
+    )
 }
 
 /// Builds ANA-2 §5.1's snapshot from the live graph, walking §4.1's chains once per field.
@@ -478,8 +499,16 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 ///
 /// The graph is read once (`read_graph`) and resolved by [`resolve_with`] (MOD-130 M3, P3).
 ///
+/// MOD-127 M2 D6: the snapshot also freezes the MCP servers each phase binds
+/// ([`GraphSnapshot::toolbox`]), resolved for `workspace`, the run's workspace (`None` for a
+/// caller with none, so the workspace level does not apply).
+///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`resolve_with`'s inputs less the graph it reads itself"
+)]
 pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     store: &S,
     source: &G,
@@ -488,6 +517,7 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     app: &BTreeMap<String, Value>,
     requested_scope: Option<&[RepoId]>,
     box_id: BoxId,
+    workspace: Option<WorkspaceId>,
 ) -> std::result::Result<Resolved, ResolveError> {
     let graph = read_graph(source, item).await?;
     Box::pin(resolve_with(
@@ -499,6 +529,7 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         app,
         requested_scope,
         box_id,
+        workspace,
     ))
     .await
 }
@@ -540,7 +571,15 @@ pub async fn resolve_with<S: htui_core::store::WorkerStore, G: GraphSource>(
     app: &BTreeMap<String, Value>,
     requested_scope: Option<&[RepoId]>,
     box_id: BoxId,
+    workspace: Option<WorkspaceId>,
 ) -> std::result::Result<Resolved, ResolveError> {
+    // MOD-127 M2 D6: the live rows' ids by node key, read before the graph is handed on, so the
+    // toolbox freeze below can scope each frozen node to its own phase.
+    let live: Vec<(String, PhaseId)> = graph
+        .phases
+        .iter()
+        .map(|row| (row.phase.name.clone(), row.phase.id))
+        .collect();
     match Box::pin(resolve_or_refused_with(
         store,
         source,
@@ -570,10 +609,100 @@ pub async fn resolve_with<S: htui_core::store::WorkerStore, G: GraphSource>(
                 &resolved.snapshot.phases,
             ))
             .await?;
+            // MOD-127 M2 D6: here, on a resolved graph only, as the memory is, so a v1 run's
+            // resume (`resolve_or_refused`) never reads a server and a failed read cannot park
+            // it; a failed read here refuses the run start instead of freezing an empty set.
+            Box::pin(freeze_toolbox(
+                source,
+                item,
+                workspace,
+                &live,
+                &mut resolved.snapshot,
+            ))
+            .await?;
             Ok(resolved)
         }
         Resolution::Refused { refusal, .. } => Err(refusal),
     }
+}
+
+/// MOD-127 M2 D6: the MCP servers every frozen node binds, written into `snapshot`: one
+/// `GraphSource::bound_mcp_servers` read per live phase, scoped `{workspace, project, item_kind,
+/// phase}`, shared by the node's expansion (a divided node's planner and integrate rows) and by
+/// its judge (`SnapshotPhase::judge` is no node of its own). Each server is frozen once, by
+/// content, ordered by name bytes then id; a node's `mcp` indexes that list and keeps the
+/// resolver's order (name bytes), `off` winners included, inactive.
+///
+/// `snapshot.toolbox` stays `None` when no node resolved a server, so a run with none serialises
+/// as before. The attachment is read; the server's secrets are not: [`SnapshotMcpServer`] holds
+/// the secret **names**.
+///
+/// # Errors
+/// The store's own failure from a read, as [`ResolveError::Store`]: the run does not start with a
+/// silently empty set.
+async fn freeze_toolbox<G: GraphSource>(
+    source: &G,
+    item: &Item,
+    workspace: Option<WorkspaceId>,
+    live: &[(String, PhaseId)],
+    snapshot: &mut GraphSnapshot,
+) -> std::result::Result<(), ResolveError> {
+    // One read per live phase, however many nodes its expansion made.
+    let mut read: Vec<(Option<PhaseId>, Vec<BoundMcp>)> = Vec::new();
+    let mut per_node: Vec<usize> = Vec::with_capacity(snapshot.phases.len());
+    for node in &snapshot.phases {
+        let key = crate::divide::divided_name(node);
+        let phase = live.iter().find(|(name, _)| name == key).map(|(_, id)| *id);
+        if let Some(at) = read.iter().position(|(seen, _)| *seen == phase) {
+            per_node.push(at);
+            continue;
+        }
+        let bound = source
+            .bound_mcp_servers(ResolveScope {
+                workspace,
+                project: item.project_id,
+                item_kind: Some(item.kind_id),
+                phase,
+            })
+            .await?;
+        per_node.push(read.len());
+        read.push((phase, bound));
+    }
+
+    let mut servers: Vec<SnapshotMcpServer> = Vec::new();
+    for (_, bound) in &read {
+        for pick in bound {
+            let frozen = SnapshotMcpServer::from(&pick.server);
+            if !servers.contains(&frozen) {
+                servers.push(frozen);
+            }
+        }
+    }
+    if servers.is_empty() {
+        return Ok(());
+    }
+    servers.sort_by(|a, b| {
+        (a.name.as_bytes(), a.id.as_uuid()).cmp(&(b.name.as_bytes(), b.id.as_uuid()))
+    });
+    for (node, at) in snapshot.phases.iter_mut().zip(per_node) {
+        node.mcp = read[at]
+            .1
+            .iter()
+            .filter_map(|pick| {
+                let frozen = SnapshotMcpServer::from(&pick.server);
+                servers
+                    .iter()
+                    .position(|server| *server == frozen)
+                    .map(|server| McpPick {
+                        server,
+                        level: pick.level,
+                        active: pick.active,
+                    })
+            })
+            .collect();
+    }
+    snapshot.toolbox = Some(SnapshotToolbox { servers });
+    Ok(())
 }
 
 /// MOD-133 D3: how each repo of `scope` integrates, frozen for `GraphSnapshot::integrate`: one
@@ -972,6 +1101,7 @@ pub(crate) async fn resolve_or_refused_with<S: htui_core::store::WorkerStore, G:
         memory: None,
         capture: frozen_capture(source, &project, app).await?,
         integrate: BTreeMap::new(),
+        toolbox: None,
     };
     // MOD-139 M3 D10 (blueprint P-11): what admission would refuse, over the frozen settings and
     // expanded phases; after every `NotYetRunnable`, so each of those outranks it.
@@ -1229,7 +1359,7 @@ pub fn topology_v2(
     let mut sorted: Vec<&SnapshotEdge> = edges.iter().collect();
     sorted.sort_by(|a, b| edge_sort_key(a, phases).cmp(&edge_sort_key(b, phases)));
     let json = serde_json::to_string(&TopologyV2 {
-        phases,
+        phases: &without_picks(phases),
         edges: sorted,
     })
     .map_err(|err| {
@@ -2090,6 +2220,7 @@ async fn snapshot_phase<G: GraphSource>(
         palette: phase.palette,
         plan_scope: phase.plan_scope,
         divide: (phase.split == Split::Divide).then(|| divide_block(phase, &row.parts)),
+        mcp: Vec::new(),
     })
 }
 
@@ -2424,6 +2555,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
         /// MOD-138 D10: a phase (by name) this source leaves out of its `resolve_graph` answer
         /// while keeping the edges that name it — a read that raced a delete.
         dropped: Option<&'static str>,
+        /// MOD-127 M2 D6: `bound_mcp_servers` fails, as a store that cannot read the set would.
+        mcp_fails: bool,
+        /// How many times `bound_mcp_servers` was asked.
+        mcp_reads: std::sync::atomic::AtomicUsize,
     }
 
     impl<'a> TestSource<'a> {
@@ -2435,6 +2570,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 unbacked: None,
                 race: None,
                 dropped: None,
+                mcp_fails: false,
+                mcp_reads: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -2446,6 +2583,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 unbacked: None,
                 race: None,
                 dropped: None,
+                mcp_fails: false,
+                mcp_reads: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -2521,8 +2660,15 @@ question and not a test fix. Decide the version bump first, then paste the new d
             self.store.bound_skills(scope).await
         }
 
-        async fn bound_mcp_servers(&self, _scope: ResolveScope) -> Result<Vec<BoundMcp>> {
-            Ok(Vec::new())
+        async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+            self.mcp_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.mcp_fails {
+                return Err(StoreError::Constraint(
+                    "the servers could not be read".to_owned(),
+                ));
+            }
+            self.store.bound_mcp_servers(scope).await
         }
 
         async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
@@ -2570,6 +2716,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             None,
             ids::BOX,
+            None,
         )
         .await
     }
@@ -2691,6 +2838,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the seeded feature graph resolves")
@@ -3003,6 +3151,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &app,
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the seeded feature graph resolves")
@@ -3029,6 +3178,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &silent,
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the seeded feature graph resolves")
@@ -3273,6 +3423,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             Some(&[repo][..]),
             ids::BOX,
+            None,
         )
         .await
     }
@@ -3404,6 +3555,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             Some(&[]),
             ids::BOX,
+            None,
         )
         .await
         .expect("a project with no repository resolves to an empty scope");
@@ -3429,6 +3581,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             Some(&[]),
             ids::BOX,
+            None,
         )
         .await
         .expect_err("an empty scope overlaps nothing, which defeats `claim_run`");
@@ -3450,6 +3603,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the primary answers");
@@ -3483,6 +3637,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the seeded feature graph resolves");
@@ -3512,6 +3667,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect_err("`web` is no repo of the project");
@@ -3825,6 +3981,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the override resolves");
@@ -5287,6 +5444,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &BTreeMap::new(),
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the pre-read graph resolves");
@@ -5535,6 +5693,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             app,
             None,
             ids::BOX,
+            None,
         )
         .await
     }
@@ -6226,6 +6385,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             &app,
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the seeded feature graph resolves")
@@ -6330,6 +6490,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 &app,
                 None,
                 ids::BOX,
+                None,
             )
             .await
             .expect("the seeded feature graph resolves")
@@ -7345,5 +7506,533 @@ question and not a test fix. Decide the version bump first, then paste the new d
         let other = with_predicate(&[("min", json!(2)), ("verdict", json!("approve"))]);
         assert_eq!(one, other, "a predicate's key order is not hashed");
         assert_ne!(one, digest, "a predicate is");
+    }
+
+    // ---- MOD-127 M2 T5: the run-start toolbox freeze ----
+
+    use htui_core::model::{
+        BindingChange, BindingKey, BindingLevel, EnvValue, McpServer, McpServerId, McpTransport,
+        NewMcpServer, SnapshotMcpServer,
+    };
+
+    /// A stdio server called `name`, created through the store's writer.
+    async fn mcp_server(store: &MemStore, name: &str) -> McpServer {
+        store
+            .create_mcp_server(NewMcpServer {
+                id: McpServerId::new(),
+                name: name.to_owned(),
+                description: format!("the {name} server"),
+                transport: McpTransport::Stdio,
+                command: format!("mcp-{name}"),
+                args: vec!["--serve".to_owned()],
+                url: None,
+                headers: Vec::new(),
+                env: Vec::new(),
+                allow: vec!["read".to_owned()],
+                deny: vec!["write".to_owned()],
+                created_by: ids::USER,
+            })
+            .await
+            .expect("the server is legal")
+    }
+
+    /// Attaches `key`'s server with `activation`.
+    async fn attach_mcp(store: &MemStore, key: BindingKey, activation: Activation) {
+        store
+            .set_skill_binding(
+                key,
+                None,
+                BindingChange::Attach(htui_core::model::Attachment {
+                    pinned_version: None,
+                    position: 0,
+                    activation,
+                    globs: Vec::new(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("the attach is legal");
+    }
+
+    /// `resolve` of `FEAT-1` for `workspace`.
+    async fn resolve_feat_in(
+        store: &MemStore,
+        source: &TestSource<'_>,
+        workspace: Option<htui_core::model::WorkspaceId>,
+    ) -> std::result::Result<Resolved, ResolveError> {
+        let item = feat_1(store).await;
+        resolve(
+            store,
+            source,
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+            workspace,
+        )
+        .await
+    }
+
+    /// The servers `node` picked, as `(name, level, active)`, through the snapshot's own list.
+    fn picked(snapshot: &GraphSnapshot, node: &str) -> Vec<(String, BindingLevel, bool)> {
+        let toolbox = snapshot.toolbox.as_ref();
+        snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == node)
+            .unwrap_or_else(|| panic!("the snapshot has node `{node}`"))
+            .mcp
+            .iter()
+            .map(|pick| {
+                let server = &toolbox.expect("a pick needs a toolbox").servers[pick.server];
+                (server.name.clone(), pick.level, pick.active)
+            })
+            .collect()
+    }
+
+    /// D6: every row resolves its own set; the project's `docs` reaches all of them, the global
+    /// `web` is hidden by the project's `off` and stays in the row inactive; the list is deduped
+    /// and ordered by name.
+    #[tokio::test]
+    async fn the_frozen_set_holds_the_resolved_servers_per_phase_row() {
+        let store = MemStore::demo();
+        let docs = mcp_server(&store, "docs").await;
+        let web = mcp_server(&store, "web").await;
+        attach_mcp(&store, BindingKey::global(web.id), Activation::Always).await;
+        attach_mcp(
+            &store,
+            BindingKey::project(web.id, ids::PROJECT_HTUI),
+            Activation::Off,
+        )
+        .await;
+        attach_mcp(
+            &store,
+            BindingKey::project(docs.id, ids::PROJECT_HTUI),
+            Activation::Always,
+        )
+        .await;
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves")
+            .snapshot;
+
+        let toolbox = snapshot.toolbox.as_ref().expect("a server was resolved");
+        assert_eq!(
+            toolbox
+                .servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["docs", "web"],
+            "each server once, ordered by name bytes"
+        );
+        assert_eq!(toolbox.servers[0], SnapshotMcpServer::from(&docs));
+        assert!(snapshot.phases.len() > 1, "the graph has several rows");
+        for phase in &snapshot.phases {
+            assert_eq!(
+                picked(&snapshot, &phase.name),
+                [
+                    ("docs".to_owned(), BindingLevel::Project, true),
+                    ("web".to_owned(), BindingLevel::Project, false),
+                ],
+                "row `{}`: the project level wins whole, `off` kept inactive",
+                phase.name
+            );
+        }
+    }
+
+    /// D6: a judge is no node: it sees the judged phase's picks, which are on that phase's row.
+    #[tokio::test]
+    async fn a_judge_sees_the_judged_phases_picks() {
+        let store = store_with(|data| {
+            for row in &mut data.phases {
+                if row.graph_id == ids::GRAPH_HTUI_FEAT && row.name == "implement" {
+                    row.fan_out = 2;
+                    row.split = Split::Compete;
+                }
+            }
+        });
+        store.set_project_settings(
+            ids::PROJECT_HTUI,
+            json!({ "judge_agent_id": ids::AGENT_AGY }),
+        );
+        let docs = mcp_server(&store, "docs").await;
+        attach_mcp(
+            &store,
+            BindingKey::phase(docs.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
+            Activation::Always,
+        )
+        .await;
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the judged feature graph resolves")
+            .snapshot;
+
+        let judged = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the judged phase");
+        assert!(judged.judge.is_some(), "the phase carries its judge");
+        assert_eq!(
+            picked(&snapshot, "implement"),
+            [("docs".to_owned(), BindingLevel::Phase, true)],
+            "the judge reads the judged phase's row; it has none of its own"
+        );
+    }
+
+    /// D6: a divided node expands to `<name>:plan` and `<name>`; both rows carry the node's picks.
+    #[tokio::test]
+    async fn planner_and_integrate_rows_of_a_divided_phase_get_picks() {
+        let store = MemStore::demo();
+        divide_feature(&store, None).await;
+        let docs = mcp_server(&store, "docs").await;
+        attach_mcp(
+            &store,
+            BindingKey::phase(docs.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
+            Activation::Always,
+        )
+        .await;
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the divided feature graph resolves")
+            .snapshot;
+
+        let expected = [("docs".to_owned(), BindingLevel::Phase, true)];
+        assert_eq!(picked(&snapshot, "implement:plan"), expected, "planner");
+        assert_eq!(picked(&snapshot, "implement"), expected, "integrate");
+        for phase in snapshot
+            .phases
+            .iter()
+            .filter(|phase| !phase.name.starts_with("implement"))
+        {
+            assert!(phase.mcp.is_empty(), "`{}` binds nothing", phase.name);
+        }
+    }
+
+    /// D6: the run's workspace is a parameter of the resolve, so a workspace attachment reaches a
+    /// run that has one and no run that has none.
+    #[tokio::test]
+    async fn a_run_with_a_workspace_freezes_the_workspace_level() {
+        let store = MemStore::demo();
+        let docs = mcp_server(&store, "docs").await;
+        attach_mcp(
+            &store,
+            BindingKey::workspace(docs.id, ids::WORKSPACE_PLATFORM),
+            Activation::Always,
+        )
+        .await;
+        let source = TestSource::claude(&store);
+
+        let with = resolve_feat_in(&store, &source, Some(ids::WORKSPACE_PLATFORM))
+            .await
+            .expect("resolves")
+            .snapshot;
+        assert_eq!(
+            picked(&with, "implement"),
+            [("docs".to_owned(), BindingLevel::Workspace, true)]
+        );
+
+        let without = resolve_feat_in(&store, &source, None)
+            .await
+            .expect("resolves")
+            .snapshot;
+        assert_eq!(without.toolbox, None, "no workspace, no workspace level");
+        assert!(without.phases.iter().all(|phase| phase.mcp.is_empty()));
+    }
+
+    /// D6: `resolve_or_refused`, what a v1 run's resume calls, reads no server and freezes none;
+    /// only `resolve` does.
+    #[tokio::test]
+    async fn resuming_a_run_does_not_refreeze() {
+        let store = MemStore::demo();
+        let docs = mcp_server(&store, "docs").await;
+        attach_mcp(
+            &store,
+            BindingKey::project(docs.id, ids::PROJECT_HTUI),
+            Activation::Always,
+        )
+        .await;
+        let item = feat_1(&store).await;
+        let source = TestSource::claude(&store);
+
+        let resolution = super::resolve_or_refused(
+            &store,
+            &source,
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the feature graph resolves");
+        let super::Resolution::Resolved(live) = resolution else {
+            panic!("the seeded feature graph is not refused");
+        };
+        assert_eq!(live.snapshot.toolbox, None, "resume's read freezes nothing");
+        assert_eq!(
+            source.mcp_reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and reads no server"
+        );
+
+        let frozen = resolve_feat(&store, &source)
+            .await
+            .expect("resolves")
+            .snapshot;
+        assert!(frozen.toolbox.is_some(), "resolve does");
+        assert!(source.mcp_reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    /// D6: a phase-level attachment reaches only its phase's row.
+    #[tokio::test]
+    async fn a_phase_attachment_reaches_only_its_phase() {
+        let store = MemStore::demo();
+        let docs = mcp_server(&store, "docs").await;
+        attach_mcp(
+            &store,
+            BindingKey::phase(docs.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
+            Activation::Always,
+        )
+        .await;
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("resolves")
+            .snapshot;
+
+        assert_eq!(
+            picked(&snapshot, "implement"),
+            [("docs".to_owned(), BindingLevel::Phase, true)]
+        );
+        for phase in snapshot
+            .phases
+            .iter()
+            .filter(|phase| phase.name != "implement")
+        {
+            assert!(phase.mcp.is_empty(), "`{}` binds nothing", phase.name);
+        }
+    }
+
+    /// D6: a run with no server (and every snapshot written before M2) has no `toolbox` and no
+    /// `mcp` key anywhere; its JSON decodes to the same snapshot and freezes nothing.
+    #[tokio::test]
+    async fn a_snapshot_without_toolbox_decodes_and_freezes_nothing() {
+        let store = MemStore::demo();
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("resolves")
+            .snapshot;
+        assert_eq!(snapshot.toolbox, None, "nothing bound, nothing frozen");
+
+        let json = serde_json::to_value(&snapshot).expect("encodes");
+        assert!(json.get("toolbox").is_none(), "{json}");
+        assert!(
+            json["phases"]
+                .as_array()
+                .expect("phases")
+                .iter()
+                .all(|phase| phase.get("mcp").is_none()),
+            "a row with no pick has no `mcp` key"
+        );
+        let decoded: GraphSnapshot = serde_json::from_value(json).expect("decodes");
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.toolbox, None);
+    }
+
+    /// D6: the snapshot is the run's own copy: a server edited or deleted after the resolve does
+    /// not reach it.
+    #[tokio::test]
+    async fn a_later_edit_does_not_change_a_started_runs_set() {
+        let store = MemStore::demo();
+        let docs = mcp_server(&store, "docs").await;
+        attach_mcp(
+            &store,
+            BindingKey::project(docs.id, ids::PROJECT_HTUI),
+            Activation::Always,
+        )
+        .await;
+        let source = TestSource::claude(&store);
+        let frozen = resolve_feat(&store, &source)
+            .await
+            .expect("resolves")
+            .snapshot;
+        let bytes = serde_json::to_string(&frozen).expect("encodes");
+
+        let outcome = store
+            .update_mcp_server(
+                docs.id,
+                docs.updated_at,
+                htui_core::model::McpServerPatch {
+                    command: Some("mcp-edited".to_owned()),
+                    ..htui_core::model::McpServerPatch::default()
+                },
+            )
+            .await
+            .expect("the edit is legal");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+        let edited = resolve_feat(&store, &source)
+            .await
+            .expect("resolves")
+            .snapshot;
+        assert_eq!(
+            edited.toolbox.as_ref().expect("still bound").servers[0].command,
+            "mcp-edited",
+            "a run started now sees the edit"
+        );
+        assert_eq!(
+            serde_json::to_string(&frozen).expect("encodes"),
+            bytes,
+            "the started run's copy does not"
+        );
+        assert_eq!(
+            frozen.toolbox.as_ref().expect("bound").servers[0].command,
+            "mcp-docs"
+        );
+
+        store
+            .delete_mcp_server(docs.id)
+            .await
+            .expect("the server is there");
+        let gone = resolve_feat(&store, &source)
+            .await
+            .expect("resolves")
+            .snapshot;
+        assert_eq!(gone.toolbox, None, "a run started now sees the delete");
+        assert_eq!(serde_json::to_string(&frozen).expect("encodes"), bytes);
+    }
+
+    /// D6: a failed read of the set refuses the run start; it is no silently empty set.
+    #[tokio::test]
+    async fn a_failed_read_refuses_the_run_start() {
+        let store = MemStore::demo();
+        let source = TestSource {
+            mcp_fails: true,
+            ..TestSource::claude(&store)
+        };
+        let error = resolve_feat(&store, &source)
+            .await
+            .expect_err("the set cannot be read");
+        assert_eq!(
+            error,
+            ResolveError::Store(StoreError::Constraint(
+                "the servers could not be read".to_owned()
+            ))
+        );
+    }
+
+    /// D3, D6: the snapshot carries the names of secrets, never a value; neither does its Debug.
+    #[tokio::test]
+    async fn the_snapshot_carries_secret_names_not_values() {
+        // What `RunSecrets::env_for` would supply: it is in no row, so it cannot be in the
+        // snapshot, and the test fails if a later change reads it in.
+        const SENTINEL: &str = "sentinel-secret-value-3f9c1b";
+        let store = MemStore::demo();
+        let stdio = store
+            .create_mcp_server(NewMcpServer {
+                env: vec![
+                    (
+                        "API_TOKEN".to_owned(),
+                        EnvValue::Secret("billing".to_owned()),
+                    ),
+                    ("REGION".to_owned(), EnvValue::Literal("eu-west".to_owned())),
+                ],
+                ..new_server_of("billing")
+            })
+            .await
+            .expect("legal");
+        let http = store
+            .create_mcp_server(NewMcpServer {
+                transport: McpTransport::Http,
+                command: String::new(),
+                args: Vec::new(),
+                url: Some("https://mcp.example.test/v1".to_owned()),
+                headers: vec![(
+                    "Authorization".to_owned(),
+                    EnvValue::Secret("gateway".to_owned()),
+                )],
+                ..new_server_of("gateway")
+            })
+            .await
+            .expect("legal");
+        for server in [&stdio, &http] {
+            attach_mcp(
+                &store,
+                BindingKey::project(server.id, ids::PROJECT_HTUI),
+                Activation::Always,
+            )
+            .await;
+        }
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("resolves")
+            .snapshot;
+
+        let json = serde_json::to_string(&snapshot).expect("encodes");
+        let debug = format!("{snapshot:?}");
+        for text in [&json, &debug] {
+            assert!(text.contains("billing"), "the secret's name is kept");
+            assert!(text.contains("gateway"), "the header secret's name is kept");
+            assert!(!text.contains(SENTINEL), "no value, ever");
+        }
+        assert!(json.contains(r#"{"secret":"billing"}"#), "{json}");
+    }
+
+    /// A stdio server record for `name`, to build a variant of.
+    fn new_server_of(name: &str) -> NewMcpServer {
+        NewMcpServer {
+            id: McpServerId::new(),
+            name: name.to_owned(),
+            description: String::new(),
+            transport: McpTransport::Stdio,
+            command: format!("mcp-{name}"),
+            args: Vec::new(),
+            url: None,
+            headers: Vec::new(),
+            env: Vec::new(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            created_by: ids::USER,
+        }
+    }
+
+    /// D6: the frozen set is not hashed. The digest of a run with servers is the digest of the
+    /// same graph without them, and recomputing it over the snapshot's own phases (what
+    /// `resume_window` does) finds it.
+    #[tokio::test]
+    async fn topology_ignores_toolbox() {
+        let store = MemStore::demo();
+        let docs = mcp_server(&store, "docs").await;
+        attach_mcp(
+            &store,
+            BindingKey::project(docs.id, ids::PROJECT_HTUI),
+            Activation::Always,
+        )
+        .await;
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("resolves")
+            .snapshot;
+
+        assert!(snapshot.toolbox.is_some());
+        assert!(snapshot.phases.iter().all(|phase| !phase.mcp.is_empty()));
+        assert_eq!(snapshot.topology, FEATURE_TOPOLOGY_V2, "{TOPOLOGY_MOVED}");
+        assert_eq!(
+            topology_v2(&snapshot.phases, &snapshot.edges).expect("serialises"),
+            snapshot.topology,
+            "recomputed over phases that carry their picks"
+        );
+        assert_eq!(
+            super::topology(&snapshot.phases).expect("serialises"),
+            FEATURE_TOPOLOGY,
+            "{TOPOLOGY_MOVED}"
+        );
     }
 }

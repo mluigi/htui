@@ -1727,6 +1727,7 @@ pub(crate) mod tests {
             &app,
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the item resolves");
@@ -1773,6 +1774,7 @@ pub(crate) mod tests {
             &app,
             None,
             ids::BOX,
+            None,
         )
         .await
         .expect("the item resolves");

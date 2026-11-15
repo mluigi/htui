@@ -1579,6 +1579,7 @@ fn demo_graph_snapshot() -> Value {
                 palette: false,
                 plan_scope: None,
                 divide: None,
+                mcp: Vec::new(),
             }
         })
         .collect();
@@ -1616,6 +1617,7 @@ fn demo_graph_snapshot() -> Value {
         memory: None,
         capture: None,
         integrate: std::collections::BTreeMap::new(),
+        toolbox: None,
     })
     .expect("a literal this module owns serialises")
 }

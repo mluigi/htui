@@ -112,6 +112,7 @@ fn capture_phase(model: &SnapshotCaptureModel) -> SnapshotPhase {
         palette: false,
         plan_scope: None,
         divide: None,
+        mcp: Vec::new(),
     }
 }
 

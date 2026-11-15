@@ -9189,6 +9189,7 @@ fn run_snapshot() -> GraphSnapshot {
         source: None,
         edges: Vec::new(),
         integrate: std::collections::BTreeMap::new(),
+        toolbox: None,
     }
 }
 
@@ -20993,6 +20994,7 @@ async fn a_finished_snapshot_defaults_a_verdict_to_concluded<S: WriteStore>(stor
         palette: false,
         plan_scope: None,
         divide: None,
+        mcp: Vec::new(),
     };
     let mut snapshot = run_snapshot();
     snapshot.phases = vec![

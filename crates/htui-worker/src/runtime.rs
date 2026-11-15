@@ -5323,6 +5323,7 @@ mod role_gate {
             &app,
             scope,
             ids::BOX,
+            None,
         )
         .await
         .expect("the item resolves");

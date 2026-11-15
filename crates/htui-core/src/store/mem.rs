@@ -18130,6 +18130,7 @@ mod tests {
             source: None,
             edges: Vec::new(),
             integrate: std::collections::BTreeMap::new(),
+            toolbox: None,
         }
     }
 

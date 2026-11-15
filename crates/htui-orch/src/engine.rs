@@ -1523,6 +1523,7 @@ where
             &self.parts.app,
             repo_scope.as_deref(),
             on,
+            workspace,
         )
         .await
         {
@@ -12434,6 +12435,7 @@ mod tests {
             palette: false,
             plan_scope: None,
             divide: None,
+            mcp: Vec::new(),
         };
         let candidates = vec![
             SnapshotCandidate {
@@ -13371,6 +13373,7 @@ mod tests {
             palette: false,
             plan_scope: None,
             divide: None,
+            mcp: Vec::new(),
         }
     }
 
@@ -17833,6 +17836,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             harness.orch.box_id(),
+            None,
         )
         .await
         .expect("the bound graph resolves");
@@ -17938,6 +17942,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             harness.orch.box_id(),
+            None,
         )
         .await
         .expect("the bound graph resolves");
@@ -19470,6 +19475,145 @@ mod tests {
             (RunStatus::AwaitingApproval, Some(0), None),
             "`StartRun`'s own first rest"
         );
+    }
+
+    /// MOD-127 M2 D6: attaches a stdio server called `docs` at `key`'s level, `always`, and
+    /// hands it back.
+    async fn attach_docs(
+        harness: &Harness,
+        key: impl FnOnce(htui_core::model::McpServerId) -> htui_core::model::BindingKey,
+    ) -> htui_core::model::McpServer {
+        use htui_core::model::{
+            Activation, Attachment, BindingChange, McpServerId, McpTransport, NewMcpServer,
+        };
+        let store = &harness.orch.store;
+        let server = store
+            .create_mcp_server(NewMcpServer {
+                id: McpServerId::new(),
+                name: "docs".to_owned(),
+                description: String::new(),
+                transport: McpTransport::Stdio,
+                command: "mcp-docs".to_owned(),
+                args: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                env: Vec::new(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("the server is legal");
+        store
+            .set_skill_binding(
+                key(server.id),
+                None,
+                BindingChange::Attach(Attachment {
+                    pinned_version: None,
+                    position: 0,
+                    activation: Activation::Always,
+                    globs: Vec::new(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("the attach is legal");
+        server
+    }
+
+    /// MOD-127 M2 D6: `StartRun`'s workspace reaches the freeze, so a workspace attachment is in
+    /// the snapshot of a run started from that workspace and in none started from nowhere.
+    #[tokio::test]
+    async fn enqueue_freezes_the_workspace_level_of_the_runs_own_workspace() {
+        use htui_core::model::{BindingKey, BindingLevel};
+
+        for (workspace, frozen) in [(Some(ids::WORKSPACE_PLATFORM), true), (None, false)] {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            attach_docs(&harness, |server| {
+                BindingKey::workspace(server, ids::WORKSPACE_PLATFORM)
+            })
+            .await;
+            harness_engine!(harness.orch, engine);
+
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, workspace)
+                .await
+                .expect("the graph resolves");
+
+            let snapshot = snapshot_of(&harness, run).await;
+            assert_eq!(
+                snapshot.toolbox.is_some(),
+                frozen,
+                "workspace {workspace:?}"
+            );
+            if frozen {
+                assert!(
+                    snapshot.phases.iter().all(|phase| {
+                        phase.mcp.iter().map(|pick| pick.level).collect::<Vec<_>>()
+                            == [BindingLevel::Workspace]
+                    }),
+                    "{snapshot:?}"
+                );
+            }
+        }
+    }
+
+    /// MOD-127 M2 D6: a server edited or deleted after `StartRun` never reaches the run, and a
+    /// resume (a v2 run reads its own snapshot; a v1 run resolves the live phases) writes no
+    /// toolbox into it.
+    #[tokio::test]
+    async fn resuming_a_run_keeps_its_frozen_servers_through_a_later_edit() {
+        use htui_core::model::{BindingKey, McpServerPatch};
+
+        let harness = Harness::new().await;
+        let server = attach_docs(&harness, |server| {
+            BindingKey::project(server, ids::PROJECT_HTUI)
+        })
+        .await;
+        let (run, _) = started(&harness).await;
+        let frozen = harness.orch.run(run).await.graph_snapshot;
+        let toolbox = snapshot_of(&harness, run).await.toolbox;
+        assert_eq!(
+            toolbox.as_ref().map(|toolbox| toolbox.servers.len()),
+            Some(1),
+            "the started run froze the server"
+        );
+
+        let outcome = harness
+            .orch
+            .store
+            .update_mcp_server(
+                server.id,
+                server.updated_at,
+                McpServerPatch {
+                    command: Some("mcp-edited".to_owned()),
+                    ..McpServerPatch::default()
+                },
+            )
+            .await
+            .expect("the edit is legal");
+        assert!(
+            matches!(outcome, CasOutcome::Applied(_)),
+            "the edit lands: {outcome:?}"
+        );
+        let resumed = harness.resume(run).await.expect("the run resumes");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+        harness
+            .orch
+            .store
+            .delete_mcp_server(server.id)
+            .await
+            .expect("the server is there");
+        let resumed = harness.resume(run).await.expect("the run resumes");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+
+        assert_eq!(
+            harness.orch.run(run).await.graph_snapshot,
+            frozen,
+            "neither the edit, the delete nor the resumes touched the frozen set"
+        );
+        assert_eq!(snapshot_of(&harness, run).await.toolbox, toolbox);
     }
 
     /// Sets `item`'s `required_tags` through `update_item`, at its current version.
@@ -24188,6 +24332,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             orch.box_id(),
+            None,
         )
         .await
         .expect("the stand-in supplies rung 1")

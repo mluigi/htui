@@ -124,6 +124,7 @@ fn snapshot() -> GraphSnapshot {
         source: None,
         edges: Vec::new(),
         integrate: BTreeMap::new(),
+        toolbox: None,
     }
 }
 
