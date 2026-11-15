@@ -29,7 +29,7 @@
 //!
 //! In other words the right side loses, as the row narrows: the background chip first (MOD-116
 //! M1 D4: `+N in background ◐ n`, drawn after the waiting count only while another workspace
-//! has a running run), then the shell's chips (MOD-115 M2 §8: `Alt→ forward`, the layout name,
+//! has a running run and the store is not offline, R1 F6), then the shell's chips (MOD-115 M2 §8: `Alt→ forward`, the layout name,
 //! then `⌫ back to <place>`, which collapses to `⌫ back` before it goes), the box name, the
 //! working count, the store label, then `F9 about` (the chips collapse to `? keys`), then
 //! `? keys` itself, and last the waiting count. The shell's chips are drawn after the key chips,
@@ -235,8 +235,9 @@ fn right_parts(
         Part::text(4, format!("{working} working"), theme.base),
         Part::text(RANK_WAITING, format!("{waiting} waiting"), waiting_style),
     ];
+    // MOD-116 M1 R1 F6 (D8 over D5): offline the counts are the last ones read, not current.
     let background = state.background;
-    if background.workspaces > 0 {
+    if background.workspaces > 0 && !state.offline() {
         parts.push(Part::text(
             RANK_BACKGROUND,
             format!(
@@ -1317,6 +1318,24 @@ mod tests {
         let text = line(&draw(200, &state()).0);
         assert!(!text.contains("background"), "{text}");
         assert!(text.contains("0 waiting \u{b7} memory"), "{text}");
+    }
+
+    /// MOD-116 M1 R1 F6 (D8 over D5): offline the counts are the last ones read, not current,
+    /// so the chip is not drawn; it comes back with the store.
+    #[test]
+    fn no_background_chip_while_offline() {
+        let offline = TopBarState {
+            store: "offline \u{b7} 3m".to_owned(),
+            ..in_background(1, 2)
+        };
+        let text = line(&draw(200, &offline).0);
+        assert!(!text.contains("background"), "{text}");
+        assert!(
+            text.contains("0 waiting \u{b7} offline \u{b7} 3m"),
+            "{text}"
+        );
+        let text = line(&draw(200, &in_background(1, 2)).0);
+        assert!(text.contains("+1 in background \u{25d0} 2"), "{text}");
     }
 
     /// The shell's chips are dim, in colour and in monochrome.

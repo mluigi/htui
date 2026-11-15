@@ -63,6 +63,15 @@ pub struct TopBarState {
     pub background: InBackground,
 }
 
+impl TopBarState {
+    /// Whether the store label reads `offline \u{b7} <age>` (`Backend::label`): the run counts
+    /// held are then the last ones read, not current (MOD-116 M1 R1 F6, D8 over D5).
+    #[must_use]
+    pub fn offline(&self) -> bool {
+        self.store.starts_with("offline")
+    }
+}
+
 /// The action sink handed to views.
 ///
 /// A view holds no channel and no store handle (`R-NF-3`): it pushes actions here and the shell
@@ -574,6 +583,11 @@ pub struct App {
     /// MOD-115 M2 D1: where the UI state is saved. `App::new` keeps it in memory, so a test never
     /// touches the home directory; only `run` hands it the real `ui-state.toml`.
     pub ui_store: UiStore,
+    /// MOD-116 M1 R1 F5: whether the workspace entered last is read at startup and saved on a
+    /// scope change (D12). `run` turns it off under `--demo`, whose workspaces are not the
+    /// store's: the file's `[workspace] last` is then neither used nor moved, and a save of
+    /// anything else writes it back as it was read.
+    pub remembers_workspace: bool,
     /// MOD-122 D7: the log buffer and control. `App::new`'s is detached (no subscriber, so a test
     /// never installs one); `run` hands it the installed one before the tabs are registered.
     pub logging: Logging,
@@ -661,6 +675,7 @@ impl App {
             pane_claim: Cell::new(None),
             last_claim: None,
             ui_store: UiStore::memory(),
+            remembers_workspace: true,
             logging: Logging::detached(),
             history: History::default(),
             recording: false,

@@ -7,12 +7,20 @@
 //! [`TopBarState::workspace_runs`](crate::app::TopBarState) (D5): the tab never polls them itself.
 //! Under each group, unless it is folded, an `overview` row and one row per project. The detail
 //! pane on the right shows the selected workspace's overview, or the selected project's, from one
-//! [`StoreRequest::WorkspaceOverview`] read per event (D7): activation, a cursor move onto another
-//! workspace, or a change in that workspace's counts. Never per frame.
+//! [`StoreRequest::WorkspaceOverview`] read per event (D7): activation (always), a cursor move
+//! onto another workspace, a change in that workspace's counts, or a list whose projects for it
+//! differ from the overview's. Never per frame. A refused read is not held: the next refresh
+//! asks again (R1 F3).
 //!
 //! `o` ([`Act::WorkspacesOpen`]) on any row of a workspace emits [`Action::SetScope`] with it
 //! (D9); the shell applies it as it applied the switcher's `Enter`, the focus stays here. A scope
-//! change keeps every row: the list is not one workspace's.
+//! change keeps every row: the list is not one workspace's. A cursor the user has not moved
+//! follows the open workspace: it lands on its row on every list and every scope change, and is
+//! not placed while there is no scope yet (R1 F1: the tab's first list can land before the
+//! shell's startup scope).
+//!
+//! Offline the shell's counts are the last ones read, not current (D8 over D5): the rows stay,
+//! but no workspace other than the open one shows a state (R1 F6).
 
 mod overview;
 
@@ -176,6 +184,12 @@ pub struct WorkspacesTab {
     /// The workspace whose overview is out: one read at a time, as a second one would make the
     /// shell drop the first one's reply.
     in_flight: Option<WorkspaceId>,
+    /// The overview is read again whatever the counts say (R1 F2): set on activation and by a
+    /// list whose projects differ from the held overview's, cleared when a read goes out.
+    stale: bool,
+    /// Whether the user put the cursor where it is (a list motion, a fold, a restored place); a
+    /// cursor the tab placed follows the open workspace (R1 F1).
+    user_placed: bool,
     /// The detail pane's scroll.
     scroll: Scroll,
     /// The detail's rows as last drawn, so a scroll is clamped to them.
@@ -239,12 +253,52 @@ impl WorkspacesTab {
         self.cursor = Some(entry);
     }
 
+    /// Lands a cursor the user has not placed on the open workspace's row, or the first
+    /// workspace's when the list does not hold it; none while there is no scope yet (R1 F1).
+    fn land(&mut self, scope: &Scope) {
+        if scope.workspace_id == WorkspaceId::default() {
+            self.cursor = None;
+            return;
+        }
+        let landed = self
+            .summary(scope.workspace_id)
+            .or_else(|| self.workspaces.first())
+            .map(|summary| Entry::Workspace(summary.workspace_id));
+        match landed {
+            Some(entry) => self.select(entry),
+            None => self.cursor = None,
+        }
+    }
+
+    /// Whether the held overview's projects differ from what the list holds for its workspace:
+    /// a project added or removed since the read (R1 F2).
+    fn overview_lags(&self) -> bool {
+        let Some((of, Held::Read(overview))) = &self.overview else {
+            return false;
+        };
+        self.summary(*of).is_some_and(|summary| {
+            let listed: BTreeSet<ProjectId> = summary
+                .projects
+                .iter()
+                .map(|project| project.project_id)
+                .collect();
+            let read: BTreeSet<ProjectId> = overview
+                .tree
+                .projects
+                .iter()
+                .map(|entry| entry.project.id)
+                .collect();
+            listed != read
+        })
+    }
+
     /// A list motion over the selectable rows.
     fn move_cursor(&mut self, act: Act) {
         let entries = self.entries();
         let Some(last) = entries.len().checked_sub(1) else {
             return;
         };
+        self.user_placed = true;
         let at = self
             .cursor
             .and_then(|cursor| entries.iter().position(|entry| *entry == cursor))
@@ -267,6 +321,7 @@ impl WorkspacesTab {
         let workspace = cursor.workspace();
         if !self.folded.remove(&workspace) {
             self.folded.insert(workspace);
+            self.user_placed = true;
             self.select(Entry::Workspace(workspace));
         }
     }
@@ -284,20 +339,23 @@ impl WorkspacesTab {
         }
     }
 
-    /// D7: asks for the selected workspace's overview when none is out and either none is held
-    /// for it or its counts row moved since it was asked for.
+    /// D7: asks for the selected workspace's overview when none is out, there is a scope, and
+    /// either none is held for it (a refusal is not held, R1 F3), it is [`stale`](Self::stale),
+    /// or its counts row moved since it was asked for.
     fn read_if_due(&mut self, ctx: &Ctx<'_>) {
-        if self.in_flight.is_some() {
+        if self.in_flight.is_some() || ctx.scope.workspace_id == WorkspaceId::default() {
             return;
         }
         let Some(workspace) = self.cursor.map(Entry::workspace) else {
             return;
         };
         let row = counts_of(ctx, workspace);
-        let held = matches!(&self.overview, Some((of, _)) if *of == workspace);
-        if held && (row.is_none() || row == self.read_against.as_ref()) {
+        let held =
+            matches!(&self.overview, Some((of, Held::Read(_) | Held::Gone)) if *of == workspace);
+        if held && !self.stale && (row.is_none() || row == self.read_against.as_ref()) {
             return;
         }
+        self.stale = false;
         self.read_against = row.cloned();
         self.in_flight = Some(workspace);
         ctx.request(StoreRequest::WorkspaceOverview(workspace));
@@ -404,29 +462,39 @@ impl WorkspacesTab {
                 .map(|(_, held)| held)
         });
 
+        let reading = |frame: &mut Frame<'_>| {
+            empty::render(
+                frame,
+                inner,
+                READING_OVERVIEW,
+                NextStep(READING_OVERVIEW_NEXT),
+                theme,
+            );
+        };
         let mut lines: Vec<Line<'static>> = Vec::new();
         match (cursor, held) {
-            (None, _) => {
+            (None, _) if self.workspaces.is_empty() => {
                 let (what, next) = self.empty_state(ctx);
                 empty::render(frame, inner, what, NextStep(&next), theme);
             }
+            // R1 F1: listed, but no scope to land the cursor by yet.
+            (None, _) => reading(frame),
+            (Some(Entry::Project(_, project)), Some(Held::Read(overview))) => {
+                // R1 F2: a project the list holds and the overview does not is still being read.
+                match overview
+                    .tree
+                    .projects
+                    .iter()
+                    .find(|candidate| candidate.project.id == project)
+                {
+                    Some(found) => lines = overview::project_lines(overview, found, width, theme),
+                    None => reading(frame),
+                }
+            }
             (Some(entry), Some(Held::Read(overview))) => {
-                let workspace = entry.workspace();
-                lines = match entry {
-                    Entry::Project(_, project) => overview
-                        .tree
-                        .projects
-                        .iter()
-                        .find(|candidate| candidate.project.id == project)
-                        .map_or_else(Vec::new, |found| {
-                            overview::project_lines(overview, found, width, theme)
-                        }),
-                    Entry::Workspace(_) | Entry::Overview(_) => {
-                        let open = ctx.scope.workspace_id == workspace;
-                        let state = WorkspaceLifecycle::of(open, &overview.counts);
-                        overview::workspace_lines(overview, state, width, theme)
-                    }
-                };
+                let open = ctx.scope.workspace_id == entry.workspace();
+                let state = WorkspaceLifecycle::of(open, &overview.counts);
+                lines = overview::workspace_lines(overview, state, width, theme);
             }
             (Some(_), Some(Held::Refused(message))) => {
                 let what = format!("{NEEDS_THE_DATABASE}: {message}");
@@ -435,15 +503,7 @@ impl WorkspacesTab {
             (Some(_), Some(Held::Gone)) => {
                 empty::render(frame, inner, GONE, NextStep(GONE_NEXT), theme);
             }
-            (Some(_), None) => {
-                empty::render(
-                    frame,
-                    inner,
-                    READING_OVERVIEW,
-                    NextStep(READING_OVERVIEW_NEXT),
-                    theme,
-                );
-            }
+            (Some(_), None) => reading(frame),
         }
         let total = lines.len();
         self.detail_rows.set(total);
@@ -496,11 +556,13 @@ fn counts_of<'a>(ctx: &Ctx<'a>, workspace: WorkspaceId) -> Option<&'a WorkspaceR
         .and_then(|rows| rows.iter().find(|row| row.workspace_id == workspace))
 }
 
-/// `workspace`'s state (D2) from the shell's counts: with none read yet (or offline), the open
-/// workspace still reads `open` and the others have no state.
+/// `workspace`'s state (D2) from the shell's counts: with none read yet, or offline (the counts
+/// held are the last ones read, not current: D8 over D5, R1 F6), the open workspace still reads
+/// `open` and the others have no state.
 fn lifecycle(ctx: &Ctx<'_>, workspace: WorkspaceId) -> Option<WorkspaceLifecycle> {
     let open = ctx.scope.workspace_id == workspace;
-    match counts_of(ctx, workspace) {
+    let row = counts_of(ctx, workspace).filter(|_| !ctx.top_bar.offline());
+    match row {
         Some(row) => Some(WorkspaceLifecycle::of(open, row)),
         None if open => Some(WorkspaceLifecycle::Open { running: 0 }),
         None => None,
@@ -558,8 +620,13 @@ impl Tab for WorkspacesTab {
     }
 
     /// The list is every workspace's, not the scope's: a scope change keeps it (only which one
-    /// reads `open` moves, and that is derived at render).
-    fn on_scope_change(&mut self, _scope: &Scope) {}
+    /// reads `open` moves, and that is derived at render). A cursor the user has not moved lands
+    /// on the newly open workspace (R1 F1); its overview is read on the activation that follows.
+    fn on_scope_change(&mut self, scope: &Scope) {
+        if self.loaded && !self.user_placed {
+            self.land(scope);
+        }
+    }
 
     /// Every key resolves through [`views::WORKSPACES_BROWSE`]: a list motion moves the cursor
     /// (or, with the detail focused, scrolls it), `list.fold` folds the group, the pane scroll
@@ -595,20 +662,14 @@ impl Tab for WorkspacesTab {
             StoreReply::Workspaces(workspaces) => {
                 self.workspaces.clone_from(workspaces);
                 self.loaded = true;
-                let kept = self.cursor.filter(|entry| self.holds(*entry));
-                let landed = kept
-                    .or_else(|| {
-                        self.summary(ctx.scope.workspace_id)
-                            .map(|summary| Entry::Workspace(summary.workspace_id))
-                    })
-                    .or_else(|| {
-                        self.workspaces
-                            .first()
-                            .map(|summary| Entry::Workspace(summary.workspace_id))
-                    });
-                match landed {
-                    Some(entry) => self.select(entry),
-                    None => self.cursor = None,
+                if self.overview_lags() {
+                    self.stale = true;
+                }
+                // The user's row is kept while the list holds it; any other cursor follows the
+                // open workspace (R1 F1).
+                if !(self.user_placed && self.cursor.is_some_and(|entry| self.holds(entry))) {
+                    self.user_placed = false;
+                    self.land(ctx.scope);
                 }
                 self.read_if_due(ctx);
             }
@@ -628,8 +689,12 @@ impl Tab for WorkspacesTab {
             StoreReply::Failed { request, message } if *request == WORKSPACE_OVERVIEW => {
                 if let Some(workspace) = self.in_flight.take() {
                     self.overview = Some((workspace, Held::Refused(message.clone())));
+                    // R1 F3: the refused workspace is asked again on the next refresh, not at
+                    // once, which would ask on every refusal; another one now selected is read.
+                    if self.cursor.map(Entry::workspace) != Some(workspace) {
+                        self.read_if_due(ctx);
+                    }
                 }
-                self.read_if_due(ctx);
             }
             // The shell has set the top bar from it already (D5); a moved row reads again.
             StoreReply::WorkspaceRunCounts(_) => self.read_if_due(ctx),
@@ -664,12 +729,16 @@ impl Tab for WorkspacesTab {
         Some(views::WORKSPACES_BROWSE)
     }
 
-    /// D7: once a second while in front, a moved counts row reads the overview again.
+    /// D7: once a second while in front, a moved counts row reads the overview again, and a
+    /// refused one is asked again (R1 F3).
     fn on_refresh(&mut self, ctx: &mut Ctx<'_>) {
         self.read_if_due(ctx);
     }
 
+    /// D7: every activation reads the overview again (R1 F2): item counts, goals, the
+    /// description and repos edited elsewhere move no run count.
     fn on_activate(&mut self, ctx: &mut Ctx<'_>) {
+        self.stale = true;
         self.read_if_due(ctx);
     }
 
@@ -698,6 +767,7 @@ impl Tab for WorkspacesTab {
         if !matches!(entry, Entry::Workspace(_)) {
             self.folded.remove(&entry.workspace());
         }
+        self.user_placed = true;
         self.select(entry);
         self.read_if_due(ctx);
         true

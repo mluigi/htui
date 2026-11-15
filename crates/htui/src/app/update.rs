@@ -439,8 +439,9 @@ impl App {
 
     /// Enters a workspace: the only path that changes the scope (plan D10).
     fn set_scope(&mut self, workspace: WorkspaceSummary) {
-        // MOD-116 M1 D12: the workspace entered last, saved when it moved, for the next start.
-        if self.ui.last_workspace != Some(workspace.workspace_id) {
+        // MOD-116 M1 D12: the workspace entered last, saved when it moved, for the next start
+        // (never under `--demo`, R1 F5). The startup scope has set it already, unsaved (R1 F4).
+        if self.remembers_workspace && self.ui.last_workspace != Some(workspace.workspace_id) {
             self.ui.last_workspace = Some(workspace.workspace_id);
             self.save_ui_state();
         }
@@ -739,7 +740,8 @@ impl App {
     ///
     /// The first workspace list picks the startup scope, which is what makes `--demo` open
     /// inside a workspace instead of an empty shell: the workspace entered last when the list
-    /// still holds it, else the first (MOD-116 M1 D12). An empty list lands on `empty_tab` (the
+    /// still holds it, else the first (MOD-116 M1 D12; the first under `--demo`, R1 F5), set in
+    /// memory and not saved (R1 F4). An empty list lands on `empty_tab` (the
     /// Workspaces tab, once registered) instead of leaving the shell blank (blueprint D,
     /// "Startup"; MOD-116 M1 D11). Nothing moves before that reply, so the first frame is always
     /// the shell itself.
@@ -773,15 +775,27 @@ impl App {
         if let StoreReply::Workspaces(workspaces) = reply
             && !self.has_scope()
         {
-            let last = self.ui.last_workspace.and_then(|last| {
-                workspaces
-                    .iter()
-                    .find(|workspace| workspace.workspace_id == last)
-            });
+            let last = self
+                .ui
+                .last_workspace
+                .filter(|_| self.remembers_workspace)
+                .and_then(|last| {
+                    workspaces
+                        .iter()
+                        .find(|workspace| workspace.workspace_id == last)
+                });
             match last.or_else(|| workspaces.first()) {
-                Some(open) => self.update(Action::SetScope {
-                    workspace: open.clone(),
-                }),
+                Some(open) => {
+                    // R1 F4: the startup scope is no change of the user's: it is remembered in
+                    // memory, so `set_scope` saves nothing, and a `ui-state.toml` that failed to
+                    // load is left alone until the user changes something (MOD-115 M2 D1).
+                    if self.remembers_workspace {
+                        self.ui.last_workspace = Some(open.workspace_id);
+                    }
+                    self.update(Action::SetScope {
+                        workspace: open.clone(),
+                    });
+                }
                 None => {
                     if let Some(id) = self.empty_tab {
                         self.land_on(id);
@@ -1160,6 +1174,51 @@ mod tests {
             text.lock().expect("the lock").is_some(),
             "another workspace saves"
         );
+    }
+
+    /// MOD-116 M1 R1 F5: a shell that does not remember the workspace (`--demo`) neither reads
+    /// nor saves it: the first list opens the first workspace, a scope change saves nothing, and
+    /// a later save writes the file's last workspace back as it was read.
+    #[test]
+    fn a_shell_that_does_not_remember_the_workspace_neither_reads_nor_saves_it() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::ui::state_file::UiStore;
+
+        let (mut app, mut rx, _seen) = shell();
+        let text = Arc::new(Mutex::new(None));
+        app.ui_store = UiStore::Memory(Arc::clone(&text));
+        app.remembers_workspace = false;
+        let (platform, graphics) = (WorkspaceId::new(), WorkspaceId::new());
+        app.ui.last_workspace = Some(graphics);
+        first_list(
+            &mut app,
+            &mut rx,
+            vec![named(platform, "Platform"), named(graphics, "Graphics")],
+        );
+        assert_eq!(
+            app.scope.workspace_id, platform,
+            "the first, not the saved one"
+        );
+        app.update(Action::SetScope {
+            workspace: named(graphics, "Graphics"),
+        });
+        app.update(Action::SetScope {
+            workspace: named(WorkspaceId::new(), "Other"),
+        });
+        assert_eq!(
+            *text.lock().expect("the lock"),
+            None,
+            "no scope change saved"
+        );
+        assert_eq!(app.ui.last_workspace, Some(graphics));
+        app.update(Action::ToggleAbout);
+        let saved = text
+            .lock()
+            .expect("the lock")
+            .take()
+            .expect("the about toggle saves");
+        assert!(saved.contains(&format!("last = \"{graphics}\"")), "{saved}");
     }
 
     #[test]
