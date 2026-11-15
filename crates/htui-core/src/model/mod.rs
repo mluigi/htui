@@ -144,7 +144,8 @@ pub use ids::{
     SkillBindingId, SkillId, StepGraphId, StepId, TargetId, UserId, WorkspaceId,
 };
 pub use indexer::{
-    IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, ProjectChanges,
+    IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, LeaseTurn,
+    ProjectChanges,
 };
 pub use integration::{IntegrateMode, Integration, IntegrationState, LandOutcome};
 pub use item::{

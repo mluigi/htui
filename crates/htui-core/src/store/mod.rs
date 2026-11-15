@@ -24,7 +24,7 @@ pub use graph_rules::{
     graph_usable_by, phase_row_refusal, walk_refusal,
 };
 pub use index_changes::IndexChangesStore;
-pub use indexer_lease::IndexerLeaseStore;
+pub use indexer_lease::{IndexerLeaseStore, PASS_REQUEST_ATTEMPTS, take_or_request_pass};
 pub use mem::MemStore;
 pub use traits::{
     BLANK_PERSONA_BODY, BLANK_SKILL_BODY, BindingFacts, CasOutcome, DeleteReach, DeleteTarget,

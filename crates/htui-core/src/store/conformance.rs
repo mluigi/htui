@@ -60,7 +60,7 @@ use crate::model::{
     PredicateError, SkillBinding, Split, StepGraphEdge,
 };
 use crate::model::{IndexChanges, ProjectChanges};
-use crate::model::{IndexedCollection, IndexerLease, LeaseTake};
+use crate::model::{IndexedCollection, IndexerLease, LeaseTake, LeaseTurn};
 use crate::model::{
     IntegrateMode, IntegrateSnapshot, Integration, IntegrationState, LandOutcome, Repo,
 };
@@ -78,7 +78,7 @@ use crate::seed::{self, DEFAULT_PROJECT_TYPE, PROJECT_TYPES};
 use crate::store::activity::ActivityStore;
 use crate::store::error::StoreError;
 use crate::store::index_changes::IndexChangesStore;
-use crate::store::indexer_lease::IndexerLeaseStore;
+use crate::store::indexer_lease::{IndexerLeaseStore, take_or_request_pass};
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL,
@@ -3158,6 +3158,11 @@ pub const INDEXER_LEASE_CASES: &[&str] = &[
     "an_out_of_range_indexer_lease_ttl_is_refused",
     "an_indexer_lease_its_owner_let_lapse_is_ours_again",
     "releasing_one_indexer_lease_leaves_the_owners_others",
+    "a_pass_request_on_a_live_lease_names_its_holder_and_only_the_holder_claims_it",
+    "a_pass_request_on_a_free_released_or_lapsed_lease_records_nothing",
+    "a_pass_request_made_after_a_claim_waits_for_the_next_claim",
+    "a_pass_request_survives_takes_and_releases_until_claimed",
+    "take_or_request_pass_takes_a_free_lease_and_asks_a_live_holder",
 ];
 
 /// Runs one [`INDEXER_LEASE_CASES`] case by name against an already-loaded store. Every arm is
@@ -3210,6 +3215,33 @@ async fn run_indexer_lease_case_inline<S: WriteStore + IndexerLeaseStore>(name: 
         }
         "releasing_one_indexer_lease_leaves_the_owners_others" => {
             Box::pin(releasing_one_indexer_lease_leaves_the_owners_others(store)).await;
+        }
+        "a_pass_request_on_a_live_lease_names_its_holder_and_only_the_holder_claims_it" => {
+            Box::pin(
+                a_pass_request_on_a_live_lease_names_its_holder_and_only_the_holder_claims_it(
+                    store,
+                ),
+            )
+            .await;
+        }
+        "a_pass_request_on_a_free_released_or_lapsed_lease_records_nothing" => {
+            Box::pin(a_pass_request_on_a_free_released_or_lapsed_lease_records_nothing(store))
+                .await;
+        }
+        "a_pass_request_made_after_a_claim_waits_for_the_next_claim" => {
+            Box::pin(a_pass_request_made_after_a_claim_waits_for_the_next_claim(
+                store,
+            ))
+            .await;
+        }
+        "a_pass_request_survives_takes_and_releases_until_claimed" => {
+            Box::pin(a_pass_request_survives_takes_and_releases_until_claimed(
+                store,
+            ))
+            .await;
+        }
+        "take_or_request_pass_takes_a_free_lease_and_asks_a_live_holder" => {
+            Box::pin(take_or_request_pass_takes_a_free_lease_and_asks_a_live_holder(store)).await;
         }
         other => panic!(
             "unknown indexer lease case `{other}`; INDEXER_LEASE_CASES and run_indexer_lease_case \
@@ -3900,6 +3932,426 @@ async fn an_out_of_range_indexer_lease_ttl_is_refused<S: WriteStore + IndexerLea
             .await
             .expect(CASE),
         "{CASE}: a zero TTL is accepted"
+    );
+}
+
+/// MOD-159 M3 plan D1, D2: a pass request on a live lease is stamped and answers its holder as
+/// `indexer_lease` shows it (box, hostname, live), with the visible row unchanged; only the
+/// holder's claim clears it, once.
+async fn a_pass_request_on_a_live_lease_names_its_holder_and_only_the_holder_claims_it<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str =
+        "a_pass_request_on_a_live_lease_names_its_holder_and_only_the_holder_claims_it";
+    let hostname = fixture_box_row(store, CASE).await.hostname;
+    let (holder, other) = (Uuid::now_v7(), Uuid::now_v7());
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, holder, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    let before = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+
+    let asked = store
+        .request_indexer_pass(&PLATFORM_COLLECTION)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: a live lease takes a request"));
+    assert_eq!(asked.collection, PLATFORM_COLLECTION.name(), "{CASE}");
+    assert_eq!(
+        asked.box_id,
+        Some(ids::BOX),
+        "{CASE}: names the holder's box"
+    );
+    assert_eq!(asked.box_name, Some(hostname), "{CASE}: and its hostname");
+    assert!(asked.live, "{CASE}: the holder's lease is live");
+    assert_eq!(
+        asked, before,
+        "{CASE}: the holder as `indexer_lease` reads it"
+    );
+    assert_eq!(
+        indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await,
+        before,
+        "{CASE}: a request moves neither the holder nor the expiry"
+    );
+
+    assert!(
+        !store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, other)
+            .await
+            .expect(CASE),
+        "{CASE}: another owner's claim finds nothing"
+    );
+    assert!(
+        store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, holder)
+            .await
+            .expect(CASE),
+        "{CASE}: and leaves the request to the holder, whose claim finds it"
+    );
+    assert!(
+        !store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, holder)
+            .await
+            .expect(CASE),
+        "{CASE}: a claim clears it"
+    );
+    assert_eq!(
+        indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await,
+        before,
+        "{CASE}: a claim moves neither the holder nor the expiry"
+    );
+}
+
+/// MOD-159 M3 plan D2: no request is recorded on a collection with no row, a released lease or a
+/// lapsed one; the request answers `None` and writes nothing, so a later taker has nothing to
+/// claim.
+async fn a_pass_request_on_a_free_released_or_lapsed_lease_records_nothing<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "a_pass_request_on_a_free_released_or_lapsed_lease_records_nothing";
+    assert_eq!(
+        store
+            .request_indexer_pass(&PLATFORM_COLLECTION)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: a collection never taken has no holder to ask"
+    );
+    assert_eq!(
+        store.indexer_lease(&PLATFORM_COLLECTION).await.expect(CASE),
+        None,
+        "{CASE}: and a refused request creates no row"
+    );
+
+    let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, first, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    assert!(
+        store
+            .release_indexer_lease(&PLATFORM_COLLECTION, first)
+            .await
+            .expect(CASE),
+        "{CASE}"
+    );
+    let released = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert_eq!(
+        store
+            .request_indexer_pass(&PLATFORM_COLLECTION)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: a released lease has no holder to ask"
+    );
+    assert_eq!(
+        indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await,
+        released,
+        "{CASE}: a refused request writes nothing"
+    );
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, second, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    assert!(
+        !store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, second)
+            .await
+            .expect(CASE),
+        "{CASE}: the next taker of a released lease has nothing to claim"
+    );
+
+    let global = IndexedCollection::Global;
+    let (lapsing, next) = (Uuid::now_v7(), Uuid::now_v7());
+    assert_eq!(
+        store
+            .take_indexer_lease(&global, ids::BOX, lapsing, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    let lapsed = indexer_lease_row(CASE, store, &global).await;
+    assert!(
+        !lapsed.live,
+        "{CASE}: a zero TTL lapses at once: {lapsed:?}"
+    );
+    assert_eq!(
+        store.request_indexer_pass(&global).await.expect(CASE),
+        None,
+        "{CASE}: a lapsed lease has no holder to ask"
+    );
+    assert!(
+        !store
+            .claim_indexer_pass(&global, lapsing)
+            .await
+            .expect(CASE),
+        "{CASE}: not even its last owner finds a request"
+    );
+    assert_eq!(
+        store
+            .take_indexer_lease(&global, ids::BOX, next, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    assert!(
+        !store.claim_indexer_pass(&global, next).await.expect(CASE),
+        "{CASE}: the next taker of a lapsed lease has nothing to claim"
+    );
+}
+
+/// MOD-159 M3 plan D3: a claim clears only the request pending when it ran; one made after it
+/// waits for the next claim.
+async fn a_pass_request_made_after_a_claim_waits_for_the_next_claim<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "a_pass_request_made_after_a_claim_waits_for_the_next_claim";
+    let holder = Uuid::now_v7();
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, holder, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    for round in ["first", "second"] {
+        assert!(
+            store
+                .request_indexer_pass(&PLATFORM_COLLECTION)
+                .await
+                .expect(CASE)
+                .is_some(),
+            "{CASE}: the {round} request is recorded"
+        );
+        assert!(
+            store
+                .claim_indexer_pass(&PLATFORM_COLLECTION, holder)
+                .await
+                .expect(CASE),
+            "{CASE}: and the claim after it finds it"
+        );
+    }
+    assert!(
+        !store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, holder)
+            .await
+            .expect(CASE),
+        "{CASE}: nothing is pending after the second claim"
+    );
+}
+
+/// MOD-159 M3 plan D2: a pending request survives its holder's renewing take, both releases, and
+/// a take by another owner; whoever holds the row next claims it.
+async fn a_pass_request_survives_takes_and_releases_until_claimed<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "a_pass_request_survives_takes_and_releases_until_claimed";
+    let (holder, other) = (Uuid::now_v7(), Uuid::now_v7());
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, holder, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    assert!(
+        store
+            .request_indexer_pass(&PLATFORM_COLLECTION)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}"
+    );
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, ids::BOX, holder, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Ours,
+        "{CASE}: the holder takes it again"
+    );
+    assert!(
+        store
+            .renew_indexer_lease(&PLATFORM_COLLECTION, holder, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: and renews it"
+    );
+    assert!(
+        store
+            .release_indexer_lease(&PLATFORM_COLLECTION, holder)
+            .await
+            .expect(CASE),
+        "{CASE}: then lets it go"
+    );
+    let other_box = BoxId::new();
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, other_box, other, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: another owner takes the released lease"
+    );
+    assert!(
+        !store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, holder)
+            .await
+            .expect(CASE),
+        "{CASE}: the former holder no longer claims it"
+    );
+    assert!(
+        store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, other)
+            .await
+            .expect(CASE),
+        "{CASE}: the request survived the renewing take, the release and the new take"
+    );
+
+    assert!(
+        store
+            .request_indexer_pass(&PLATFORM_COLLECTION)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}"
+    );
+    assert_eq!(
+        store.release_indexer_leases(other).await.expect(CASE),
+        1,
+        "{CASE}: the holder releases every lease it holds"
+    );
+    assert_eq!(
+        store
+            .take_indexer_lease(&PLATFORM_COLLECTION, other_box, other, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}: a released lease is taken afresh"
+    );
+    assert!(
+        store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, other)
+            .await
+            .expect(CASE),
+        "{CASE}: the request survived the release of every lease"
+    );
+}
+
+/// MOD-159 M3 plan D4: [`take_or_request_pass`] takes a free lease, asks a live holder (whose
+/// claim then finds the request) and leaves its lease alone, and takes a lapsed one rather than
+/// asking.
+async fn take_or_request_pass_takes_a_free_lease_and_asks_a_live_holder<
+    S: WriteStore + IndexerLeaseStore,
+>(
+    store: &S,
+) {
+    const CASE: &str = "take_or_request_pass_takes_a_free_lease_and_asks_a_live_holder";
+    let hostname = fixture_box_row(store, CASE).await.hostname;
+    let (holder, asker) = (Uuid::now_v7(), Uuid::now_v7());
+    assert_eq!(
+        take_or_request_pass(store, &PLATFORM_COLLECTION, ids::BOX, holder, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTurn::Ours,
+        "{CASE}: a free lease is taken"
+    );
+    let held = indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await;
+    assert!(held.live, "{CASE}: {held:?}");
+    assert_eq!(held.box_id, Some(ids::BOX), "{CASE}");
+    assert!(
+        !store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, holder)
+            .await
+            .expect(CASE),
+        "{CASE}: taking a free lease records no request"
+    );
+
+    let turn = take_or_request_pass(store, &PLATFORM_COLLECTION, BoxId::new(), asker, LEASE)
+        .await
+        .expect(CASE);
+    let LeaseTurn::Requested(asked) = turn else {
+        panic!("{CASE}: a live holder is asked, got {turn:?}");
+    };
+    assert_eq!(
+        asked.box_id,
+        Some(ids::BOX),
+        "{CASE}: names the holder's box"
+    );
+    assert_eq!(asked.box_name, Some(hostname), "{CASE}: and its hostname");
+    assert_eq!(asked, held, "{CASE}: as `indexer_lease` reads it");
+    assert_eq!(
+        indexer_lease_row(CASE, store, &PLATFORM_COLLECTION).await,
+        held,
+        "{CASE}: the asker takes nothing"
+    );
+    assert!(
+        store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, holder)
+            .await
+            .expect(CASE),
+        "{CASE}: the holder's claim finds the request"
+    );
+    assert_eq!(
+        take_or_request_pass(store, &PLATFORM_COLLECTION, ids::BOX, holder, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTurn::Ours,
+        "{CASE}: the holder's own lease is taken again, not requested"
+    );
+    assert!(
+        !store
+            .claim_indexer_pass(&PLATFORM_COLLECTION, holder)
+            .await
+            .expect(CASE),
+        "{CASE}: and records no request"
+    );
+
+    let global = IndexedCollection::Global;
+    let (lapsing, next) = (Uuid::now_v7(), Uuid::now_v7());
+    assert_eq!(
+        store
+            .take_indexer_lease(&global, ids::BOX, lapsing, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        LeaseTake::Taken,
+        "{CASE}"
+    );
+    assert_eq!(
+        take_or_request_pass(store, &global, ids::BOX, next, LEASE)
+            .await
+            .expect(CASE),
+        LeaseTurn::Ours,
+        "{CASE}: a lapsed lease is taken, not requested"
+    );
+    assert!(indexer_lease_row(CASE, store, &global).await.live, "{CASE}");
+    assert!(
+        !store.claim_indexer_pass(&global, next).await.expect(CASE),
+        "{CASE}: and no request is recorded"
     );
 }
 
