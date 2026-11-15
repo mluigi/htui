@@ -561,8 +561,6 @@ pub enum Act {
     AgentsCancel,
     /// `settings.agents.choose`: select the highlighted login method.
     AgentsChoose,
-    /// `settings.hierarchy.new_workspace`: create a workspace.
-    HierarchyNewWorkspace,
     /// `settings.hierarchy.primary`: make the selected checkout primary.
     HierarchyPrimary,
     /// `settings.hierarchy.choose_path`: choose a path with the picker.
@@ -1423,15 +1421,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["enter"],
         "select",
     ),
-    // [settings.hierarchy]
-    // hierarchy.rs:1220.
-    row(
-        Act::HierarchyNewWorkspace,
-        SettingsHierarchy,
-        "new_workspace",
-        &["N"],
-        "new workspace",
-    ),
+    // [settings.hierarchy]: `new_workspace` retired (MOD-116 M3 D14): new workspaces are created
+    // on the Workspaces tab, `[workspaces] new`; a key file naming it loads with a notice
+    // (`keys::load::RETIRED_ACTIONS`).
     // hierarchy.rs:1250.
     row(
         Act::HierarchyPrimary,
@@ -2945,7 +2937,8 @@ mod tests {
         Act::AgentsPasteRedirect,
         Act::AgentsCancel,
         Act::AgentsChoose,
-        Act::HierarchyNewWorkspace,
+        // MOD-116 M3 D14: in the retired `settings.hierarchy.new_workspace`'s slot.
+        Act::WorkspacesNew,
         Act::HierarchyPrimary,
         Act::HierarchyChoosePath,
         Act::HierarchyInfer,
@@ -3144,7 +3137,6 @@ mod tests {
         Act::WorkspacesStop,
         Act::WorkspacesResume,
         Act::LeaveStop,
-        Act::WorkspacesNew,
         Act::WorkspacesTarget,
     ];
 
@@ -3208,7 +3200,7 @@ mod tests {
             Act::AgentsPasteRedirect => 53,
             Act::AgentsCancel => 54,
             Act::AgentsChoose => 55,
-            Act::HierarchyNewWorkspace => 56,
+            Act::WorkspacesNew => 56,
             Act::HierarchyPrimary => 57,
             Act::HierarchyChoosePath => 58,
             Act::HierarchyInfer => 59,
@@ -3407,8 +3399,7 @@ mod tests {
             Act::WorkspacesStop => 252,
             Act::WorkspacesResume => 253,
             Act::LeaveStop => 254,
-            Act::WorkspacesNew => 255,
-            Act::WorkspacesTarget => 256,
+            Act::WorkspacesTarget => 255,
         }
     }
 
@@ -3448,7 +3439,9 @@ mod tests {
         // MOD-116 M1 D10: `workspaces.open` took the retired `switcher.switch`'s row, still 252.
         // MOD-116 M2 D10: `workspaces.stop` and `workspaces.resume`, 254; `leave.stop`, 255.
         // MOD-116 M3 D14: `workspaces.new`, 256; `workspaces.target`, 257.
-        assert_eq!(CATALOGUE.len(), 257);
+        // MOD-116 M3 D14: `workspaces.new` took the retired `settings.hierarchy.new_workspace`'s
+        // slot, 256.
+        assert_eq!(CATALOGUE.len(), 256);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {

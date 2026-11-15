@@ -65,6 +65,16 @@ const RETIRED: &[(&str, &str)] = &[(
      [workspaces] open)",
 )];
 
+/// MOD-116 M3 D14 (MOD-115 MD4): the actions htui no longer has in a table that lives on, as
+/// `(table, name, notice)`. An entry naming one loads with the notice on its line, whatever its
+/// value; nothing is read from it.
+const RETIRED_ACTIONS: &[(&str, &str, &str)] = &[(
+    "settings.hierarchy",
+    "new_workspace",
+    "[settings.hierarchy] new_workspace: new workspaces are created on the Workspaces tab (its \
+     key is [workspaces] new)",
+)];
+
 /// The report's last line, after every error (ANA-26 §7.5).
 const HINT: &str = "Fix the file, or run `htui --default-keys` to start with the default keys.";
 
@@ -424,6 +434,17 @@ impl Loader<'_> {
             .find(|spec| spec.context == context && spec.name == name)
             .or_else(|| overridable(context).find(|spec| spec.name == name))
         else {
+            // MOD-116 M3 D14: a retired action is a notice on its line, never a refusal.
+            if let Some((_, _, notice)) = RETIRED_ACTIONS
+                .iter()
+                .find(|(retired, action, _)| *retired == table && *action == name)
+            {
+                self.keys.retired.push(KeyFileError {
+                    line: key_line,
+                    message: (*notice).to_owned(),
+                });
+                return;
+            }
             let names = CATALOGUE
                 .iter()
                 .filter(|spec| spec.context == context)
@@ -1526,6 +1547,52 @@ quit = ["x", "shift-a"]
         let empty = load_str("[switcher]\n").expect("loads");
         assert_eq!(empty.notices().len(), 1);
         assert_eq!(empty, Keys::defaults(), "the notice is no binding");
+    }
+
+    /// The notice a retired `[settings.hierarchy] new_workspace` loads with (MOD-116 M3 D14).
+    const NEW_WORKSPACE_RETIRED: &str = "[settings.hierarchy] new_workspace: new workspaces are \
+         created on the Workspaces tab (its key is [workspaces] new)";
+
+    /// MOD-116 M3 D14 (MOD-115 MD4: existing overrides keep loading): `new_workspace`, retired
+    /// from a table that lives on, loads whatever it holds, even a chord that does not parse or a
+    /// value that is no chord, with one notice on its line and nothing bound; the table's "no
+    /// such action" list no longer names it.
+    #[test]
+    fn the_retired_new_workspace_key_loads_with_one_notice() {
+        for value in [
+            "\"ctrl-n\"",
+            "[\"N\", \"ctrl-n\"]",
+            "\"ctrl-nope-x\"",
+            "3",
+            "[]",
+        ] {
+            let keys = load_str(&format!("[settings.hierarchy]\nnew_workspace = {value}\n"))
+                .unwrap_or_else(|err| panic!("{value}: a retired action loads: {err:?}"));
+            assert_eq!(
+                keys.notices(),
+                [KeyFileError {
+                    line: 2,
+                    message: NEW_WORKSPACE_RETIRED.to_owned(),
+                }],
+                "{value}"
+            );
+            assert_eq!(keys, Keys::defaults(), "{value}: the notice is no binding");
+            assert_eq!(
+                keys.actions(views::HIERARCHY_BROWSE, chord("ctrl-n")),
+                [],
+                "{value}"
+            );
+        }
+        let refused = errors("[settings.hierarchy]\nnew_project = \"x\"\n");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].1.starts_with(
+                "[settings.hierarchy] new_project: no such action; [settings.hierarchy] has \
+                 primary, "
+            ),
+            "{refused:?}"
+        );
+        assert!(!refused[0].1.contains("new_workspace"), "{refused:?}");
     }
 
     /// MOD-67 M5 §3.1: `[backlog.runs]` overrides a `[backlog]` verb in the Runs pane alone,

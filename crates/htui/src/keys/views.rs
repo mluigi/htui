@@ -266,7 +266,6 @@ pub const HIERARCHY_BROWSE: Stack<'static> = Stack::new(&[
     Layer::view(
         Context::SettingsHierarchy,
         &[
-            Act::HierarchyNewWorkspace,
             Act::HierarchyPrimary,
             Act::HierarchyChoosePath,
             Act::HierarchyInfer,
@@ -1685,6 +1684,8 @@ mod tests {
         assert_eq!(resolve(KINDS_BROWSE, "ctrl-d"), []);
         assert_eq!(resolve(HIERARCHY_BROWSE, "d"), [Act::Delete]);
         assert_eq!(resolve(HIERARCHY_BROWSE, "down"), [Act::ListDown]);
+        // MOD-116 M3 D14: `N` is the Workspaces tab's now; Hierarchy binds nothing on it.
+        assert_eq!(resolve(HIERARCHY_BROWSE, "N"), []);
         // MOD-115 M2 D4: `Tab` moves the pane focus (nothing on a single-pane tab).
         assert_eq!(resolve(HIERARCHY_BROWSE, "tab"), [Act::NextPane]);
         assert_eq!(resolve(HIERARCHY_BROWSE, "ctrl-pgdn"), [Act::NextTab]);
