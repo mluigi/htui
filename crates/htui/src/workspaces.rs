@@ -6,11 +6,19 @@
 //! `goals` owner document of its scope row, its run counts (the tally of its unfinished runs and
 //! its stop row, as [`WorkspaceRunCounts`]), the default target its scope row names or inherits,
 //! and per project the items by state, the running runs and the rows waiting on a person (the
-//! rows the header's `⚠ n waiting` counts). Offline there is no writer and the read is refused
-//! with `DATABASE_UNREACHABLE`: `workspace_stop` is not mirrored.
+//! rows the header's `⚠ n waiting` counts), and its stop report ([`stop_report::report`], MOD-116
+//! M2 D5). Offline there is no writer and the read is refused with `DATABASE_UNREACHABLE`:
+//! `workspace_stop` is not mirrored.
+//!
+//! MOD-116 M2 D4: [`serve`] also answers the two writes, [`StoreRequest::StopWorkspaces`] and
+//! [`StoreRequest::ResumeWorkspace`], through the writer as this user at the worker's clock, each
+//! target re-read against the stop row its question was decided on
+//! ([`stop_report::write_stop`], [`stop_report::write_resume`]); offline they are refused before
+//! any write.
 
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
 use htui_core::model::document::GOALS_KIND;
 use htui_core::model::{
     ItemFilter, ItemState, ProjectId, RunStatus, Scope, WorkspaceId, WorkspaceRunCounts,
@@ -20,6 +28,7 @@ use htui_core::store::{ReadStore, Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::hierarchy::{self, HierarchySnapshot};
+use crate::stop_report::{self, Report};
 use crate::store_worker::{StoreReply, StoreRequest, serve_waiting};
 
 /// One workspace as the Workspaces tab's detail pane shows it (D7).
@@ -39,6 +48,9 @@ pub struct WorkspaceOverview {
     pub default_target: TargetLine,
     /// One per project, in the tree's order (`workspace_project.position`).
     pub projects: Vec<ProjectOverview>,
+    /// MOD-116 M2 D5: the workspace's stop report (`stop_report::report`), its live steps' agents
+    /// named.
+    pub report: Report,
 }
 
 /// Where a workspace's runs go by default (D7): the target its scope row names, or the Settings
@@ -82,12 +94,13 @@ impl ProjectOverview {
     }
 }
 
-/// Serves [`StoreRequest::WorkspaceOverview`] (D7) with this user's home directory.
+/// Serves [`StoreRequest::WorkspaceOverview`] (D7) with this user's home directory, and the
+/// MOD-116 M2 D4 writes [`StoreRequest::StopWorkspaces`] and [`StoreRequest::ResumeWorkspace`].
 ///
 /// # Errors
 /// [`StoreError::Unreachable`] offline (`DATABASE_UNREACHABLE`), whatever the store reports, and
-/// [`StoreError::Backend`] for a request that is not this module's: `try_serve` routes only the
-/// overview here, so a caller that reached it anyway is told which request it sent.
+/// [`StoreError::Backend`] for a request that is not this module's: `try_serve` routes only these
+/// three here, so a caller that reached it anyway is told which request it sent.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     serve_with_home(backend, request, dirs::home_dir().as_deref()).await
 }
@@ -102,21 +115,59 @@ pub async fn serve_with_home(
     request: &StoreRequest,
     home: Option<&Path>,
 ) -> Result<StoreReply> {
-    let StoreRequest::WorkspaceOverview(workspace) = request else {
-        return Err(StoreError::Backend(format!(
-            "`{}` is not a workspaces request",
-            request.name()
-        )));
+    let writer = || {
+        backend
+            .writer()
+            .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))
     };
-    let workspace = *workspace;
-    let writer = backend
-        .writer()
-        .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
-    let overview = overview(backend, &writer, workspace, home).await?;
-    Ok(StoreReply::WorkspaceOverview {
-        workspace,
-        overview: overview.map(Box::new),
-    })
+    match request {
+        StoreRequest::WorkspaceOverview(workspace) => {
+            let workspace = *workspace;
+            let overview = overview(backend, &writer()?, workspace, home).await?;
+            Ok(StoreReply::WorkspaceOverview {
+                workspace,
+                overview: overview.map(Box::new),
+            })
+        }
+        StoreRequest::StopWorkspaces { mode, targets } => {
+            let writer = writer()?;
+            let user = backend.this_user().await?;
+            // Taken when the request is served: after the question was answered (M4 R1).
+            let at = Utc::now();
+            let mut outcomes = Vec::with_capacity(targets.len());
+            for target in targets {
+                let outcome = stop_report::write_stop(
+                    &writer,
+                    target.workspace,
+                    *mode,
+                    target.decided_on.as_ref(),
+                    user,
+                    at,
+                )
+                .await?;
+                outcomes.push((target.workspace, outcome));
+            }
+            Ok(StoreReply::StopsWritten {
+                mode: *mode,
+                outcomes,
+            })
+        }
+        StoreRequest::ResumeWorkspace {
+            workspace,
+            decided_on,
+        } => {
+            let outcome =
+                stop_report::write_resume(&writer()?, *workspace, decided_on.as_ref()).await?;
+            Ok(StoreReply::ResumeWritten {
+                workspace: *workspace,
+                outcome,
+            })
+        }
+        other => Err(StoreError::Backend(format!(
+            "`{}` is not a workspaces request",
+            other.name()
+        ))),
+    }
 }
 
 /// The N+1 reads of one overview; `None` when the workspace does not exist.
@@ -141,6 +192,12 @@ async fn overview(
     let counts = WorkspaceRunCounts::tally(workspace, runs.iter().map(|run| run.status), stop);
 
     let default_target = default_target(writer, &tree).await?;
+
+    let agents = backend.agents().await?;
+    let names = stop_report::agent_names(&agents);
+    let caps = stop_report::caps_map(agents);
+    let report =
+        stop_report::report(writer, &caps, &names, workspace, &tree.workspace.slug).await?;
 
     let scope = Scope {
         workspace_id: workspace,
@@ -197,6 +254,7 @@ async fn overview(
         counts,
         default_target,
         projects,
+        report,
     }))
 }
 
@@ -235,7 +293,9 @@ mod tests {
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
 
     use super::{ProjectOverview, TargetLine, WorkspaceOverview, serve, serve_with_home};
+    use crate::stop_report::{ResumeWrite, RunResume, StopTarget, StopWrite};
     use crate::store_worker::{StoreReply, StoreRequest};
+    use htui_core::model::StopMode;
 
     /// The overview of `workspace` over `backend`, with `home` as the home directory.
     async fn overview_of(
@@ -489,5 +549,228 @@ mod tests {
             matches!(&reply, Err(StoreError::Backend(message)) if message.contains("`workspaces`")),
             "{reply:?}"
         );
+    }
+
+    /// MOD-116 M2 D5: the overview carries the workspace's stop report: Platform's three runs in
+    /// `(queued_at, id)` order and no stop row; Graphics's box-less stopped `RUN_8`.
+    #[tokio::test]
+    async fn the_overview_carries_the_stop_report() {
+        let backend = Backend::memory(MemStore::demo());
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let platform = overview_of(&backend, ids::WORKSPACE_PLATFORM, home.path())
+            .await
+            .expect("Platform exists");
+        let report = &platform.report;
+        assert_eq!(report.slug, platform.tree.workspace.slug);
+        assert_eq!(report.stop, None);
+        assert_eq!(
+            report
+                .lines
+                .iter()
+                .map(|line| (line.run, line.resume.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (ids::RUN_2, RunResume::Held),
+                (ids::RUN_4, RunResume::Stopping),
+                (ids::RUN_5, RunResume::AtGate),
+            ]
+        );
+
+        let graphics = overview_of(&backend, ids::WORKSPACE_GRAPHICS, home.path())
+            .await
+            .expect("Graphics exists");
+        assert_eq!(
+            graphics
+                .report
+                .lines
+                .iter()
+                .map(|line| (line.run, line.resume.clone()))
+                .collect::<Vec<_>>(),
+            [(ids::RUN_8, RunResume::NoBox)]
+        );
+    }
+
+    /// The stop row of `workspace`, read through the writer.
+    async fn stop_of(
+        backend: &Backend,
+        workspace: htui_core::model::WorkspaceId,
+    ) -> Option<htui_core::model::WorkspaceStop> {
+        backend
+            .writer()
+            .expect("a memory backend writes")
+            .workspace_stop(workspace)
+            .await
+            .expect("a memory read")
+    }
+
+    /// MOD-116 M2 D4: one request stops each target, in order, as this user; routed by the
+    /// store worker under `stop_workspaces`.
+    #[tokio::test]
+    async fn a_stop_request_writes_each_target_by_this_user() {
+        let backend = Backend::memory(MemStore::demo());
+        let request = StoreRequest::StopWorkspaces {
+            mode: StopMode::Graceful,
+            targets: vec![
+                StopTarget {
+                    workspace: ids::WORKSPACE_PLATFORM,
+                    decided_on: None,
+                },
+                StopTarget {
+                    workspace: ids::WORKSPACE_GRAPHICS,
+                    decided_on: None,
+                },
+            ],
+        };
+        let before = Utc::now();
+        let reply = crate::store_worker::serve(&backend, &request).await;
+        let StoreReply::StopsWritten { mode, outcomes } = reply else {
+            panic!("expected the stops written, got {reply:?}");
+        };
+        assert_eq!(mode, StopMode::Graceful);
+        assert_eq!(
+            outcomes,
+            [
+                (ids::WORKSPACE_PLATFORM, StopWrite::Written),
+                (ids::WORKSPACE_GRAPHICS, StopWrite::Written),
+            ]
+        );
+        let user = backend.this_user().await.expect("the demo has a user");
+        for workspace in [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS] {
+            let row = stop_of(&backend, workspace).await.expect("stopped");
+            assert_eq!((row.mode, row.requested_by), (StopMode::Graceful, user));
+            assert!(row.requested_at >= before, "{row:?}");
+        }
+    }
+
+    /// MOD-116 M2 D3/D4: a target decided on no stop row, when one was written meanwhile, writes
+    /// nothing.
+    #[tokio::test]
+    async fn a_stop_over_a_changed_stop_writes_nothing() {
+        let backend = Backend::memory(MemStore::demo());
+        let writer = backend.writer().expect("a memory backend writes");
+        let meanwhile = writer
+            .stop_workspace(
+                ids::WORKSPACE_PLATFORM,
+                StopMode::Graceful,
+                ids::USER,
+                Utc::now(),
+            )
+            .await
+            .expect("a stop is written");
+        let reply = serve(
+            &backend,
+            &StoreRequest::StopWorkspaces {
+                mode: StopMode::Forced,
+                targets: vec![StopTarget {
+                    workspace: ids::WORKSPACE_PLATFORM,
+                    decided_on: None,
+                }],
+            },
+        )
+        .await
+        .expect("served");
+        assert!(
+            matches!(
+                &reply,
+                StoreReply::StopsWritten { mode: StopMode::Forced, outcomes }
+                    if outcomes == &[(ids::WORKSPACE_PLATFORM, StopWrite::Changed)]
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            stop_of(&backend, ids::WORKSPACE_PLATFORM).await,
+            Some(meanwhile)
+        );
+    }
+
+    /// MOD-116 M2 D3/D4: a resume deletes the stop row it was decided on, routed by the store
+    /// worker under `resume_workspace`; asked again, the workspace is not stopped.
+    #[tokio::test]
+    async fn a_resume_request_resumes_the_stop_it_was_decided_on() {
+        let backend = Backend::memory(MemStore::demo());
+        let writer = backend.writer().expect("a memory backend writes");
+        let row = writer
+            .stop_workspace(
+                ids::WORKSPACE_GRAPHICS,
+                StopMode::Forced,
+                ids::USER,
+                Utc::now(),
+            )
+            .await
+            .expect("a stop is written");
+        let request = StoreRequest::ResumeWorkspace {
+            workspace: ids::WORKSPACE_GRAPHICS,
+            decided_on: Some(row),
+        };
+        let reply = crate::store_worker::serve(&backend, &request).await;
+        assert!(
+            matches!(
+                reply,
+                StoreReply::ResumeWritten {
+                    workspace: ids::WORKSPACE_GRAPHICS,
+                    outcome: ResumeWrite::Resumed,
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(stop_of(&backend, ids::WORKSPACE_GRAPHICS).await, None);
+
+        let again = StoreRequest::ResumeWorkspace {
+            workspace: ids::WORKSPACE_GRAPHICS,
+            decided_on: None,
+        };
+        let reply = crate::store_worker::serve(&backend, &again).await;
+        assert!(
+            matches!(
+                reply,
+                StoreReply::ResumeWritten {
+                    outcome: ResumeWrite::NotStopped,
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+    }
+
+    /// MOD-116 M2 D4: offline there is no writer, so both writes are refused before any write,
+    /// each under its own name.
+    #[tokio::test]
+    async fn offline_stop_and_resume_are_refused_before_any_write() {
+        let _keyring = htui_store::testkit::mock_keyring().await;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "stop-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: Some(Utc::now()),
+        };
+        let stop = StoreRequest::StopWorkspaces {
+            mode: StopMode::Graceful,
+            targets: vec![StopTarget {
+                workspace: ids::WORKSPACE_PLATFORM,
+                decided_on: None,
+            }],
+        };
+        let resume = StoreRequest::ResumeWorkspace {
+            workspace: ids::WORKSPACE_PLATFORM,
+            decided_on: None,
+        };
+        for (request, name) in [(stop, "stop_workspaces"), (resume, "resume_workspace")] {
+            assert!(matches!(
+                serve(&backend, &request).await,
+                Err(StoreError::Unreachable(message)) if message == DATABASE_UNREACHABLE
+            ));
+            let reply = crate::store_worker::serve(&backend, &request).await;
+            assert!(
+                matches!(
+                    &reply,
+                    StoreReply::Failed { request, message }
+                        if *request == name && message.ends_with(DATABASE_UNREACHABLE)
+                ),
+                "{reply:?}"
+            );
+        }
+        cache.close().await;
     }
 }

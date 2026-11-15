@@ -30,8 +30,9 @@ use htui_core::model::{
     PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, ProjectRef,
     ProjectType, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunCommandId,
     RunStatus, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges,
-    StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission,
-    WorkspaceId, WorkspacePatch, WorkspaceRunCounts, WorkspaceSummary,
+    StepGraphId, StepGraphPatch, StepId, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount,
+    WaitingPermission, WorkspaceId, WorkspacePatch, WorkspaceRunCounts, WorkspaceStop,
+    WorkspaceSummary,
 };
 use htui_core::model::{
     LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, OwnerDocument,
@@ -78,6 +79,7 @@ use crate::run_worker::{LiveChats, RunRuntime, RunServed, TuiRuns as _};
 use crate::secrets_settings::{self, IdentityEntry, Redacted, SecretCheck, SecretsSnapshot};
 use crate::skill_import::SkillImports;
 use crate::skills::{self, SkillWrite, SkillsSnapshot, StaleWhat};
+use crate::stop_report::{ResumeWrite, StopTarget, StopWrite};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -484,6 +486,28 @@ pub enum StoreRequest {
     /// through the writer; offline `Unreachable`. Answered with
     /// [`StoreReply::WorkspaceOverview`].
     WorkspaceOverview(WorkspaceId),
+    /// MOD-116 M2 D4: stop each target workspace in `mode`, in order, each re-read against the
+    /// stop row its question was decided on (`stop_report::write_stop`, D3), as this user at the
+    /// worker's clock. Served by [`crate::workspaces::serve`] through the writer; offline
+    /// `Unreachable` before any write (`workspace_stop` is not mirrored). One batched request,
+    /// since a newer request of the same name supersedes an older one's reply: the leave dialog
+    /// stops several workspaces, the Workspaces tab one. A target that fails ends the batch (the
+    /// ones before it are written). Answered with [`StoreReply::StopsWritten`].
+    StopWorkspaces {
+        /// The stop's mode.
+        mode: StopMode,
+        /// The workspaces, each with the stop row it was decided on.
+        targets: Vec<StopTarget>,
+    },
+    /// MOD-116 M2 D4: resume `workspace` when its stop row is still `decided_on`
+    /// (`stop_report::write_resume`, D3). Served as [`Self::StopWorkspaces`]. Answered with
+    /// [`StoreReply::ResumeWritten`].
+    ResumeWorkspace {
+        /// The workspace to resume.
+        workspace: WorkspaceId,
+        /// The stop row read when the question was built; `None` when it had none.
+        decided_on: Option<WorkspaceStop>,
+    },
     /// This user's headless workers' log lines (MOD-122 M2 D10): `id > after`, oldest first, at
     /// most 2 000; `after: None` is the newest 2 000. Served in `try_serve` through
     /// `Backend::worker_logs`, so offline it is answered empty rather than refused, and an
@@ -1463,6 +1487,8 @@ impl StoreRequest {
             Self::ProjectTypes => "project_types",
             Self::WorkspaceRunCounts => "workspace_run_counts",
             Self::WorkspaceOverview(..) => "workspace_overview",
+            Self::StopWorkspaces { .. } => "stop_workspaces",
+            Self::ResumeWorkspace { .. } => "resume_workspace",
             Self::WorkerLogs { .. } => "worker_logs",
             Self::Activity { .. } => "activity",
             Self::SweepRetention => "sweep_retention",
@@ -1944,6 +1970,21 @@ pub enum StoreReply {
         workspace: WorkspaceId,
         /// Its overview; `None` for an unknown workspace.
         overview: Option<Box<WorkspaceOverview>>,
+    },
+    /// The answer to [`StoreRequest::StopWorkspaces`] (MOD-116 M2 D4): what each target's write
+    /// did, in target order.
+    StopsWritten {
+        /// The mode asked for.
+        mode: StopMode,
+        /// Each target workspace and what its write did.
+        outcomes: Vec<(WorkspaceId, StopWrite)>,
+    },
+    /// The answer to [`StoreRequest::ResumeWorkspace`] (MOD-116 M2 D4).
+    ResumeWritten {
+        /// The workspace asked about.
+        workspace: WorkspaceId,
+        /// What the write did.
+        outcome: ResumeWrite,
     },
     /// The answer to [`StoreRequest::WorkerLogs`] (MOD-122 M2 D10): rows oldest first, empty
     /// offline.
@@ -2749,7 +2790,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         }
         // MOD-116 M1 D7: the Workspaces tab's overview, assembled in its own module as the
         // hierarchy snapshot is; the `?` keeps `go_offline` working for an `Unreachable`.
-        StoreRequest::WorkspaceOverview(..) => workspaces::serve(backend, request).await?,
+        // MOD-116 M2 D4: the stop and resume writes are served there too, through the writer.
+        StoreRequest::WorkspaceOverview(..)
+        | StoreRequest::StopWorkspaces { .. }
+        | StoreRequest::ResumeWorkspace { .. } => workspaces::serve(backend, request).await?,
         // MOD-122 M2 D10, blueprint F5/F11: one read, inline. Offline answers empty (the tab
         // merges it, adding nothing); the `?` keeps `go_offline` working for an `Unreachable`.
         StoreRequest::WorkerLogs { after } => {
@@ -6871,6 +6915,22 @@ mod tests {
         assert_eq!(
             StoreRequest::WorkspaceOverview(ids::WORKSPACE_PLATFORM).name(),
             "workspace_overview"
+        );
+        assert_eq!(
+            StoreRequest::StopWorkspaces {
+                mode: StopMode::Graceful,
+                targets: Vec::new(),
+            }
+            .name(),
+            "stop_workspaces"
+        );
+        assert_eq!(
+            StoreRequest::ResumeWorkspace {
+                workspace: ids::WORKSPACE_PLATFORM,
+                decided_on: None,
+            }
+            .name(),
+            "resume_workspace"
         );
         assert_eq!(
             StoreRequest::WorkerLogs { after: None }.name(),
