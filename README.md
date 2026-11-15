@@ -123,8 +123,10 @@ clash with a Postgres you may already have on 5432:
 
 ```
 docker compose up -d
-echo postgres://postgres:htui@localhost:5439/htui | htui --set-dsn
+echo postgres://postgres:<password>@localhost:5439/htui | htui --set-dsn
 ```
+
+`<password>` is `POSTGRES_PASSWORD` in `compose.yaml`.
 
 The same file also starts Qdrant, which is only needed for [Search](#search).
 
@@ -705,8 +707,11 @@ Without the variable those tests print `skipped: HTUI_TEST_DATABASE_URL not set`
 
 ```
 docker compose up -d
-HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres cargo test --workspace --all-features
+HTUI_TEST_DATABASE_URL=postgres://postgres:<password>@localhost:5440/postgres cargo test --workspace --all-features
 ```
+
+That is the separate test server, `htui-postgres-test` on port 5440 (data in RAM, durability off),
+not the `htui` database on 5439; `<password>` is `POSTGRES_PASSWORD` in `compose.yaml`.
 
 The Qdrant tests read `HTUI_TEST_QDRANT_URL` the same way (`http://localhost:6336`, the
 included `compose.yaml`'s `htui-qdrant-test`, whose storage is a tmpfs; not the dev Qdrant on
@@ -741,11 +746,11 @@ Postgres queries are checked at compile time against the committed data in
 
 ```
 cargo install sqlx-cli --no-default-features --features postgres,sqlite   # once
-psql postgres://postgres:htui@localhost:5439/postgres -c "CREATE DATABASE htui_sqlx;"
-DATABASE_URL=postgres://postgres:htui@localhost:5439/htui_sqlx cargo sqlx migrate run --source crates/htui-store/migrations
+psql postgres://postgres:<password>@localhost:5439/postgres -c "CREATE DATABASE htui_sqlx;"
+DATABASE_URL=postgres://postgres:<password>@localhost:5439/htui_sqlx cargo sqlx migrate run --source crates/htui-store/migrations
 
 cd crates/htui-store
-DATABASE_URL=postgres://postgres:htui@localhost:5439/htui_sqlx cargo sqlx prepare -- --all-targets --all-features
+DATABASE_URL=postgres://postgres:<password>@localhost:5439/htui_sqlx cargo sqlx prepare -- --all-targets --all-features
 ```
 
 Keep `--all-targets --all-features`: without them, the queries used only by tests and the demo are
