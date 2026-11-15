@@ -73,7 +73,8 @@ use crate::fanout::{
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput, Unmerged};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{
-    Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, LandRequest, PartTip, env_files,
+    Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, LandRequest, PartTip, RunBranches,
+    env_files,
 };
 use crate::kill_point::{KillPoint, Site};
 use crate::land;
@@ -5834,6 +5835,15 @@ where
         } else {
             None
         };
+        let integrate_slot = integrate
+            .as_ref()
+            .and_then(|stage| stage.slot(phase.isolation));
+        // MOD-133 M3 D2: any other step of a `pull_request` run starts from its run branch, through
+        // a width-1 slot; a `local` or `push` run reads nothing more and prepares with no slot.
+        let run_branch_base = match integrate_slot {
+            Some(_) => None,
+            None => self.run_branch_base(run, snapshot).await?,
+        };
         let prepared = self
             .parts
             .isolator
@@ -5842,9 +5852,13 @@ where
                 step.id,
                 &run.repo_scope,
                 phase.isolation,
-                integrate
-                    .as_ref()
-                    .and_then(|stage| stage.slot(phase.isolation)),
+                integrate_slot.or_else(|| {
+                    run_branch_base.as_ref().map(|base| FanoutSlot {
+                        index: 0,
+                        width: 1,
+                        base,
+                    })
+                }),
             )
             .await?;
         let trees: Vec<_> = prepared
@@ -6808,7 +6822,7 @@ where
                 .map(Some);
         }
         let base = self
-            .group_base(run, &steps, phase.position, attempt)
+            .group_base(run, snapshot, &steps, phase.position, attempt)
             .await?;
         let item = Self::item_of(run)?;
         // MOD-139 M2 D13: once for the group, as its one prompt is; a compete group's siblings
@@ -6947,7 +6961,8 @@ where
 
     /// The group's base per repo (plan D54(b)): the `before_hash`es a candidate of the slot already
     /// recorded, else the base the latest retired attempt at the position started from, else the
-    /// repositories' `HEAD`s read once through `Isolator::base`.
+    /// repositories' `HEAD`s read once through `Isolator::base` (MOD-133 M3 D2: a `pull_request`
+    /// run's run branches, [`Self::run_branch_base`]).
     ///
     /// A retried group — plan D65's `retry` or D49(1)'s `never` × `failed` cell — starts where its
     /// retired slot started, because ANA-2 `:754-758` supersedes that slot's winner and losers
@@ -6963,6 +6978,7 @@ where
     async fn group_base(
         &self,
         run: &Run,
+        snapshot: &GraphSnapshot,
         steps: &[RunStep],
         position: i32,
         attempt: i32,
@@ -7016,7 +7032,35 @@ where
             }
             return Ok(bases);
         }
-        Ok(self.parts.isolator.base(&run.repo_scope).await?)
+        match self.run_branch_base(run, snapshot).await? {
+            Some(base) => Ok(base),
+            None => Ok(self.parts.isolator.base(&run.repo_scope).await?),
+        }
+    }
+
+    /// MOD-133 M3 D2: the base a step of a `pull_request` run starts from: the scope's `HEAD`s
+    /// ([`Isolator::base`]) with each run branch's tip laid over its repo, the branches ensured
+    /// first ([`Isolator::run_branches`]: cut at `HEAD`, fast-forwarded, or kept). `None` when the
+    /// snapshot names no run branch ([`land::run_branches`]), so a `local` or `push` run makes no
+    /// isolator call here.
+    ///
+    /// Called every time a base is computed rather than once at run start: all the state is in
+    /// git, so a crash, a resume or an adoption simply ensures again.
+    ///
+    /// # Errors
+    /// Every isolator error, a refused ensure included (`real::run_branch_checked_out`).
+    async fn run_branch_base(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+    ) -> Result<Option<BTreeMap<RepoId, String>>, EngineError> {
+        let branches = land::run_branches(snapshot);
+        if branches.is_empty() {
+            return Ok(None);
+        }
+        let mut base = self.parts.isolator.base(&run.repo_scope).await?;
+        base.extend(self.parts.isolator.run_branches(&branches).await?);
+        Ok(Some(base))
     }
 
     /// Plan D76 (blueprint A-5): a required input missing from the group's one prompt. No
@@ -7482,7 +7526,9 @@ where
     /// rule): a part's named agent when the walk left it eligible, with the part's model or the
     /// candidate's, else the selector's choice with D60's substitution note (blueprint P-17), and
     /// no choice at all is plan D62's refusal after the planner moves `running -> failed`; the
-    /// primary's HEAD per repo ([`Isolator::base`]) as `base_refs`; then `admit_plan`. A store or
+    /// primary's HEAD per repo ([`Isolator::base`]) as `base_refs`, or a `pull_request` run's run
+    /// branches (MOD-133 M3 D2, [`Self::run_branch_base`]), which the parts and integrate start
+    /// from; then `admit_plan`. A store or
     /// isolator error propagates with the planner still `running`: admission never ran (D14).
     async fn admit_parts(
         &self,
@@ -7555,7 +7601,10 @@ where
             picks.push((index, pick));
         }
 
-        let base = self.parts.isolator.base(&run.repo_scope).await?;
+        let base = match self.run_branch_base(run, snapshot).await? {
+            Some(base) => base,
+            None => self.parts.isolator.base(&run.repo_scope).await?,
+        };
         let base_refs = serde_json::to_value(&base).map_err(|err| EngineError::Snapshot {
             run: run.id,
             reason: format!("the base refs do not serialise: {err}"),
@@ -9265,6 +9314,10 @@ where
     /// `siblings` are the other candidates of a fan-out winner's slot, handed to the isolator so a
     /// `shared_serialized` checkout left at a sibling's commit may be moved to the winner's (plan
     /// D56); empty for a `fan_out = 1` step.
+    ///
+    /// MOD-133 M3 D3: a `pull_request` run's steps land onto its run branches
+    /// ([`Isolator::reconcile_onto`] with [`RunBranches`]), never into the primary; any other run
+    /// passes none, which is `reconcile`. A snapshot that does not decode parks too.
     async fn reconcile_done_step(
         &self,
         run: &Run,
@@ -9272,10 +9325,18 @@ where
         siblings: &[StepId],
     ) -> Result<Option<Rest>, EngineError> {
         let trees = self.parts.store.step_trees(step.id).await?;
+        let branches = match Self::snapshot_of(run) {
+            Ok(snapshot) => land::run_branches(&snapshot),
+            Err(err) => return Ok(Some(self.park_run(run, step, &err.to_string()).await?)),
+        };
+        let onto = (!branches.is_empty()).then_some(RunBranches {
+            run: run.id,
+            branches: &branches,
+        });
         match self
             .parts
             .isolator
-            .reconcile(step.id, &trees, siblings)
+            .reconcile_onto(step.id, &trees, siblings, onto)
             .await
         {
             Ok(after) => {

@@ -5,13 +5,17 @@
 //! the record settles, and the item carries a note. A `local` run writes and lands nothing.
 //! Refusals at run start are `ResolveError::IntegrateRefused`, before any run row exists.
 
+use std::collections::BTreeMap;
+
 use htui_core::fixtures::ids;
+use htui_core::model::link::ProposeLink;
 use htui_core::model::{
-    Gate, IntegrateMode, IntegrationState, Isolation, ItemId, ItemPatch, LandOutcome, NewRepo,
-    NewStepGraph, PhaseId, RepoId, RepoPatch, RunId, RunMode, RunStatus, Split, StepGraphId,
-    StepGraphPhase,
+    Gate, GraphBody, GraphSnapshot, IntegrateMode, IntegrationState, Isolation, ItemFilter, ItemId,
+    ItemPatch, LandOutcome, LinkKind, NewItem, NewRepo, NewRun, NewRunStep, NewStepGraph, PhaseId,
+    PhasePart, RepoId, RepoPatch, RunId, RunMode, RunStatus, Scope, Split, StepGraphId,
+    StepGraphPhase, StepId, StepRole,
 };
-use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer};
 use htui_orch::fake::{FakeOrchestrator, IsolatorCall, ScriptedStep};
 use htui_orch::graph::ResolveError;
@@ -603,4 +607,464 @@ async fn the_project_default_applies_and_a_repo_override_wins() {
             .expect("MemStore never fails a read")
             .is_empty()
     );
+}
+
+// -- MOD-133 M3 D2, D3, D5: a `pull_request` run's run branch through the walk ------------------
+
+/// The run branch every `pull_request` case of `FEAT-3` names.
+const RUN_BRANCH: &str = "htui/item/FEAT-3";
+
+/// The isolator's call log, each step named by its phase and the run's own `cleanup`/`release`
+/// by `run`.
+async fn call_log_of(orch: &FakeOrchestrator, run: RunId) -> Vec<String> {
+    let steps = orch.steps(run).await;
+    let name = |step: StepId| {
+        steps
+            .iter()
+            .find(|row| row.id == step)
+            .map_or_else(|| "?".to_owned(), |row| row.phase_name.clone())
+    };
+    orch.isolator
+        .call_log()
+        .into_iter()
+        .map(|call| match call {
+            IsolatorCall::Prepare(step) => format!("prepare {}", name(step)),
+            IsolatorCall::Capture(step) => format!("capture {}", name(step)),
+            IsolatorCall::Reconcile(step) => format!("reconcile {}", name(step)),
+            IsolatorCall::Reset(step) => format!("reset {}", name(step)),
+            IsolatorCall::Premerge(step) => format!("premerge {}", name(step)),
+            IsolatorCall::Unmerged(step) => format!("unmerged {}", name(step)),
+            IsolatorCall::Reacquire(step) => format!("reacquire {}", name(step)),
+            IsolatorCall::Land(_) => "land".to_owned(),
+            IsolatorCall::RunBranches => "run_branches".to_owned(),
+            IsolatorCall::Cleanup(id) => format!("cleanup {}", if id == run { "run" } else { "?" }),
+            IsolatorCall::Release(id) => format!("release {}", if id == run { "run" } else { "?" }),
+        })
+        .collect()
+}
+
+/// The `prepare` and `run_branches` entries of [`call_log_of`], in order.
+async fn bases_of(orch: &FakeOrchestrator, run: RunId) -> Vec<String> {
+    call_log_of(orch, run)
+        .await
+        .into_iter()
+        .filter(|call| call.starts_with("prepare ") || call == "run_branches")
+        .collect()
+}
+
+/// The fake's tip of `repo`'s run branch ([`htui_orch::isolate::Isolator::run_branches`]).
+fn fake_tip(repo: RepoId) -> String {
+    format!("fake:group-base:{repo}")
+}
+
+/// D2, D3: a `pull_request` run ensures its run branch before every step that prepares the scope,
+/// every such tree starts from the run branch's tip, and every landing goes onto the run branch.
+#[tokio::test]
+async fn a_pull_request_run_bases_steps_on_its_run_branch_and_reconciles_onto_it() {
+    let orch = harness(&[]).await;
+    let repo = repo(&orch, Some(REMOTE), Some(IntegrateMode::PullRequest)).await;
+    orch.isolator.script_land(LandOutcome::Pushed {
+        hash: "abcdef0123456789abcdef0123456789abcdef01".to_owned(),
+    });
+
+    let (run, rest) = started(&orch, repo).await;
+    assert_eq!(rest, RunStatus::Done);
+
+    let steps = orch.steps(run).await;
+    let calls = bases_of(&orch, run).await;
+    let mut expected = Vec::new();
+    for step in &steps {
+        expected.push("run_branches".to_owned());
+        expected.push(format!("prepare {}", step.phase_name));
+    }
+    assert_eq!(calls, expected, "an ensure before every prepare");
+    for step in &steps {
+        let trees = orch
+            .store
+            .step_trees(step.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            trees
+                .iter()
+                .map(|tree| (tree.repo_id, tree.base_ref.clone()))
+                .collect::<Vec<_>>(),
+            [(repo, fake_tip(repo))],
+            "`{}` starts from the run branch",
+            step.phase_name
+        );
+    }
+    let onto = orch.isolator.reconcile_onto_log();
+    assert_eq!(onto.len(), steps.len(), "every step lands: {onto:?}");
+    for landing in onto {
+        assert_eq!(
+            landing.onto,
+            Some((run, BTreeMap::from([(repo, RUN_BRANCH.to_owned())]))),
+            "onto the run branch"
+        );
+    }
+}
+
+/// D2: a fan-out group's candidates start from the run branch (one ensure for the group, in
+/// `group_base`), and a divided node's plan records the run branch as its `base_refs` (one ensure
+/// at admission), which its parts and its integrate step start from without another.
+#[tokio::test]
+async fn fan_out_and_divided_parts_follow_the_run_branch() {
+    let orch = harness(&[]).await;
+    repoint(&orch.store, ids::HTUI_FEAT_3, |phase| {
+        phase.input_kinds.clear();
+        if phase.name == "prd" {
+            phase.fan_out = 2;
+        }
+    })
+    .await;
+    edit_graph(&orch.store, ids::HTUI_FEAT_3, |body| {
+        let node = body
+            .nodes
+            .iter_mut()
+            .find(|node| node.phase.name == "implement")
+            .expect("FEAT-3's graph has `implement`");
+        node.phase.split = Split::Divide;
+        node.phase.fan_out = 1;
+        let phase = node.phase.id;
+        node.parts = ["api", "ui"]
+            .into_iter()
+            .enumerate()
+            .map(|(position, key)| PhasePart {
+                phase_id: phase,
+                position: i32::try_from(position).expect("two parts"),
+                key: key.to_owned(),
+                title: format!("The {key}"),
+                brief: format!("Build the {key} part."),
+                owned_paths: vec![format!("src/{key}/**")],
+                acceptance: None,
+                agent_id: None,
+                model: None,
+                persona_id: None,
+            })
+            .collect();
+    })
+    .await;
+    orch.store.set_project_settings(
+        ids::PROJECT_HTUI,
+        serde_json::json!({ "judge_agent_id": ids::AGENT_AGY }),
+    );
+    for call in 0..2 {
+        orch.script_candidate("prd:judge", 1, -1, call, ScriptedStep::judge(0, &[]));
+    }
+    let repo = repo(&orch, Some(REMOTE), Some(IntegrateMode::PullRequest)).await;
+    orch.isolator.script_land(LandOutcome::Pushed {
+        hash: "abcdef0123456789abcdef0123456789abcdef01".to_owned(),
+    });
+
+    let (run, rest) = started(&orch, repo).await;
+    assert_eq!(rest, RunStatus::Done);
+
+    let plans = orch
+        .store
+        .run_plans(run)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.base_refs.clone())
+            .collect::<Vec<_>>(),
+        [Some(
+            serde_json::json!({ repo.to_string(): fake_tip(repo) })
+        )],
+        "the plan's base is the run branch"
+    );
+    for step in orch.steps(run).await {
+        for tree in orch
+            .store
+            .step_trees(step.id)
+            .await
+            .expect("MemStore never fails a read")
+        {
+            assert_eq!(
+                tree.base_ref,
+                fake_tip(repo),
+                "`{}` starts from the run branch",
+                step.phase_name
+            );
+        }
+    }
+    assert!(
+        orch.isolator
+            .reconcile_onto_log()
+            .iter()
+            .all(|landing| landing.onto
+                == Some((run, BTreeMap::from([(repo, RUN_BRANCH.to_owned())])))),
+        "every landing goes onto the run branch"
+    );
+    assert_eq!(
+        bases_of(&orch, run).await,
+        [
+            "run_branches",
+            "prepare prd",
+            "prepare prd",
+            // The judge prepares an empty scope: no base, no ensure.
+            "prepare prd:judge",
+            "run_branches",
+            "prepare plan",
+            // Admission's `base_refs`; the parts and integrate start from them.
+            "run_branches",
+            "prepare implement/api",
+            "prepare implement/ui",
+            "prepare implement",
+            "run_branches",
+            "prepare review",
+        ]
+    );
+}
+
+/// D5: the walk lands a `pull_request` record as its run branch: the request names it, the
+/// record settles `pending` with the pushed head, the item is noted, and the next sweep does not
+/// take it again.
+#[tokio::test]
+async fn a_pull_request_run_settles_pushed_and_the_sweep_leaves_it() {
+    let orch = harness(&[]).await;
+    let repo = repo(&orch, Some(REMOTE), Some(IntegrateMode::PullRequest)).await;
+    let hash = "abcdef0123456789abcdef0123456789abcdef01";
+    orch.isolator.script_land(LandOutcome::Pushed {
+        hash: hash.to_owned(),
+    });
+
+    let (run, rest) = started(&orch, repo).await;
+    assert_eq!(rest, RunStatus::Done);
+
+    let requests = orch.isolator.land_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| (request.repo, request.run_branch.as_deref()))
+            .collect::<Vec<_>>(),
+        [(repo, Some(RUN_BRANCH))],
+        "one landing, of the run branch"
+    );
+    let records = orch
+        .store
+        .integrations(run)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.mode, record.state, record.landed_hash.as_deref()))
+            .collect::<Vec<_>>(),
+        [(
+            IntegrateMode::PullRequest,
+            IntegrationState::Pending,
+            Some(hash)
+        )]
+    );
+    assert_eq!(
+        integration_notes(&orch).await,
+        [format!(
+            "integration pushed: repo `htui` run branch {RUN_BRANCH} at abcdef0; its pull \
+             request against main waits for MOD-134"
+        )]
+    );
+    assert_eq!(
+        orch.land(None).await.expect("the pass runs"),
+        0,
+        "a pushed record is not taken again"
+    );
+    assert_eq!(orch.isolator.land_requests().len(), 1);
+}
+
+/// A fresh `FEAT` item of the HTUI project, `blocked_by` `FEAT-3`. The link is proposed by a step
+/// of a run of its own, cancelled at once, as an agent would have proposed it (MOD-11 D13).
+async fn dependent_of_feat_3(orch: &FakeOrchestrator, snapshot: GraphSnapshot) -> ItemId {
+    let user = orch.user();
+    let item = orch
+        .store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: "waits on FEAT-3".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            target_id: None,
+            created_by: user,
+            box_id: Some(orch.box_id()),
+        })
+        .await
+        .expect("the demo project mints")
+        .id;
+    let run = orch
+        .store
+        .create_run(NewRun {
+            id: RunId::new(),
+            project_id: ids::PROJECT_HTUI,
+            item_id: item,
+            mode: RunMode::Manual,
+            target_box_id: orch.box_id(),
+            started_by: user,
+            graph_snapshot: snapshot,
+            repo_scope: Vec::new(),
+            queued_at: orch.clock.now(),
+            batch_id: None,
+            workspace_id: None,
+            target: None,
+        })
+        .await
+        .expect("the run is queued")
+        .id;
+    let step = orch
+        .store
+        .create_step(NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("opus".to_owned()),
+            role: StepRole::Step,
+            parent_step_id: None,
+            node_key: None,
+        })
+        .await
+        .expect("the step is written")
+        .id;
+    orch.store
+        .propose_link(
+            StepFence::Unleased,
+            ProposeLink {
+                from: item,
+                to: ids::HTUI_FEAT_3,
+                kind: LinkKind::BlockedBy,
+                step,
+            },
+        )
+        .await
+        .expect("the step proposes its own item's link");
+    orch.store
+        .finish_run(run, RunStatus::Cancelled, None, orch.clock.now())
+        .await
+        .expect("the queued run cancels");
+    item
+}
+
+/// Whether `item` is in the `Platform` workspace's ready list.
+async fn is_ready(orch: &FakeOrchestrator, item: ItemId) -> bool {
+    orch.store
+        .items(
+            &Scope {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+            },
+            &ItemFilter {
+                ready: Some(true),
+                ..ItemFilter::default()
+            },
+        )
+        .await
+        .expect("MemStore never fails a read")
+        .iter()
+        .any(|row| row.id == item)
+}
+
+/// D5: a pushed `pull_request` record is not landed, so an item `blocked_by` the run's item keeps
+/// waiting after the run is `done`; the same walk under `push`, landed, releases it.
+#[tokio::test]
+async fn its_dependent_stays_unready() {
+    for (mode, outcome, released) in [
+        (
+            IntegrateMode::PullRequest,
+            LandOutcome::Pushed {
+                hash: "abcdef0123456789abcdef0123456789abcdef01".to_owned(),
+            },
+            false,
+        ),
+        (
+            IntegrateMode::Push,
+            LandOutcome::Landed {
+                hash: "abcdef0123456789abcdef0123456789abcdef01".to_owned(),
+            },
+            true,
+        ),
+    ] {
+        let orch = harness(&[]).await;
+        let repo = repo(&orch, Some(REMOTE), Some(mode)).await;
+        orch.isolator.script_land(outcome);
+
+        let (run, rest) = started(&orch, repo).await;
+        assert_eq!(rest, RunStatus::Done, "{mode:?}");
+        let snapshot =
+            serde_json::from_value(orch.run(run).await.graph_snapshot.expect("a graph run"))
+                .expect("the snapshot decodes");
+        let dependent = dependent_of_feat_3(&orch, snapshot).await;
+        assert_eq!(
+            is_ready(&orch, dependent).await,
+            released,
+            "{mode:?}: the dependent is released only once the work landed"
+        );
+    }
+}
+
+/// D2: a `push` run makes no `run_branches` call: its call log is the one it made before M3.
+#[tokio::test]
+async fn a_push_run_makes_no_run_branches_call() {
+    let orch = harness(&[]).await;
+    let repo = repo(&orch, Some(REMOTE), Some(IntegrateMode::Push)).await;
+
+    let (run, rest) = started(&orch, repo).await;
+    assert_eq!(rest, RunStatus::Done);
+    assert_eq!(
+        call_log_of(&orch, run).await,
+        [
+            "prepare prd",
+            "capture prd",
+            "reconcile prd",
+            "prepare plan",
+            "capture plan",
+            "reconcile plan",
+            "prepare implement",
+            "capture implement",
+            "reconcile implement",
+            "prepare review",
+            "capture review",
+            "reconcile review",
+            "cleanup run",
+            "land",
+        ]
+    );
+    assert!(
+        orch.isolator
+            .reconcile_onto_log()
+            .iter()
+            .all(|landing| landing.onto.is_none()),
+        "a `push` run reconciles into the primary"
+    );
+}
+
+/// Rewrites `item`'s live graph through `replace_graph` after `edit` (the conformance suite's
+/// helper, over the store).
+async fn edit_graph(store: &MemStore, item: ItemId, edit: impl FnOnce(&mut GraphBody)) {
+    let graph = store
+        .resolve_graph(item)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item resolves to a graph")
+        .graph
+        .id;
+    let mut body = store
+        .graph_body(graph)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item's graph is there");
+    edit(&mut body);
+    let outcome = store
+        .replace_graph(graph, body.graph.revision, body)
+        .await
+        .expect("the store takes the edited graph");
+    assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
 }
