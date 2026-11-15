@@ -133,9 +133,9 @@ pub use document::{
 pub use event::{EventKind, EventRole, SessionEvent};
 pub use hand_written::HandWrittenError;
 pub use hierarchy::{
-    NewProject, NewRepo, NewWorkspace, Project, ProjectPatch, ProjectRef, ProjectType, Repo,
-    RepoBoxPath, RepoPatch, WORKSPACES_DIR, Workspace, WorkspaceBoxPath, WorkspacePatch,
-    WorkspaceProject, WorkspaceSummary, workspace_folder,
+    NewProject, NewRepo, NewWorkspace, PROJECTS_DIR, Project, ProjectPatch, ProjectRef,
+    ProjectType, Repo, RepoBoxPath, RepoPatch, WORKSPACES_DIR, Workspace, WorkspaceBoxPath,
+    WorkspacePatch, WorkspaceProject, WorkspaceSummary, project_folder, slug_of, workspace_folder,
 };
 pub use ids::{
     AgentId, ArtifactLinkId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId,

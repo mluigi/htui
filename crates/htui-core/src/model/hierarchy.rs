@@ -293,15 +293,47 @@ pub fn workspace_folder(
 ) -> Option<PathBuf> {
     match row {
         Some(row) => Some(PathBuf::from(&row.folder_path)),
-        None => {
-            let mut parts = Path::new(slug).components();
-            let one_name = matches!(
-                (parts.next(), parts.next()),
-                (Some(std::path::Component::Normal(name)), None) if name == slug
-            );
-            one_name.then(|| home.join(WORKSPACES_DIR).join(slug))
+        None => one_name(slug).then(|| home.join(WORKSPACES_DIR).join(slug)),
+    }
+}
+
+/// MOD-147 M1 R1: whether `slug` is exactly one plain name, so that `Path::join` nests it one
+/// level below its base: not absolute, not `.` or `..`, no separator, not empty.
+fn one_name(slug: &str) -> bool {
+    let mut parts = Path::new(slug).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(name)), None) if name == slug
+    )
+}
+
+/// MOD-116 M3 D2: the directory under a workspace folder that holds projects cloned or started there.
+pub const PROJECTS_DIR: &str = "projects";
+
+/// The longest slug [`slug_of`] suggests, in bytes.
+const SLUG_MAX: usize = 40;
+
+/// MOD-116 M3 D2: the slug a name suggests: ASCII letters lowercased and digits kept, every other
+/// run one `-`, trimmed of `-`, at most 40 bytes; `""` when nothing is left.
+#[must_use]
+pub fn slug_of(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len().min(SLUG_MAX));
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
         }
     }
+    // Every byte is ASCII, so any cut is on a char boundary.
+    slug.truncate(SLUG_MAX);
+    slug.trim_end_matches('-').to_owned()
+}
+
+/// MOD-116 M3 D2: `<workspace_folder>/projects/<slug>`; `None` when `slug` is not one plain name.
+#[must_use]
+pub fn project_folder(workspace_folder: &Path, slug: &str) -> Option<PathBuf> {
+    one_name(slug).then(|| workspace_folder.join(PROJECTS_DIR).join(slug))
 }
 
 /// Join of `workspace_project` and `project`, ordered by position. Not a table.
@@ -376,6 +408,41 @@ mod tests {
             workspace_folder("../x", Some(&row), home),
             Some(PathBuf::from("/srv/graphics"))
         );
+    }
+
+    /// MOD-116 M3 D2: a name's slug keeps ASCII letters (lowercased) and digits; every other
+    /// run of characters, a non-ASCII letter included, is one `-`; the ends are trimmed of `-`
+    /// and the slug is cut to at most 40 bytes, still ending in a letter or digit.
+    #[test]
+    fn slug_of_keeps_letters_and_digits_and_joins_the_rest() {
+        assert_eq!(slug_of("Mobile App 2"), "mobile-app-2");
+        assert_eq!(slug_of("  --Ünïcode__x "), "n-code-x");
+        assert_eq!(slug_of("!!!"), "");
+        assert_eq!(slug_of(""), "");
+        let long = "ab ".repeat(20);
+        assert_eq!(long.len(), 60);
+        let slug = slug_of(&long);
+        assert!(slug.len() <= 40, "{slug:?} is {} bytes", slug.len());
+        assert!(
+            slug.ends_with(|c: char| c.is_ascii_alphanumeric()),
+            "{slug:?} ends in a letter or digit"
+        );
+        assert_eq!(slug, format!("{}a", "ab-".repeat(13)));
+        let cut = slug_of(&format!("{} tail", "x".repeat(39)));
+        assert_eq!(cut, "x".repeat(39), "a cut that ends on a `-` drops it");
+    }
+
+    /// MOD-116 M3 D2: a project's folder is `<workspace folder>/projects/<slug>`, under the
+    /// same one-plain-name rule as a workspace's default folder.
+    #[test]
+    fn project_folder_is_under_projects_and_refuses_a_path_slug() {
+        assert_eq!(
+            project_folder(Path::new("/w"), "api"),
+            Some(PathBuf::from("/w/projects/api"))
+        );
+        for slug in ["../x", "a/b", "/", "", "..", ".", "/srv"] {
+            assert_eq!(project_folder(Path::new("/w"), slug), None, "slug {slug:?}");
+        }
     }
 
     /// CLEAN-8 #2: `ProjectPatch.secret`'s three states survive a JSON round trip, as
