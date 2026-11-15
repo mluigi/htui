@@ -6,9 +6,11 @@
 # are development-only; the real DSN lives in the OS keyring (R-STO-1).
 #
 # `postgres-test` is what the suites run against: Postgres 18, data in RAM, durability off.
+# `qdrant-test` is the suites' Qdrant, its storage in RAM too.
 #
 #   docker compose up -d
 #   export HTUI_TEST_DATABASE_URL=postgres://postgres:<password from POSTGRES_PASSWORD below>@localhost:5440/postgres
+#   export HTUI_TEST_QDRANT_URL=http://localhost:6336
 #   cargo test -p htui-store --all-features
 #
 # The store tests create and drop `htui_test_*` databases through this maintenance DSN.
@@ -102,6 +104,23 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - htui-qdrant-data:/qdrant/storage
+
+  qdrant-test:
+    # The suites' Qdrant (HTUI_TEST_QDRANT_URL=http://localhost:6336), kept apart from `qdrant`
+    # above as `postgres-test` is from `postgres`. Every Qdrant write (a create, each payload index)
+    # waits on an fsync. Measured on this box (2026-11-15) for one store open, the create plus its
+    # five keyword indexes with `wait`: 2.5 s idle on the disk volume, 0.06 s on this tmpfs. Under
+    # the full gate the disk's fsyncs stretched single creates past qdrant-client's 5 s deadline
+    # three times running ("create collection: ... Timeout expired"). A test collection lives
+    # seconds, so a restart emptying the tmpfs costs nothing.
+    image: qdrant/qdrant:v1.19.1
+    container_name: htui-qdrant-test
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6336:6334"
+      - "127.0.0.1:6335:6333"
+    tmpfs:
+      - /qdrant/storage:size=2g
 
 volumes:
   htui-pgdata-18:

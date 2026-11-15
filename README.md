@@ -708,8 +708,9 @@ docker compose up -d
 HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres cargo test --workspace --all-features
 ```
 
-The Qdrant tests read `HTUI_TEST_QDRANT_URL` the same way (`http://localhost:6334` with the
-included `compose.yaml`). The gate's `qdrant` step reports whether they ran: skipped while
+The Qdrant tests read `HTUI_TEST_QDRANT_URL` the same way (`http://localhost:6336`, the
+included `compose.yaml`'s `htui-qdrant-test`, whose storage is a tmpfs; not the dev Qdrant on
+6334). The gate's `qdrant` step reports whether they ran: skipped while
 `HTUI_TEST_QDRANT_URL` is unset, failed when its host and port do not answer within 3 seconds.
 
 The Infisical live test reads `HTUI_TEST_INFISICAL_URL`, `HTUI_TEST_INFISICAL_CLIENT_ID`,

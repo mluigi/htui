@@ -77,6 +77,9 @@ Overview: `.claude/skills/handoff-docs.md`.
   durability off), apart from the dev `htui` database on `htui-postgres` (also 18, port 5439).
   The hr sandbox runs 18 the same way. Postgres 18 is the only supported server (the ANA-9 floor
   of 16 was dropped on 2026-11-15): pin what 18 sends, e.g. `ON DELETE RESTRICT` is `23001`.
+- Test Qdrant: `htui-qdrant-test` in `compose.yaml` (gRPC port 6336, storage on a tmpfs), apart
+  from the dev `htui-qdrant` (6334). On the disk volume every create and payload index waits on an
+  fsync, and under the full gate those passed qdrant-client's 5 s deadline.
 - Workflow docs alone: `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`.
 - Commit hooks live in `scripts/githooks/`; `install-workflow-hooks.sh`/`.ps1` sets
   `core.hooksPath` to them. Escape hatch: `WORKFLOW_SKIP_HOOK=1`, never `--no-verify`.

@@ -428,10 +428,11 @@ scripts/hr gc [--yes]
 
 | What | Where | Change with |
 |---|---|---|
-| Run directory: clone, `target/`, `claude.json`, `cargo-empty`, `claude-mask/`, `tmp/` (the container's `/tmp`), `qdrant/` (Qdrant storage) | `/media/projects/htui-hr/<ITEM>/` | `HR_ROOT`; `--ssd` → `HR_SSD_ROOT` (`~/htui-hr`) |
+| Run directory: clone, `target/`, `claude.json`, `cargo-empty`, `claude-mask/`, `tmp/` (the container's `/tmp`) | `/media/projects/htui-hr/<ITEM>/` | `HR_ROOT`; `--ssd` → `HR_SSD_ROOT` (`~/htui-hr`) |
 | ID leases: `id-leases.tsv`, `id-leases.lock` | `/media/projects/htui-hr/.state/` (`/hr-state` inside, shared read-write) | `HR_STATE` — every run and the host must agree |
 | Run registry, its `.lock`, `.leases-initialized`, `.migrated` | `/media/projects/htui-hr/.runs/` (host only, never mounted) | `HR_RUNS` — never inside `HR_STATE` (exit `2`) |
 | Postgres, Gortex store, extracted crate sources (`~/.cargo/registry/src`) | per-run Docker volumes, under `/var/lib/docker` | — |
+| Qdrant storage | a tmpfs in the run's `qdrant` container (RAM, up to 2 GB; emptied when the container restarts) | — |
 | Cargo download cache, index and git cache | `htui-hr-cargo` Docker volume, shared by all runs | — |
 | Host repo the runs clone and collect into | the main worktree of this repo | `HR_HOST_REPO` |
 
@@ -457,10 +458,13 @@ df -h /media /
 docker system df
 ```
 
-`/` holds the Docker volumes, and a full `/` takes the runs' Postgres down with it. `/tmp` and Qdrant
-are bind mounts into the run directory, so agent-made target dirs and vectors stay off `/`. A run
-made before that keeps its old `/tmp` (the container's writable layer) and Qdrant volume until it is
-recreated; recreating loses both (the old Qdrant data is not carried over). Purge collected
+`/` holds the Docker volumes, and a full `/` takes the runs' Postgres down with it. `/tmp` is a
+bind mount into the run directory, so agent-made target dirs stay off `/`. Qdrant keeps its storage
+on a tmpfs, off both disks: on disk every Qdrant write waits on an fsync, and creates there took
+3.5-19 s against the client's 5 s deadline, failing the live Qdrant suites. A restart empties it,
+and htui's indexer rebuilds the run's collections. A run made before the tmpfs keeps its
+`qdrant/` directory, now unused, until it is purged; its Qdrant container picks up the tmpfs the
+next time `scripts/hr up` recreates it (the old Qdrant data is not carried over). Purge collected
 runs rather than letting them pile up.
 
 ## What is inside a sandbox, and what is not
@@ -715,7 +719,7 @@ process ids inside a container mean nothing on the host and vice versa. When a h
 save collide, an entry can land interleaved. This is a known, accepted limitation.
 
 **Postgres in a run restarts or reports recovery mode.** Check `df -h /` first: the run databases
-live under `/var/lib/docker`. (`/tmp` and Qdrant do not: they are in the run directory.)
+live under `/var/lib/docker`. (`/tmp` does not: it is in the run directory. Qdrant is on a tmpfs.)
 
 ## Tests
 

@@ -39,14 +39,18 @@ services:
     image: qdrant/qdrant:v1.19.1
     network_mode: service:postgres
     depends_on: [postgres]
-    # Storage is a bind into the run dir (HDD unless --ssd), not a named volume: named volumes live
-    # in /var/lib/docker on the system disk. Non-root so the files it writes stay removable by
-    # `down --purge`; snapshots go under the storage mount because /qdrant/snapshots is root-owned.
+    # Storage is a tmpfs, as the host's htui-qdrant-test (compose.yaml): every Qdrant write waits on
+    # an fsync, and on the run dir's disk (0dc8c51f) a create took 3.5-19 s against qdrant-client's
+    # 5 s deadline, failing the live Qdrant suites even at idle. On a tmpfs a create and its five
+    # payload indexes take 0.06 s (measured 2026-11-15). Not a named volume either: those live in
+    # /var/lib/docker on the system disk. A restart empties it; htui's indexer rebuilds the run's
+    # collections. mode=1777 because the server runs non-root; snapshots go under the storage mount
+    # because /qdrant/snapshots is root-owned.
     user: "${HR_UID:?}:${HR_GID:?}"
     environment:
       QDRANT__STORAGE__SNAPSHOTS_PATH: /qdrant/storage/snapshots
-    volumes:
-      - {type: bind, source: "${HR_QDRANT:?}", target: /qdrant/storage, bind: {create_host_path: false}}
+    tmpfs:
+      - /qdrant/storage:size=2g,mode=1777
 
   dev:
     image: ${HR_IMAGE:-htui-hr-dev}
