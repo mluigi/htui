@@ -4,9 +4,10 @@
 //! [`TargetChannel`], which runs one argv there and reports how it exited. The seam is argv only:
 //! no working directory and no environment travel with a command. Every `git` command names its
 //! repository with `-C <dir>`, and configuration travels as `-c key=value` argv, so the same
-//! [`ExecSpec`] fits `docker exec -i <ctr> -- argv` and `ssh -T host -- argv` (the real channels
-//! are MOD-131's). Stdin is nothing or a file on this box read from an offset; stdout is a tail or
-//! a fresh private file with a byte cap; stderr is always a tail; a deadline kills the command.
+//! [`ExecSpec`] fits `docker exec -i <ctr> argv` (MOD-44) and `ssh -T host -- argv` (MOD-131); what
+//! those real channels owe is on [`TargetChannel`]. Stdin is nothing or a file on this box read
+//! from an offset; stdout is a tail or a fresh private file with a byte cap; stderr is always a
+//! tail; a deadline kills the command.
 //!
 //! The only implementation in this item is [`StandInChannel`] (feature `test-support`), which
 //! runs the argv on this box under a throwaway `home`.
@@ -108,7 +109,11 @@ pub enum ChannelError {
     /// The command could not be started (no such program, an empty argv).
     #[error("{0}")]
     Spawn(String),
-    /// The deadline passed; the command and everything it started were killed.
+    /// The deadline passed and the command was killed.
+    ///
+    /// The stand-in kills the command's process group (its job object on Windows) on this box. A
+    /// remote channel owes the same on the target: killing only its local client (`ssh`,
+    /// `docker`) is not enough, see [`TargetChannel`].
     #[error("{verb} timed out after {} s on the target; it was killed", after.as_secs())]
     TimedOut {
         /// The command's [`ExecSpec::verb`].
@@ -130,6 +135,30 @@ pub enum ChannelError {
 }
 
 /// How htui runs a command on a target (plan P1, P2).
+///
+/// # What a real channel owes
+///
+/// The stand-in runs on this box, so it meets these for free; a remote channel (MOD-44's
+/// `docker exec`, MOD-131's `ssh`) must meet them itself.
+///
+/// - **Its own failures are errors, never exit codes.** A transport failure maps to
+///   [`ChannelError::Unreachable`] (the target cannot be reached) or [`ChannelError::Spawn`] (the
+///   command could not be started), not to [`ExecOutput::code`]. `ssh` exits 255 for its own
+///   failures, and the docker CLI exits non-zero for a missing or stopped container; passed
+///   through, a caller would read `Some(1)` with empty stdout as `git`'s answer.
+/// - **A deadline kills the remote process too.** Killing the local client leaves the command
+///   running on the target. A channel that cannot kill it there wraps the remote side so the
+///   target ends it itself (`timeout`, `setsid` and a group kill).
+/// - **Paths are absolute.** The argv carries absolute target paths for a real channel, which has
+///   no working directory to resolve them against. A relative path means something only on the
+///   stand-in, where it lands under the stand-in's home.
+///
+/// Notes for the implementers, not code here:
+///
+/// - `docker exec -i <ctr> argv` takes **no** `--` after the container name: docker stops
+///   parsing its own flags there, so a `--` would become the command.
+/// - `ssh` joins its argv into one string that the remote login shell parses again, so every
+///   argument needs POSIX shell quoting; the target's login shell is assumed to be POSIX.
 pub trait TargetChannel: Send + Sync + fmt::Debug {
     /// The target in words, for sentences: `"stand-in at /tmp/x"`.
     fn describe(&self) -> String;
@@ -182,6 +211,22 @@ mod stand_in {
         "GIT_DISCOVERY_ACROSS_FILESYSTEM",
     ];
 
+    /// The variables that hand `git` configuration from outside the stand-in home, removed from
+    /// every command; `XDG_CONFIG_HOME` and `GIT_CONFIG_NOSYSTEM` are then set afresh.
+    const CONFIG_ENV: [&str; 6] = [
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_NOSYSTEM",
+        "XDG_CONFIG_HOME",
+    ];
+
+    /// The prefixes of `git`'s numbered configuration pairs (`GIT_CONFIG_KEY_0`,
+    /// `GIT_CONFIG_VALUE_0`, ...): every inherited variable that starts with one is removed,
+    /// whatever its index, so a stray pair cannot outlive the removed `GIT_CONFIG_COUNT`.
+    const CONFIG_ENV_PREFIXES: [&str; 2] = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
     /// A canned answer: the stdout bytes and exit code an argv gets instead of running.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Canned {
@@ -196,6 +241,11 @@ mod stand_in {
     /// A [`TargetChannel`] that runs every argv on this box, with `current_dir` and `HOME` both
     /// `home` (so a relative target path lands under it), [`STAND_IN_MARKER`] set, and
     /// `htui_core::secret::HTUI_OWN_ENV` and the `git` location variables removed.
+    ///
+    /// Its `git` reads configuration from `home` alone: the variables that point it at other
+    /// configuration are removed (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`,
+    /// `GIT_CONFIG_PARAMETERS`, every `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*`),
+    /// `XDG_CONFIG_HOME` is `<home>/.config` and `GIT_CONFIG_NOSYSTEM` is `1`.
     ///
     /// Test knobs: [`unreachable`](Self::unreachable) and [`canned`](Self::canned).
     #[derive(Clone)]
@@ -278,8 +328,23 @@ mod stand_in {
                 for key in htui_core::secret::HTUI_OWN_ENV {
                     command.env_remove(key);
                 }
+                for key in CONFIG_ENV {
+                    command.env_remove(key);
+                }
+                for (key, _) in std::env::vars_os() {
+                    let numbered = key.to_str().is_some_and(|key| {
+                        CONFIG_ENV_PREFIXES
+                            .iter()
+                            .any(|prefix| key.starts_with(prefix))
+                    });
+                    if numbered {
+                        command.env_remove(&key);
+                    }
+                }
                 command
                     .env("HOME", &self.home)
+                    .env("XDG_CONFIG_HOME", self.home.join(".config"))
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
                     .env(STAND_IN_MARKER, "1")
                     .stdin(if stdin.is_some() {
                         Stdio::piped()

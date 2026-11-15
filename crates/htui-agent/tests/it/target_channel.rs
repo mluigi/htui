@@ -43,7 +43,8 @@ async fn describe_names_the_stand_in_and_its_home() {
 
 /// The inherited half of the environment pin: a test cannot plant a variable in its own process
 /// (`set_var` is `unsafe`), so it re-runs itself, alone, as a child test binary that inherits
-/// `HTUI_QDRANT_API_KEY` and `GIT_DIR`, and the child execs through the stand-in and asserts.
+/// `HTUI_QDRANT_API_KEY`, `GIT_DIR` and the variables that hand `git` configuration from outside
+/// the stand-in home, and the child execs through the stand-in and asserts.
 #[cfg(unix)]
 #[tokio::test]
 async fn argv_runs_under_home_with_home_and_the_marker_set_and_htui_own_env_absent() {
@@ -61,6 +62,16 @@ async fn argv_runs_under_home_with_home_and_the_marker_set_and_htui_own_env_abse
             .env(htui_core::secret::QDRANT_KEY_ENV, KEY_SENTINEL)
             .env("GIT_DIR", "/nonexistent-git-dir")
             .env("GIT_WORK_TREE", "/nonexistent-work-tree")
+            .env("GIT_CONFIG_GLOBAL", "/nonexistent-global-config")
+            .env("GIT_CONFIG_SYSTEM", "/nonexistent-system-config")
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "htui.leak")
+            .env("GIT_CONFIG_VALUE_0", "count")
+            .env("GIT_CONFIG_KEY_7", "htui.stray")
+            .env("GIT_CONFIG_VALUE_7", "stray")
+            .env("GIT_CONFIG_PARAMETERS", "'htui.leak'='parameters'")
+            .env("XDG_CONFIG_HOME", "/nonexistent-xdg-config")
             .output()
             .expect("re-run the test binary");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -84,7 +95,13 @@ async fn argv_runs_under_home_with_home_and_the_marker_set_and_htui_own_env_abse
     let script = format!(
         "pwd; echo \"home=$HOME\"; echo \"marker=${{{STAND_IN_MARKER}-unset}}\"; \
          echo \"key=${{{key}-unset}}\"; echo \"gitdir=${{GIT_DIR-unset}}\"; \
-         echo \"worktree=${{GIT_WORK_TREE-unset}}\"; mkdir rel",
+         echo \"worktree=${{GIT_WORK_TREE-unset}}\"; \
+         echo \"global=${{GIT_CONFIG_GLOBAL-unset}}\"; echo \"system=${{GIT_CONFIG_SYSTEM-unset}}\"; \
+         echo \"nosystem=${{GIT_CONFIG_NOSYSTEM-unset}}\"; echo \"count=${{GIT_CONFIG_COUNT-unset}}\"; \
+         echo \"key0=${{GIT_CONFIG_KEY_0-unset}}\"; echo \"value0=${{GIT_CONFIG_VALUE_0-unset}}\"; \
+         echo \"key7=${{GIT_CONFIG_KEY_7-unset}}\"; echo \"value7=${{GIT_CONFIG_VALUE_7-unset}}\"; \
+         echo \"parameters=${{GIT_CONFIG_PARAMETERS-unset}}\"; echo \"xdg=${{XDG_CONFIG_HOME-unset}}\"; \
+         echo \"leak=$(git config --get htui.leak || echo none)\"; mkdir rel",
         key = htui_core::secret::QDRANT_KEY_ENV,
     );
     let out = run(&channel, &spec(&["sh", "-c", &script]))
@@ -101,6 +118,17 @@ async fn argv_runs_under_home_with_home_and_the_marker_set_and_htui_own_env_abse
             "key=unset",
             "gitdir=unset",
             "worktree=unset",
+            "global=unset",
+            "system=unset",
+            "nosystem=1",
+            "count=unset",
+            "key0=unset",
+            "value0=unset",
+            "key7=unset",
+            "value7=unset",
+            "parameters=unset",
+            format!("xdg={}/.config", home_path.display()).as_str(),
+            "leak=none",
         ],
         "{out:?}"
     );
