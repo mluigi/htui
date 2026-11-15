@@ -5285,6 +5285,7 @@ mod role_gate {
                 item_id: row.id,
                 mode: RunMode::Manual,
                 target_box_id: ids::BOX,
+                executing_box_id: None,
                 started_by: ids::USER,
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,

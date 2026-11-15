@@ -9089,6 +9089,7 @@ fn new_run(project: ProjectId, item: ItemId, scope: Vec<RepoId>) -> NewRun {
         item_id: item,
         mode: RunMode::Manual,
         target_box_id: ids::BOX,
+        executing_box_id: None,
         started_by: ids::USER,
         graph_snapshot: run_snapshot(),
         repo_scope: scope,

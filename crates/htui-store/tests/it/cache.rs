@@ -679,6 +679,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
         item_id: item,
         mode: RunMode::Manual,
         target_box_id: ids::BOX,
+        executing_box_id: None,
         started_by: ids::USER,
         graph_snapshot: GraphSnapshot {
             v: GraphSnapshot::V,
@@ -997,6 +998,7 @@ async fn the_mirror_derives_item_state_like_postgres() {
         item_id: ids::HTUI_ANA_2,
         mode: RunMode::Manual,
         target_box_id: ids::BOX,
+        executing_box_id: None,
         started_by: ids::USER,
         graph_snapshot: GraphSnapshot {
             v: GraphSnapshot::V,
@@ -1410,6 +1412,7 @@ async fn a_runs_target_reaches_the_mirror() {
             item_id: ids::HTUI_ANA_2,
             mode: RunMode::Manual,
             target_box_id: ids::BOX,
+            executing_box_id: None,
             started_by: ids::USER,
             graph_snapshot: GraphSnapshot {
                 v: GraphSnapshot::V,

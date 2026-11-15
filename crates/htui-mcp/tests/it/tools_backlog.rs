@@ -98,6 +98,7 @@ impl Leased {
                 item_id: item,
                 mode: RunMode::Manual,
                 target_box_id: ids::BOX,
+                executing_box_id: None,
                 started_by: ids::USER,
                 graph_snapshot: snapshot(),
                 repo_scope: Vec::new(),
