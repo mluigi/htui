@@ -546,7 +546,7 @@ mod tests {
 
     /// Blueprint B4: a name is stored as given, so space around it is refused, not trimmed.
     #[test]
-    fn a_name_is_trimmed_and_bounded() {
+    fn a_name_is_bounded_and_never_trimmed() {
         for good in [
             "this box",
             "a",

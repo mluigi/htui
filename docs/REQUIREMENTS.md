@@ -902,11 +902,12 @@ and R-LATER-7 were promoted to must on 2026-10-15 and keep their IDs.
   dependency on any external daemon, except the code-context tools in coding sessions (R-LATER-7).
   `dockerd` and `sshd` are opt-in per execution target (R-ORCH-15): only a docker or ssh target needs
   them, gated by the box probe's `docker` tag and a successful target probe; a project that never adds
-  such a target needs neither. An error-reporting endpoint the user configures in Settings stays optional: it is off unless set,
-  receives only scrubbed events (R-ID-7, MOD-99), and fails open with nothing else affected. Amended by
-  maintainer decision, 2026-10-14, 2026-10-15 (context tools; Qdrant to ANA-37), on ANA-37,
-  2026-10-19 (one shared Qdrant per workspace, required, failing open), on 2026-10-20 (one Qdrant
-  for the whole database), and on 2026-11-14 (ANA-42, §8 Q4: `dockerd` and `sshd` opt-in per target).
+  such a target needs neither. An error-reporting endpoint the user configures in Settings stays
+  optional: it is off unless set, receives only scrubbed events (R-ID-7, MOD-99), and fails open with
+  nothing else affected. Amended by maintainer decision, 2026-10-14, 2026-10-15 (context tools; Qdrant
+  to ANA-37), on ANA-37, 2026-10-19 (one shared Qdrant per workspace, required, failing open), on
+  2026-10-20 (one Qdrant for the whole database), and on 2026-11-14 (ANA-42, §8 Q4: `dockerd` and `sshd`
+  opt-in per target).
 - **R-NF-3 (must).** All long operations (probe, cache refresh, sessions) run off the UI thread;
   the TUI never blocks on network or subprocess I/O, and reflects a key press on screen within a
   bound set by ANA-32's measurement (order of 50 ms) under load. Amended 2026-10-15.
