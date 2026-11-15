@@ -3,6 +3,7 @@
 **Source PRD**: `.claude/prds/mod-133-integration-modes.prd.md`
 **Selected Milestone**: 2 — Settings, visibility and retry
 **Complexity**: Large
+**Status**: complete 2026-11-15 (`56c0e5cb..4665aba2`; review fix round R1, brief `R1.md`)
 **Routing**: PRD path (C2, C4 fired; PRD accepted 2026-11-14, M1 complete), ultracode for implement (lane
 script, one serial lane). No architect: the seams are decided below. `/handoff-run` waived this skill's
 "WAIT for CONFIRM".
@@ -299,6 +300,8 @@ Fact-check 2026-11-15 (one agent, 17 claim groups against HEAD `3e7b7d38`; amend
 | Task coupling (serial lane) | ok with T2 owning cross-crate literals | `list.rs` (T2 literal, T5), `views.rs` (T2 literal, T4); no snapshot is moved by two tasks once E9 keeps the demo |
 
 ## Acceptance
-- [ ] T1-T6 complete; the gate is green in the sandbox
-- [ ] `local` behaviour unchanged; every moved snapshot reviewed against E9
-- [ ] Reviewer (`rust-reviewer`) findings applied or deferred with the maintainer
+- [x] T1-T6 complete; the gate is green in the sandbox (the known load flake
+  `cache::the_spawned_refresher_passes_and_follows_the_scope` aside, which passes alone)
+- [x] `local` behaviour unchanged; no demo snapshot moved (E9)
+- [x] Reviewer (`rust-reviewer`) findings applied in R1 (F1-F5); F6 (`a4a22aa3` alone does not compile
+  `htui`) is the maintainer's at collect

@@ -72,7 +72,7 @@ MOD-152's, MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`,
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-159 M1, MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), and MOD-159 M2, MOD-133 M1 and MOD-130 M1 (merged on main 2026-11-15): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 343), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection;
+Live coordinates after MOD-159 M1, MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), and MOD-159 M2, MOD-133 M1 and MOD-130 M1 (merged on main 2026-11-15): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 343; 346 after MOD-133 M2 on `hr/MOD-133`, no migration), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection;
 not mirrored; `0036` on its branch), before it the index-only
 `0037_stopped_run_index` (MOD-125 M4: `idx_run_stopped_box`, serves `pending_resumes`; not mirrored; `0036` on its branch), before it `0036_activity_event` (MOD-122 M3:
 `activity_event`, deferred constraint triggers on `run`/`run_step`/`item`/`step_permission`, one event per transition per
@@ -479,8 +479,20 @@ items it follows are done.
   close-out table. Requirement edits ANA-34 §10.2 and §10.9 applied. Migration `0039_integration`, cache
   `0013_integration` (live coordinates above). Owed on the host: a real-network push over ssh and https
   with the box's credentials (tests use local bare remotes only), and the merged-tree Postgres gate.
-  Remaining: M2 Settings fields, the refused waiting row and `Unblock` retry, the item display state;
-  M3 the `pull_request` run branch.
+  **Phase 2 landed (`56c0e5cb..4665aba2` on `hr/MOD-133`, 2026-11-15):** M2 Settings, visibility and
+  retry (plan `.claude/plans/mod-133-m2-settings-visibility-retry.plan.md`). The project default is the
+  project-only registry key `integrate` (`SettingKey::Integrate`, Settings > Prompt; cycles not set,
+  `local`, `push`); the repo mode is an `integrate` choice row of the Hierarchy repo editor; both refuse
+  `pull_request` (MOD-134) and a non-`local` mode without a remote URL (`IntegrateMode::selectable_refusal`).
+  Derived display states `landing` (`⇡`) and `landing refused` (`↯`) from the latest graph run's records
+  (`RunLanding`, `ItemState::of_landing`; `is_finished` is `done | landing | landing refused`, close-out
+  law unchanged for MOD-135), on Pg, Mem and the cache. A refused record is a `landing` waiting row, and
+  `Unblock` retries it (`UnblockCase::RetryLanding`, `WriteStore::retry_landing`; the executing process
+  lands at once under a walk token, other boxes by their sweep). No migration; conformance `CASES` 346.
+  No demo item reads the landing states (the demo has no repos). Review fix round R1 (sweep/Unblock
+  double push, `Q` on a landing item, three lows). Commit `a4a22aa3` alone does not compile `htui`
+  (the next commit does; a squash at collect is the maintainer's call).
+  Remaining: M3 the `pull_request` run branch.
 - [ ] **MOD-134 - Forge adapter and push/forge credentials** (from ANA-34, `docs/ANA-34.md` §7.4,
   §7.5). `R-ORCH-14`, `R-BOX-4`, `R-STO-1`, `R-SEC-2`, `R-SEC-3`, `R-SEC-4`. A forge adapter with four
   verbs (push a branch, open or update a PR, set auto-merge, read PR state); OneDev REST first
