@@ -1560,7 +1560,9 @@ pub trait WriteStore: ReadStore {
     /// on a scope row carries its workspace ([`run_workspace_for`]: `None` is filled), another
     /// workspace is `Constraint` ([`scope_row_run_workspace`]), checked before any foreign key.
     /// MOD-125 M2 D10: an unknown (or deleted) `new.workspace_id` is `Constraint` in
-    /// [`workspace_gone`]'s sentence on both stores.
+    /// [`workspace_gone`]'s sentence on both stores. MOD-130 M2 P8: a `new.target` naming no row
+    /// is `Constraint(`[`references_no_row`]`("run.target_id", ..))`, a retired one
+    /// `Constraint(`[`target_retired`]`)`, checked after `repo_scope` and before the batch.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).

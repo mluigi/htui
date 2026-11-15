@@ -7866,7 +7866,10 @@ impl WriteStore for PgStore {
     /// is taken, or on any of the keys above.
     /// Nothing is written on any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for
     /// an unknown or closed `new.batch_id` (MOD-12 D7). An unknown workspace is
-    /// [`workspace_gone`]'s sentence (`fk_run_workspace`, MOD-125 M2 D10).
+    /// [`workspace_gone`]'s sentence (`fk_run_workspace`, MOD-125 M2 D10). MOD-130 M2 P8: a
+    /// `new.target` naming no row is `Constraint(`[`references_no_row`]`("run.target_id", ..))`,
+    /// a retired one `Constraint(`[`target_retired`]`)`, checked after `repo_scope` and before
+    /// the batch; the row is read `FOR SHARE`, so a racing retire or delete serialises with it.
     async fn create_run(&self, new: NewRun) -> Result<Run> {
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))

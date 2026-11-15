@@ -11748,7 +11748,7 @@ impl State {
         if runs > 0 {
             return Err(StoreError::Constraint(target_has_runs(
                 &current.name,
-                u64::try_from(runs).unwrap_or(u64::MAX),
+                u64::try_from(runs).unwrap_or_default(),
             )));
         }
         self.targets.remove(&id);

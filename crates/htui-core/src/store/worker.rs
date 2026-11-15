@@ -1241,7 +1241,11 @@ impl WorkerStore for MemStore {
     async fn target_binding(&self, id: TargetId) -> Result<Option<TargetBinding>> {
         let target = match ReadStore::target(self, id).await {
             Ok(target) => target,
-            Err(StoreError::NotFound { .. }) => return Ok(None),
+            // MOD-130 M2 R1 L5: only the target's own absence is `None`; any other error is
+            // the caller's.
+            Err(StoreError::NotFound {
+                entity: "target", ..
+            }) => return Ok(None),
             Err(err) => return Err(err),
         };
         let bound = match target.box_id {
