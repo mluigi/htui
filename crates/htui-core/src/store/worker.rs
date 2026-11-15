@@ -695,9 +695,10 @@ pub trait WorkerHost: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
 
     // -- MOD-41 T7 (plan D11)
-    /// `Backend::queued_runs_on_box`: this box's `queued` runs, `(id, queued_at)` in
-    /// `(queued_at, id)` order, less the queued runs of a stopped workspace (MOD-125 M2 D8: they
-    /// hold no slot and cannot be claimed until the resume).
+    /// `Backend::queued_runs_on_box`: the `queued` runs this box drives (MOD-130 M3 D8:
+    /// `COALESCE(executing_box_id, target_box_id)`), `(id, queued_at)` in `(queued_at, id)` order,
+    /// less the queued runs of a stopped workspace (MOD-125 M2 D8: they hold no slot and cannot be
+    /// claimed until the resume).
     fn queued_runs_on_box(
         &self,
         box_id: BoxId,

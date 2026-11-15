@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id AS \"id: RunId\", queued_at\n              FROM run\n             WHERE target_box_id = $1 AND status = 'queued'\n               AND NOT EXISTS (SELECT 1 FROM workspace_stop ws WHERE ws.workspace_id = run.workspace_id)\n             ORDER BY queued_at, id\n            ",
+  "query": "\n            SELECT id AS \"id: RunId\", queued_at\n              FROM run\n             WHERE COALESCE(executing_box_id, target_box_id) = $1 AND status = 'queued'\n               AND NOT EXISTS (SELECT 1 FROM workspace_stop ws WHERE ws.workspace_id = run.workspace_id)\n             ORDER BY queued_at, id\n            ",
   "describe": {
     "columns": [
       {
@@ -36,5 +36,5 @@
       false
     ]
   },
-  "hash": "9d580d51745ba85b80af3eb0a965ecd73e1faac3fb9ffb039442c928f9ba2449"
+  "hash": "450e5219acdd62d0fc2a00e9e03780200e6fe4b7968ff0a1a5fac29a149b2c87"
 }

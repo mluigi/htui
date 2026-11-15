@@ -1192,7 +1192,8 @@ impl MemStore {
         }))
     }
 
-    /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11).
+    /// The `queued` runs this box drives, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan
+    /// D11; MOD-130 M3 D8: keyed on [`Run::driver`], so a child-box run is its driver's).
     /// `RunId`'s `Ord` is uuid byte order, which is Postgres' uuid order. MOD-125 M2 D8: less the
     /// queued runs of a stopped workspace (they hold no slot and cannot be claimed until the
     /// resume).
@@ -1205,7 +1206,7 @@ impl MemStore {
                 .runs
                 .values()
                 .filter(|row| {
-                    row.target_box_id == box_id
+                    row.driver() == box_id
                         && row.status == RunStatus::Queued
                         // MOD-125 M2 D8: a stopped workspace's queued run takes no free slot and
                         // is not re-claimed every sweep; it reappears at the resume.
@@ -6612,7 +6613,8 @@ impl State {
     }
 
     /// MOD-12 M3 D6: `item`'s latest `kind = 'graph'` run by `(queued_at, id)`, **cancelled
-    /// included** (PD6), with its target box's hostname and its first `awaiting_approval` step by
+    /// included** (PD6), with its target box's hostname, its driving box ([`Run::driver`],
+    /// MOD-130 M3 P5) and that box's hostname, and its first `awaiting_approval` step by
     /// `(position, attempt, fanout_index)`.
     fn latest_queue_run(&self, item: ItemId) -> Option<QueueRunFact> {
         let run = self
@@ -6628,6 +6630,11 @@ impl State {
             target_hostname: self
                 .boxes
                 .get(&run.target_box_id)
+                .map(|row| row.hostname.clone()),
+            driver_box_id: run.driver(),
+            driver_hostname: self
+                .boxes
+                .get(&run.driver())
                 .map(|row| row.hostname.clone()),
             failure: run.failure.clone(),
             parked_step: self
@@ -18423,6 +18430,120 @@ mod tests {
         );
     }
 
+    /// A docker target and a child box of the fixture machine bound to it, hostname `hostname`
+    /// (MOD-130 M3 T3): a box whose work the machine drives.
+    async fn child_box_of_the_fixture(store: &MemStore, hostname: &str) -> BoxId {
+        use crate::model::{NewChildBox, NewTarget, TargetId, TargetKind};
+
+        let docker = store
+            .create_target(NewTarget {
+                id: TargetId::new(),
+                name: format!("{hostname} docker"),
+                kind: TargetKind::Docker,
+                locator: json!({}),
+            })
+            .await
+            .expect("the target is created");
+        let child = BoxId::new();
+        store
+            .attach_child_box(NewChildBox {
+                id: child,
+                parent: ids::BOX,
+                hostname: hostname.to_owned(),
+                target: docker.id,
+            })
+            .await
+            .expect("the child box is attached");
+        child
+    }
+
+    /// MOD-130 M3 T3 (D8, P5): `queued_runs_on_box` answers the queued runs `box_id` drives,
+    /// `COALESCE(executing_box_id, target_box_id)`: a child-box run the machine drives is the
+    /// machine's, not the child's; a run of another machine with no driver (MOD-43's shape) is
+    /// that machine's, not this one's; a local run is this box's. The Postgres half is
+    /// `pg_criteria.rs::queued_runs_on_box_lists_the_runs_this_box_drives`.
+    #[tokio::test]
+    async fn queued_runs_on_box_lists_the_runs_this_box_drives() {
+        let mut data = crate::fixtures::demo_data();
+        let mut elsewhere = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .clone();
+        let other = BoxId::new();
+        elsewhere.id = other;
+        elsewhere.hostname = "ELSEWHERE".to_owned();
+        data.boxes.push(elsewhere);
+        let store = MemStore::from_demo(data);
+        let child = child_box_of_the_fixture(&store, "driven-child").await;
+
+        let queue = |title: &'static str, target: BoxId, driver: Option<BoxId>| {
+            let store = &store;
+            async move {
+                let item = store
+                    .mint_item(NewItem {
+                        id: ItemId::new(),
+                        project_id: ids::PROJECT_HTUI,
+                        kind_id: ids::KIND_HTUI_FEAT,
+                        title: title.to_owned(),
+                        body: String::new(),
+                        required_tags: Vec::new(),
+                        touched_paths: Vec::new(),
+                        priority: 0,
+                        step_graph_id: None,
+                        target_id: None,
+                        created_by: ids::USER,
+                        box_id: Some(ids::BOX),
+                    })
+                    .await
+                    .expect("the mint lands")
+                    .id;
+                store
+                    .create_run(NewRun {
+                        target_box_id: target,
+                        executing_box_id: driver,
+                        ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
+                    })
+                    .await
+                    .expect("the run is queued")
+                    .id
+            }
+        };
+        let driven = queue("driven here, works on the child", child, Some(ids::BOX)).await;
+        let theirs = queue("another machine's, no driver", other, None).await;
+        let local = queue("local to this box", ids::BOX, None).await;
+
+        let listed = |box_id: BoxId| {
+            let store = &store;
+            async move {
+                store
+                    .queued_runs_on_box(box_id)
+                    .await
+                    .expect("the read is answered")
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let here = listed(ids::BOX).await;
+        assert!(
+            here.contains(&driven),
+            "the machine drives the child-box run"
+        );
+        assert!(here.contains(&local), "a local run is this box's");
+        assert!(
+            !here.contains(&theirs),
+            "another machine's run is not this box's"
+        );
+        assert_eq!(listed(child).await, [], "the child drives nothing");
+        assert_eq!(
+            listed(other).await,
+            [theirs],
+            "no driver: its target box drives it"
+        );
+    }
+
     /// MOD-125 M2 D8: `queued_runs_on_box` leaves out the queued runs of a stopped workspace (they
     /// hold no slot and cannot be claimed until the resume), keeps a run without a workspace, and
     /// lists the held run again once the workspace resumes. The Postgres half is
@@ -22105,6 +22226,8 @@ mod tests {
                 mode: RunMode::Manual,
                 target_box_id: ids::BOX,
                 target_hostname: Some("DESKTOP-HTUI".to_owned()),
+                driver_box_id: ids::BOX,
+                driver_hostname: Some("DESKTOP-HTUI".to_owned()),
                 failure: None,
                 parked_step: None,
             }),
@@ -22197,6 +22320,47 @@ mod tests {
             "AGY ANA-1 is done, so FIX-1 has no open blocker"
         );
         assert!(store.queue_rows(laptop).await.expect("read").is_empty());
+    }
+
+    /// MOD-130 M3 T3 (D8, P5): a queued child-box run's queue fact names both boxes: the machine
+    /// that drives it (`driver_box_id`, `driver_hostname`) and the child its work runs on
+    /// (`target_box_id`, `target_hostname`). The Postgres half is
+    /// `pg_criteria.rs::queue_rows_name_the_driving_box`.
+    #[tokio::test]
+    async fn queue_rows_name_the_driving_box() {
+        let store = MemStore::demo();
+        let child = child_box_of_the_fixture(&store, "queue-child").await;
+        let run = store
+            .create_run(NewRun {
+                target_box_id: child,
+                executing_box_id: Some(ids::BOX),
+                ..graph_run(ids::AGY_FIX_1, ids::PROJECT_AGY, Vec::new())
+            })
+            .await
+            .expect("a run on the child, driven by the machine")
+            .id;
+        store
+            .queue_item(ids::AGY_FIX_1, ids::BOX, None, ids::USER, Utc::now())
+            .await
+            .expect("queue");
+
+        let rows = store.queue_rows(ids::BOX).await.expect("read");
+        let fact = rows
+            .iter()
+            .find(|row| row.entry.item_id == ids::AGY_FIX_1)
+            .and_then(|row| row.latest_run.as_ref())
+            .expect("the run");
+        assert_eq!(fact.id, run);
+        assert_eq!(
+            (
+                fact.driver_box_id,
+                fact.driver_hostname.as_deref(),
+                fact.target_box_id,
+                fact.target_hostname.as_deref()
+            ),
+            (ids::BOX, Some("DESKTOP-HTUI"), child, Some("queue-child")),
+            "driven by the machine, its work on the child"
+        );
     }
 
     /// MOD-12 M3 D3: the first move writes `position = 1..n` over the current order, then swaps.

@@ -218,6 +218,11 @@ pub struct QueueRunFact {
     pub target_box_id: BoxId,
     /// That box's `hostname`; `None` when no box row answers (Mem only; Pg's FK guarantees one).
     pub target_hostname: Option<String>,
+    /// `COALESCE(run.executing_box_id, run.target_box_id)`: the box that drives the run (MOD-130
+    /// M3, D8, P5).
+    pub driver_box_id: BoxId,
+    /// That box's `hostname`; `None` when no box row answers (Mem only; MOD-130 M3, P5).
+    pub driver_hostname: Option<String>,
     /// `run.failure`.
     pub failure: Option<String>,
     /// The run's first step `awaiting_approval` by `(position, attempt, fanout_index)`: a parked
@@ -334,18 +339,19 @@ pub enum Escalation {
 /// MOD-12 M3 D5: what one entry is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryState {
-    /// A `queued` or `running` run targeted at this box.
+    /// A `queued` or `running` run driven by this box; its work may run on a child box (MOD-130
+    /// M3, D8).
     Running {
         /// The run.
         run: RunId,
         /// `Queued` (admitted, not claimed yet) or `Running`.
         status: RunStatus,
     },
-    /// A `queued` or `running` run targeted at another box (MOD-43 owns choosing; M3 reports).
+    /// A `queued` or `running` run driven by another box (MOD-43 owns choosing; MOD-130 M3, D8).
     Elsewhere {
         /// The run.
         run: RunId,
-        /// The target box's hostname.
+        /// The driving box's hostname (MOD-130 M3, P5).
         hostname: Option<String>,
         /// `Queued` or `Running`.
         status: RunStatus,
@@ -445,8 +451,9 @@ pub struct QueueOverview {
 
 /// MOD-12 M3 D5: what `row` is doing on box `here`, given `live`. First match wins:
 ///
-/// 1. a `queued`/`running` latest run targeted here is [`EntryState::Running`], 2. one targeted
-///    elsewhere is [`EntryState::Elsewhere`]; a live run beats everything below;
+/// 1. a `queued`/`running` latest run driven by this box is [`EntryState::Running`], 2. one
+///    driven by another box is [`EntryState::Elsewhere`] (MOD-130 M3, D8: the driver is
+///    [`QueueRunFact::driver_box_id`]); a live run beats everything below;
 /// 3. an item whose state is `failed` (MOD-144: latest graph run `failed`) is
 ///    [`Escalation::Failed`];
 /// 4. a `blocked` item whose latest run is parked is [`Escalation::ReviewLoopExhausted`] (any
@@ -472,7 +479,7 @@ pub fn classify_entry(row: &QueueRow, here: BoxId, live: &LiveFacts) -> EntrySta
     if let Some(run) =
         latest.filter(|run| matches!(run.status, RunStatus::Queued | RunStatus::Running))
     {
-        return if run.target_box_id == here {
+        return if run.driver_box_id == here {
             EntryState::Running {
                 run: run.id,
                 status: run.status,
@@ -480,7 +487,7 @@ pub fn classify_entry(row: &QueueRow, here: BoxId, live: &LiveFacts) -> EntrySta
         } else {
             EntryState::Elsewhere {
                 run: run.id,
-                hostname: run.target_hostname.clone(),
+                hostname: run.driver_hostname.clone(),
                 status: run.status,
             }
         };
@@ -844,6 +851,8 @@ mod tests {
             mode: RunMode::Auto,
             target_box_id: target,
             target_hostname: Some(if target == here() { HERE_HOST } else { "b" }.to_owned()),
+            driver_box_id: target,
+            driver_hostname: Some(if target == here() { HERE_HOST } else { "b" }.to_owned()),
             failure: None,
             parked_step: None,
         }
@@ -967,11 +976,61 @@ mod tests {
 
         let mut nameless = run(RunStatus::Running, there());
         nameless.target_hostname = None;
+        nameless.driver_hostname = None;
         item.latest_run = Some(nameless);
         assert_eq!(
             classify_entry(&item, here(), &live).to_string(),
             "running on another box"
         );
+    }
+
+    /// MOD-130 M3 T3 (D8, P5): a live run this box drives is [`EntryState::Running`] here even
+    /// when its work runs on a child box, queued or running.
+    #[test]
+    fn a_run_driven_here_on_a_child_box_is_running_here() {
+        let child = BoxId::from_uuid(uuid::Uuid::from_u128(3));
+        let item = row(Status::Open, Some(RunStatus::Running));
+        for status in [RunStatus::Queued, RunStatus::Running] {
+            let mut item = item.clone();
+            let driven = QueueRunFact {
+                target_box_id: child,
+                target_hostname: Some("child".to_owned()),
+                ..run(status, here())
+            };
+            item.latest_run = Some(driven.clone());
+            assert_eq!(
+                classify_entry(&item, here(), &facts(&item)),
+                EntryState::Running {
+                    run: driven.id,
+                    status
+                },
+                "{status:?}: driven here, so running here"
+            );
+        }
+    }
+
+    /// MOD-130 M3 T3 (D8, P5): a live run another box drives is [`EntryState::Elsewhere`] and
+    /// names the driver's hostname, even when its work runs on this box.
+    #[test]
+    fn a_run_driven_elsewhere_names_the_driver() {
+        let mut item = row(Status::Open, Some(RunStatus::Queued));
+        for status in [RunStatus::Queued, RunStatus::Running] {
+            let driven = QueueRunFact {
+                driver_box_id: there(),
+                driver_hostname: Some("driver".to_owned()),
+                ..run(status, here())
+            };
+            item.latest_run = Some(driven.clone());
+            assert_eq!(
+                classify_entry(&item, here(), &facts(&item)),
+                EntryState::Elsewhere {
+                    run: driven.id,
+                    hostname: Some("driver".to_owned()),
+                    status
+                },
+                "{status:?}: targeted here but driven elsewhere"
+            );
+        }
     }
 
     #[test]
