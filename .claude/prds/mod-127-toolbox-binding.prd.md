@@ -94,7 +94,7 @@ skipped**.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Typed binding and resolver | A person can attach a skill at global, workspace, project, item-kind or phase level; one shared resolver gives the same answer on both stores; each step records what it received and why. Every earlier skill attachment behaves as before. | pending | — |
+| 1 | Typed binding and resolver | A person can attach a skill at global, workspace, project, item-kind or phase level; one shared resolver gives the same answer on both stores; each step records what it received and why. Every earlier skill attachment behaves as before. | in-progress | `.claude/plans/mod-127-toolbox-binding-m1.plan.md` |
 | 2 | MCP server kind | A person can define an MCP server, attach it at any level, keep its secrets by reference, and have runs on Claude CLI and ACP start with exactly the resolved servers; other agents skip it with the reason shown. | pending | — |
 | 3 | Command and env-preset kinds | A person can define reusable commands and named environment sets, attach them like any kind, and see them reach the run (or be skipped with a reason); the htui agent can add them unasked. | pending | — |
 
