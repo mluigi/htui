@@ -1,8 +1,8 @@
 ---
-source: crates/htui/tests/skills.rs
+source: crates/htui/tests/it/skills.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            0 waiting ·  ?  keys
+Graphics   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  ⁶Chat      0 waiting ·  ?  keys
 ╭─ import report ─────────────────────────────────────────────────────────────── Skills  Templates ╮
 │▌! /nonexistent/htui-import-report — could not read `/nonexistent/htui-import-report` (No such    │
 │▌  file or directory (os error 2))                                                                │

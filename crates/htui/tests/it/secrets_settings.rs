@@ -2845,7 +2845,7 @@ async fn the_product_registers_secrets_last() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
     harness.settle().await;
-    harness.key("4");
+    harness.key("5");
     harness.settle().await;
     for _ in 0..8 {
         harness.key("l");
@@ -3007,7 +3007,7 @@ async fn a_rebound_check_runs_on_its_new_chord_only() {
     let mut harness = Harness::demo().with_keys(keys);
     htui::app::register_all(harness.app());
     harness.settle().await;
-    harness.key("4");
+    harness.key("5");
     harness.settle().await;
     for _ in 0..8 {
         harness.key("l");

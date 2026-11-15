@@ -102,11 +102,11 @@ impl Stack {
             .unwrap_or_else(|err| panic!("the server read failed: {err}"))
     }
 
-    /// Saves [`MARKER`] as a new first line of `implement` through the Templates view: `2`, `l`,
+    /// Saves [`MARKER`] as a new first line of `implement` through the Templates view: `3`, `l`,
     /// select, `e`, type, `ctrl-s`, then serve what the save asked for.
     async fn save_marker(&mut self) {
         let harness = &mut self.harness;
-        harness.key("2");
+        harness.key("3");
         harness.key("l");
         harness.settle().await;
         select(harness, NAME);

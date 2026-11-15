@@ -247,13 +247,12 @@ mod binary {
                      settings.boxes, settings.personas, settings.secrets, settings.queue, \
                      settings.project_types, settings.logging, settings.memory, \
                      settings.documents, graph_editor, \
-                     graph_editor.links, concepts, switcher, migration, \
+                     graph_editor.links, concepts, workspaces, migration, \
                      waiting, skills, skills.library, \
                      skills.templates, skills.attach, skills.help, requirements, backlog, \
                      backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
                      backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
-                     logs, activity, queue, picker, layout, history, leave, field, choice, answer, \
-                     workspaces"
+                     logs, activity, queue, picker, layout, history, leave, field, choice, answer"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
@@ -375,6 +374,42 @@ mod binary {
         let head = format!("htui: cannot read {}: ", path.display());
         assert!(stderr.starts_with(&head), "{stderr}");
         assert!(stderr.ends_with(&format!("\n{HINT}")), "{stderr}");
+    }
+
+    /// MOD-116 M1 D10 (MOD-115 MD4: existing overrides keep loading): a file that still holds the
+    /// retired `[switcher]` table starts htui: `--print-keys` exits 0 with the rest of the file
+    /// applied and `[workspaces]` at its default, and stderr carries one notice on the table's
+    /// line; `load_path` answers `Ok` with exactly that notice.
+    #[test]
+    fn a_key_file_with_the_retired_switcher_table_still_loads_with_a_notice() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = fixture("switcher");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let notice = "[switcher]: the workspace switcher is gone; w opens the Workspaces tab \
+                      (its key is [workspaces] open)";
+        assert_eq!(stderr, format!("htui: {}:8: {notice}\n", path.display()));
+        let keys = load_path(&path).expect("the file loads");
+        assert_eq!(stdout, print(&keys));
+        assert!(
+            stdout.contains("quit         = [\"ctrl-y\", \"ctrl-c\"]      # quit (changed)\n"),
+            "the [global] change is applied: {stdout}"
+        );
+        assert!(
+            stdout.contains("[workspaces]\nopen = [\"o\"]  # open workspace\n"),
+            "[workspaces] is at its default: {stdout}"
+        );
+        assert!(!stdout.contains("[switcher]"), "{stdout}");
+        let notices: Vec<(usize, String)> = keys
+            .notices()
+            .into_iter()
+            .map(|notice| (notice.line, notice.message))
+            .collect();
+        assert_eq!(notices, [(8, notice.to_owned())]);
     }
 
     /// MOD-12 M3 D8 made `ctrl-q` `global.queue`'s default. MOD-12 M3 R1 H1: a file written
@@ -624,7 +659,7 @@ mod app {
     use htui::agent_worker::AgentRuntime;
     use htui::app::register_all;
     use htui::testkit::Harness;
-    use htui::ui::overlay::WorkspaceSwitcher;
+    use htui::ui::overlay::WaitingList;
     use htui_agent::registry::DriverFactory;
 
     /// The keys line the status row listed before MOD-115 (`tests/keys.rs`'s).
@@ -656,19 +691,20 @@ mod app {
         harness.key("?");
         assert!(!harness.app().help_visible, "`?` closes it");
 
-        harness.key("w");
+        // MOD-116 M1: the waiting list (`ctrl-w`), a modal overlay, since the switcher is gone.
+        harness.key("ctrl-w");
         harness.drive_to_end().await;
         assert_eq!(
             harness.app().overlays.top().map(|overlay| overlay.id()),
-            Some(WorkspaceSwitcher::ID)
+            Some(WaitingList::ID)
         );
         harness.key("f2");
         assert!(
             harness.app().overlays.is_empty(),
-            "`F2` closes the switcher"
+            "`F2` closes the waiting list"
         );
 
-        harness.key("w");
+        harness.key("ctrl-w");
         harness.drive_to_end().await;
         harness.key("?");
         let frame = harness.render();

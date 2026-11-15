@@ -2,7 +2,7 @@
 source: crates/htui/tests/it/activity.rs
 expression: pinned
 ---
-Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            3 waiting ·  ?  keys
+Platform   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  ⁶Chat      3 waiting ·  ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
 │ ▾ Platform (0)                                      ││Data model, box registry and sync topology │
 │ ▾ htui (8)                                          ││● done · no tags · priority 0 · version 1  │

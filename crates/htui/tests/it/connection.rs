@@ -1182,9 +1182,9 @@ fn sections() -> Vec<Box<dyn SettingsSection>> {
 
 /// A two-tab shell over `backend`: Backlog on `1`, Settings on `2`.
 ///
-/// Registered by hand rather than through `register_all` on purpose: `register_all` also names
-/// the workspace switcher as the startup overlay, and a backend with no workspaces in it would
-/// open the switcher over every frame these cases want to read. The product's own registration is
+/// Registered by hand rather than through `register_all` on purpose: `register_all` also lands
+/// a backend with no workspaces in it on the Workspaces tab (MOD-116 M1 D11), which would stand
+/// in front of every frame these cases want to read. The product's own registration is
 /// pinned separately, by `the_product_registers_connection_after_prompt`.
 fn shell(backend: Backend) -> Harness {
     Harness::over_backend(backend)
@@ -2158,8 +2158,9 @@ async fn the_product_registers_connection_after_prompt() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
     harness.settle().await;
-    // Settings is the fourth tab since the Requirements tab took `3` (MOD-39 plan T5).
-    harness.key("4");
+    // Settings is the fifth tab since the Requirements tab took `3` (MOD-39 plan T5) and the
+    // Workspaces tab `1` (MOD-116 M1 D11).
+    harness.key("5");
     harness.settle().await;
 
     let frame = harness.render();

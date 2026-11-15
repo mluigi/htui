@@ -1,4 +1,5 @@
-//! Shell-level tests for the workspace switcher and the migration prompt (blueprint E, MOD-6 E.5).
+//! Shell-level tests for moving between workspaces and the migration prompt (blueprint E, MOD-6
+//! E.5). MOD-116 M1 replaced the workspace switcher with the Workspaces tab (`w`, then `o`).
 //!
 //! Everything here goes through [`htui::testkit::Harness`] and the public `Overlay` contract: no
 //! store handle, no database and no sleeps. The MOD-6 cases feed the shell a synthetic
@@ -11,7 +12,7 @@ use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, register_all};
 use htui::store_worker::{Origin, ReplyEnvelope, StoreReply};
 use htui::testkit::Harness;
-use htui::ui::overlay::workspace_switcher::WorkspaceSwitcher;
+use htui::ui::overlay::WaitingList;
 use htui_agent::registry::DriverFactory;
 
 /// A `StoreState` reply addressed to the shell, as the fourth-tick refresh receives it.
@@ -37,10 +38,20 @@ async fn shell_reporting(label: &str, migrations_pending: Option<usize>) -> Harn
     harness
 }
 
-/// The demo shell with the switcher open over it, settled and ready to render.
-async fn open_over_demo() -> Harness {
+/// The demo shell on the Workspaces tab (`w`), settled and ready to render.
+async fn on_the_workspaces_tab() -> Harness {
+    let mut harness = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    register_all(harness.app());
+    harness.drive_to_end().await;
+    harness.key("w");
+    harness.drive_to_end().await;
+    harness
+}
+
+/// The demo shell with the waiting list (a modal overlay) open over it.
+async fn waiting_over_demo() -> Harness {
     let mut harness = Harness::demo()
-        .with_overlay(Box::new(WorkspaceSwitcher::new()))
+        .with_overlay(Box::new(WaitingList::new()))
         .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
     register_all(harness.app());
     harness.drive_to_end().await;
@@ -54,7 +65,7 @@ fn top_bar(frame: &str) -> String {
 }
 
 /// The header drawn 160 columns wide, then the harness back at the default 100x30. At 100 the
-/// six tab chips and `? keys` leave no room for the working count and the store label.
+/// seven tab chips and `? keys` leave no room for the working count and the store label.
 fn wide_header(harness: &mut Harness) -> String {
     harness.resize(160, 30);
     let header = top_bar(&harness.render());
@@ -62,77 +73,25 @@ fn wide_header(harness: &mut Harness) -> String {
     header
 }
 
+/// MOD-116 M1 D9: `o` on a workspace's row of the Workspaces tab enters it, and the header and
+/// the Backlog follow.
 #[tokio::test]
-async fn the_switcher_lists_every_workspace_with_its_project_count() {
-    let mut harness = open_over_demo().await;
-    let frame = harness.render();
-
-    assert!(frame.contains("Graphics"), "the first workspace is listed");
-    assert!(frame.contains("Platform"), "the second workspace is listed");
-    assert!(
-        frame.contains("1 project") && frame.contains("2 projects"),
-        "each row carries its project count: {frame}"
-    );
-    insta::assert_snapshot!("switcher_open", frame);
-}
-
-#[tokio::test]
-async fn the_switcher_opens_on_the_workspace_the_shell_is_already_inside() {
-    let mut harness = open_over_demo().await;
-    let frame = harness.render();
-
-    assert_eq!(
-        harness.app().top_bar.workspace,
-        "Graphics",
-        "startup entered the first workspace"
-    );
-    assert!(
-        frame.contains("▌Graphics") && !frame.contains("▌Platform"),
-        "the cursor starts on the scope's own workspace: {frame}"
-    );
-}
-
-#[tokio::test]
-async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
-    let mut harness = open_over_demo().await;
-
-    harness.key("j");
-    let down = harness.render();
-    assert!(
-        down.contains("▌Platform") && !down.contains("▌Graphics"),
-        "`j` moves onto the second workspace: {down}"
-    );
-
-    // The list does not wrap: `j` at the bottom and `k` at the top are no-ops.
-    harness.key("j");
-    assert_eq!(harness.render(), down, "`j` stops at the last row");
-
-    harness.key("k");
-    harness.key("k");
-    let up = harness.render();
-    assert!(
-        up.contains("▌Graphics") && !up.contains("▌Platform"),
-        "`k` walks back to the first workspace and stops there: {up}"
-    );
-}
-
-#[tokio::test]
-async fn enter_switches_the_scope_and_the_top_bar_follows() {
-    let mut harness = open_over_demo().await;
+async fn o_on_the_workspaces_tab_switches_the_scope_and_the_top_bar_follows() {
+    let mut harness = on_the_workspaces_tab().await;
     let header = wide_header(&mut harness);
     assert!(
         header.starts_with("Graphics") && header.contains("0 working · 0 waiting · memory"),
         "the fixture's only active run is in the other workspace: {header}"
     );
 
-    harness.key("j");
-    harness.key("enter");
+    // Graphics, overview, Vulkan Tutorials, Platform.
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("o");
     harness.drive_to_end().await;
 
-    assert!(
-        harness.app().overlays.is_empty(),
-        "entering a workspace closes the switcher"
-    );
+    assert!(harness.app().overlays.is_empty(), "no overlay is involved");
     assert_eq!(harness.app().top_bar.workspace, "Platform");
     assert_eq!(
         harness.app().scope.project_ids.len(),
@@ -150,6 +109,9 @@ async fn enter_switches_the_scope_and_the_top_bar_follows() {
         "`workspace_project.position` decides the order"
     );
 
+    // Back to the Backlog, which read its rows for the new scope.
+    harness.key("2");
+    harness.drive_to_end().await;
     let header = wide_header(&mut harness);
     let frame = harness.render();
     assert!(
@@ -160,48 +122,25 @@ async fn enter_switches_the_scope_and_the_top_bar_follows() {
     insta::assert_snapshot!("after_switch", frame);
 }
 
+/// MOD-116 M1 D9: moving the cursor on the Workspaces tab and leaving it enters nothing.
 #[tokio::test]
-async fn esc_closes_the_switcher_and_leaves_the_scope_alone() {
-    let mut harness = open_over_demo().await;
-    harness.key("j");
-    harness.key("esc");
+async fn leaving_the_workspaces_tab_without_o_leaves_the_scope_alone() {
+    let mut harness = on_the_workspaces_tab().await;
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("2");
     harness.drive_to_end().await;
 
-    assert!(
-        harness.app().overlays.is_empty(),
-        "`Esc` closes the overlay"
-    );
     assert_eq!(
         harness.app().top_bar.workspace,
         "Graphics",
         "a cursor move that was never confirmed changes nothing"
     );
-    assert!(
-        !harness.render().contains("Workspaces"),
-        "the box is gone from the frame"
+    assert_eq!(
+        harness.app().tabs.active_id().map(|id| id.0),
+        Some("backlog")
     );
-}
-
-#[tokio::test]
-async fn an_empty_store_shows_no_workspaces() {
-    // `register_all` opens the switcher over a shell that never entered a workspace (blueprint D,
-    // "Startup"), so this one does not push its own: two overlays sharing an id would put the
-    // second one out of reach of every reply, which `OverlayStack::by_id_mut` addresses by id.
-    let mut harness = Harness::empty();
-    register_all(harness.app());
-    harness.drive_to_end().await;
-    let frame = harness.render();
-
-    assert!(
-        frame.contains("no workspaces"),
-        "an empty store is an empty list, not a blank box: {frame}"
-    );
-    harness.key("enter");
-    assert!(
-        !harness.app().overlays.is_empty(),
-        "`Enter` on an empty list does nothing"
-    );
-    insta::assert_snapshot!("switcher_empty", frame);
 }
 
 #[tokio::test]
@@ -292,11 +231,12 @@ async fn esc_answers_the_prompt_like_n() {
     );
 }
 
-/// MOD-52: the switcher is modal and swallows `q`, but `ctrl-c` quits through the overlay
-/// stack's quit layer: it opens the leave dialog (MOD-115 M2 D6), and a second one leaves.
+/// MOD-52: a modal overlay (the waiting list, since MOD-116 M1 retired the switcher) swallows
+/// `q`, but `ctrl-c` quits through the overlay stack's quit layer: it opens the leave dialog
+/// (MOD-115 M2 D6), and a second one leaves.
 #[tokio::test]
-async fn ctrl_c_quits_from_the_modal_switcher() {
-    let mut harness = open_over_demo().await;
+async fn ctrl_c_quits_from_a_modal_overlay() {
+    let mut harness = waiting_over_demo().await;
     harness.key("q");
     assert!(
         !harness.app().should_quit,
@@ -412,40 +352,18 @@ async fn the_status_line_and_help_box_over_the_migration_prompt() {
     assert!(frame.contains("?/F1 closes this box"), "{frame}");
 }
 
-/// MOD-67 M3 (D14): the switcher moves on `list.down`, and chord equality includes modifiers, so
-/// `ctrl-j` no longer moves it.
+/// MOD-67 M3 (D7, D8): on the Workspaces tab the `?` box renders the tab's stack, one line per
+/// layer, its own verb first (MOD-116 M1 D10).
 #[tokio::test]
-async fn ctrl_j_does_not_move_the_switcher() {
-    let mut harness = open_over_demo().await;
-    harness.key("ctrl-j");
-    let frame = harness.render();
-    assert!(
-        frame.contains("▌Graphics") && !frame.contains("▌Platform"),
-        "`ctrl-j` left the cursor alone: {frame}"
-    );
-    harness.key("j");
-    assert!(harness.render().contains("▌Platform"), "`j` still moves");
-}
-
-/// MOD-67 M3 (D7, D8): over the switcher the status line and the `?` box render the switcher's
-/// stack, one line per layer, and drop the tab's legacy line.
-#[tokio::test]
-async fn the_status_line_and_help_box_over_the_switcher() {
-    let mut harness = open_over_demo().await;
-    assert_eq!(status_line(&mut harness), "Ctrl+c quit · ? help");
+async fn the_help_box_on_the_workspaces_tab() {
+    let mut harness = on_the_workspaces_tab().await;
     harness.key("?");
     assert!(harness.app().help_visible);
     let frame = harness.render();
-    for line in [
-        "Workspaces: Enter switch workspace",
-        "List: j/Down down · k/Up up",
-        "Overlay: Esc close",
-        "Global: Ctrl+c quit · ?/F1 help",
-        "?/F1 closes this box",
-    ] {
+    for line in ["Workspaces: o open workspace", "?/F1 closes this box"] {
         assert!(frame.contains(line), "`{line}` is in the box: {frame}");
     }
-    assert!(!frame.contains("Backlog: "), "no legacy tab line: {frame}");
+    assert!(!frame.contains("Backlog: "), "no other tab's line: {frame}");
 }
 
 /// The hints of a 100x30 frame (MOD-67 M6 T2): MOD-115 draws them on the body's bottom border,
@@ -493,12 +411,12 @@ async fn the_hint_row_shows_the_active_tabs_keys() {
 #[tokio::test]
 async fn the_hint_row_is_blank_under_an_overlay() {
     let mut harness = demo_shell(None).await;
-    harness.key("w");
+    harness.key("ctrl-w");
     harness.drive_to_end().await;
     assert_eq!(
         harness.app().overlays.iter().count(),
         1,
-        "`w` opened the switcher"
+        "`ctrl-w` opened the waiting list"
     );
     let frame = harness.render();
     assert_eq!(hint_row(&frame), "", "{frame}");
@@ -544,14 +462,15 @@ async fn f9_toggles_the_about_panel_under_the_header() {
 }
 
 /// MOD-115 review: the header's key chips are labelled through the stack that holds the
-/// keyboard, so `F9 about` is gone under an overlay that does not take it (the switcher, the
+/// keyboard, so `F9 about` is gone under an overlay that does not take it (the waiting list, the
 /// migration prompt), `? keys` stays, and `F9 about` returns once the overlay closes.
 #[tokio::test]
 async fn the_header_chips_follow_the_overlay_stack() {
-    let mut harness = open_over_demo().await;
-    // MOD-122 D4: the sixth chip (`  ⁶Logs`, seven cells) leaves 100 columns no room for
-    // `F9 about`, so the header is read seven columns wider: the room it had before.
-    harness.resize(107, 30);
+    let mut harness = waiting_over_demo().await;
+    // MOD-122 D4: the sixth chip (`  ⁶Logs`, seven cells) left 100 columns no room for
+    // `F9 about`, so the header was read seven columns wider; MOD-116 M1 D11's `  ¹Workspaces`
+    // chip (13 cells) widens it again: the room it had before.
+    harness.resize(120, 30);
     let header = top_bar(&harness.render());
     assert!(
         !header.contains("about") && !header.contains("F9") && header.ends_with(" ?  keys"),
@@ -563,7 +482,7 @@ async fn the_header_chips_follow_the_overlay_stack() {
     assert!(header.ends_with(" F9  about   ?  keys"), "{header}");
 
     let mut harness = shell_reporting("online", Some(3)).await;
-    harness.resize(107, 30);
+    harness.resize(120, 30);
     let header = top_bar(&harness.render());
     assert!(
         !header.contains("about") && header.ends_with(" ?  keys"),
@@ -638,12 +557,16 @@ async fn requirements_shell(keys: Option<&str>) -> Harness {
     }
     register_all(harness.app());
     harness.settle().await;
+    // MOD-116 M1: `w`, the cursor onto Platform's row (Graphics, overview, Vulkan Tutorials,
+    // Platform), `o`; Requirements is tab 4.
     harness.key("w");
     harness.settle().await;
-    harness.key("j");
-    harness.key("enter");
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("o");
     harness.settle().await;
-    harness.key("3");
+    harness.key("4");
     harness.settle().await;
     assert_eq!(harness.app().tabs.active_id(), Some(RequirementsTab::ID));
     harness

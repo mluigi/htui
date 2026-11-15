@@ -1,8 +1,8 @@
 ---
-source: crates/htui/tests/skills.rs
+source: crates/htui/tests/it/skills.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            0 waiting ·  ?  keys
+Graphics   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  ⁶Chat      0 waiting ·  ?  keys
 ╭─────────── Skills  Templates ╮╭─ rust-style v2 (head v2) · ~42 tokens ───────────────────────────╮
 │▌  rust-style             v2  ││House Rust conventions: no `unwrap` off the test path, one error  │
 │   tests                  v1  ││enum per crate                                                    │

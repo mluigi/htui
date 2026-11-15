@@ -1,8 +1,8 @@
 ---
-source: crates/htui/tests/skills.rs
+source: crates/htui/tests/it/skills.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            0 waiting ·  ?  keys
+Graphics   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  ⁶Chat      0 waiting ·  ?  keys
 ╭─────────── Skills  Templates ╮╭─ diff v1 → v2 ───────────────────────────────────────────────────╮
 │▌  rust-style             v2  ││--- rust-style v1                                                 │
 │   tests                  v1  ││+++ rust-style v2                                                 │

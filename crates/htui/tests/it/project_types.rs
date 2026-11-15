@@ -295,8 +295,8 @@ async fn the_product_registers_project_types_after_queue() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
     harness.settle().await;
-    // Settings is the fourth tab.
-    harness.key("4");
+    // Settings is the fifth tab (MOD-116 M1 D11 put Workspaces first).
+    harness.key("5");
     harness.settle().await;
     for _ in 0..10 {
         harness.key("l");

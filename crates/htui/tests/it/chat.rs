@@ -2225,7 +2225,7 @@ async fn the_composer_status_line_and_box() {
     let mut full = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
     register_all(full.app());
     full.drive_to_end().await;
-    full.key("5");
+    full.key("6");
     full.key("i");
     assert_eq!(
         status(&mut full),

@@ -1,8 +1,8 @@
 ---
-source: crates/htui/tests/skills.rs
+source: crates/htui/tests/it/skills.rs
 expression: frame
 ---
-Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           2 waiting ·  F1  keys
+Platform   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  ⁶Chat     2 waiting ·  F1  keys
 ╭─ attachments · tests ───────────────────────────────────────────────────────── Skills  Templates ╮
 │   global                       —                                                                 ┃
 │▌* htui                         always · latest · pos 0                                           ┃
