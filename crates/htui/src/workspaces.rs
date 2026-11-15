@@ -30,7 +30,7 @@ use htui_core::store::{ReadStore, Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::hierarchy::{self, HierarchySnapshot};
-use crate::stop_report::{self, Report, StopWrite};
+use crate::stop_report::{self, Report, StopTarget, StopWrite};
 use crate::store_worker::{StoreReply, StoreRequest, serve_waiting};
 
 /// One workspace as the Workspaces tab's detail pane shows it (D7).
@@ -136,38 +136,17 @@ pub async fn serve_with_home(
             let user = backend.this_user().await?;
             // Taken when the request is served: after the question was answered (M4 R1).
             let at = Utc::now();
-            let mut outcomes = Vec::with_capacity(targets.len());
-            let mut lost: Option<StoreError> = None;
-            // R1 F1: a target whose write fails is its outcome, and the next target is still
-            // written, so the answer tells every target: the ones written before it stand.
-            // M3 T2 (M2 R1 carried): a lost connection ends the batch instead: that target and
-            // every untried one are `Failed` in its words, and the loss rides beside the outcomes
-            // so `lost_the_store` still drops the backend onto the mirror.
-            for target in targets {
-                let outcome = match &lost {
-                    Some(err) => StopWrite::Failed(err.to_string()),
-                    None => match stop_report::write_stop(
-                        &writer,
-                        target.workspace,
-                        *mode,
-                        target.decided_on.as_ref(),
-                        user,
-                        at,
-                    )
-                    .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(err) => {
-                            let failed = StopWrite::Failed(err.to_string());
-                            if matches!(err, StoreError::Unreachable(_)) {
-                                lost = Some(err);
-                            }
-                            failed
-                        }
-                    },
-                };
-                outcomes.push((target.workspace, outcome));
-            }
+            let (outcomes, lost) = stop_batch(targets, |target| {
+                stop_report::write_stop(
+                    &writer,
+                    target.workspace,
+                    *mode,
+                    target.decided_on.as_ref(),
+                    user,
+                    at,
+                )
+            })
+            .await;
             Ok(StoreReply::StopsWritten {
                 mode: *mode,
                 outcomes,
@@ -190,6 +169,43 @@ pub async fn serve_with_home(
             other.name()
         ))),
     }
+}
+
+/// The stop writes of one batch, `write` per target in order: each target's outcome, and the loss
+/// that ended the batch, if one did.
+///
+/// R1 F1: a target whose write fails is its outcome, and the next target is still written, so the
+/// answer tells every target: the ones written before it stand. M3 T2 (M2 R1 carried): a lost
+/// connection ends the batch instead: that target and every untried one are `Failed` in its
+/// words, and the loss rides beside the outcomes so `lost_the_store` still drops the backend onto
+/// the mirror. No target after the loss is tried (R1a A9).
+async fn stop_batch<'a, W, F>(
+    targets: &'a [StopTarget],
+    mut write: W,
+) -> (Vec<(WorkspaceId, StopWrite)>, Option<StoreError>)
+where
+    W: FnMut(&'a StopTarget) -> F,
+    F: Future<Output = Result<StopWrite>>,
+{
+    let mut outcomes = Vec::with_capacity(targets.len());
+    let mut lost: Option<StoreError> = None;
+    for target in targets {
+        let outcome = match &lost {
+            Some(err) => StopWrite::Failed(err.to_string()),
+            None => match write(target).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let failed = StopWrite::Failed(err.to_string());
+                    if matches!(err, StoreError::Unreachable(_)) {
+                        lost = Some(err);
+                    }
+                    failed
+                }
+            },
+        };
+        outcomes.push((target.workspace, outcome));
+    }
+    (outcomes, lost)
 }
 
 /// The N+1 reads of one overview; `None` when the workspace does not exist.
@@ -763,6 +779,58 @@ mod tests {
             ]
         );
         cache.close().await;
+    }
+
+    /// MOD-116 M3 R1a A9: the batch tries no target after the one that lost the connection; a
+    /// counting writer proves it, since a lost server answers every try alike.
+    #[tokio::test]
+    async fn a_lost_connection_tries_no_target_after_it() {
+        let targets: Vec<StopTarget> = [
+            ids::WORKSPACE_PLATFORM,
+            ids::WORKSPACE_GRAPHICS,
+            htui_core::model::WorkspaceId::new(),
+        ]
+        .into_iter()
+        .map(|workspace| StopTarget {
+            workspace,
+            decided_on: None,
+        })
+        .collect();
+        let lost = StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned());
+        let refused = StoreError::NotFound {
+            entity: "workspace",
+            id: "x".to_owned(),
+        };
+        let tried = std::cell::RefCell::new(Vec::new());
+
+        let (outcomes, carried) = super::stop_batch(&targets, |target| {
+            tried.borrow_mut().push(target.workspace);
+            // The first refuses (the batch goes on), the second loses the store.
+            let answer = match tried.borrow().len() {
+                1 => Err(refused.clone()),
+                _ => Err(lost.clone()),
+            };
+            async move { answer }
+        })
+        .await;
+
+        assert_eq!(
+            tried.into_inner(),
+            [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS],
+            "the third target is never tried"
+        );
+        assert_eq!(carried, Some(lost.clone()));
+        assert_eq!(
+            outcomes,
+            [
+                (
+                    ids::WORKSPACE_PLATFORM,
+                    StopWrite::Failed(refused.to_string())
+                ),
+                (ids::WORKSPACE_GRAPHICS, StopWrite::Failed(lost.to_string())),
+                (targets[2].workspace, StopWrite::Failed(lost.to_string())),
+            ]
+        );
     }
 
     /// MOD-116 M2 D3/D4: a target decided on no stop row, when one was written meanwhile, writes
