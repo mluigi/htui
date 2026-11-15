@@ -48,6 +48,7 @@ pub mod skill_import;
 pub mod skills;
 pub mod state_cmd;
 pub mod stop_cmd;
+pub mod stop_report;
 pub mod store_worker;
 pub mod templates;
 pub mod terminal;

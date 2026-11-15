@@ -10,6 +10,9 @@
 //! changed meanwhile writes nothing (refused). A request that writes nothing (a repeat stop, a
 //! resume of a workspace that is not stopped) asks nothing. Every ending is a [`StateExit`]: 0 done, 2 refused, 3 Postgres did not
 //! answer, 1 any other store failure.
+//!
+//! The report, its wording and the stop row's comparison live in [`crate::stop_report`] (MOD-116
+//! M2 D1), shared with the Workspaces tab; the questions, the wait and the exits stay here.
 
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal as _, Write};
@@ -17,25 +20,19 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use htui_agent::driver::DriverCaps;
-use htui_agent::registry::caps_for;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxId, Run, RunId, RunStatus, StepStatus, StopMode, UserId,
-    WorkspaceStop, WorkspaceStopState, WorkspaceSummary,
+    AgentId, RunStatus, StopMode, UserId, WorkspaceStop, WorkspaceStopState, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, StoreError, WriteStore};
-use htui_orch::promote::{StepResume, stopped_step_resume};
 use htui_store::PgStore;
 
 use crate::cli;
 use crate::qdrant_cmd;
 use crate::state_cmd::StateExit;
-
-/// How long `htui stop` waits for its workspace's running runs to stop (D7): a graceful stop
-/// settles within `CANCEL_GRACE` + `STOP_SLACK` + one command poll.
-pub const STOP_WAIT: Duration = Duration::from_secs(20);
-
-/// How often `htui stop` re-reads the workspace while it waits (D7).
-pub const STOP_POLL: Duration = Duration::from_secs(1);
+use crate::stop_report::{self, same_stop};
+/// The report and its wording live in [`crate::stop_report`] (MOD-116 M2 D1), shared with the
+/// Workspaces tab; re-exported so this verb's API is unchanged.
+pub use crate::stop_report::{Report, RunLine, RunResume, STOP_POLL, STOP_WAIT, caps_map};
 
 /// The confirmation seam (D2): what `run_*` read from the process.
 pub struct Ask<'a> {
@@ -77,163 +74,6 @@ pub struct Context<'a> {
     pub wait: Duration,
     /// How often it re-reads meanwhile ([`STOP_POLL`]).
     pub poll: Duration,
-}
-
-/// Each agent's caps, keyed by its id, as the engine reads them (`registry::caps_for`).
-#[must_use]
-pub fn caps_map(agents: Vec<AgentSummary>) -> HashMap<AgentId, DriverCaps> {
-    agents
-        .into_iter()
-        .map(|summary| (summary.agent.id, caps_for(&summary.agent)))
-        .collect()
-}
-
-/// D4: a workspace's stop state and each of its runs that is not finished.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Report {
-    /// The workspace's slug.
-    pub slug: String,
-    /// Derived from the stop row and the runs ([`WorkspaceStopState::of`]).
-    pub state: WorkspaceStopState,
-    /// The stop row, when there is one.
-    pub stop: Option<WorkspaceStop>,
-    /// One per run that is not finished, in `(queued_at, id)` order.
-    pub lines: Vec<RunLine>,
-}
-
-/// One run of a [`Report`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunLine {
-    /// The item's key; `-` for a run without an item.
-    pub item: String,
-    /// The run.
-    pub run: RunId,
-    /// Its status.
-    pub status: RunStatus,
-    /// The executing box's hostname (its id when no box row this user sees names it); `None` when
-    /// the run executes nowhere.
-    pub on_box: Option<String>,
-    /// How it will resume, or why it waits.
-    pub resume: RunResume,
-}
-
-/// D4: what a run does when its workspace resumes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunResume {
-    /// `running`: its executor is applying the stop (or, in a workspace that is not stopped, it
-    /// runs).
-    Stopping,
-    /// `queued`: held until the workspace resumes.
-    Held,
-    /// `awaiting_approval`: its gate can be answered once the workspace resumes.
-    AtGate,
-    /// `stopped`, on a box: each stopped step, by phase name, and how it resumes.
-    Steps(Vec<(String, StepResume)>),
-    /// `stopped`, on a box, with no stopped step: it continues from where it stopped.
-    Continues,
-    /// `stopped` with no executing box (M3 D6): it can only be cancelled.
-    NoBox,
-}
-
-impl RunResume {
-    /// The line's last column; `stopped` is whether the workspace has a stop row.
-    fn words(&self, stopped: bool) -> String {
-        match self {
-            Self::Stopping if stopped => "stopping".to_owned(),
-            Self::Stopping => "keeps running".to_owned(),
-            Self::Held if stopped => "starts when the workspace is resumed".to_owned(),
-            Self::Held => "waits for its box to start it".to_owned(),
-            Self::AtGate if stopped => "its gate can be answered once resumed".to_owned(),
-            Self::AtGate => "waits at its gate".to_owned(),
-            Self::Steps(steps) => {
-                let steps: Vec<String> = steps
-                    .iter()
-                    .map(|(phase, how)| match how {
-                        StepResume::Reopen(_) => format!("{phase} reopens its agent session"),
-                        StepResume::FreshWithHandoff => {
-                            format!("{phase} starts a fresh session with the handoff")
-                        }
-                        StepResume::Rerun => format!("{phase} runs again from its start"),
-                    })
-                    .collect();
-                format!("resumes: {}", steps.join("; "))
-            }
-            Self::Continues => "resumes: continues from where it stopped".to_owned(),
-            Self::NoBox => "cannot be resumed: cancel it from the Runs pane".to_owned(),
-        }
-    }
-
-    /// A run its box will resume.
-    const fn resumes(&self) -> bool {
-        matches!(self, Self::Steps(_) | Self::Continues)
-    }
-}
-
-impl RunLine {
-    /// The status column.
-    fn status_words(&self) -> String {
-        match (self.status, self.on_box.as_deref()) {
-            (RunStatus::Stopped, Some(host)) => format!("stopped on {host}"),
-            (RunStatus::Stopped, None) => "stopped, no box".to_owned(),
-            (RunStatus::Running, Some(host)) => format!("running on {host}"),
-            (RunStatus::AwaitingApproval, _) => "awaiting approval".to_owned(),
-            (status, _) => status.to_string(),
-        }
-    }
-}
-
-impl core::fmt::Display for Report {
-    /// D4's text: the header, one aligned line per run (or `no runs in this workspace`), and a
-    /// footer when a run will resume.
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "workspace {}: {}", self.slug, self.state)?;
-        match (&self.stop, self.state) {
-            (Some(stop), WorkspaceStopState::Stopping | WorkspaceStopState::Stopped) => writeln!(
-                f,
-                " ({}, requested {})",
-                stop.mode,
-                stop.requested_at.format("%Y-%m-%d %H:%M UTC")
-            )?,
-            _ => writeln!(f)?,
-        }
-        if self.lines.is_empty() {
-            return writeln!(f, "  no runs in this workspace");
-        }
-        let stopped = self.state != WorkspaceStopState::NotStopped;
-        let statuses: Vec<String> = self.lines.iter().map(RunLine::status_words).collect();
-        let item_width = self
-            .lines
-            .iter()
-            .map(|line| line.item.chars().count())
-            .max();
-        let status_width = statuses.iter().map(|status| status.chars().count()).max();
-        let (item_width, status_width) = (item_width.unwrap_or(0), status_width.unwrap_or(0));
-        for (line, status) in self.lines.iter().zip(&statuses) {
-            let run = line.run.to_string();
-            writeln!(
-                f,
-                "  {:<item_width$}  {}  {status:<status_width$}  {}",
-                line.item,
-                &run[..8],
-                line.resume.words(stopped)
-            )?;
-        }
-        if self.lines.iter().any(|line| line.resume.resumes()) {
-            writeln!(f, "checks rerun after each resumed step")?;
-            if stopped {
-                writeln!(
-                    f,
-                    "once resumed, each box resumes its stopped runs at its next command poll"
-                )?;
-            } else {
-                writeln!(
-                    f,
-                    "each box resumes its stopped runs at its next command poll"
-                )?;
-            }
-        }
-        Ok(())
-    }
 }
 
 /// D2: the graceful stop's question.
@@ -464,9 +304,8 @@ pub async fn resume_on<S: ReadStore + WriteStore>(
     emit(out, &format!("{lead}{report}"))
 }
 
-/// D4's read, before and after the write: the stop row, the runs that are not finished
-/// (`workspace_live_runs`), their items' keys, the boxes' hostnames, and each stopped step's
-/// forecast ([`stopped_step_resume`] over its row, its agent's caps and its log).
+/// D4's read, before and after the write: [`stop_report::report`] with this verb's caps and no
+/// agent names (the CLI prints no step), its store failure mapped to a [`StateExit`].
 ///
 /// # Errors
 /// [`StateExit`]: 3 Postgres did not answer, 1 any other failure.
@@ -475,89 +314,15 @@ pub async fn report<S: ReadStore + WriteStore>(
     ctx: &Context<'_>,
     workspace: &WorkspaceSummary,
 ) -> Result<Report, StateExit> {
-    let read = |err: StoreError| store_exit(&err, &workspace.slug, "read");
-    let stop = store
-        .workspace_stop(workspace.workspace_id)
-        .await
-        .map_err(read)?;
-    let runs: Vec<Run> = store
-        .workspace_live_runs(workspace.workspace_id)
-        .await
-        .map_err(read)?
-        .into_iter()
-        .filter(|run| !run.status.is_terminal())
-        .collect();
-    let state = WorkspaceStopState::of(stop.as_ref(), runs.iter().map(|run| run.status));
-    let hosts: HashMap<BoxId, String> = if runs.iter().any(|run| run.executing_box_id.is_some()) {
-        store
-            .boxes()
-            .await
-            .map_err(read)?
-            .into_iter()
-            .map(|record| (record.row.id, record.row.hostname))
-            .collect()
-    } else {
-        HashMap::new()
-    };
-    let mut lines = Vec::with_capacity(runs.len());
-    for run in runs {
-        // One live graph run per item at most, so no key is read twice.
-        let item = match run.item_id {
-            Some(id) => store.item(id).await.map_err(read)?.map(|item| item.key),
-            None => None,
-        }
-        .unwrap_or_else(|| "-".to_owned());
-        let resume = match run.status {
-            RunStatus::Running => RunResume::Stopping,
-            RunStatus::Queued => RunResume::Held,
-            RunStatus::AwaitingApproval => RunResume::AtGate,
-            _ if run.executing_box_id.is_none() => RunResume::NoBox,
-            _ => stopped_resume(store, ctx, run.id).await.map_err(read)?,
-        };
-        lines.push(RunLine {
-            item,
-            run: run.id,
-            status: run.status,
-            on_box: run
-                .executing_box_id
-                .map(|id| hosts.get(&id).cloned().unwrap_or_else(|| id.to_string())),
-            resume,
-        });
-    }
-    Ok(Report {
-        slug: workspace.slug.clone(),
-        state,
-        stop,
-        lines,
-    })
-}
-
-/// A stopped run's forecast: each `stopped` step through [`stopped_step_resume`], or
-/// [`RunResume::Continues`] when none is.
-async fn stopped_resume<S: ReadStore>(
-    store: &S,
-    ctx: &Context<'_>,
-    run: RunId,
-) -> Result<RunResume, StoreError> {
-    let mut steps = Vec::new();
-    for step in store.run_steps(run).await? {
-        if step.status != StepStatus::Stopped {
-            continue;
-        }
-        // The engine's `stopped_opening` reads `DriverCaps::default()` for an unknown agent.
-        let caps = step
-            .agent_id
-            .and_then(|agent| ctx.caps.get(&agent).copied())
-            .unwrap_or_default();
-        let events = store.step_events(step.id).await?.unwrap_or_default();
-        let how = stopped_step_resume(&step, caps, &events);
-        steps.push((step.phase_name, how));
-    }
-    Ok(if steps.is_empty() {
-        RunResume::Continues
-    } else {
-        RunResume::Steps(steps)
-    })
+    stop_report::report(
+        store,
+        ctx.caps,
+        &HashMap::new(),
+        workspace.workspace_id,
+        &workspace.slug,
+    )
+    .await
+    .map_err(|err| store_exit(&err, &workspace.slug, "read"))
 }
 
 /// D7: re-reads every `ctx.poll` until the workspace no longer reads `stopping` or `ctx.wait`
@@ -654,8 +419,7 @@ async fn unchanged<S: ReadStore + WriteStore>(
         .workspace_stop(workspace.workspace_id)
         .await
         .map_err(|err| store_exit(&err, &workspace.slug, "read"))?;
-    let key = |row: &WorkspaceStop| (row.mode, row.requested_at);
-    if stored.as_ref().map(key) == decided_on.map(key) {
+    if same_stop(stored.as_ref(), decided_on) {
         Ok(())
     } else {
         Err(StateExit::Refused(format!(
@@ -1705,5 +1469,42 @@ mod tests {
             ended.to_string(),
             "the workspace could not be stopped: store backend error: boom"
         );
+    }
+
+    /// MOD-116 M2 D1: the CLI's report is the shared one, read with no agent names, so its text is
+    /// the shared `Display` over the same store.
+    #[tokio::test(start_paused = true)]
+    async fn the_cli_report_text_is_the_shared_display() {
+        let fx = Fixture::demo().await;
+        let ws = ids::WORKSPACE_GRAPHICS;
+        let owner = Uuid::now_v7();
+        let reopen = fx.claimed(ws, 1, owner).await;
+        fx.running_step(reopen, owner, 0, "implement", &banner())
+            .await;
+        fx.stop_run(reopen, owner).await;
+        let running = fx.claimed(ws, 2, owner).await;
+        fx.running_step(running, owner, 0, "review", &no_banner())
+            .await;
+        fx.queued(ws, 3).await;
+        fx.store
+            .stop_workspace(ws, StopMode::Graceful, ids::USER, now())
+            .await
+            .expect("stop");
+
+        let cli = report(&fx.store, &fx.ctx(), fx.graphics())
+            .await
+            .expect("report");
+        let shared = crate::stop_report::report(
+            &fx.store,
+            &fx.caps,
+            &HashMap::new(),
+            ws,
+            &fx.graphics().slug,
+        )
+        .await
+        .expect("report");
+        assert_eq!(cli, shared);
+        assert_eq!(cli.to_string(), shared.to_string());
+        assert_eq!(cli.lines.len(), 4, "{cli}");
     }
 }
