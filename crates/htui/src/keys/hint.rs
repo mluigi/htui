@@ -718,7 +718,7 @@ mod tests {
                 "Ctrl+c quit · F1 help · F9 about"
             );
         }
-        for stack in [views::SWITCHER, views::WAITING_LIST, views::MIGRATION] {
+        for stack in [views::WAITING_LIST, views::MIGRATION] {
             assert_eq!(keys.status_line(stack, all), "Ctrl+c quit · ? help");
             assert_eq!(keys.status_line(stack, bare), "Ctrl+c quit · ? help");
         }
@@ -745,15 +745,6 @@ mod tests {
                 HISTORY_LINE,
                 "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab \
                  · ?/F1 help · F9 about · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
-            ]
-        );
-        assert_eq!(
-            texts(keys.help_lines(views::SWITCHER, all)),
-            [
-                "Workspaces: Enter switch workspace",
-                "List: j/Down down · k/Up up",
-                "Overlay: Esc close",
-                "Global: Ctrl+c quit · ?/F1 help",
             ]
         );
         assert_eq!(
@@ -978,7 +969,7 @@ mod tests {
             Some("?/F1 closes this box")
         );
         assert_eq!(
-            keys.help_closer(views::SWITCHER).as_deref(),
+            keys.help_closer(views::WAITING_LIST).as_deref(),
             Some("?/F1 closes this box")
         );
         for stack in [views::CONCEPTS_QUERY, views::CAPTURE] {

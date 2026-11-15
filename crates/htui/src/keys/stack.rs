@@ -272,7 +272,9 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in Settings > Project types", views::PROJECT_TYPES_BROWSE),
     ("in Settings > Logging", views::LOGGING_BROWSE),
     ("in the concepts search", views::CONCEPTS_QUERY),
-    ("in the workspace switcher", views::SWITCHER),
+    // MOD-116 M1 D10: the Workspaces tab, in the retired workspace switcher's slot, so no other
+    // first-reported phrase moved.
+    ("in Workspaces", views::WORKSPACES_BROWSE),
     ("in the migration prompt", views::MIGRATION),
     ("in the waiting list", views::WAITING_LIST),
     ("in Skills > Library", views::LIBRARY_BROWSE),
@@ -382,9 +384,6 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     // MOD-122 M3 D10: the shell's activity panel, appended so every first-reported phrase is
     // unchanged.
     ("in the activity panel", views::ACTIVITY_BROWSE),
-    // MOD-116 M1 D10: the Workspaces tab, appended so every first-reported phrase is unchanged
-    // (T4 moves it into the switcher's slot).
-    ("in Workspaces", views::WORKSPACES_BROWSE),
 ];
 
 impl Keys {
@@ -479,13 +478,19 @@ mod tests {
         // Logging's before it.
         // MOD-141 D12: the graph editor's six; M2 D14: its part form's.
         // MOD-147 M3 D9: the owner documents pane's three; MOD-122 M3 D10: the activity panel.
-        // MOD-116 M1 D10: the Workspaces tab's, appended after it.
-        assert_eq!(DECLARED.len(), 103);
+        // MOD-116 M1 D10: the Workspaces tab's took the retired switcher's slot, still 102.
+        assert_eq!(DECLARED.len(), 102);
         assert_eq!(
             DECLARED[101],
             ("in the activity panel", views::ACTIVITY_BROWSE)
         );
-        assert_eq!(DECLARED[102], ("in Workspaces", views::WORKSPACES_BROWSE));
+        assert_eq!(
+            DECLARED
+                .iter()
+                .position(|(phrase, _)| *phrase == "in the concepts search")
+                .map(|at| DECLARED[at + 1]),
+            Some(("in Workspaces", views::WORKSPACES_BROWSE))
+        );
         assert_eq!(DECLARED[83], ("in the leave dialog", views::LEAVE));
         // MOD-122 D4: the Logs tab, appended after it.
         assert_eq!(DECLARED[84], ("in Logs", views::LOGS_BROWSE));

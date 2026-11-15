@@ -215,11 +215,16 @@ close = []  # close; Esc always"#;
                        option_6 = [\"6\"]  # answer\n\
                        option_7 = [\"7\"]  # answer\n\
                        option_8 = [\"8\"]  # answer\n\
-                       option_9 = [\"9\"]  # answer\n\
-                       \n\
-                       [workspaces]\n\
-                       open = [\"o\"]  # open workspace\n"
+                       option_9 = [\"9\"]  # answer\n"
             ),
+            "{printed}"
+        );
+        // MOD-116 M1 D10: `[workspaces]` sits where the retired `[switcher]` did.
+        assert!(
+            printed.contains("[concepts]")
+                && printed
+                    .contains("\n[workspaces]\nopen = [\"o\"]  # open workspace\n\n[migration]\n")
+                && !printed.contains("[switcher]"),
             "{printed}"
         );
         assert!(!printed.ends_with("\n\n"));

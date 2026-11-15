@@ -439,6 +439,11 @@ impl App {
 
     /// Enters a workspace: the only path that changes the scope (plan D10).
     fn set_scope(&mut self, workspace: WorkspaceSummary) {
+        // MOD-116 M1 D12: the workspace entered last, saved when it moved, for the next start.
+        if self.ui.last_workspace != Some(workspace.workspace_id) {
+            self.ui.last_workspace = Some(workspace.workspace_id);
+            self.save_ui_state();
+        }
         self.scope = Scope::from_workspace(&workspace);
         let mut projects = workspace.projects;
         projects.sort_by_key(|p| p.position);
@@ -733,10 +738,11 @@ impl App {
     /// Replies the shell asked for itself.
     ///
     /// The first workspace list picks the startup scope, which is what makes `--demo` open
-    /// inside a workspace instead of an empty shell. An empty list opens `startup_overlay`
-    /// (the switcher, once registered) over the bare shell instead of leaving it blank
-    /// (blueprint D, "Startup"). Nothing is opened before that reply, so the first frame is
-    /// always the shell itself.
+    /// inside a workspace instead of an empty shell: the workspace entered last when the list
+    /// still holds it, else the first (MOD-116 M1 D12). An empty list lands on `empty_tab` (the
+    /// Workspaces tab, once registered) instead of leaving the shell blank (blueprint D,
+    /// "Startup"; MOD-116 M1 D11). Nothing moves before that reply, so the first frame is always
+    /// the shell itself.
     fn on_app_reply(&mut self, reply: StoreReply) {
         // MOD-122 M3 D8 (blueprint F9): the activity panel's read, after the freshness gate,
         // taken by value (review L2: it comes once a second). A refusal lets the next read go
@@ -767,15 +773,18 @@ impl App {
         if let StoreReply::Workspaces(workspaces) = reply
             && !self.has_scope()
         {
-            match workspaces.first() {
-                Some(first) => self.update(Action::SetScope {
-                    workspace: first.clone(),
+            let last = self.ui.last_workspace.and_then(|last| {
+                workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == last)
+            });
+            match last.or_else(|| workspaces.first()) {
+                Some(open) => self.update(Action::SetScope {
+                    workspace: open.clone(),
                 }),
                 None => {
-                    if let Some(id) = self.startup_overlay
-                        && !self.overlays.iter().any(|o| o.id() == id)
-                    {
-                        self.update(Action::Overlay(OverlayAction::Open(id)));
+                    if let Some(id) = self.empty_tab {
+                        self.land_on(id);
                     }
                 }
             }
@@ -1006,6 +1015,151 @@ mod tests {
         envelope.origin = Origin::Tab(TabId("someone-else"));
         app.update(Action::Reply(envelope));
         assert!(seen.borrow().is_empty());
+    }
+
+    /// A tab that only shows: for a second registered tab (MOD-116 M1 D11's empty tab).
+    #[derive(Debug)]
+    struct Plain(TabId);
+
+    impl Tab for Plain {
+        fn id(&self) -> TabId {
+            self.0
+        }
+        fn title(&self) -> &str {
+            "Plain"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    /// A workspace named `name` with id `id` and no projects.
+    fn named(id: WorkspaceId, name: &str) -> WorkspaceSummary {
+        WorkspaceSummary {
+            workspace_id: id,
+            slug: name.to_lowercase(),
+            name: name.to_owned(),
+            projects: Vec::new(),
+        }
+    }
+
+    /// `app.start()`, then the first `Workspaces` reply answered with `rows`.
+    fn first_list(
+        app: &mut App,
+        rx: &mut UnboundedReceiver<RequestEnvelope>,
+        rows: Vec<WorkspaceSummary>,
+    ) {
+        app.start();
+        let seq = loop {
+            let envelope = rx.try_recv().expect("start dispatched its requests");
+            if matches!(envelope.request, StoreRequest::Workspaces) {
+                break envelope.seq;
+            }
+        };
+        app.update(Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::Workspaces(rows),
+        }));
+    }
+
+    /// MOD-116 M1 D12: the UI state's last workspace, still in the list, is the one entered.
+    #[test]
+    fn the_first_workspace_list_reopens_the_last_workspace() {
+        let (mut app, mut rx, _seen) = shell();
+        let graphics = WorkspaceId::new();
+        app.ui.last_workspace = Some(graphics);
+        first_list(
+            &mut app,
+            &mut rx,
+            vec![
+                named(WorkspaceId::new(), "Platform"),
+                named(graphics, "Graphics"),
+            ],
+        );
+        assert_eq!(app.top_bar.workspace, "Graphics");
+        assert_eq!(app.scope.workspace_id, graphics);
+    }
+
+    /// D12: a last workspace the list no longer holds opens the first, as a first launch does.
+    #[test]
+    fn a_last_workspace_that_is_gone_opens_the_first() {
+        let (mut app, mut rx, _seen) = shell();
+        app.ui.last_workspace = Some(WorkspaceId::new());
+        let platform = WorkspaceId::new();
+        first_list(
+            &mut app,
+            &mut rx,
+            vec![
+                named(platform, "Platform"),
+                named(WorkspaceId::new(), "Graphics"),
+            ],
+        );
+        assert_eq!(app.top_bar.workspace, "Platform");
+        assert_eq!(
+            app.ui.last_workspace,
+            Some(platform),
+            "the first is now the last"
+        );
+    }
+
+    /// MOD-116 M1 D11: an empty first list lands on the empty tab: no overlay opens and no
+    /// history place is recorded.
+    #[test]
+    fn an_empty_first_list_lands_on_the_empty_tab() {
+        const EMPTY: TabId = TabId("empty");
+        let (mut app, mut rx, _seen) = shell();
+        app.register_tab(Box::new(Plain(EMPTY)));
+        app.empty_tab = Some(EMPTY);
+        assert_eq!(app.tabs.active_id(), Some(Recorder::ID));
+        first_list(&mut app, &mut rx, Vec::new());
+        assert_eq!(app.tabs.active_id(), Some(EMPTY));
+        assert!(app.overlays.is_empty(), "no overlay opened");
+        assert!(app.history.peek_back().is_none(), "no history place");
+        assert!(!app.has_scope());
+    }
+
+    /// D12: a scope change saves the last workspace when it moved, and only then.
+    #[test]
+    fn a_scope_change_saves_the_last_workspace_once() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::ui::state_file::UiStore;
+
+        let (mut app, _rx, _seen) = shell();
+        let text = Arc::new(Mutex::new(None));
+        app.ui_store = UiStore::Memory(Arc::clone(&text));
+        let platform = WorkspaceId::new();
+        app.update(Action::SetScope {
+            workspace: named(platform, "Platform"),
+        });
+        let saved = text
+            .lock()
+            .expect("the lock")
+            .take()
+            .expect("the first entry saves");
+        assert!(saved.contains(&format!("last = \"{platform}\"")), "{saved}");
+        app.update(Action::SetScope {
+            workspace: named(platform, "Platform"),
+        });
+        assert_eq!(
+            *text.lock().expect("the lock"),
+            None,
+            "re-entering saves nothing"
+        );
+        app.update(Action::SetScope {
+            workspace: named(WorkspaceId::new(), "Graphics"),
+        });
+        assert!(
+            text.lock().expect("the lock").is_some(),
+            "another workspace saves"
+        );
     }
 
     #[test]

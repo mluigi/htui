@@ -894,11 +894,19 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::widgets::Paragraph;
 
+    /// MOD-116 M1 D11: an empty store lands on the Workspaces tab, which says there are no
+    /// workspaces and how to make one; no overlay opens and no way back is offered.
     #[tokio::test]
-    async fn an_empty_store_renders_the_shell_with_the_switcher_over_it() {
+    async fn an_empty_store_lands_on_the_workspaces_tab() {
         let mut harness = Harness::empty();
         crate::app::register_all(harness.app());
         harness.drive_to_end().await;
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("workspaces")
+        );
+        assert!(harness.app().overlays.is_empty(), "no overlay opened");
+        assert!(harness.app().history.peek_back().is_none());
         insta::assert_snapshot!("shell_empty", harness.render());
     }
 
@@ -983,7 +991,7 @@ mod tests {
             },
             "Platform's running run, from the counts read the scope change asked for"
         );
-        // No tab chips here: with `register_all`'s six the chip does not fit even at 160.
+        // No tab chips here: with `register_all`'s seven the chip does not fit even at 160.
         harness.resize(140, 30);
         let frame = harness.render();
         let header = frame.lines().next().unwrap_or_default();
@@ -1098,10 +1106,17 @@ mod tests {
         let mut harness = Harness::empty();
         crate::app::register_all(harness.app());
         harness.settle().await;
-        // An empty store leaves the registration's switcher up and a modal overlay swallows what
-        // it does not handle, so the tab bindings only apply once it is closed.
-        harness.key("esc");
+        // MOD-116 M1 D11: an empty store lands on the Workspaces tab, tab `1`; no overlay is up.
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("workspaces")
+        );
         // MOD-115 M2 D4: `ctrl-pgdn` is the next tab (`Tab` moves the pane focus).
+        harness.key("ctrl-pgdn");
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("backlog")
+        );
         harness.key("ctrl-pgdn");
         harness.settle().await;
         assert!(harness.render().contains("Skills"));
@@ -1109,10 +1124,15 @@ mod tests {
             harness.app().tabs.active_id().map(|id| id.0),
             Some("skills")
         );
-        harness.key("1");
+        harness.key("2");
         assert_eq!(
             harness.app().tabs.active_id().map(|id| id.0),
             Some("backlog")
+        );
+        harness.key("1");
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("workspaces")
         );
     }
 
@@ -1129,6 +1149,12 @@ mod tests {
         assert_eq!(top_bar.box_name, "DESKTOP-HTUI");
         assert_eq!(top_bar.store, "memory");
         assert_eq!(harness.app().projects.len(), 1);
+        // MOD-116 M1 D11: the shell still lands on the Backlog, tab `2`, with no way back.
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("backlog")
+        );
+        assert!(harness.app().history.peek_back().is_none());
         // `register_all` without a runtime leaves an error for the header's flash to show.
         harness.app().status = None;
         // 100 columns drop the working count and the store for the five tab chips and `? keys`.

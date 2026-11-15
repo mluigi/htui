@@ -214,8 +214,8 @@ up        = ["up"]      # previous hit
 down      = ["down"]    # next hit
 why       = ["ctrl-e"]  # why search is unavailable
 
-[switcher]
-switch = ["enter"]  # switch workspace
+[workspaces]
+open = ["o"]  # open workspace
 
 [migration]
 yes = ["y", "Y"]  # yes
@@ -424,7 +424,4 @@ option_6 = ["6"]  # answer
 option_7 = ["7"]  # answer
 option_8 = ["8"]  # answer
 option_9 = ["9"]  # answer
-
-[workspaces]
-open = ["o"]  # open workspace
 ```

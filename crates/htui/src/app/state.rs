@@ -474,15 +474,14 @@ pub struct App {
     pub(super) next_seq: Seq,
     /// Ticks since startup; the top bar refreshes every fourth one.
     pub(super) ticks: u64,
-    /// Overlay to open when the first `Workspaces` reply is empty (blueprint D, "Startup").
-    ///
-    /// Set by [`register_all`](crate::app::register_all); `None` leaves an empty store on the
-    /// bare shell. Held as an id, not a view, so the shell never names a concrete overlay.
-    pub startup_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// MOD-116 M1 D11: the tab the shell lands on when the first workspace list is empty (the
+    /// Workspaces tab, named by [`register_all`](crate::app::register_all)); the shell never
+    /// names a concrete view. `None` leaves an empty store on the tab it is on.
+    pub empty_tab: Option<TabId>,
     /// Overlay to open when a `StoreState` reply carries a pending-migration count (plan D11).
     ///
     /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
-    /// `startup_overlay` is one: the shell must not name a concrete view (MOD-1 blueprint D).
+    /// `empty_tab` is one: the shell must not name a concrete view (MOD-1 blueprint D).
     pub migration_overlay: Option<crate::ui::overlay::OverlayId>,
     /// The leave dialog (MOD-115 M2 D6, `R-TUI-18`; it replaced MOD-57 M2 E4's quit question):
     /// opened by `global.quit` (`q`, `ctrl-c`) on every screen. Set by
@@ -635,7 +634,7 @@ impl App {
             latest: HashMap::new(),
             next_seq: 0,
             ticks: 0,
-            startup_overlay: None,
+            empty_tab: None,
             migration_overlay: None,
             leave_overlay: None,
             abort_overlay: None,
@@ -907,6 +906,25 @@ impl App {
         self.tabs.register(tab);
         if first {
             self.activate_tab();
+        }
+        self.dirty = true;
+    }
+
+    /// MOD-116 M1 D11: focuses `id` and issues its requests without recording a history place;
+    /// nothing when it is not registered. `register_all` lands on the Backlog with it, and an
+    /// empty first workspace list on [`empty_tab`](Self::empty_tab): a recorded place would put
+    /// a way back in every first frame.
+    pub fn land_on(&mut self, id: TabId) {
+        let before = self.tabs.active_id();
+        if !self.tabs.focus(id) {
+            return;
+        }
+        if self.tabs.active_id() != before {
+            self.activate_tab();
+        }
+        // Inside an `update` the outer `recorded` would record the move; this tells it not to.
+        if self.recording {
+            self.history_move = true;
         }
         self.dirty = true;
     }
@@ -2785,7 +2803,7 @@ pub(crate) mod shell_tests {
     /// one; closing it gives the focus back.
     #[test]
     fn under_an_overlay_a_tab_draws_no_focused_pane() {
-        use crate::ui::overlay::WorkspaceSwitcher;
+        use crate::ui::overlay::WaitingList;
 
         let theme = Theme::default();
         let mut app = sentinel_app();
@@ -2794,7 +2812,7 @@ pub(crate) mod shell_tests {
         let list = areas.list.expect("the list is shown");
         let red = SENTINEL.fg.unwrap_or_default();
         let faint = theme.border_faint.fg.unwrap_or_default();
-        app.push_overlay(Box::new(WorkspaceSwitcher::new()));
+        app.push_overlay(Box::new(WaitingList::new()));
         let buf = draw(&mut app, 100, 30);
         assert_eq!(
             buf[(list.x, list.y)].fg,
@@ -2812,7 +2830,7 @@ pub(crate) mod shell_tests {
             pane_bottom(&buf, list).contains("j/k move"),
             "the focused list's"
         );
-        app.push_overlay(Box::new(WorkspaceSwitcher::new()));
+        app.push_overlay(Box::new(WaitingList::new()));
         let buf = draw(&mut app, 100, 30);
         for pane in [list, areas.detail] {
             assert!(
@@ -2887,7 +2905,7 @@ pub(crate) mod shell_tests {
         assert!(!cells[..at].concat().contains("open"));
 
         // Under an overlay the activity pane is not focused either, so it draws no hints.
-        app.push_overlay(Box::new(crate::ui::overlay::WorkspaceSwitcher::new()));
+        app.push_overlay(Box::new(crate::ui::overlay::WaitingList::new()));
         let buf = draw(&mut app, 100, 30);
         assert_eq!(
             buf[(activity.x, activity.y)].fg,
@@ -3123,6 +3141,64 @@ pub(crate) mod shell_tests {
         assert_eq!(left.list, ListSize::Percent(60));
         assert!(left.zoom);
         assert!(!again.about_visible, "the about panel stays off");
+    }
+
+    /// MOD-116 M1 D11: `land_on` focuses a tab and issues its requests, and records no history
+    /// place, outside an `update` (`register_all`) and inside one (the first workspace list);
+    /// an id nothing registered is a no-op.
+    #[test]
+    fn land_on_records_no_history_place() {
+        const OTHER: TabId = TabId("other");
+        let mut app = split_app();
+        app.register_tab(Box::new(SplitTab::new(OTHER, "Other")));
+        assert_eq!(app.tabs.active_id(), Some(SPLIT));
+        app.land_on(OTHER);
+        assert_eq!(app.tabs.active_id(), Some(OTHER));
+        assert!(app.history.peek_back().is_none(), "no place recorded");
+        app.recorded(|app| app.land_on(SPLIT));
+        assert_eq!(app.tabs.active_id(), Some(SPLIT));
+        assert!(
+            app.history.peek_back().is_none(),
+            "none inside an update either"
+        );
+        app.land_on(TabId("nowhere"));
+        assert_eq!(app.tabs.active_id(), Some(SPLIT));
+        // The next real move is recorded as ever.
+        app.update(crate::app::Action::Tab(crate::app::TabAction::Focus(OTHER)));
+        assert!(
+            app.history.peek_back().is_some(),
+            "a later move is recorded"
+        );
+    }
+
+    /// MOD-116 M1 D12: the workspace entered last survives a restart: enter one, drop the shell,
+    /// build another over the same store, and its UI state names it.
+    #[test]
+    fn the_last_workspace_survives_a_restart() {
+        use crate::ui::state_file::UiStore;
+        use htui_core::model::WorkspaceSummary;
+
+        let store = UiStore::memory();
+        let mut app = split_app();
+        app.apply_ui_state(store.load().state);
+        app.ui_store = store.clone();
+        let id = WorkspaceId::new();
+        app.update(crate::app::Action::SetScope {
+            workspace: WorkspaceSummary {
+                workspace_id: id,
+                slug: "platform".to_owned(),
+                name: "Platform".to_owned(),
+                projects: Vec::new(),
+            },
+        });
+        drop(app);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut again = App::new(tx);
+        let loaded = store.load();
+        assert_eq!(loaded.notice, None);
+        again.apply_ui_state(loaded.state);
+        assert_eq!(again.ui.last_workspace, Some(id));
     }
 
     /// RV2 H1, D1: a layout key saves through the background writer the moment it changes,
@@ -3449,13 +3525,12 @@ pub(crate) mod shell_tests {
     fn ctrl_c_opens_the_leave_dialog_from_every_screen_and_a_second_leaves() {
         use crate::ui::overlay::{
             AbortConfirm, ConceptsSearch, LeaveDialog, MigrationPrompt, Overlay, QueueOverlay,
-            WaitingList, WorkspaceSwitcher,
+            WaitingList,
         };
 
         type MakeOverlay = fn() -> Box<dyn Overlay>;
         let overlays: Vec<Option<MakeOverlay>> = vec![
             None,
-            Some(|| Box::new(WorkspaceSwitcher::new())),
             Some(|| Box::new(ConceptsSearch::new())),
             Some(|| Box::new(WaitingList::new())),
             Some(|| Box::new(QueueOverlay::new())),

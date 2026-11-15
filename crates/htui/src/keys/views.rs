@@ -708,15 +708,6 @@ pub const CONCEPTS_QUERY: Stack<'static> = Stack::new(&[
     HELP.with_modal_filter(),
 ]);
 
-/// The workspace switcher overlay.
-pub const SWITCHER: Stack<'static> = Stack::new(&[
-    Layer::view(Context::Switcher, &[Act::SwitcherSwitch]),
-    LIST,
-    OVERLAY,
-    QUIT,
-    HELP,
-]);
-
 /// The schema migration prompt overlay.
 pub const MIGRATION: Stack<'static> = Stack::new(&[
     Layer::view(Context::Migration, &[]),
@@ -1352,7 +1343,6 @@ mod tests {
         source!("ui/overlay/queue.rs"),
         source!("ui/overlay/leave.rs"),
         source!("ui/overlay/waiting_list.rs"),
-        source!("ui/overlay/workspace_switcher.rs"),
         source!("ui/tabs/skills/mod.rs"),
         source!("ui/tabs/skills/library.rs"),
         source!("ui/tabs/skills/templates.rs"),
@@ -1482,7 +1472,6 @@ mod tests {
         PROJECT_TYPES_BROWSE,
         LOGGING_BROWSE,
         CONCEPTS_QUERY,
-        SWITCHER,
         MIGRATION,
         ABORT_CONFIRM,
         WAITING_LIST,
@@ -1719,8 +1708,6 @@ mod tests {
             resolve(MIGRATION, "esc"),
             [Act::ConfirmNo, Act::OverlayClose]
         );
-        assert_eq!(resolve(SWITCHER, "enter"), [Act::SwitcherSwitch]);
-        assert_eq!(resolve(SWITCHER, "2"), []);
         // MOD-163 D22: the Hierarchy memory pane; `e` is the clash's own act there, the common
         // edit in the list, and the pane captures input so `h` cycles no section.
         assert_eq!(resolve(HIERARCHY_BROWSE, "m"), [Act::HierarchyMemory]);
@@ -2260,8 +2247,9 @@ mod tests {
         // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
         // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
         // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94; MOD-122
-        // M3 D10: the activity panel's, 95; MOD-116 M1 D10: the Workspaces tab's, 96.
-        assert_eq!(views.len(), 96);
+        // M3 D10: the activity panel's, 95; MOD-116 M1 D10: the Workspaces tab's took the retired
+        // switcher's place, still 95.
+        assert_eq!(views.len(), 95);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

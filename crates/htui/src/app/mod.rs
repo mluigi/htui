@@ -17,35 +17,35 @@ pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 use crate::keys::Act;
 use crate::ui::overlay::{
     AbortConfirm, ConceptsSearch, LeaveDialog, MigrationPrompt, QueueOverlay, WaitingList,
-    WorkspaceSwitcher,
 };
 use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection, LoggingSection,
     PersonasSection, ProjectTypesSection, PromptSection, QdrantSection, QueueSection,
     SecretsSection,
 };
-use crate::ui::tabs::{BacklogTab, ChatTab, LogsTab, RequirementsTab, SettingsTab, SkillsTab};
+use crate::ui::tabs::{
+    BacklogTab, ChatTab, LogsTab, RequirementsTab, SettingsTab, SkillsTab, WorkspacesTab,
+};
 
-/// Registers every tab and every overlay factory, and names the workspace switcher as the
-/// startup overlay.
+/// Registers every tab and every overlay factory, and names the Workspaces tab as the tab an
+/// empty store lands on.
 ///
 /// This is the whole registration surface: MOD-2's Chat tab and MOD-13's filter overlay are one
 /// line each here plus their own file, with no change to the event loop (plan D5).
 ///
-/// Three things happen, in this order:
+/// In this order:
 ///
-/// 1. Backlog, Skills, Requirements and Settings are registered. Registration order is tab-strip
-///    order and `1`..`9` order, so Backlog first is what makes it the tab a user lands on.
-///    Requirements sits before Settings, `R-TUI-1`'s order (MOD-39 PRD D2). Chat follows them
-///    and, last, Logs (MOD-122 D4), so appending it moves no tab's digit.
-/// 2. The switcher's factory goes in under its own [`OverlayId`](crate::ui::overlay::OverlayId)
-///    and global `w` is **offered** ([`App::offer`] with [`Act::Workspaces`], MOD-67 D5) rather
-///    than mapped by the shell, because it names an overlay, and the shell must not know which
-///    views exist.
-/// 3. The switcher is named as the startup overlay. Nothing opens here: the first frame is the
-///    bare shell, and the first workspace list either picks a startup scope (`--demo`) or is
-///    empty, in which case `App::on_app_reply` opens the switcher reading "no workspaces"
-///    instead of leaving a blank shell (blueprint D, "Startup").
+/// 1. Workspaces, Backlog, Skills, Requirements and Settings are registered. Registration order
+///    is tab-strip order and `1`..`9` order, so Workspaces is tab `1` and Backlog `2` (MOD-116 M1
+///    D11). Requirements sits before Settings, `R-TUI-1`'s order (MOD-39 PRD D2). Chat follows
+///    them and, last, Logs (MOD-122 D4).
+/// 2. Global `w` is **offered** ([`App::offer`] with [`Act::Workspaces`], MOD-67 D5) as the focus
+///    of the Workspaces tab rather than mapped by the shell, because it names a view, and the
+///    shell must not know which views exist (MOD-116 M1 D10; it replaced the workspace switcher).
+/// 3. The Workspaces tab is named as the empty tab ([`App::empty_tab`]). Nothing opens here: the
+///    first workspace list either opens the last workspace, else the first (MOD-116 M1 D12), or
+///    is empty, in which case `App::on_app_reply` lands on the Workspaces tab, which says there
+///    are no workspaces and how to create one (blueprint D, "Startup").
 /// 4. The migration prompt's factory goes in and it is named as the migration overlay. It has no
 ///    key binding on purpose: it is opened by the shell when a `StoreState` reply reports a
 ///    pending schema, never by the user (`R-STO-5`, plan D11).
@@ -64,10 +64,14 @@ use crate::ui::tabs::{BacklogTab, ChatTab, LogsTab, RequirementsTab, SettingsTab
 ///     opens it on every screen, and its `leave.confirm` (`Enter`, a second `ctrl-c`) leaves.
 /// 11. `App::start` is told to ask for the Qdrant snapshot, so an old keyring Qdrant URL is said
 ///     once on the status line (MOD-158 D10).
+/// 12. Last, the shell lands on the Backlog ([`App::land_on`], no history place), so a restart
+///     still opens on the tab it always did (MOD-116 M1 D11).
 ///
-/// Calling this twice would stack a second switcher; the shell calls it exactly once, between
+/// Calling this twice would register every tab twice; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
 pub fn register_all(app: &mut App) {
+    // MOD-116 M1 D11: first, so it is tab `1`; every other tab's digit moved up by one.
+    app.register_tab(Box::new(WorkspacesTab::new()));
     app.register_tab(Box::new(BacklogTab::new()));
     app.register_tab(Box::new(SkillsTab::new()));
     app.register_tab(Box::new(RequirementsTab::new()));
@@ -94,14 +98,13 @@ pub fn register_all(app: &mut App) {
         Box::new(LoggingSection::new(app.logging.control().clone())),
     ])));
     app.register_tab(Box::new(ChatTab::new()));
-    // Last (MOD-122 D4): `6`, so no tab's digit moves. The buffer is the one `run` installed.
+    // Last (MOD-122 D4): `7` since MOD-116 M1 D11. The buffer is the one `run` installed.
     app.register_tab(Box::new(LogsTab::new(app.logging.buffer().clone())));
 
-    app.overlay_factories
-        .register(WorkspaceSwitcher::ID, || Box::new(WorkspaceSwitcher::new()));
+    // MOD-116 M1 D10: `w` focuses the Workspaces tab (the switcher it opened is gone).
     app.offer(
         Act::Workspaces,
-        Action::Overlay(OverlayAction::Open(WorkspaceSwitcher::ID)),
+        Action::Tab(TabAction::Focus(WorkspacesTab::ID)),
     );
 
     // MOD-64 D236: the concepts search, global `Ctrl+F`. A chord, so no tab's letters and no text
@@ -129,7 +132,8 @@ pub fn register_all(app: &mut App) {
         Action::Overlay(OverlayAction::Open(QueueOverlay::ID)),
     );
 
-    app.startup_overlay = Some(WorkspaceSwitcher::ID);
+    // MOD-116 M1 D11: an empty first workspace list lands on the Workspaces tab.
+    app.empty_tab = Some(WorkspacesTab::ID);
 
     app.overlay_factories
         .register(MigrationPrompt::ID, || Box::new(MigrationPrompt::new()));
@@ -154,4 +158,6 @@ pub fn register_all(app: &mut App) {
     // MOD-158 D10 (blueprint P-6): `App::start` asks whether this box's keyring holds the old
     // Qdrant URL, so the status line can say once that Settings > Qdrant offers it.
     app.qdrant_offer_check = true;
+    // MOD-116 M1 D11: a restart still opens on the Backlog, with no history place recorded.
+    app.land_on(BacklogTab::ID);
 }

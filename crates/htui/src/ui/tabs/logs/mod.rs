@@ -1207,7 +1207,8 @@ mod tests {
         let buffer = harness.app().logging.buffer().clone();
         push_lines(&buffer, 0..3);
 
-        harness.key("6");
+        // Logs is tab 7 since MOD-116 M1 D11 put Workspaces first.
+        harness.key("7");
         let frame = harness.render();
 
         assert!(

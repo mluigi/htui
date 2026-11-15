@@ -49,7 +49,7 @@ use Context::{
     Overlay, Pane, Picker, Queue, Requirements, Settings, SettingsAgents, SettingsBoxes,
     SettingsConnection, SettingsDocuments, SettingsHierarchy, SettingsKinds, SettingsMemory,
     SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills, SkillsAttach, SkillsHelp,
-    SkillsLibrary, SkillsTemplates, Switcher, Waiting, Workspaces,
+    SkillsLibrary, SkillsTemplates, Waiting, Workspaces,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
@@ -115,8 +115,9 @@ pub enum Context {
     GraphEditorLinks,
     /// `[concepts]`: the concepts search overlay.
     Concepts,
-    /// `[switcher]`: the workspace switcher overlay.
-    Switcher,
+    /// `[workspaces]`: the Workspaces tab (MOD-116 M1 D10), in the slot the retired workspace
+    /// switcher's `[switcher]` held, so no other table moved.
+    Workspaces,
     /// `[migration]`: the schema migration prompt (no own action; view defaults only).
     Migration,
     /// `[waiting]`: the waiting list overlay.
@@ -183,9 +184,6 @@ pub enum Context {
     Choice,
     /// `[answer]`: a parked request's numbered options (MOD-115 M2 D7), in Runs and in Chat.
     Answer,
-    /// `[workspaces]`: the Workspaces tab (MOD-116 M1 D10). Appended last while the switcher
-    /// still exists; T4 moves it into the switcher's slot.
-    Workspaces,
 }
 
 impl Context {
@@ -218,7 +216,7 @@ impl Context {
         Self::GraphEditor,
         Self::GraphEditorLinks,
         Self::Concepts,
-        Self::Switcher,
+        Self::Workspaces,
         Self::Migration,
         Self::Waiting,
         Self::Skills,
@@ -248,7 +246,6 @@ impl Context {
         Self::Field,
         Self::Choice,
         Self::Answer,
-        Self::Workspaces,
     ];
 
     /// The TOML table name: `global`, `overlay`, `list`, ..., `settings.agents`, `concepts`.
@@ -281,7 +278,7 @@ impl Context {
             Self::GraphEditor => "graph_editor",
             Self::GraphEditorLinks => "graph_editor.links",
             Self::Concepts => "concepts",
-            Self::Switcher => "switcher",
+            Self::Workspaces => "workspaces",
             Self::Migration => "migration",
             Self::Waiting => "waiting",
             Self::Skills => "skills",
@@ -311,7 +308,6 @@ impl Context {
             Self::Field => "field",
             Self::Choice => "choice",
             Self::Answer => "answer",
-            Self::Workspaces => "workspaces",
         }
     }
 
@@ -346,7 +342,7 @@ impl Context {
             Self::GraphEditor => "Graph editor",
             Self::GraphEditorLinks => "Links",
             Self::Concepts => "Search concepts",
-            Self::Switcher => "Workspaces",
+            Self::Workspaces => "Workspaces",
             Self::Migration => "Schema",
             Self::Waiting => "Waiting on you",
             Self::Skills => "Skills",
@@ -376,7 +372,6 @@ impl Context {
             Self::Field => "Text field",
             Self::Choice => "Choice",
             Self::Answer => "Answer",
-            Self::Workspaces => "Workspaces",
         }
     }
 
@@ -406,7 +401,7 @@ impl Context {
                 | Self::GraphEditor
                 | Self::GraphEditorLinks
                 | Self::Concepts
-                | Self::Switcher
+                | Self::Workspaces
                 | Self::Migration
                 | Self::Waiting
                 | Self::SkillsLibrary
@@ -429,7 +424,6 @@ impl Context {
                 | Self::Queue
                 | Self::Picker
                 | Self::Leave
-                | Self::Workspaces
         )
     }
 
@@ -483,7 +477,7 @@ pub enum Act {
     Help,
     /// `global.about`: toggle the about panel under the header (MOD-115).
     About,
-    /// `global.workspaces`: open the workspace switcher (offered by `register_all`).
+    /// `global.workspaces`: focus the Workspaces tab (offered by `register_all`, MOD-116 M1 D10).
     Workspaces,
     /// `global.find`: open the concepts search (offered by `register_all`).
     Find,
@@ -615,8 +609,9 @@ pub enum Act {
     ConceptsDown,
     /// `concepts.why`: show why knowledge search is unavailable.
     ConceptsWhy,
-    /// `switcher.switch`: switch to the selected workspace.
-    SwitcherSwitch,
+    /// `workspaces.open`: open the selected workspace (MOD-116 M1 D9), in the slot the retired
+    /// switcher's `switcher.switch` held.
+    WorkspacesOpen,
     /// `waiting.open`: open the selected waiting step.
     WaitingOpen,
     /// `skills.switch_view`: toggle between the Library and Templates views.
@@ -967,8 +962,6 @@ pub enum Act {
     LinksClose,
     /// `settings.kinds.editor`: open the graph editor on the row's graph (MOD-141 D3).
     KindsEditor,
-    /// `workspaces.open`: open the selected workspace (MOD-116 M1 D9).
-    WorkspacesOpen,
 }
 
 impl Act {
@@ -1165,7 +1158,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::Help, Global, "help", &["?", "f1"], "help"),
     // MOD-115: `f9` toggles the about panel; `?` and `f1` stay help's.
     row(Act::About, Global, "about", &["f9"], "about"),
-    // Offered by `register_all` (D5): `app/mod.rs` workspace switcher, concepts search,
+    // Offered by `register_all` (D5): `app/mod.rs` Workspaces tab (MOD-116 M1), concepts search,
     // waiting list (MOD-69 D7) and queue overlay (MOD-12 M3 D8). `queue` follows `waiting`, so
     // the status line a 100-column frame cuts before `Ctrl+w waiting` is unchanged.
     row(Act::Workspaces, Global, "workspaces", &["w"], "workspaces"),
@@ -1195,7 +1188,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
     capture_row(Act::OverlayClose, Overlay, "close", &["esc"], "close"),
     // [list]
     // backlog/mod.rs:789, requirements/mod.rs:443, connection.rs:811, kinds.rs:1492,
-    // qdrant.rs:404, workspace_switcher.rs:163, waiting_list.rs:274, queue.rs:440,
+    // qdrant.rs:404, waiting_list.rs:274, queue.rs:440,
     // path_picker.rs:142. agents.rs:2420 and hierarchy.rs:1212 take `j` only (ANA §6.6 adds
     // `down`, M3).
     row(Act::ListDown, List, "down", &["j", "down"], "down"),
@@ -1208,7 +1201,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::ListBottom, List, "bottom", &["G", "end"], "bottom"),
     // backlog/mod.rs:779 (fold, else the detail pane at :784; the Backlog tries it before the
     // pane, MOD-67 M5 PA-2), requirements/mod.rs:448. Elsewhere `Enter` is a view verb
-    // (connection.rs:807, workspace_switcher.rs:171).
+    // (connection.rs:807).
     row(Act::ListFold, List, "fold", &["enter"], "fold"),
     // [pane]
     // backlog/detail/mod.rs:466 (`Scroll::apply`), requirements/mod.rs:453, library.rs:812,
@@ -1805,14 +1798,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["ctrl-e"],
         "why search is unavailable",
     ),
-    // [switcher]
-    // workspace_switcher.rs:171.
+    // [workspaces] (MOD-116 M1 D10): the Workspaces tab, in the retired switcher's slot.
+    // `j`/`k`/`g`/`G`/`enter` are `list.*`. ui/tabs/workspaces/mod.rs: on_key.
     row(
-        Act::SwitcherSwitch,
-        Switcher,
-        "switch",
-        &["enter"],
-        "switch workspace",
+        Act::WorkspacesOpen,
+        Workspaces,
+        "open",
+        &["o"],
+        "open workspace",
     ),
     // [waiting]
     // waiting_list.rs:284.
@@ -2581,15 +2574,6 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::AnswerOption7, Answer, "option_7", &["7"], "answer").since(2),
     row(Act::AnswerOption8, Answer, "option_8", &["8"], "answer").since(2),
     row(Act::AnswerOption9, Answer, "option_9", &["9"], "answer").since(2),
-    // [workspaces] (MOD-116 M1 D10): the Workspaces tab. `j`/`k`/`g`/`G`/`enter` are `list.*`.
-    // ui/tabs/workspaces/mod.rs: on_key.
-    row(
-        Act::WorkspacesOpen,
-        Workspaces,
-        "open",
-        &["o"],
-        "open workspace",
-    ),
 ];
 
 /// Extra default chords a view adds to a shared act, on top of whatever the shared row resolves
@@ -2710,7 +2694,7 @@ pub static V1_DEFAULTS: &[(Act, &[&str])] = &[
 pub static STATE_GUARDED: &[(Act, Act)] = &[
     (Act::Back, Act::Dismiss),
     // boxes.rs:712-721: the executor question opens only over a listed box with a readable
-    // list; otherwise `w` declines and falls through to the switcher (box_settings.rs:1356).
+    // list; otherwise `w` declines and falls through to the Workspaces tab (box_settings.rs).
     (Act::BoxesExecutor, Act::Workspaces),
     // backlog/mod.rs:779-786, ANA-26 §7.4: a project header folds; on an item row the fold
     // declines and the pane (Runs replays) or the miss answers. The tab tries the fold first
@@ -2776,7 +2760,7 @@ mod tests {
             Context::GraphEditor => 23,
             Context::GraphEditorLinks => 24,
             Context::Concepts => 25,
-            Context::Switcher => 26,
+            Context::Workspaces => 26,
             Context::Migration => 27,
             Context::Waiting => 28,
             Context::Skills => 29,
@@ -2806,15 +2790,14 @@ mod tests {
             Context::Field => 53,
             Context::Choice => 54,
             Context::Answer => 55,
-            Context::Workspaces => 56,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
         // MOD-147 M3 D9: `settings.documents`, 55; MOD-122 M3 D10: `activity`, 56.
-        // MOD-116 M1 D10: `workspaces`, 57.
-        assert_eq!(Context::ALL.len(), 57);
+        // MOD-116 M1 D10: `workspaces` took the retired `switcher`'s place, still 56.
+        assert_eq!(Context::ALL.len(), 56);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -2932,7 +2915,7 @@ mod tests {
         Act::ConceptsReindex,
         Act::ConceptsUp,
         Act::ConceptsDown,
-        Act::SwitcherSwitch,
+        Act::WorkspacesOpen,
         Act::WaitingOpen,
         Act::SkillsSwitchView,
         Act::SkillsPrevVersion,
@@ -3106,7 +3089,6 @@ mod tests {
         Act::DocumentsNewVersion,
         Act::ActivityOpen,
         Act::ActivityFilter,
-        Act::WorkspacesOpen,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3191,7 +3173,7 @@ mod tests {
             Act::ConceptsReindex => 75,
             Act::ConceptsUp => 76,
             Act::ConceptsDown => 77,
-            Act::SwitcherSwitch => 78,
+            Act::WorkspacesOpen => 78,
             Act::WaitingOpen => 79,
             Act::SkillsSwitchView => 80,
             Act::SkillsPrevVersion => 81,
@@ -3365,7 +3347,6 @@ mod tests {
             Act::DocumentsNewVersion => 249,
             Act::ActivityOpen => 250,
             Act::ActivityFilter => 251,
-            Act::WorkspacesOpen => 252,
         }
     }
 
@@ -3402,8 +3383,8 @@ mod tests {
         // MOD-122 M2 D11: `settings.boxes.log_level`, 247.
         // MOD-147 M3 D9: `settings.hierarchy.documents` and the documents pane's two, 250.
         // MOD-122 M3 D10: `activity.open` and `activity.filter`, 252.
-        // MOD-116 M1 D10: `workspaces.open`, 253.
-        assert_eq!(CATALOGUE.len(), 253);
+        // MOD-116 M1 D10: `workspaces.open` took the retired `switcher.switch`'s row, still 252.
+        assert_eq!(CATALOGUE.len(), 252);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -3724,7 +3705,7 @@ mod tests {
             (Context::GraphEditor, "graph_editor", "Graph editor"),
             (Context::GraphEditorLinks, "graph_editor.links", "Links"),
             (Context::Concepts, "concepts", "Search concepts"),
-            (Context::Switcher, "switcher", "Workspaces"),
+            (Context::Workspaces, "workspaces", "Workspaces"),
             (Context::Migration, "migration", "Schema"),
             (Context::Waiting, "waiting", "Waiting on you"),
             (Context::Skills, "skills", "Skills"),
@@ -3754,7 +3735,6 @@ mod tests {
             (Context::Field, "field", "Text field"),
             (Context::Choice, "choice", "Choice"),
             (Context::Answer, "answer", "Answer"),
-            (Context::Workspaces, "workspaces", "Workspaces"),
         ];
         assert_eq!(table.len(), Context::ALL.len());
         for (context, name, heading) in table {
