@@ -8,6 +8,8 @@
 //! `MemStore` through a clone.
 #![cfg(feature = "testkit")]
 
+use std::time::Duration;
+
 use chrono::Utc;
 use htui::app::Action;
 use htui::testkit::Harness;
@@ -102,15 +104,18 @@ async fn s_stops_every_live_workspace_then_leaves_when_they_settle() {
     assert!(harness.app().should_quit, "every stop has settled");
 }
 
-#[tokio::test]
+/// The bound is wall time from `S` (R1 F7): one refresh a second, the twentieth leaves.
+#[tokio::test(start_paused = true)]
 async fn s_leaves_after_the_bound_when_a_run_never_stops() {
     let store = MemStore::demo();
     let mut harness = demo(store.clone()).await;
     stop_first(&mut harness).await;
     for second in 1..20 {
+        tokio::time::advance(Duration::from_secs(1)).await;
         refresh(&mut harness).await;
         assert!(!harness.app().should_quit, "second {second}");
     }
+    tokio::time::advance(Duration::from_secs(1)).await;
     refresh(&mut harness).await;
     assert!(harness.app().should_quit, "20 s waited");
     assert_eq!(
@@ -145,4 +150,33 @@ async fn esc_while_settling_stays_and_the_stop_stands() {
         stop_of(&store, ids::WORKSPACE_PLATFORM).await,
         Some(StopMode::Graceful)
     );
+}
+
+/// MOD-116 M2 R1 F7: the bound is wall time, not a count of the dialog's refreshes: the first
+/// refresh after 20 s leaves, however few came before it.
+#[tokio::test(start_paused = true)]
+async fn the_bound_is_wall_time_so_a_late_refresh_leaves() {
+    let mut harness = demo(MemStore::demo()).await;
+    stop_first(&mut harness).await;
+    tokio::time::advance(Duration::from_secs(21)).await;
+    refresh(&mut harness).await;
+    assert!(harness.app().should_quit, "20 s have passed");
+}
+
+/// MOD-116 M2 R1 F8: offline, the dialog's own counts read while its stops settle is refused
+/// once a second; that stays off the status line, as the shell's own read does.
+#[tokio::test]
+async fn offline_the_settling_counts_refusal_stays_off_the_status_line() {
+    let mut harness = demo(MemStore::demo()).await;
+    stop_first(&mut harness).await;
+    assert!(!harness.app().should_quit, "RUN_4 still runs");
+    for _ in 0..4 {
+        harness.app().update(Action::Tick);
+    }
+    harness
+        .settle_refusing("workspace_run_counts", "the database is unreachable")
+        .await;
+    assert_eq!(harness.app().status, None);
+    assert!(!harness.app().should_quit, "still settling");
+    assert_eq!(top(&mut harness), Some(LeaveDialog::ID));
 }

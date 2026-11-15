@@ -14,13 +14,18 @@
 //! when pushed. Another workspace's "waiting" counts its runs parked at a gate: the counts read
 //! carries no question rows. Before the names land those rows fold into one.
 //!
-//! `S` (`leave.stop`) stops them gracefully first: offered when the counts are known and some
-//! workspace has a live run and no stop row, or a running run under one, it writes one graceful
-//! `StopWorkspaces` for every live workspace without a stop row, then waits, reading the counts
-//! once a second, until every waited workspace has no running run, or `htui stop`'s 20 s wait
-//! has passed, and leaves. `Enter` leaves at once and `Esc` stays in every stage; written stops
-//! stand. Leaving still runs `RunRuntime::shutdown` (MOD-125 Q5), whose walks are by then
-//! stopped.
+//! Offline (`TopBarState::offline`) the counts held are the last ones read (R1 F2): no other
+//! workspace gets a row (one folded line says work may be running there) and `S` is not offered.
+//!
+//! `S` (`leave.stop`) stops them gracefully first: offered when the counts are known and current
+//! and some workspace has a live run and no stop row, or a running run under one, it writes one
+//! graceful `StopWorkspaces` for every live workspace without a stop row, then waits, reading the
+//! counts once a second, until every waited workspace has no running run, or `htui stop`'s 20 s
+//! wait has passed since `S` (wall time, the write's own wait included, R1 F7), and leaves. A
+//! target whose stop row changed meanwhile is waited for (R1 F3); one whose write failed is named
+//! and not (R1 F1), and when no target was written and nothing else is waited for, `S` is offered
+//! again. `Enter` leaves at once and `Esc` stays in every stage; written stops stand. Leaving
+//! still runs `RunRuntime::shutdown` (MOD-125 Q5), whose walks are by then stopped.
 //!
 //! Every answer resolves through [`Keys`] on [`views::LEAVE`], and the chips name the chords in
 //! force. Shaped like the quit question it replaced: a centred, modal box sized to its text.
@@ -37,10 +42,11 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use tokio::time::Instant;
 
 use crate::app::{Action, Ctx, Handled, OverlayAction};
 use crate::keys::{Act, KeyChord, Stack, views};
-use crate::stop_report::{STOP_POLL, STOP_WAIT, StopTarget, StopWrite};
+use crate::stop_report::{STOP_WAIT, StopTarget, StopWrite};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::chips::chip_line;
 use crate::ui::kit::modal::{Modal, ModalSize};
@@ -89,9 +95,8 @@ const STAY_STANDS_WORD: &str = "stay (the stops stand)";
 /// The `S` line's second half (D9); its first names the chord and the wait.
 const STOP_THEN: &str = "then leaves; each resumes later.";
 
-/// How many refreshes (one a second) `S` waits for the stops to settle before it leaves anyway:
-/// `htui stop`'s own wait (D9).
-const SETTLE_TICKS: u64 = STOP_WAIT.as_secs() / STOP_POLL.as_secs();
+/// Offline, in place of the other workspaces' rows (R1 F2): their counts are not current.
+const OTHERS_UNKNOWN: &str = "work may be running in other workspaces";
 
 /// Asks before `global.quit` closes htui, naming what stops with it.
 #[derive(Debug, Default)]
@@ -112,6 +117,8 @@ enum Stage {
     Writing {
         /// The workspaces the dialog waits for once the stops are written.
         waited: Vec<WorkspaceId>,
+        /// When `S` was answered: the bound runs from here (R1 F7).
+        began: Instant,
     },
     /// D9: waiting for `waited` to settle.
     Settling {
@@ -119,12 +126,14 @@ enum Stage {
         waited: Vec<WorkspaceId>,
         /// Targets whose stop row changed while asking, left as they are.
         changed: usize,
-        /// Refreshes so far.
-        ticks: u64,
+        /// R1 F1: targets whose write failed, each with its refusal; not waited for.
+        failed: Vec<(WorkspaceId, String)>,
+        /// When `S` was answered: the dialog leaves once `STOP_WAIT` has passed since (R1 F7).
+        began: Instant,
         /// The waited rows' running runs, as last read.
         running: u32,
     },
-    /// The write was refused; `S` is offered again.
+    /// The write was refused (the sentence to show); `S` is offered again.
     Refused(String),
 }
 
@@ -144,14 +153,30 @@ impl LeaveDialog {
         match &self.stage {
             Stage::Asking => self.question(ctx, None),
             Stage::Refused(message) => self.question(ctx, Some(message)),
-            Stage::Writing { waited } => Self::settling_lines(ctx, waited.len(), None, 0),
+            Stage::Writing { waited, .. } => self.settling_lines(ctx, waited.len(), None, 0, &[]),
             Stage::Settling {
                 waited,
                 changed,
-                ticks,
+                failed,
+                began,
                 running,
-            } => Self::settling_lines(ctx, waited.len(), Some((*running, *ticks)), *changed),
+            } => self.settling_lines(
+                ctx,
+                waited.len(),
+                Some((*running, seconds_left(*began))),
+                *changed,
+                failed,
+            ),
         }
+    }
+
+    /// `workspace`'s name from the `Workspaces` reply, `a workspace` before it lands.
+    fn name_of(&self, workspace: WorkspaceId) -> String {
+        self.names
+            .iter()
+            .flatten()
+            .find(|summary| summary.workspace_id == workspace)
+            .map_or_else(|| "a workspace".to_owned(), |summary| summary.name.clone())
     }
 
     /// The question: the sentence, the live rows when something is live, the `S` line when it is
@@ -199,12 +224,9 @@ impl LeaveDialog {
             ));
             lines.push(Line::styled(format!("{LEAD}{STOP_THEN}"), theme.base));
         }
-        if let Some(message) = refused {
+        if let Some(sentence) = refused {
             lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                format!("{LEAD}Could not stop: {message}"),
-                theme.error,
-            ));
+            lines.push(Line::styled(format!("{LEAD}{sentence}"), theme.error));
         }
         lines.push(Line::raw(""));
 
@@ -227,13 +249,15 @@ impl LeaveDialog {
     }
 
     /// The settling box (D9): how many workspaces stop, how many runs are still running and the
-    /// seconds left (once the write is answered), the targets left as they were, then the two
-    /// answers that still hold.
+    /// seconds left (once the write is answered), the targets left as they were, each target
+    /// whose write failed (R1 F1), then the two answers that still hold.
     fn settling_lines(
+        &self,
         ctx: &Ctx<'_>,
         stopping: usize,
         running: Option<(u32, u64)>,
         changed: usize,
+        failed: &[(WorkspaceId, String)],
     ) -> Vec<Line<'static>> {
         let theme = ctx.theme;
         let workspaces = plural(stopping, "workspace");
@@ -241,8 +265,7 @@ impl LeaveDialog {
             format!("{LEAD}Stopping {stopping} {workspaces} gracefully, then leaving\u{2026}"),
             theme.base,
         )];
-        if let Some((running, ticks)) = running {
-            let left = SETTLE_TICKS.saturating_sub(ticks);
+        if let Some((running, left)) = running {
             let runs = plural(usize::try_from(running).unwrap_or(usize::MAX), "run");
             lines.push(Line::styled(
                 format!("{LEAD}{ROW}waiting for {running} running {runs} to stop ({left} s left)"),
@@ -253,6 +276,15 @@ impl LeaveDialog {
             lines.push(Line::styled(
                 format!("{LEAD}{ROW}{changed} changed meanwhile, left as they are"),
                 theme.dim,
+            ));
+        }
+        for (workspace, message) in failed {
+            lines.push(Line::styled(
+                format!(
+                    "{LEAD}{ROW}could not stop {}: {message}",
+                    self.name_of(*workspace)
+                ),
+                theme.error,
             ));
         }
         lines.push(Line::raw(""));
@@ -314,7 +346,9 @@ impl LeaveDialog {
     }
 
     /// One row per other workspace in the background or stopping, in the names' order; the ones
-    /// without a name (before the names land, or created since) fold into one row.
+    /// without a name (before the names land, or created since) fold into one row. Offline the
+    /// counts are the last ones read: when they show one, a single line says work may be running
+    /// elsewhere (R1 F2).
     fn other_rows(&self, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
         let open = ctx.scope.workspace_id;
         let mut live: Vec<&WorkspaceRunCounts> = ctx
@@ -330,6 +364,16 @@ impl LeaveDialog {
                 )
             })
             .collect();
+        if ctx.top_bar.offline() {
+            return if live.is_empty() {
+                Vec::new()
+            } else {
+                vec![Line::styled(
+                    format!("{LEAD}{ROW}{OTHERS_UNKNOWN}"),
+                    ctx.theme.base,
+                )]
+            };
+        }
         let mut lines = Vec::new();
         for summary in self.names.iter().flatten() {
             if let Some(at) = live
@@ -413,17 +457,19 @@ impl LeaveDialog {
             })
             .map(|row| row.workspace_id)
             .collect();
+        let began = Instant::now();
         if targets.is_empty() {
             let running = running_of(rows, &waited);
             self.stage = Stage::Settling {
                 waited,
                 changed: 0,
-                ticks: 0,
+                failed: Vec::new(),
+                began,
                 running,
             };
             ctx.request(StoreRequest::WorkspaceRunCounts);
         } else {
-            self.stage = Stage::Writing { waited };
+            self.stage = Stage::Writing { waited, began };
             ctx.request(StoreRequest::StopWorkspaces {
                 mode: StopMode::Graceful,
                 targets,
@@ -432,14 +478,22 @@ impl LeaveDialog {
     }
 }
 
-/// D9: `S` is offered when the counts are known and some workspace (the open one included) has
-/// a live run and no stop row, or a running run under a stop row.
+/// D9: `S` is offered when the counts are known and current (not offline, R1 F2) and some
+/// workspace (the open one included) has a live run and no stop row, or a running run under a
+/// stop row.
 fn offers_stop(ctx: &Ctx<'_>) -> bool {
-    ctx.top_bar.workspace_runs.as_ref().is_some_and(|rows| {
-        rows.iter().any(|row| {
-            (row.live() > 0 && row.stop.is_none()) || (row.stop.is_some() && row.running > 0)
+    !ctx.top_bar.offline()
+        && ctx.top_bar.workspace_runs.as_ref().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                (row.live() > 0 && row.stop.is_none()) || (row.stop.is_some() && row.running > 0)
+            })
         })
-    })
+}
+
+/// The whole seconds left of `STOP_WAIT` since `began`, rounded up: `20` right after `S`.
+fn seconds_left(began: Instant) -> u64 {
+    let left = STOP_WAIT.saturating_sub(began.elapsed());
+    left.as_secs() + u64::from(left.subsec_nanos() > 0)
 }
 
 /// The running runs of the `waited` rows still under a stop (a row resumed meanwhile, or gone,
@@ -516,16 +570,36 @@ impl Overlay for LeaveDialog {
         match reply {
             StoreReply::Workspaces(list) => self.names = Some(list.clone()),
             StoreReply::StopsWritten { outcomes, .. } => {
-                let Stage::Writing { waited } = &mut self.stage else {
+                let Stage::Writing { waited, began } = &mut self.stage else {
                     return;
                 };
+                let began = *began;
                 let mut waited = std::mem::take(waited);
-                let changed: Vec<WorkspaceId> = outcomes
+                // R1 F3: a changed target has a stop row now (`decided_on` was none): it is
+                // said and waited for like the written ones.
+                let changed = outcomes
                     .iter()
                     .filter(|(_, outcome)| *outcome == StopWrite::Changed)
-                    .map(|(workspace, _)| *workspace)
+                    .count();
+                // R1 F1: a failed one is named and not waited for.
+                let failed: Vec<(WorkspaceId, String)> = outcomes
+                    .iter()
+                    .filter_map(|(workspace, outcome)| match outcome {
+                        StopWrite::Failed(message) => Some((*workspace, message.clone())),
+                        _ => None,
+                    })
                     .collect();
-                waited.retain(|workspace| !changed.contains(workspace));
+                waited.retain(|workspace| failed.iter().all(|(gone, _)| gone != workspace));
+                if waited.is_empty() && !failed.is_empty() {
+                    let sentences: Vec<String> = failed
+                        .iter()
+                        .map(|(workspace, message)| {
+                            format!("Could not stop {}: {message}", self.name_of(*workspace))
+                        })
+                        .collect();
+                    self.stage = Stage::Refused(sentences.join("; "));
+                    return;
+                }
                 let rows = ctx.top_bar.workspace_runs.as_deref().unwrap_or_default();
                 // Before the read below lands, the rows the dialog was asked over.
                 let running = rows
@@ -535,8 +609,9 @@ impl Overlay for LeaveDialog {
                     .sum();
                 self.stage = Stage::Settling {
                     waited,
-                    changed: changed.len(),
-                    ticks: 0,
+                    changed,
+                    failed,
+                    began,
                     running,
                 };
                 ctx.request(StoreRequest::WorkspaceRunCounts);
@@ -550,7 +625,7 @@ impl Overlay for LeaveDialog {
                     .name()
                     && matches!(self.stage, Stage::Writing { .. }) =>
             {
-                self.stage = Stage::Refused(message.clone());
+                self.stage = Stage::Refused(format!("Could not stop: {message}"));
             }
             StoreReply::WorkspaceRunCounts(rows) => {
                 let Stage::Settling {
@@ -573,15 +648,16 @@ impl Overlay for LeaveDialog {
         }
     }
 
-    /// While settling: one more second waited, then leave at the bound or read the counts again.
+    /// While writing or settling: leave once `STOP_WAIT` has passed since `S` (wall time, so a
+    /// refresh that did not come does not stretch it, R1 F7); otherwise, settling, read the
+    /// counts again.
     fn refresh(&mut self, ctx: &mut Ctx<'_>) {
-        let Stage::Settling { ticks, .. } = &mut self.stage else {
+        let (Stage::Writing { began, .. } | Stage::Settling { began, .. }) = &self.stage else {
             return;
         };
-        *ticks += 1;
-        if *ticks >= SETTLE_TICKS {
+        if began.elapsed() >= STOP_WAIT {
             ctx.emit(Action::Quit);
-        } else {
+        } else if matches!(self.stage, Stage::Settling { .. }) {
             ctx.request(StoreRequest::WorkspaceRunCounts);
         }
     }
@@ -604,7 +680,7 @@ mod tests {
     use super::*;
     use crate::app::{Emit, TopBarState};
     use crate::keys::{Keys, load_str};
-    use crate::stop_report::StopWrite;
+    use crate::stop_report::{STOP_POLL, StopWrite};
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
@@ -714,6 +790,12 @@ mod tests {
         fn key(&self, dialog: &mut LeaveDialog, spec: &str) -> Handled {
             let chord = KeyChord::parse_strict(spec).expect("a valid spec");
             dialog.on_key(chord.to_event(), &mut self.ctx())
+        }
+
+        /// The store label reads offline: the counts held are the last ones read.
+        fn offline(mut self) -> Self {
+            self.top_bar.store = "offline \u{b7} 0s".to_owned();
+            self
         }
 
         /// Every workspace's counts row (`TopBarState::workspace_runs`).
@@ -1242,8 +1324,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn with_nothing_to_write_s_goes_straight_to_settling() {
+    #[tokio::test(start_paused = true)]
+    async fn with_nothing_to_write_s_goes_straight_to_settling() {
         let world = World::new();
         let bench = Bench::new().runs(vec![
             counts(world.open, (0, 0, 0), None),
@@ -1263,8 +1345,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn settling_leaves_once_every_waited_workspace_has_no_running_run() {
+    #[tokio::test(start_paused = true)]
+    async fn settling_leaves_once_every_waited_workspace_has_no_running_run() {
         let world = World::new();
         let bench = world.bench();
         let mut dialog = settling(
@@ -1318,36 +1400,99 @@ mod tests {
         );
     }
 
-    #[test]
-    fn settling_gives_up_after_the_bound() {
+    /// R1 F7: the bound is `STOP_WAIT` of wall time from `S`, read on each refresh: one a
+    /// second reads the counts again until it has passed, then leaves.
+    #[tokio::test(start_paused = true)]
+    async fn settling_gives_up_after_the_bound() {
         let world = World::new();
         let bench = world.bench();
         let mut dialog = settling(&world, &bench, vec![(world.platform, StopWrite::Written)]);
         let _ = bench.emit.take();
-        assert_eq!(SETTLE_TICKS, 20);
-        for tick in 1..=SETTLE_TICKS {
+        assert_eq!(STOP_WAIT.as_secs(), 20);
+        for second in 1..=STOP_WAIT.as_secs() {
+            tokio::time::advance(STOP_POLL).await;
             bench.refresh(&mut dialog);
             let emitted = bench.emit.take();
-            if tick < SETTLE_TICKS {
+            if second < STOP_WAIT.as_secs() {
                 assert!(
                     matches!(only_request(&emitted), StoreRequest::WorkspaceRunCounts),
-                    "refresh {tick} reads again: {emitted:?}"
+                    "second {second} reads again: {emitted:?}"
                 );
             } else {
                 assert!(
                     matches!(emitted.as_slice(), [Action::Quit]),
-                    "refresh {tick} gives up and leaves: {emitted:?}"
+                    "second {second} gives up and leaves: {emitted:?}"
                 );
             }
-            if tick == 5 {
+            if second == 5 {
                 let frame = bench.render_of(&dialog);
                 assert!(frame.contains("(15 s left)"), "{frame}");
             }
         }
     }
 
+    /// R1 F7: refreshes that did not come (an overlay on top is not refreshed) do not stretch the
+    /// wait: the first refresh past the bound leaves.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_refresh_past_the_bound_leaves_at_once() {
+        let world = World::new();
+        let bench = world.bench();
+        let mut dialog = settling(&world, &bench, vec![(world.platform, StopWrite::Written)]);
+        let _ = bench.emit.take();
+        tokio::time::advance(STOP_WAIT + STOP_POLL).await;
+        bench.refresh(&mut dialog);
+        assert!(
+            matches!(bench.emit.take().as_slice(), [Action::Quit]),
+            "one refresh, after the bound"
+        );
+    }
+
+    /// R1 F7: a write that is never answered is bound too, from `S`; until then a refresh reads
+    /// nothing (there is nothing to wait for yet).
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_write_leaves_after_the_bound() {
+        let world = World::new();
+        let bench = world.bench();
+        let mut dialog = LeaveDialog::new();
+        assert_eq!(bench.key(&mut dialog, "S"), Handled::Consumed);
+        let _ = bench.emit.take();
+        tokio::time::advance(STOP_WAIT - STOP_POLL).await;
+        bench.refresh(&mut dialog);
+        assert!(bench.emit.is_empty(), "still writing, within the bound");
+        tokio::time::advance(STOP_POLL).await;
+        bench.refresh(&mut dialog);
+        assert!(
+            matches!(bench.emit.take().as_slice(), [Action::Quit]),
+            "the bound has passed"
+        );
+    }
+
+    /// R1 F7: the write's answer keeps the bound `S` started: what passed while writing counts.
+    #[tokio::test(start_paused = true)]
+    async fn the_time_spent_writing_counts_into_the_bound() {
+        let world = World::new();
+        let bench = world.bench();
+        let mut dialog = LeaveDialog::new();
+        bench.reply(&mut dialog, StoreReply::Workspaces(world.names()));
+        assert_eq!(bench.key(&mut dialog, "S"), Handled::Consumed);
+        let _ = bench.emit.take();
+        tokio::time::advance(STOP_POLL * 5).await;
+        bench.reply(
+            &mut dialog,
+            StoreReply::StopsWritten {
+                mode: StopMode::Graceful,
+                outcomes: vec![(world.platform, StopWrite::Written)],
+            },
+        );
+        let _ = bench.emit.take();
+        let frame = bench.render_of(&dialog);
+        assert!(frame.contains("(15 s left)"), "{frame}");
+    }
+
+    /// R1 F3: a target decided on no stop row that comes back `Changed` has a stop row now
+    /// (someone else stopped it meanwhile): it is said, left as it is, and waited for.
     #[test]
-    fn a_changed_target_is_left_as_it_is_and_said() {
+    fn a_changed_target_is_left_as_it_is_said_and_waited_for() {
         let world = World::new();
         let bench = world.bench();
         let mut dialog = settling(
@@ -1365,10 +1510,10 @@ mod tests {
             "{frame}"
         );
         assert!(
-            frame.contains("Stopping 2 workspaces gracefully, then leaving…"),
-            "Graphics and Ops: {frame}"
+            frame.contains("Stopping 3 workspaces gracefully, then leaving\u{2026}"),
+            "Graphics, Platform and Ops: {frame}"
         );
-        // Platform still runs under someone else's stop; it is not waited for.
+        // Platform still runs under someone else's stop: it is waited for.
         bench.reply(
             &mut dialog,
             StoreReply::WorkspaceRunCounts(vec![
@@ -1377,7 +1522,139 @@ mod tests {
                 counts(world.ops, (0, 0, 0), Some(StopMode::Graceful)),
             ]),
         );
+        assert!(bench.emit.is_empty(), "Platform still runs");
+        bench.reply(
+            &mut dialog,
+            StoreReply::WorkspaceRunCounts(vec![
+                counts(world.open, (0, 0, 0), Some(StopMode::Graceful)),
+                counts(world.platform, (0, 0, 0), Some(StopMode::Forced)),
+                counts(world.ops, (0, 0, 0), Some(StopMode::Graceful)),
+            ]),
+        );
         assert!(matches!(bench.emit.take().as_slice(), [Action::Quit]));
+    }
+
+    /// R1 F1: a target whose write failed is named with its refusal and not waited for; the
+    /// written ones are.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_target_is_named_and_the_written_ones_are_waited_for() {
+        let world = World::new();
+        let bench = world.bench();
+        let mut dialog = settling(
+            &world,
+            &bench,
+            vec![
+                (world.open, StopWrite::Written),
+                (
+                    world.platform,
+                    StopWrite::Failed("workspace not found".to_owned()),
+                ),
+            ],
+        );
+        let emitted = bench.emit.take();
+        assert!(
+            matches!(only_request(&emitted), StoreRequest::WorkspaceRunCounts),
+            "{emitted:?}"
+        );
+        let frame = bench.render_of(&dialog);
+        assert!(
+            frame.contains("could not stop Platform: workspace not found"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("Stopping 2 workspaces gracefully, then leaving\u{2026}"),
+            "Graphics and Ops: {frame}"
+        );
+        insta::assert_snapshot!("the_box_settling_with_a_failed_target", frame);
+        // Graphics still runs under its stop; Platform, not stopped, still runs too.
+        bench.reply(
+            &mut dialog,
+            StoreReply::WorkspaceRunCounts(vec![
+                counts(world.open, (0, 1, 0), Some(StopMode::Graceful)),
+                counts(world.platform, (0, 1, 0), None),
+                counts(world.ops, (0, 0, 0), Some(StopMode::Graceful)),
+            ]),
+        );
+        assert!(bench.emit.is_empty(), "Graphics still runs");
+        bench.reply(
+            &mut dialog,
+            StoreReply::WorkspaceRunCounts(vec![
+                counts(world.open, (0, 0, 0), Some(StopMode::Graceful)),
+                counts(world.platform, (0, 1, 0), None),
+                counts(world.ops, (0, 0, 0), Some(StopMode::Graceful)),
+            ]),
+        );
+        assert!(
+            matches!(bench.emit.take().as_slice(), [Action::Quit]),
+            "every written stop has settled"
+        );
+    }
+
+    /// R1 F1: when every target failed and nothing else is waited for, the dialog says so and
+    /// offers `S` again.
+    #[test]
+    fn when_every_target_failed_the_dialog_asks_again() {
+        let world = World::new();
+        let bench = Bench::new().runs(vec![
+            counts(world.open, (0, 0, 0), None),
+            counts(world.platform, (0, 1, 0), None),
+        ]);
+        let mut dialog = LeaveDialog::new();
+        bench.reply(&mut dialog, StoreReply::Workspaces(world.names()));
+        assert_eq!(bench.key(&mut dialog, "S"), Handled::Consumed);
+        let _ = bench.emit.take();
+        bench.reply(
+            &mut dialog,
+            StoreReply::StopsWritten {
+                mode: StopMode::Graceful,
+                outcomes: vec![(world.platform, StopWrite::Failed("no".to_owned()))],
+            },
+        );
+        assert!(bench.emit.is_empty(), "{:?}", bench.emit.take());
+        let frame = bench.render_of(&dialog);
+        assert!(frame.contains("Could not stop Platform: no"), "{frame}");
+        assert!(frame.contains("S  stop first"), "{frame}");
+    }
+
+    /// R1 F2: offline the counts held are the last ones read: no other workspace's row (one
+    /// folded line says work may be running there) and no `S`; back online both return.
+    #[test]
+    fn offline_no_other_workspace_row_and_no_stop_first() {
+        let world = World::new();
+        let mut dialog = LeaveDialog::new();
+        let bench = world.bench().offline();
+        bench.reply(&mut dialog, StoreReply::Workspaces(world.names()));
+        let frame = bench.render_of(&dialog);
+        assert!(!frame.contains("Platform"), "{frame}");
+        assert!(!frame.contains("Ops"), "{frame}");
+        assert!(
+            frame.contains("work may be running in other workspaces"),
+            "{frame}"
+        );
+        assert!(!frame.contains("stop first"), "{frame}");
+        assert_eq!(bench.key(&mut dialog, "S"), Handled::Pass);
+        assert!(bench.emit.is_empty());
+
+        let online = world.bench();
+        let frame = online.render_of(&dialog);
+        assert!(frame.contains("Platform"), "{frame}");
+        assert!(frame.contains("S  stop first"), "{frame}");
+        assert!(
+            !frame.contains("work may be running in other workspaces"),
+            "{frame}"
+        );
+    }
+
+    /// R1 F2: offline with no other workspace live in the last counts, no folded line either.
+    #[test]
+    fn offline_with_nothing_live_elsewhere_there_is_no_folded_line() {
+        let world = World::new();
+        let bench = Bench::new()
+            .runs(vec![counts(world.open, (0, 0, 0), None)])
+            .offline();
+        let frame = bench.render();
+        assert!(frame.contains(NOTHING), "{frame}");
+        assert!(!frame.contains("other workspaces"), "{frame}");
     }
 
     #[test]

@@ -585,7 +585,8 @@ impl App {
     }
 
     /// Whether the tab a refused `request` was issued from draws it itself
-    /// ([`Tab::absorbs_failure`]). The shell's and an overlay's refusals are always the line's.
+    /// ([`Tab::absorbs_failure`]). The shell's and an overlay's refusals are the line's, but for
+    /// the polls below.
     ///
     /// One shell request is not the line's either: the launch's old-URL check (MOD-158 R1, C-L7),
     /// which the user never asked for. Its refusal is logged at `debug` instead.
@@ -608,6 +609,14 @@ impl App {
                 if request == StoreRequest::Activity { after: None }.name()
                     || request == StoreRequest::SweepRetention.name()
                     || request == StoreRequest::WorkspaceRunCounts.name() =>
+            {
+                true
+            }
+            // MOD-116 M2 R1 F8: so does the leave dialog's own counts read while its stops
+            // settle, once a second; it keeps the last rows and its bound still runs.
+            Origin::Overlay(id)
+                if *id == crate::ui::overlay::LeaveDialog::ID
+                    && request == StoreRequest::WorkspaceRunCounts.name() =>
             {
                 true
             }
