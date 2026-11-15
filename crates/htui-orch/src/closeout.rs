@@ -7,9 +7,9 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    DocumentHead, DocumentId, Integration, IntegrationState, Item, ItemId, LinkGraph, LinkKind,
-    NewDocument, Repo, RepoId, Resolution, RunId, RunStepCommit, RunSummary, Status, StepId,
-    UserId,
+    DocumentHead, DocumentId, IntegrateMode, Integration, IntegrationState, Item, ItemId,
+    LinkGraph, LinkKind, NewDocument, Repo, RepoId, Resolution, RunId, RunStepCommit, RunSummary,
+    Status, StepId, UserId, run_branch_name,
 };
 
 use crate::infer::redact_remote;
@@ -125,7 +125,9 @@ fn label(item: &Item, links: &LinkGraph, id: ItemId) -> String {
 /// mode, the remote (without userinfo) and target, and the outcome (`landed <short hash>`,
 /// `refused: <reason>`, `pending`, or a PR state's wire name). Rows follow the run lines' order,
 /// then the repo name. No record writes no section, so the body is byte-identical to a `local`
-/// item's.
+/// item's. MOD-133 M3 D6: a `pull_request` record keeps `{remote} {target}` (the pull request's
+/// base) as its target, and one `pending` with a `landed_hash` reads `` pushed `htui/item/<key>` at
+/// <short>; pull request not opened (MOD-134) ``.
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
@@ -169,7 +171,7 @@ pub fn summary(
         }
         body.push('\n');
     }
-    integration_section(&mut body, &oldest_first, repos, integrations);
+    integration_section(&mut body, &oldest_first, repos, integrations, &item.key);
     NewDocument {
         id,
         item_id: item.id,
@@ -183,11 +185,15 @@ pub fn summary(
 }
 
 /// MOD-133 D11: the `## Integration` table, appended to `body` when `integrations` is not empty.
+///
+/// MOD-133 M3 D6: `item_key` names a `pull_request` record's run branch
+/// ([`run_branch_name`]) once it is pushed: `pending` with a `landed_hash`.
 fn integration_section(
     body: &mut String,
     oldest_first: &[&RunSummary],
     repos: &[Repo],
     integrations: &[Integration],
+    item_key: &str,
 ) {
     if integrations.is_empty() {
         return;
@@ -213,15 +219,20 @@ fn integration_section(
         "\n## Integration\n\n| repo | run | mode | target | outcome |\n|---|---|---|---|---|\n",
     );
     for (_, repo, _, record) in rows {
-        let outcome = match record.state {
-            IntegrationState::Landed => format!(
+        let outcome = match (record.state, record.mode, record.landed_hash.as_deref()) {
+            (IntegrationState::Pending, IntegrateMode::PullRequest, Some(hash)) => format!(
+                "pushed `{}` at {}; pull request not opened (MOD-134)",
+                run_branch_name(item_key).unwrap_or_else(|_| format!("htui/item/{item_key}")),
+                short_hash(hash)
+            ),
+            (IntegrationState::Landed, ..) => format!(
                 "landed {}",
                 record.landed_hash.as_deref().map_or("?", short_hash)
             ),
-            IntegrationState::Refused => {
+            (IntegrationState::Refused, ..) => {
                 format!("refused: {}", record.refusal.as_deref().unwrap_or_default())
             }
-            other => other.as_str().to_owned(),
+            (other, ..) => other.as_str().to_owned(),
         };
         body.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
@@ -325,8 +336,8 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
     use htui_core::model::{
-        BoxId, IntegrateMode, IntegrationState, ItemKindId, LinkEdge, LinkNode, ProjectId, RunKind,
-        RunMode, RunStatus, RunStepSummary, StepStatus,
+        BoxId, IntegrationState, ItemKindId, LinkEdge, LinkNode, ProjectId, RunKind, RunMode,
+        RunStatus, RunStepSummary, StepStatus,
     };
     use uuid::Uuid;
 
@@ -604,6 +615,90 @@ mod tests {
                  - graph run {}: done, finished 2026-09-02 12:00 UTC\n",
                 run_id(1)
             )
+        );
+    }
+
+    /// MOD-133 M3 D6: a `pull_request` row keeps the PR base in its target cell and reads its
+    /// pushed run branch while it waits for MOD-134; one not pushed yet reads `pending`.
+    #[test]
+    fn a_pull_request_row_reads_its_pushed_branch() {
+        let runs = [run(
+            1,
+            at(2, 10),
+            RunStatus::Done,
+            Some(at(2, 12)),
+            vec![step(1, 1, 1, 0, "implement")],
+        )];
+        let commits = [(step_id(1), vec![commit(1, 1, "0a1b2c3", Some("9f8e7d6"))])];
+        let repos = [repo(1, "htui"), repo(2, "docs")];
+        let pushed = Integration {
+            mode: IntegrateMode::PullRequest,
+            landed_hash: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            ..record(1, 1, IntegrationState::Pending)
+        };
+        let waiting = Integration {
+            mode: IntegrateMode::PullRequest,
+            ..record(1, 2, IntegrationState::Pending)
+        };
+
+        let doc = write_with(&runs, &commits, &repos, &[pushed, waiting]);
+
+        assert_eq!(
+            table_rows(doc.body.split("## Integration").nth(1).unwrap_or_default()),
+            [
+                format!(
+                    "| docs | {} | pull_request | https://forge.example/o/htui.git main | pending |",
+                    run_id(1)
+                ),
+                format!(
+                    "| htui | {} | pull_request | https://forge.example/o/htui.git main | pushed \
+                     `htui/item/FEAT-1` at fedcba9; pull request not opened (MOD-134) |",
+                    run_id(1)
+                ),
+            ]
+        );
+    }
+
+    /// MOD-133 M3 D6: `push` and `local` rows keep their bytes; a `landed_hash` on a `pending`
+    /// row of either mode is not read as a pushed run branch.
+    #[test]
+    fn push_and_local_rows_keep_their_bytes() {
+        let runs = [run(
+            1,
+            at(2, 10),
+            RunStatus::Done,
+            Some(at(2, 12)),
+            vec![step(1, 1, 1, 0, "implement")],
+        )];
+        let repos = [repo(1, "htui"), repo(2, "docs"), repo(3, "web")];
+        let pending_push = Integration {
+            landed_hash: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            ..record(1, 1, IntegrationState::Pending)
+        };
+        let local = Integration {
+            mode: IntegrateMode::Local,
+            ..record(1, 2, IntegrationState::Landed)
+        };
+        let landed_push = record(1, 3, IntegrationState::Landed);
+
+        let doc = write_with(&runs, &[], &repos, &[pending_push, local, landed_push]);
+
+        assert_eq!(
+            table_rows(doc.body.split("## Integration").nth(1).unwrap_or_default()),
+            [
+                format!(
+                    "| docs | {} | local | https://forge.example/o/htui.git main | landed 0123456 |",
+                    run_id(1)
+                ),
+                format!(
+                    "| htui | {} | push | https://forge.example/o/htui.git main | pending |",
+                    run_id(1)
+                ),
+                format!(
+                    "| web | {} | push | https://forge.example/o/htui.git main | landed 0123456 |",
+                    run_id(1)
+                ),
+            ]
         );
     }
 
