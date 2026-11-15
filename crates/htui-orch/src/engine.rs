@@ -36,13 +36,13 @@ use htui_core::model::{
     AgentId, BatchId, BoundSkill, BoxId, BoxProfile, BranchFacts, Claim, CommandRunId,
     CommandRunStatus, Document, DocumentId, EdgeKind, EventKind, FOLLOW_UP_RUN_CANCELLED,
     FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, IfPredicate, Integration, Isolation,
-    Item, ItemId, LandOutcome, NewCommandRun, NewNote, NewRun, NewRunPlan, NewRunStep, NodeRole,
-    NoteId, PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, Project, ProjectId, ProjectSettings,
-    PromptScope, RelaySessionId, Repo, RepoId, Resolution, ResolveScope, Run, RunId, RunPlanId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate,
-    SnapshotEdge, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId,
-    StepOpening, StepOutcome, StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
-    VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
+    Item, ItemId, ItemKindId, LandOutcome, NewCommandRun, NewNote, NewRun, NewRunPlan, NewRunStep,
+    NodeRole, NoteId, PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, Project, ProjectId,
+    ProjectSettings, PromptScope, RelaySessionId, Repo, RepoId, Resolution, ResolveScope, Run,
+    RunId, RunPlanId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent,
+    SnapshotCandidate, SnapshotEdge, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status,
+    StepFiles, StepId, StepOpening, StepOutcome, StepRole, StepStatus, TIMESTAMPTZ_DIGITS,
+    Transport, UserId, VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -8900,7 +8900,16 @@ where
 
         let kind = self.item_kind_name(&row).await?;
         let skills = self
-            .phase_skills(project.id, snapshot, phase, &mut notes)
+            .phase_skills(
+                SkillReach {
+                    workspace: run.workspace_id,
+                    project: project.id,
+                    item_kind: row.kind_id,
+                },
+                snapshot,
+                phase,
+                &mut notes,
+            )
             .await?;
         let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&self.parts.app);
         let spec = |reverse: bool| PromptSpec {
@@ -9849,14 +9858,24 @@ where
             .upstream_summaries(
                 item,
                 settings::resolve_hops(Some(&project.settings), &self.parts.app, &mut notes),
-                // The engine is headless (`R-NF-3`) and holds no workspace, so the walk is bounded
-                // by the item's own project — `PromptScope`'s own no-workspace case.
+                // The engine is headless (`R-NF-3`) and holds no UI scope, so the upstream walk is
+                // bounded by the item's own project — `PromptScope`'s own no-workspace case. Skill
+                // resolution below does read the run's workspace (MOD-127 D5).
                 &PromptScope::project_only(project.id),
             )
             .await?;
         let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&self.parts.app);
         let skills = self
-            .phase_skills(project.id, snapshot, phase, &mut notes)
+            .phase_skills(
+                SkillReach {
+                    workspace: run.workspace_id,
+                    project: project.id,
+                    item_kind: row.kind_id,
+                },
+                snapshot,
+                phase,
+                &mut notes,
+            )
             .await?;
 
         let role = TemplateRole::of_name(&template.name);
@@ -9947,7 +9966,7 @@ where
     /// (plan R-15). An override graph's phases carry their own copies (MOD-9 D80).
     async fn phase_skills(
         &self,
-        project: ProjectId,
+        reach: SkillReach,
         snapshot: &GraphSnapshot,
         phase: &SnapshotPhase,
         notes: &mut Vec<String>,
@@ -9971,7 +9990,12 @@ where
         let skills = self
             .parts
             .graphs
-            .bound_skills(ResolveScope::project(project, phase_id))
+            .bound_skills(ResolveScope {
+                workspace: reach.workspace,
+                project: reach.project,
+                item_kind: Some(reach.item_kind),
+                phase: phase_id,
+            })
             .await?;
         Ok(skills)
     }
@@ -11191,6 +11215,19 @@ where
     fn project_settings(project: &Project) -> ProjectSettings {
         serde_json::from_value(project.settings.clone()).unwrap_or_default()
     }
+}
+
+/// The levels above a phase that decide which skill attachments reach a step (MOD-127 D5): the
+/// run's workspace (`None` for a chat run or a project in none or several workspaces), the
+/// project, and the item's kind.
+#[derive(Debug, Clone, Copy)]
+struct SkillReach {
+    /// `Run.workspace_id`.
+    workspace: Option<WorkspaceId>,
+    /// The item's project.
+    project: ProjectId,
+    /// The item's `kind_id`.
+    item_kind: ItemKindId,
 }
 
 /// What close-out reads (MOD-4 plan D167), once, for the preview and the command alike.
@@ -23753,6 +23790,177 @@ mod tests {
                 .contains("<skill name=\"docs-style\" version=\"1\">"),
             "and renders it: {}",
             other.text
+        );
+    }
+
+    /// Create a skill named `name` and attach it `always` at `key` (MOD-127 M1 T3).
+    async fn attach_always(
+        harness: &Harness,
+        name: &str,
+        key: impl FnOnce(htui_core::model::SkillId) -> htui_core::model::SkillBindingKey,
+    ) {
+        use htui_core::model::{Activation, Attachment, BindingChange, NewSkill, SkillId};
+        use htui_core::store::CasOutcome;
+
+        let store = &harness.orch.store;
+        let (skill, _) = store
+            .create_skill(NewSkill {
+                id: SkillId::new(),
+                name: name.to_owned(),
+                description: String::new(),
+                body: format!("{name} body."),
+                source: serde_json::json!({}),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("a new skill");
+        let outcome = store
+            .set_skill_binding(
+                key(skill.id),
+                None,
+                BindingChange::Attach(Attachment {
+                    pinned_version: None,
+                    position: 0,
+                    activation: Activation::Always,
+                    globs: Vec::new(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("the attach is legal");
+        assert!(
+            matches!(outcome, CasOutcome::Applied(Some(_))),
+            "{outcome:?}"
+        );
+    }
+
+    /// The `(name, level)` of `item`'s `implement` candidates for `run`, through `phase_spec`.
+    async fn implement_skill_levels(
+        harness: &Harness,
+        run: &htui_core::model::Run,
+        snapshot: &GraphSnapshot,
+        prd: &htui_core::model::RunStep,
+        item: htui_core::model::ItemId,
+    ) -> Vec<(String, htui_core::model::SkillLevel)> {
+        harness_engine!(harness.orch, engine);
+        let implement = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        let spec = engine
+            .phase_spec(run, snapshot, prd, implement, item, false, false)
+            .await
+            .expect("the spec is built")
+            .expect("not strict: no input is refused");
+        spec.skills
+            .iter()
+            .map(|skill| (skill.name.clone(), skill.level))
+            .collect()
+    }
+
+    /// MOD-127 D5: a workspace attachment reaches a run that holds a workspace, at the workspace
+    /// level, and the judge of that run's phase reads the same candidates.
+    #[tokio::test]
+    async fn a_workspace_attachment_reaches_a_run_with_a_workspace() {
+        use htui_core::model::SkillBindingKey;
+        use htui_core::model::SkillLevel;
+
+        let harness = Harness::new().await;
+        let (mut row, snapshot, prd) = skills_prologue(&harness).await;
+        attach_always(&harness, "ws-style", |skill| {
+            SkillBindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
+        })
+        .await;
+        row.workspace_id = Some(ids::WORKSPACE_PLATFORM);
+        let item = row.item_id.expect("an item's run");
+
+        let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, item).await;
+        assert!(
+            levels.contains(&("ws-style".to_owned(), SkillLevel::Workspace)),
+            "{levels:?}"
+        );
+
+        harness_engine!(harness.orch, engine);
+        let implement = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        let judge = engine
+            .judge_prompts(&row, &snapshot, implement, 1, &[&prd])
+            .await
+            .expect("the judge's inputs are read")
+            .expect("the judge assembles");
+        assert!(
+            judge
+                .forward
+                .trim
+                .skill_choices
+                .iter()
+                .any(|choice| choice.name == "ws-style"),
+            "the judge resolves the workspace level too: {:?}",
+            judge.forward.trim.skill_choices
+        );
+
+        // Another workspace's attachment does not reach it.
+        attach_always(&harness, "other-ws-style", |skill| {
+            SkillBindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
+        })
+        .await;
+        let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, item).await;
+        assert!(
+            !levels.iter().any(|(name, _)| name == "other-ws-style"),
+            "{levels:?}"
+        );
+    }
+
+    /// MOD-127 D5: a run with no workspace (a chat run, or a project in none or several) gets no
+    /// workspace-level candidate.
+    #[tokio::test]
+    async fn a_chat_run_without_a_workspace_gets_no_workspace_attachment() {
+        use htui_core::model::SkillBindingKey;
+
+        let harness = Harness::new().await;
+        let (mut row, snapshot, prd) = skills_prologue(&harness).await;
+        attach_always(&harness, "ws-style", |skill| {
+            SkillBindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
+        })
+        .await;
+        row.workspace_id = None;
+        let item = row.item_id.expect("an item's run");
+
+        let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, item).await;
+        assert!(
+            !levels.iter().any(|(name, _)| name == "ws-style"),
+            "{levels:?}"
+        );
+    }
+
+    /// MOD-127 D5: an item-kind attachment reaches the items of that kind and no others.
+    #[tokio::test]
+    async fn an_item_kind_attachment_reaches_only_items_of_that_kind() {
+        use htui_core::model::{SkillBindingKey, SkillLevel};
+
+        let harness = Harness::new().await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        attach_always(&harness, "feat-style", |skill| {
+            SkillBindingKey::item_kind(skill, ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT)
+        })
+        .await;
+        let feat = row.item_id.expect("an item's run");
+        assert_eq!(feat, ids::HTUI_FEAT_3);
+
+        let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, feat).await;
+        assert!(
+            levels.contains(&("feat-style".to_owned(), SkillLevel::ItemKind)),
+            "{levels:?}"
+        );
+
+        let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, ids::HTUI_FIX_1).await;
+        assert!(
+            !levels.iter().any(|(name, _)| name == "feat-style"),
+            "a `fix` item is not a `feat` item: {levels:?}"
         );
     }
 

@@ -266,7 +266,14 @@ pub async fn build(
             }
         };
     let skills = backend
-        .bound_skills(ResolveScope::project(row.project_id, phase))
+        .bound_skills(ResolveScope {
+            // MOD-127 D5: the open workspace, as the UI holds it. A project in several workspaces
+            // is previewed under the one open, and a run started from here would carry it.
+            workspace: Some(scope.workspace_id),
+            project: row.project_id,
+            item_kind: Some(row.kind_id),
+            phase,
+        })
         .await?;
     // MOD-163 D18: what a run started now would freeze — the same `select`, over the project's
     // live `Active` entries. Read after the templates, so an offline arm refuses with the prompt

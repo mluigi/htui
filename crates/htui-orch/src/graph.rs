@@ -3482,6 +3482,68 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
     }
 
+    /// MOD-127 M1: the clone copies phase attachments only. A workspace or item-kind attachment
+    /// of the source's project already applies to the clone's items, so a copy would be a second
+    /// row at the same level.
+    #[tokio::test]
+    async fn override_clone_copies_phase_level_attachments_only() {
+        use htui_core::model::{Activation, Attachment, BindingChange, SkillBindingKey};
+
+        let store = MemStore::demo();
+        let item = feat_1(&store).await;
+        let source = TestSource::claude(&store);
+        for key in [
+            SkillBindingKey::workspace(ids::SKILL_RUST_STYLE, ids::WORKSPACE_PLATFORM),
+            SkillBindingKey::item_kind(
+                ids::SKILL_RUST_STYLE,
+                ids::PROJECT_HTUI,
+                ids::KIND_HTUI_FEAT,
+            ),
+        ] {
+            store
+                .set_skill_binding(
+                    key,
+                    None,
+                    BindingChange::Attach(Attachment {
+                        pinned_version: None,
+                        position: 0,
+                        activation: Activation::Always,
+                        globs: Vec::new(),
+                        languages: Vec::new(),
+                    }),
+                )
+                .await
+                .expect("the attach is legal");
+        }
+        let before = store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+
+        override_graph(&store, &source, &item)
+            .await
+            .expect("the item takes an override");
+
+        let after = store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            after.len(),
+            before + 1,
+            "one phase-level copy and no item-kind or workspace copy: {after:?}"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .filter(|row| row.item_kind_id.is_some())
+                .count(),
+            1,
+            "the item-kind row is not copied"
+        );
+    }
+
     /// ANA-2 §4.1 with MOD-9 D80: the clone is deep over `step_graph_phase` **and** over the
     /// source phases' own attachments, each copied onto its cloned phase, and it is marked
     /// `is_override`. Project and global attachments are not copied: they already apply to the

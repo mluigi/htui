@@ -634,6 +634,105 @@ async fn the_preview_carries_the_phase_skills_of_the_matching_phase() {
     );
 }
 
+/// A new skill named `name`, attached `always` at `key`, in `store`.
+async fn attach_always(
+    store: &MemStore,
+    name: &str,
+    key: impl FnOnce(htui_core::model::SkillId) -> htui_core::model::SkillBindingKey,
+) {
+    use htui_core::model::{Attachment, BindingChange, NewSkill, SkillId};
+    use htui_core::store::CasOutcome;
+
+    let (skill, _) = store
+        .create_skill(NewSkill {
+            id: SkillId::new(),
+            name: name.to_owned(),
+            description: String::new(),
+            body: format!("{name} body."),
+            source: serde_json::json!({}),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("a new skill");
+    let outcome = store
+        .set_skill_binding(
+            key(skill.id),
+            None,
+            BindingChange::Attach(Attachment {
+                pinned_version: None,
+                position: 0,
+                activation: Activation::Always,
+                globs: Vec::new(),
+                languages: Vec::new(),
+            }),
+        )
+        .await
+        .expect("the attach is legal");
+    assert!(
+        matches!(outcome, CasOutcome::Applied(Some(_))),
+        "{outcome:?}"
+    );
+}
+
+/// The `(name, level)` of every recorded choice of `item`'s `implement` preview in `scope`.
+async fn implement_levels(
+    backend: &Backend,
+    item: &str,
+    scope: &Scope,
+) -> Vec<(String, SkillLevel)> {
+    let preview = preview::build(backend, item_id(item).await, Some("implement"), scope)
+        .await
+        .expect("the demo store answers every prompt read");
+    let assembled = preview.outcome.as_ref().expect("the demo item assembles");
+    assembled
+        .trim
+        .skill_choices
+        .iter()
+        .map(|choice| (choice.name.clone(), choice.level))
+        .collect()
+}
+
+#[tokio::test]
+async fn preview_resolves_item_kind_and_workspace_levels() {
+    // MOD-127 D5: the preview resolves with the open workspace and the previewed item's kind, so
+    // it shows what a run started from here would get.
+    let store = MemStore::demo();
+    attach_always(&store, "platform-style", |skill| {
+        htui_core::model::SkillBindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
+    })
+    .await;
+    attach_always(&store, "graphics-style", |skill| {
+        htui_core::model::SkillBindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
+    })
+    .await;
+    attach_always(&store, "feat-style", |skill| {
+        htui_core::model::SkillBindingKey::item_kind(skill, ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT)
+    })
+    .await;
+    let backend = Backend::memory(store);
+    let scope = platform_scope().await;
+
+    let feat = implement_levels(&backend, "FEAT-1", &scope).await;
+    assert!(
+        feat.contains(&("platform-style".to_owned(), SkillLevel::Workspace)),
+        "the open workspace's attachment reaches the preview: {feat:?}"
+    );
+    assert!(
+        feat.contains(&("feat-style".to_owned(), SkillLevel::ItemKind)),
+        "a `feat` item takes the `feat` kind's attachment: {feat:?}"
+    );
+    assert!(
+        !feat.iter().any(|(name, _)| name == "graphics-style"),
+        "another workspace's attachment does not: {feat:?}"
+    );
+
+    let ana = implement_levels(&backend, "ANA-2", &scope).await;
+    assert!(
+        !ana.iter().any(|(name, _)| name == "feat-style"),
+        "an `ana` item does not take it: {ana:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_template_no_phase_uses_is_noted_and_shows_project_skills() {
     // MOD-9 D45's second note: the `feature` graph has no `research` phase, so only global and
