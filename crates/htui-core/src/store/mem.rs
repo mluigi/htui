@@ -1793,6 +1793,20 @@ impl MemStore {
         })
     }
 
+    /// MOD-130 M3 P7: sets `target.probed_at` as no writer does until MOD-44/131 probe a target,
+    /// on this store and every clone of it; `updated_at` does not move. The engine tests that start
+    /// a run on a child-box target make it `ready` through it. Whether the target exists.
+    #[cfg(feature = "test-support")]
+    pub fn set_target_probed(&self, id: TargetId, at: DateTime<Utc>) -> bool {
+        self.write(|state| {
+            state
+                .targets
+                .get_mut(&id)
+                .map(|row| row.probed_at = Some(at))
+                .is_some()
+        })
+    }
+
     /// This handle's "now": its injected clock, else `Utc::now()` untruncated (blueprint B21).
     fn now(&self) -> DateTime<Utc> {
         self.clock.now()
@@ -6866,6 +6880,16 @@ impl State {
                 "box",
             )));
         }
+        // MOD-130 M3 P6: `run.executing_box_id`'s foreign key, right after the target box's.
+        if let Some(driver) = new.executing_box_id
+            && !self.boxes.contains_key(&driver)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "run.executing_box_id",
+                driver,
+                "box",
+            )));
+        }
         // MOD-125 D3: `fk_run_workspace` (M2 D10: in the readable sentence).
         if let Some(workspace) = workspace_id
             && !self.workspaces.contains_key(&workspace)
@@ -6912,7 +6936,7 @@ impl State {
             mode: new.mode,
             status: RunStatus::Queued,
             target_box_id: new.target_box_id,
-            executing_box_id: None,
+            executing_box_id: new.executing_box_id,
             graph_snapshot: Some(snapshot),
             started_by: new.started_by,
             // Postgres keeps `timestamptz` to the microsecond (sqlx truncates toward zero), and
@@ -17839,6 +17863,40 @@ mod tests {
             "only the snapshot moved"
         );
         assert!(!store.set_run_snapshot(RunId::new(), serde_json::json!({})));
+    }
+
+    /// MOD-130 M3 P7's seam: `probed_at` is set on every clone, nothing else on the row moves,
+    /// and an unknown target answers `false`.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn set_target_probed_stamps_probed_at_and_nothing_else() {
+        use crate::model::{NewTarget, Target, TargetId, TargetKind};
+
+        let store = MemStore::demo();
+        let clone = store.clone();
+        let before = store
+            .create_target(NewTarget {
+                id: TargetId::new(),
+                name: "probed docker".to_owned(),
+                kind: TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("creates");
+        assert_eq!(before.probed_at, None, "no writer probes a target yet");
+        let at = before.created_at + TimeDelta::minutes(5);
+        assert!(store.set_target_probed(before.id, at));
+        let after = clone.target(before.id).await.expect("reads");
+        assert_eq!(after.probed_at, Some(at));
+        assert_eq!(
+            Target {
+                probed_at: None,
+                ..after
+            },
+            before,
+            "only probed_at moved"
+        );
+        assert!(!store.set_target_probed(TargetId::new(), at));
     }
 
     /// `create_run` is one transaction (plan D6): the `run` row lands and the item is not written

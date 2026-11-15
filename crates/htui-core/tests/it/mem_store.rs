@@ -62,7 +62,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        346,
+        347,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -127,7 +127,7 @@ async fn demo_store_loads_the_fixture() {
          T2's four for creating, editing and binding targets (P4-P6, P9), and MOD-130 M1 T3's \
          item target spec field (D11), and MOD-130 M1 T4's five for the levels, the Settings \
          default, retire and delete (D3, D5, D11, D14), and MOD-130 M2 T2's three for the run's \
-         recorded target (D7, P7-P9)"
+         recorded target (D7, P7-P9), and MOD-130 M3 T1's driving-box case (D8, P6)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

@@ -7998,7 +7998,7 @@ impl WriteStore for PgStore {
             INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,
                              executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,
                              batch_id, workspace_id, target_id, target_source)
-            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10, $11,
+            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, $14, $6, $7, $8, $9::uuid[], $10, $11,
                     $12, $13)
             RETURNING id               AS "id: RunId",
                       project_id       AS "project_id: ProjectId",
@@ -8035,6 +8035,8 @@ impl WriteStore for PgStore {
             workspace_id.map(WorkspaceId::as_uuid),
             new.target.map(|t| t.target.as_uuid()),
             new.target.map(|t| t.source.as_str()),
+            // MOD-130 M3 P6: the driving box; a phantom one is the column's foreign key.
+            new.executing_box_id.map(BoxId::as_uuid),
         )
         .fetch_one(&mut *tx)
         .await

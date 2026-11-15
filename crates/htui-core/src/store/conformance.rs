@@ -513,6 +513,8 @@ pub const CASES: &[&str] = &[
     "create_run_records_the_target_and_source",
     "create_run_refuses_an_unknown_or_retired_target",
     "delete_target_refuses_a_target_with_runs",
+    // MOD-130 M3 T1: runs name their driver (D8, P6)
+    "create_run_records_the_driving_box",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1635,6 +1637,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "delete_target_refuses_a_target_with_runs" => {
             boxed(delete_target_refuses_a_target_with_runs, store).await;
+        }
+        "create_run_records_the_driving_box" => {
+            boxed(create_run_records_the_driving_box, store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -41301,6 +41306,99 @@ async fn delete_target_refuses_a_target_with_runs<S: WriteStore>(store: &S) {
         store.target(used.id).await.expect(CASE),
         used,
         "{CASE}: the refusal deleted nothing"
+    );
+}
+
+/// MOD-130 M3 T1 (D8, P6): `create_run` records `executing_box_id`, the box that drives a run
+/// whose work runs on another box. A run on a child box of the fixture machine, driven by the
+/// machine, reads back both boxes and its summary names the driver's hostname; `None` reads back
+/// `None`; a driver that names no box is `Constraint` and writes no run.
+async fn create_run_records_the_driving_box<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_run_records_the_driving_box";
+    let machine = fixture_box_row(store, CASE).await;
+    let docker = store
+        .create_target(new_target("driven docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let child = BoxId::new();
+    store
+        .attach_child_box(NewChildBox {
+            id: child,
+            parent: ids::BOX,
+            hostname: "driven-child".to_owned(),
+            target: docker.id,
+        })
+        .await
+        .expect(CASE);
+
+    let driven = store
+        .create_run(NewRun {
+            target_box_id: child,
+            executing_box_id: Some(ids::BOX),
+            target: Some(ResolvedTarget {
+                target: docker.id,
+                source: TargetSource::Item,
+            }),
+            ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+        })
+        .await
+        .expect(CASE);
+    let row = run_row(CASE, store, driven.id).await;
+    assert_eq!(
+        row.target_box_id, child,
+        "{CASE}: the work runs on the child"
+    );
+    assert_eq!(
+        row.executing_box_id,
+        Some(ids::BOX),
+        "{CASE}: the machine drives it"
+    );
+    assert_eq!(row.driver(), ids::BOX, "{CASE}: the driver is the machine");
+    assert_eq!(row.status, RunStatus::Queued, "{CASE}: still queued");
+    let summary = store
+        .runs(ids::HTUI_ANA_2)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|summary| summary.id == driven.id)
+        .unwrap_or_else(|| panic!("{CASE}: the driven run is listed"));
+    assert_eq!(
+        summary.box_hostname, machine.hostname,
+        "{CASE}: the summary names the driving box"
+    );
+
+    let local_item = mint_tagged(CASE, store, "Driven by its target", &[]).await;
+    let local = store
+        .create_run(new_run(ids::PROJECT_HTUI, local_item, Vec::new()))
+        .await
+        .expect(CASE);
+    let row = run_row(CASE, store, local.id).await;
+    assert_eq!(
+        row.executing_box_id, None,
+        "{CASE}: None = the target box drives"
+    );
+    assert_eq!(row.driver(), ids::BOX, "{CASE}");
+
+    let phantom_item = mint_tagged(CASE, store, "Driven by no box", &[]).await;
+    let before = store.runs(phantom_item).await.expect(CASE);
+    let request = NewRun {
+        executing_box_id: Some(BoxId::new()),
+        ..new_run(ids::PROJECT_HTUI, phantom_item, Vec::new())
+    };
+    let id = request.id;
+    let refused = store.create_run(request).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: a driver that names no box is Constraint, got {refused:?}"
+    );
+    assert!(
+        matches!(store.run(id).await, Ok(None)),
+        "{CASE}: the refusal wrote no run"
+    );
+    assert_eq!(
+        store.runs(phantom_item).await.expect(CASE),
+        before,
+        "{CASE}: the item's runs are unchanged"
     );
 }
 
