@@ -339,6 +339,17 @@ pub enum UnblockCase {
     Resume(RunId),
 }
 
+/// MOD-130 M2 R1 F1: the note a target refusal writes on its item, and the tail of
+/// [`EngineError::TargetRefused`]'s sentence: the refusal, then the level that chose the target
+/// (`target dev docker is docker, …; chosen by its project`).
+#[must_use]
+pub fn target_refusal_note(
+    refusal: &htui_core::model::TargetRefusal,
+    level: htui_core::model::TargetSource,
+) -> String {
+    format!("{refusal}; chosen by {}", level.chosen_by())
+}
+
 /// Why the engine refused, or what it could not get past.
 ///
 /// The transparent arms are the seams the walk borrows — the store, resolution, the isolator, the
@@ -439,6 +450,25 @@ pub enum EngineError {
         run: Option<RunId>,
         /// The missing tags: byte order, deduplicated, never empty.
         missing: Vec<String>,
+    },
+    /// MOD-130 M2 P10 (D1, D10): the target the cascade chose cannot run a run started here (a
+    /// kind this build does not run, a retired target, a box elsewhere, a target not `ready`).
+    /// Raised at enqueue, after resolution: no run row was written and the item is `blocked`
+    /// with the refusal's sentence and the level that chose the target as a note
+    /// (`Engine::refuse_target`; R1 F1: ``…; chosen by its project``). Permanent until the
+    /// cascade or the target changes, so it is **not** [`EngineError::ClaimRefused`] and nothing
+    /// re-queues it. A `Retired` refusal is the one soft case (R1 L2): only a race reaches it,
+    /// so it writes no note and blocks nothing, and the next tick re-reads the cascade.
+    #[error("item {item}: {}", target_refusal_note(.refusal, *.level))]
+    TargetRefused {
+        /// The item refused.
+        item: ItemId,
+        /// Why the run cannot start on the target.
+        refusal: htui_core::model::TargetRefusal,
+        /// MOD-130 M2 R1 F1: the cascade level that chose the target, named in the sentence
+        /// ([`TargetSource::chosen_by`](htui_core::model::TargetSource::chosen_by)). Not `source`:
+        /// `thiserror` takes a field of that name for the error's cause.
+        level: htui_core::model::TargetSource,
     },
     /// Plan D86: a heartbeat's refresh touched zero rows, so another orchestrator took the lease
     /// and the walk was dropped where it stood, writing nothing further (ANA-2 `:1280-1282`).
@@ -2118,6 +2148,24 @@ mod tests {
                 ids::WORKSPACE_PLATFORM
             ),
             "MOD-125 D5"
+        );
+        assert_eq!(
+            EngineError::TargetRefused {
+                item: ids::HTUI_FEAT_3,
+                refusal: htui_core::model::TargetRefusal::NotRunnable {
+                    name: "dev docker".to_owned(),
+                    kind: htui_core::model::TargetKind::Docker,
+                    owner: "MOD-44",
+                },
+                level: htui_core::model::TargetSource::Project,
+            }
+            .to_string(),
+            format!(
+                "item {}: target dev docker is docker, which this build cannot run yet; \
+                 MOD-44 brings it; chosen by its project",
+                ids::HTUI_FEAT_3
+            ),
+            "MOD-130 M2 P10, R1 F1: the enqueue refusal names the item, the target and the level"
         );
         assert_eq!(
             EngineError::MissingTags {

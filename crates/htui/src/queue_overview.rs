@@ -333,6 +333,7 @@ mod tests {
                 repo_scope: Vec::new(),
                 queued_at: Utc::now(),
                 batch_id: Some(batch),
+                target: None,
             })
             .await
             .expect("the batch run lands")

@@ -70,6 +70,7 @@ async fn run_with(store: &MemStore, snapshot: GraphSnapshot) -> Run {
             repo_scope: Vec::new(),
             queued_at: Utc::now(),
             batch_id: None,
+            target: None,
         })
         .await
         .expect("the item is `open`, so it queues")

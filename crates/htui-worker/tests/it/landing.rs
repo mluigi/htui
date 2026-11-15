@@ -184,6 +184,7 @@ impl Harness {
                 queued_at: at,
                 batch_id: None,
                 workspace_id: None,
+                target: None,
             })
             .await
             .expect("the run is created")

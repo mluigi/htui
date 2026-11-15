@@ -1649,6 +1649,8 @@ fn runs() -> Vec<Run> {
         lease_box_id: None,
         lease_expires_at: None,
         updated_at: demo_at(queued.0, queued.1 + i64::from(status.is_terminal())),
+        target_id: None,
+        target_source: None,
     };
     vec![
         Run {
@@ -1671,6 +1673,8 @@ fn runs() -> Vec<Run> {
             lease_box_id: None,
             lease_expires_at: None,
             updated_at: demo_at(1, 12),
+            target_id: None,
+            target_source: None,
         },
         Run {
             workspace_id: Some(ids::WORKSPACE_PLATFORM),
@@ -1692,6 +1696,8 @@ fn runs() -> Vec<Run> {
             lease_box_id: None,
             lease_expires_at: None,
             updated_at: demo_at(2, 8),
+            target_id: None,
+            target_source: None,
         },
         Run {
             workspace_id: Some(ids::WORKSPACE_PLATFORM),
@@ -1713,6 +1719,8 @@ fn runs() -> Vec<Run> {
             lease_box_id: None,
             lease_expires_at: None,
             updated_at: demo_at(1, 17),
+            target_id: None,
+            target_source: None,
         },
         graph_run(
             ids::RUN_4,

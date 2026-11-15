@@ -947,6 +947,7 @@ mod tests {
                     queued_at: demo_at(20, hour),
                     batch_id: None,
                     workspace_id: Some(workspace),
+                    target: None,
                 })
                 .await
                 .expect("create")

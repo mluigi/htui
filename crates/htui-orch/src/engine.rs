@@ -1367,9 +1367,10 @@ where
     }
 
     /// §6.2's `run`/`queue` up to the claim (MOD-4 plan D186, blueprint F-I): refuse missing tags,
-    /// then resolve the item's graph and refuse rung 4, onto the item, and create the run
-    /// `queued`. `create_run` moves the item `open | failed -> queued` in its own transaction, so
-    /// it admits one run per item and no item lock is needed.
+    /// then resolve the item's graph and refuse rung 4, onto the item, then resolve the target
+    /// cascade and refuse a target that cannot run here (MOD-130 M2 P10, P11), and create the run
+    /// `queued` on it. `create_run` moves the item `open | failed -> queued` in its own
+    /// transaction, so it admits one run per item and no item lock is needed.
     ///
     /// `pub` so milestone 6's `run_worker` can take the run's lock between this and
     /// [`Self::claim`]: `StartRun` is exactly the two, in that order.
@@ -1380,7 +1381,12 @@ where
     /// # Errors
     /// [`EngineError::Resolve`] (rung 4, after its note on the item),
     /// [`EngineError::MissingTags`] (`R-ORCH-10`, after its note on the item, before resolution),
-    /// and the store's refusals.
+    /// [`EngineError::TargetRefused`] (MOD-130 M2 P10: the cascade's target cannot run here, after
+    /// its note on the item, after resolution; R1 L2: a retired one with no note), the store's
+    /// `Constraint` ([`scope_row_run_workspace`](htui_core::store::scope_row_run_workspace)) for a
+    /// scope-row item started from another workspace (R1 L3: before the tags, nothing written),
+    /// and the store's refusals, among them `create_run`'s for a target retired since it was read
+    /// (P8).
     pub async fn enqueue(
         &self,
         item: ItemId,
@@ -1445,6 +1451,18 @@ where
         // the item lock and stays the authority (MOD-7 D98). This read takes no lock; a run
         // another box creates after it is caught by the refusals' own `block_if_idle`.
         crate::command::start_enabled(&item, &self.parts.store.runs(item.id).await?)?;
+        // MOD-130 M2 R1 L3: a scope row's runs carry its own workspace (MOD-147 D8). Another one is
+        // `create_run`'s refusal, answered here before anything writes, so the cascade never
+        // resolves (or refuses) a target for a run that could not be created.
+        let project = self.project_row(item.project_id).await?;
+        htui_core::store::run_workspace_for(project.owner_workspace_id, workspace).map_err(
+            |asked| {
+                StoreError::Constraint(htui_core::store::scope_row_run_workspace(
+                    &project.slug,
+                    asked,
+                ))
+            },
+        )?;
         // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
         // lacks tags *and* has no candidate is refused for the tags, the cheaper box-level fact.
         let missing = self
@@ -1472,6 +1490,25 @@ where
             }
             Err(err) => return Err(err.into()),
         };
+        // MOD-130 M2 P2, P11: after resolution, whose graph is the workflow level, and before
+        // `create_run`, which re-reads the chosen target under its own lock (P8).
+        let chosen = self
+            .cascade_target(&item, &project, workspace, resolved.workflow_target)
+            .await?;
+        let binding =
+            htui_core::store::WorkerStore::target_binding(self.parts.store, chosen.target)
+                .await?
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "target",
+                    id: chosen.target.to_string(),
+                })?;
+        if let Some(refusal) = htui_core::model::run_start_refusal(
+            &binding,
+            self.parts.box_id,
+            htui_core::model::RUNNABLE_KINDS,
+        ) {
+            return Err(self.refuse_target(&item, refusal, chosen.source).await?);
+        }
 
         let now = self.now();
         let id = RunId::new();
@@ -1485,12 +1522,13 @@ where
                 project_id: item.project_id,
                 item_id: item.id,
                 mode,
-                target_box_id: self.parts.box_id,
+                target_box_id: htui_core::model::runs_on(&binding, self.parts.box_id),
                 started_by: self.parts.user,
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: now,
                 batch_id: batch,
+                target: Some(chosen),
             })
             .await?;
         Ok(id)
@@ -1612,6 +1650,93 @@ where
             item: item.id,
             run: None,
             missing,
+        })
+    }
+
+    /// MOD-130 M2 P11: the target cascade's levels for a run of `item` (filed on `project`)
+    /// started from `workspace`, resolved by [`htui_core::model::resolve_target`]. An item filed
+    /// on a scope row answers its project row as `workspace` and has no project level (D5); any
+    /// other item's workspace level is the scope row of `workspace`, the level skipped when it is
+    /// `None` (D6). Settings is `app_setting.default_target` (P5).
+    ///
+    /// # Errors
+    /// `NotFound` for a scope row gone since `scope_project` read it, the store's own, and
+    /// `default_target_in`'s for a malformed Settings value.
+    async fn cascade_target(
+        &self,
+        item: &Item,
+        project: &Project,
+        workspace: Option<WorkspaceId>,
+        workflow: Option<htui_core::model::TargetId>,
+    ) -> Result<htui_core::model::ResolvedTarget, EngineError> {
+        let (project_level, workspace_level) = if project.owner_workspace_id.is_some() {
+            (None, project.target_id)
+        } else {
+            let scope_row = match workspace {
+                Some(workspace) => {
+                    htui_core::store::WorkerStore::scope_project(self.parts.store, workspace)
+                        .await?
+                }
+                None => None,
+            };
+            let scope_target = match scope_row {
+                Some(scope_row) => self.project_row(scope_row).await?.target_id,
+                None => None,
+            };
+            (project.target_id, scope_target)
+        };
+        Ok(htui_core::model::resolve_target(
+            &htui_core::model::TargetLevels {
+                item: item.target_id,
+                workflow,
+                project: project_level,
+                workspace: workspace_level,
+                settings: htui_core::model::default_target_in(&self.parts.app)?,
+            },
+        ))
+    }
+
+    /// MOD-130 M2 P11: the project row `id`, `NotFound` when it is gone.
+    async fn project_row(&self, id: ProjectId) -> Result<Project, EngineError> {
+        htui_core::store::WorkerStore::project(self.parts.store, id)
+            .await?
+            .ok_or_else(|| {
+                StoreError::NotFound {
+                    entity: "project",
+                    id: id.to_string(),
+                }
+                .into()
+            })
+    }
+
+    /// MOD-130 M2 P10 at `StartRun`: the target `level` chose cannot run here, and no run row
+    /// exists, so the refusal's sentence and its level (R1 F1: ``…; chosen by its project``) are
+    /// written to the item as a note and `open -> blocked`, and [`EngineError::TargetRefused`] is
+    /// handed back. The write is [`Self::refuse_missing_tags`]'s one `block_if_idle` call, with
+    /// its rules: nothing over a live run another box created since `startable`'s read (D98), the
+    /// note on an item another writer moved (invariant 7).
+    ///
+    /// R1 L2: a [`Retired`](htui_core::model::TargetRefusal::Retired) refusal is soft: it writes
+    /// no note and blocks nothing. Retiring refuses a target any level names, so only a race
+    /// reaches it (a stale `app` map, or a retire between the reads), and the next tick re-reads
+    /// the cascade. Every other refusal blocks.
+    async fn refuse_target(
+        &self,
+        item: &Item,
+        refusal: htui_core::model::TargetRefusal,
+        level: htui_core::model::TargetSource,
+    ) -> Result<EngineError, EngineError> {
+        if !matches!(refusal, htui_core::model::TargetRefusal::Retired { .. }) {
+            self.block_if_idle(
+                item.id,
+                crate::command::target_refusal_note(&refusal, level),
+            )
+            .await?;
+        }
+        Ok(EngineError::TargetRefused {
+            item: item.id,
+            refusal,
+            level,
         })
     }
 
@@ -13803,6 +13928,7 @@ mod tests {
                 repo_scope: Vec::new(),
                 queued_at: now,
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -17517,6 +17643,7 @@ mod tests {
                 repo_scope: resolved.repo_scope,
                 queued_at: harness.orch.clock.now(),
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -17623,6 +17750,7 @@ mod tests {
                 repo_scope: resolved.repo_scope,
                 queued_at: harness.orch.clock.now(),
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -19372,6 +19500,627 @@ mod tests {
                 .len(),
             notes_before,
             "and gets no note (D98)"
+        );
+    }
+
+    /// MOD-130 M2: the target a run recorded and the box it names, for the cascade tests.
+    async fn recorded_target(
+        harness: &Harness,
+        run: htui_core::model::RunId,
+    ) -> (
+        Option<htui_core::model::TargetId>,
+        Option<htui_core::model::TargetSource>,
+        htui_core::model::BoxId,
+    ) {
+        let row = harness
+            .orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("enqueue wrote the run");
+        (row.target_id, row.target_source, row.target_box_id)
+    }
+
+    /// MOD-130 M2 D2, D7: with no level set, `enqueue` records the seeded local target, from
+    /// `default`, and the run's `target_box_id` is this box.
+    #[tokio::test]
+    async fn enqueue_snapshots_the_local_default() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness_engine!(harness.orch, engine);
+
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+            .await
+            .expect("FEAT-3 resolves");
+        assert_eq!(
+            recorded_target(&harness, run).await,
+            (
+                Some(htui_core::seed::LOCAL_TARGET_ID),
+                Some(htui_core::model::TargetSource::Default),
+                harness.orch.box_id(),
+            )
+        );
+    }
+
+    /// MOD-130 M2 D3, D5, D6, D11: each level, set alone to the local target (the only runnable
+    /// one), answers, and the run records it as its source.
+    #[tokio::test]
+    async fn enqueue_names_the_level_that_answered() {
+        use htui_core::model::TargetSource;
+        let local = htui_core::seed::LOCAL_TARGET_ID;
+
+        // Item: `item.target_id`, through the item's version path.
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let row = harness.orch.item(ids::HTUI_FEAT_3).await;
+            harness
+                .orch
+                .store
+                .update_item(
+                    row.id,
+                    row.version,
+                    ItemPatch {
+                        target_id: Some(Some(local)),
+                        author_id: row.created_by,
+                        reason: "a test's target".to_owned(),
+                        ..ItemPatch::default()
+                    },
+                )
+                .await
+                .expect("the item's version is current");
+            harness_engine!(harness.orch, engine);
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+                .await
+                .expect("FEAT-3 resolves");
+            assert_eq!(
+                recorded_target(&harness, run).await.1,
+                Some(TargetSource::Item),
+                "item"
+            );
+        }
+
+        // Workflow: the resolved graph's `target_id`.
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let graph = harness
+                .orch
+                .store
+                .resolve_graph(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("FEAT-3 resolves to a graph")
+                .graph;
+            let set = harness
+                .orch
+                .store
+                .set_graph_target(graph.id, graph.updated_at, Some(local))
+                .await
+                .expect("the graph accepts the target");
+            assert!(matches!(set, CasOutcome::Applied(_)), "{set:?}");
+            harness_engine!(harness.orch, engine);
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+                .await
+                .expect("FEAT-3 resolves");
+            assert_eq!(
+                recorded_target(&harness, run).await.1,
+                Some(TargetSource::Workflow),
+                "workflow"
+            );
+        }
+
+        // Project: the item's own project row.
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            set_project_target(&harness, ids::PROJECT_HTUI, Some(local)).await;
+            harness_engine!(harness.orch, engine);
+            let run = engine
+                .enqueue(
+                    ids::HTUI_FEAT_3,
+                    RunMode::Manual,
+                    None,
+                    Some(ids::WORKSPACE_PLATFORM),
+                )
+                .await
+                .expect("FEAT-3 resolves");
+            assert_eq!(
+                recorded_target(&harness, run).await.1,
+                Some(TargetSource::Project),
+                "project, over the workspace level left unset"
+            );
+        }
+
+        // Workspace: the scope row of the run's workspace (D6).
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            set_project_target(&harness, ids::PROJECT_SCOPE_PLATFORM, Some(local)).await;
+            harness_engine!(harness.orch, engine);
+            let run = engine
+                .enqueue(
+                    ids::HTUI_FEAT_3,
+                    RunMode::Manual,
+                    None,
+                    Some(ids::WORKSPACE_PLATFORM),
+                )
+                .await
+                .expect("FEAT-3 resolves");
+            assert_eq!(
+                recorded_target(&harness, run).await.1,
+                Some(TargetSource::Workspace),
+                "workspace"
+            );
+            // Without a workspace the level is skipped (D6).
+            let other = Harness::new().await;
+            other.free_feat_3().await;
+            set_project_target(&other, ids::PROJECT_SCOPE_PLATFORM, Some(local)).await;
+            harness_engine!(other.orch, engine);
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+                .await
+                .expect("FEAT-3 resolves");
+            assert_eq!(
+                recorded_target(&other, run).await.1,
+                Some(TargetSource::Default),
+                "no workspace, no workspace level"
+            );
+        }
+
+        // A scope-row item: its project row is the workspace level (D5).
+        {
+            let harness = Harness::new().await;
+            set_project_target(&harness, ids::PROJECT_SCOPE_PLATFORM, Some(local)).await;
+            let item = harness
+                .orch
+                .store
+                .mint_item(htui_core::model::NewItem {
+                    id: htui_core::model::ItemId::new(),
+                    project_id: ids::PROJECT_SCOPE_PLATFORM,
+                    kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+                    title: "a workspace item".to_owned(),
+                    body: String::new(),
+                    required_tags: Vec::new(),
+                    touched_paths: Vec::new(),
+                    priority: 0,
+                    step_graph_id: None,
+                    target_id: None,
+                    created_by: harness.orch.user(),
+                    box_id: Some(harness.orch.box_id()),
+                })
+                .await
+                .expect("the scope row takes items");
+            harness_engine!(harness.orch, engine);
+            let run = engine
+                .enqueue(item.id, RunMode::Manual, None, None)
+                .await
+                .expect("the scope row's graph resolves");
+            assert_eq!(
+                recorded_target(&harness, run).await.1,
+                Some(TargetSource::Workspace),
+                "a scope-row item answers as `workspace`, never `project`"
+            );
+        }
+
+        // Settings: `app_setting.default_target`, read into the engine's `app` map.
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let set = harness
+                .orch
+                .store
+                .set_default_target(Some(local), None)
+                .await
+                .expect("the default is set");
+            assert!(matches!(set, CasOutcome::Applied(_)), "{set:?}");
+            // `fake_parts` reads `app` when the engine is built: after the write.
+            harness_engine!(harness.orch, engine);
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+                .await
+                .expect("FEAT-3 resolves");
+            assert_eq!(
+                recorded_target(&harness, run).await,
+                (
+                    Some(local),
+                    Some(TargetSource::Settings),
+                    harness.orch.box_id()
+                ),
+                "settings"
+            );
+        }
+    }
+
+    /// MOD-130 M2: sets a project's target (`set_project_target`) at its current `updated_at`.
+    async fn set_project_target(
+        harness: &Harness,
+        project: htui_core::model::ProjectId,
+        target: Option<htui_core::model::TargetId>,
+    ) {
+        let row = harness
+            .orch
+            .store
+            .project(project)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture holds the project");
+        let set = harness
+            .orch
+            .store
+            .set_project_target(project, row.updated_at, target)
+            .await
+            .expect("the project accepts the target");
+        assert!(matches!(set, CasOutcome::Applied(_)), "{set:?}");
+    }
+
+    /// MOD-130 M2 D7: the target is recorded at enqueue and never updated, so a cascade edit
+    /// after it moves no queued run.
+    #[tokio::test]
+    async fn a_cascade_edit_moves_no_queued_run() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        let local = htui_core::seed::LOCAL_TARGET_ID;
+        set_project_target(&harness, ids::PROJECT_HTUI, Some(local)).await;
+        harness_engine!(harness.orch, engine);
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+            .await
+            .expect("FEAT-3 resolves");
+        let before = recorded_target(&harness, run).await;
+        assert_eq!(
+            before.1,
+            Some(htui_core::model::TargetSource::Project),
+            "control"
+        );
+
+        set_project_target(&harness, ids::PROJECT_HTUI, None).await;
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .run(run)
+                .await
+                .expect("MemStore never fails a read")
+                .map(|row| row.status),
+            Some(RunStatus::Queued),
+            "the run is still queued"
+        );
+        assert_eq!(recorded_target(&harness, run).await, before);
+    }
+
+    /// MOD-130 M2 D1, P10: a docker target at the project level resolves, but the run cannot
+    /// start on it. No run row is written; the item is `blocked` with the refusal's sentence.
+    #[tokio::test]
+    async fn enqueue_refuses_a_target_this_build_cannot_run() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        let docker = harness
+            .orch
+            .store
+            .create_target(htui_core::model::NewTarget {
+                id: htui_core::model::TargetId::new(),
+                name: "dev docker".to_owned(),
+                kind: htui_core::model::TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("the target is created");
+        set_project_target(&harness, ids::PROJECT_HTUI, Some(docker.id)).await;
+        let runs_before = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+            .await
+            .expect_err("this build runs only local");
+        // R1 F1: the note names the level that chose the target.
+        let sentence = "target dev docker is docker, which this build cannot run yet; MOD-44 \
+                        brings it; chosen by its project";
+        assert!(
+            matches!(
+                &refused,
+                EngineError::TargetRefused {
+                    item,
+                    refusal: htui_core::model::TargetRefusal::NotRunnable { owner: "MOD-44", .. },
+                    level: htui_core::model::TargetSource::Project,
+                } if *item == ids::HTUI_FEAT_3
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!("item {}: {sentence}", ids::HTUI_FEAT_3)
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            runs_before,
+            "a refused target writes no run row"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Blocked
+        );
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        let added: Vec<&str> = notes[notes_before..]
+            .iter()
+            .map(|note| note.body.as_str())
+            .collect();
+        assert_eq!(added, vec![sentence]);
+    }
+
+    /// MOD-130 M2 P10, mirroring `a_startrun_refusal_writes_nothing_over_a_live_run`: the target
+    /// refusal's one `block_if_idle` writes no note and blocks nothing over a live run (D98).
+    #[tokio::test]
+    async fn a_target_refusal_writes_nothing_over_a_live_run() {
+        let harness = Harness::new().await;
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        assert_eq!(
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Queued,
+            "control: a live run holds FEAT-3"
+        );
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        harness_engine!(harness.orch, engine);
+
+        // R1 L2: a blocking refusal; `Retired` writes nothing anyway.
+        let refused = engine
+            .refuse_target(
+                &item,
+                htui_core::model::TargetRefusal::NotRunnable {
+                    name: "dev docker".to_owned(),
+                    kind: htui_core::model::TargetKind::Docker,
+                    owner: "MOD-44",
+                },
+                htui_core::model::TargetSource::Item,
+            )
+            .await
+            .expect("the refusal is answered");
+        assert!(
+            matches!(&refused, EngineError::TargetRefused { item, .. } if *item == ids::HTUI_FEAT_3),
+            "{refused:?}"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Open,
+            "an item a live run holds is never blocked"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes_before,
+            "and gets no note (D98)"
+        );
+    }
+
+    /// MOD-130 M2 R1 L2: a `Retired` refusal comes only from a race, here a stale `app` map
+    /// naming a Settings default that was cleared and then retired. It is soft: no run row, no
+    /// note, and the item stays `open`, so the next tick re-reads the cascade.
+    #[tokio::test]
+    async fn a_retired_target_refusal_neither_blocks_nor_notes() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        let target = harness
+            .orch
+            .store
+            .create_target(htui_core::model::NewTarget {
+                id: htui_core::model::TargetId::new(),
+                name: "stale docker".to_owned(),
+                kind: htui_core::model::TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("the target is created");
+        let CasOutcome::Applied(Some(set)) = harness
+            .orch
+            .store
+            .set_default_target(Some(target.id), None)
+            .await
+            .expect("the default is set")
+        else {
+            panic!("the default is set from no row");
+        };
+        // `fake_parts` reads `app` when the engine is built: it keeps the default from here on.
+        harness_engine!(harness.orch, engine);
+        let cleared = harness
+            .orch
+            .store
+            .set_default_target(None, Some(set.updated_at))
+            .await
+            .expect("the default is cleared");
+        assert!(matches!(cleared, CasOutcome::Applied(None)), "{cleared:?}");
+        let retired = harness
+            .orch
+            .store
+            .retire_target(target.id, target.updated_at)
+            .await
+            .expect("nothing names the target now");
+        assert!(matches!(retired, CasOutcome::Applied(_)), "{retired:?}");
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        let runs_before = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+
+        let refused = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+            .await
+            .expect_err("the stale default names a retired target");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::TargetRefused {
+                    item,
+                    refusal: htui_core::model::TargetRefusal::Retired { name },
+                    level: htui_core::model::TargetSource::Settings,
+                } if *item == ids::HTUI_FEAT_3 && name == "stale docker"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "item {}: target stale docker is retired; choose another target or inherit; \
+                 chosen by the Settings default",
+                ids::HTUI_FEAT_3
+            )
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Open,
+            "a retired target does not block the item"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes_before,
+            "and writes no note"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            runs_before,
+            "nor a run row"
+        );
+    }
+
+    /// MOD-130 M2 R1 L3: a scope-row item started from another workspace is refused for the
+    /// workspace, as `create_run` would refuse it, before the target is resolved: its scope row
+    /// names a target this build cannot run, yet nothing is written and the item stays `open`.
+    #[tokio::test]
+    async fn a_scope_row_item_from_another_workspace_is_refused_for_the_workspace() {
+        let harness = Harness::new().await;
+        let docker = harness
+            .orch
+            .store
+            .create_target(htui_core::model::NewTarget {
+                id: htui_core::model::TargetId::new(),
+                name: "scope docker".to_owned(),
+                kind: htui_core::model::TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("the target is created");
+        set_project_target(&harness, ids::PROJECT_SCOPE_PLATFORM, Some(docker.id)).await;
+        let item = harness
+            .orch
+            .store
+            .mint_item(htui_core::model::NewItem {
+                id: htui_core::model::ItemId::new(),
+                project_id: ids::PROJECT_SCOPE_PLATFORM,
+                kind_id: ids::KIND_SCOPE_PLATFORM_WS,
+                title: "a workspace item".to_owned(),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                target_id: None,
+                created_by: harness.orch.user(),
+                box_id: Some(harness.orch.box_id()),
+            })
+            .await
+            .expect("the scope row takes items");
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .enqueue(
+                item.id,
+                RunMode::Manual,
+                None,
+                Some(ids::WORKSPACE_GRAPHICS),
+            )
+            .await
+            .expect_err("a scope row's runs carry its own workspace");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::Store(htui_core::store::StoreError::Constraint(sentence))
+                    if *sentence == htui_core::store::scope_row_run_workspace(
+                        "@platform",
+                        ids::WORKSPACE_GRAPHICS,
+                    )
+            ),
+            "the workspace, not the target: {refused:?}"
+        );
+        assert_eq!(harness.orch.item(item.id).await.status, Status::Open);
+        assert!(
+            harness
+                .orch
+                .store
+                .notes(item.id)
+                .await
+                .expect("MemStore never fails a read")
+                .is_empty(),
+            "no note"
+        );
+        assert!(
+            harness
+                .orch
+                .store
+                .runs(item.id)
+                .await
+                .expect("MemStore never fails a read")
+                .is_empty(),
+            "no run row"
         );
     }
 
@@ -28122,6 +28871,7 @@ mod settle_walk_writes {
                 repo_scope: Vec::new(),
                 queued_at: orch.clock.now(),
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("MemStore creates the run");

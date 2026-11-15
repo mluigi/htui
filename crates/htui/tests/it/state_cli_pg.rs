@@ -347,6 +347,7 @@ async fn park_a_workspace_gate(db: &testkit::TestDb) -> String {
             queued_at: Utc::now(),
             batch_id: None,
             workspace_id: Some(ids::WORKSPACE_PLATFORM),
+            target: None,
         })
         .await
         .expect("a run on the WS item");

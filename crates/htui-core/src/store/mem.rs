@@ -125,8 +125,8 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     box_bound_to_other_target, box_hostname_is_blank, box_not_a_child_of,
-    child_box_needs_a_machine, has_nul, target_bound_elsewhere, target_built_in, target_name_taken,
-    target_retired, target_takes_no_container,
+    child_box_needs_a_machine, has_nul, target_bound_elsewhere, target_built_in, target_has_runs,
+    target_name_taken, target_retired, target_takes_no_container,
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
@@ -2509,7 +2509,7 @@ impl State {
         }
         // MOD-130 M1 D11: after the kind, before the id and the author, as `PgStore`'s guard
         // (folded into the counter CTE) refuses before its insert can.
-        item_target_refusal(&self.targets, new.target_id)?;
+        level_target_refusal(&self.targets, "item.target_id", new.target_id)?;
         if self.items.contains_key(&new.id) {
             return Err(StoreError::Constraint(format!(
                 "item `{}` already exists",
@@ -2614,7 +2614,7 @@ impl State {
         }
         // MOD-130 M1 D11: after the kind check, before the first write.
         if let Some(target_id) = patch.target_id {
-            item_target_refusal(&self.targets, target_id)?;
+            level_target_refusal(&self.targets, "item.target_id", target_id)?;
         }
 
         if let Some(kind_id) = patch.kind_id {
@@ -3200,6 +3200,8 @@ impl State {
             lease_box_id: None,
             lease_expires_at: None,
             updated_at: chat.started_at,
+            target_id: None,
+            target_source: None,
         });
         self.steps.entry(chat.step_id).or_insert_with(|| RunStep {
             id: chat.step_id,
@@ -6880,6 +6882,8 @@ impl State {
                 )));
             }
         }
+        // MOD-130 M2 P8: `PgStore`'s `FOR SHARE` read of the target, in the same place.
+        level_target_refusal(&self.targets, "run.target_id", new.target.map(|t| t.target))?;
         // MOD-12 D7, H-6: `PgStore`'s `FOR SHARE` read of the batch, in the same place.
         if let Some(batch) = new.batch_id {
             let open = self
@@ -6921,6 +6925,8 @@ impl State {
             lease_box_id: None,
             lease_expires_at: None,
             updated_at: now,
+            target_id: new.target.map(|t| t.target),
+            target_source: new.target.map(|t| t.source),
         };
         self.runs.insert(row.id, row.clone());
         if let Some(batch) = new.batch_id {
@@ -10593,11 +10599,13 @@ fn require_author(id: UserId, column: &str) -> Result<()> {
     Ok(())
 }
 
-/// MOD-130 M1 D11 (blueprint B3): an item's target is inherit (`None`), the built-in local target
-/// (never in `targets`, blueprint B8, and never retired), or a target that is not retired. A free
-/// function over `targets`, so `update` can call it while it holds the item.
-fn item_target_refusal(
+/// MOD-130 M1 D11 (blueprint B3), M2 P8: an item's or a run's target is inherit (`None`), the
+/// built-in local target (never in `targets`, blueprint B8, and never retired), or a target that
+/// is not retired; `column` names the refused column. A free function over `targets`, so `update`
+/// can call it while it holds the item.
+fn level_target_refusal(
     targets: &BTreeMap<TargetId, Target>,
+    column: &str,
     target_id: Option<TargetId>,
 ) -> Result<()> {
     let Some(id) = target_id.filter(|id| *id != seed::LOCAL_TARGET_ID) else {
@@ -10605,9 +10613,7 @@ fn item_target_refusal(
     };
     match targets.get(&id) {
         None => Err(StoreError::Constraint(references_no_row(
-            "item.target_id",
-            id,
-            "target",
+            column, id, "target",
         ))),
         Some(row) if row.retired_at.is_some() => {
             Err(StoreError::Constraint(target_retired(&row.name)))
@@ -11733,10 +11739,21 @@ impl State {
         Ok(CasOutcome::Applied(row.clone()))
     }
 
-    /// [`WriteStore::delete_target`]: the shared refusals, then the delete. Run history waits
-    /// for M2's `Run.target_id` here (P8).
+    /// [`WriteStore::delete_target`]: the shared refusals, then run history (MOD-130 M2 P9:
+    /// `target_has_runs`, as `PgStore` answers it), then the delete.
     fn delete_target(&mut self, id: TargetId) -> Result<()> {
-        self.target_free(id)?;
+        let current = self.target_free(id)?;
+        let runs = self
+            .runs
+            .values()
+            .filter(|run| run.target_id == Some(id))
+            .count();
+        if runs > 0 {
+            return Err(StoreError::Constraint(target_has_runs(
+                &current.name,
+                u64::try_from(runs).unwrap_or_default(),
+            )));
+        }
         self.targets.remove(&id);
         Ok(())
     }
@@ -17728,6 +17745,7 @@ mod tests {
             repo_scope: scope,
             queued_at: Utc::now(),
             batch_id: None,
+            target: None,
         }
     }
 

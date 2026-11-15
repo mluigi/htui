@@ -122,6 +122,7 @@ async fn stopped_on_the_box(db: &testkit::TestDb) -> RunId {
             queued_at: Utc::now(),
             batch_id: None,
             workspace_id: Some(ids::WORKSPACE_GRAPHICS),
+            target: None,
         })
         .await
         .expect("create")

@@ -73,15 +73,16 @@ use htui_store::testkit as common;
 /// and MOD-130 M1 T2's four create, edit and bind target cases (P4-P6, P9) make it 337,
 /// and MOD-130 M1 T3's item target spec field case (D11) makes it 338,
 /// and MOD-130 M1 T4's five level, default, retire and delete cases (D3, D5, D11, D14) make it
-/// 343.
-const EXPECTED_CASES: usize = 343;
+/// 343,
+/// and MOD-130 M2 T2's three recorded-target cases (D7, P7-P9) make it 346.
+const EXPECTED_CASES: usize = 346;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (343 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (346 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -101,7 +102,8 @@ fn case_list_matches_mem_store() {
              refinement and coverage cases, and MOD-125 M4's `workspace_live_runs` case, and MOD-133 M1's seven integration \
              cases, and MOD-130 M1 T1's seeded local target case, and MOD-130 \
              M1 T2's four target cases, and MOD-130 M1 T3's item target case, and MOD-130 M1 \
-             T4's five level, default, retire and delete cases)"
+             T4's five level, default, retire and delete cases, and MOD-130 M2 T2's three \
+             recorded-target cases)"
     );
 }
 

@@ -44,7 +44,7 @@ use htui_core::model::{
 };
 use htui_core::model::{ArtifactLinkKind, LinkedDocument};
 use htui_core::model::{PlanScope, PlanStatus, RunPlan, RunPlanId};
-use htui_core::model::{Target, TargetId, TargetKind};
+use htui_core::model::{Target, TargetId, TargetKind, TargetSource};
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
@@ -303,7 +303,7 @@ fn state_case() -> String {
 /// is no use to a reader.
 const RUN_SELECT: &str = "id, project_id, item_id, kind, mode, status, target_box_id, \
      executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, \
-     repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id";
+     repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id, target_id, target_source";
 
 /// One `run` row, every column of [`RUN_SELECT`].
 fn run_of(row: &SqliteRow) -> Result<Run> {
@@ -339,6 +339,12 @@ fn run_of(row: &SqliteRow) -> Result<Run> {
         )?,
         lease_expires_at: opt_ts_col("run.lease_expires_at", get(row, "lease_expires_at")?)?,
         updated_at: ts_col("run.updated_at", get(row, "updated_at")?)?,
+        // MOD-130 M2 P12: the mirror carries both since cache `0014`.
+        target_id: opt_uuid_col::<TargetId>(
+            "run.target_id",
+            opt_text(row, "target_id")?.as_deref(),
+        )?,
+        target_source: get::<Option<TargetSource>>(row, "target_source")?,
     })
 }
 

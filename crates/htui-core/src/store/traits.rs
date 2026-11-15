@@ -1560,7 +1560,9 @@ pub trait WriteStore: ReadStore {
     /// on a scope row carries its workspace ([`run_workspace_for`]: `None` is filled), another
     /// workspace is `Constraint` ([`scope_row_run_workspace`]), checked before any foreign key.
     /// MOD-125 M2 D10: an unknown (or deleted) `new.workspace_id` is `Constraint` in
-    /// [`workspace_gone`]'s sentence on both stores.
+    /// [`workspace_gone`]'s sentence on both stores. MOD-130 M2 P8: a `new.target` naming no row
+    /// is `Constraint(`[`references_no_row`]`("run.target_id", ..))`, a retired one
+    /// `Constraint(`[`target_retired`]`)`, checked after `repo_scope` and before the batch.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
@@ -3142,8 +3144,7 @@ pub trait WriteStore: ReadStore {
     /// 1. an unknown id is `NotFound { entity: "target" }`;
     /// 2. the local target is [`target_built_in`] (D2);
     /// 3. a target a level or the Settings default names is [`target_in_use`];
-    /// 4. a target a run references is [`target_has_runs`] (Postgres only until M2 gives the
-    ///    in-memory run a target, P8).
+    /// 4. a target a run references is [`target_has_runs`].
     ///
     /// Postgres locks the target row `FOR UPDATE` before step 3 (blueprint B7).
     ///

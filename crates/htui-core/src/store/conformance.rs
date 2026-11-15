@@ -50,8 +50,8 @@ use crate::model::{
     executor_scrub_refusal, missing_tags_failure,
 };
 use crate::model::{
-    BoxKind, NewChildBox, NewTarget, StepGraph, Target, TargetEdit, TargetId, TargetKind,
-    TargetStatus,
+    BoxKind, NewChildBox, NewTarget, ResolvedTarget, StepGraph, Target, TargetEdit, TargetId,
+    TargetKind, TargetSource, TargetStatus,
 };
 use crate::model::{CAPTURE_KEY, CAPTURE_POSITION, NewOwnerDocument, Project, StepRole};
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog};
@@ -97,8 +97,8 @@ use crate::store::traits::{
 use crate::store::traits::{
     DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN, box_bound_to_other_target, box_hostname_is_blank,
     box_not_a_child_of, child_box_needs_a_machine, target_bound_elsewhere, target_built_in,
-    target_in_use, target_locator_refused, target_name_refused, target_name_taken, target_retired,
-    target_takes_no_container,
+    target_has_runs, target_in_use, target_locator_refused, target_name_refused, target_name_taken,
+    target_retired, target_takes_no_container,
 };
 use crate::store::traits::{
     MAX_PARENT_DEPTH, parent_cycle, parent_too_deep, second_canonical, second_parent,
@@ -509,6 +509,10 @@ pub const CASES: &[&str] = &[
     "default_target_is_cas_on_updated_at",
     "retire_and_delete_refuse_a_target_in_use",
     "a_retired_target_is_refused_everywhere",
+    // MOD-130 M2 T2: runs record their target (D7, P7-P9)
+    "create_run_records_the_target_and_source",
+    "create_run_refuses_an_unknown_or_retired_target",
+    "delete_target_refuses_a_target_with_runs",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1622,6 +1626,15 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "a_retired_target_is_refused_everywhere" => {
             boxed(a_retired_target_is_refused_everywhere, store).await;
+        }
+        "create_run_records_the_target_and_source" => {
+            boxed(create_run_records_the_target_and_source, store).await;
+        }
+        "create_run_refuses_an_unknown_or_retired_target" => {
+            boxed(create_run_refuses_an_unknown_or_retired_target, store).await;
+        }
+        "delete_target_refuses_a_target_with_runs" => {
+            boxed(delete_target_refuses_a_target_with_runs, store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -9082,6 +9095,7 @@ fn new_run(project: ProjectId, item: ItemId, scope: Vec<RepoId>) -> NewRun {
         queued_at: seam_clock(),
         batch_id: None,
         workspace_id: None,
+        target: None,
     }
 }
 
@@ -41147,6 +41161,145 @@ async fn a_retired_target_is_refused_everywhere<S: WriteStore>(store: &S) {
         store.target(retired.id).await.expect(CASE),
         retired,
         "{CASE}: the target is untouched"
+    );
+}
+
+/// MOD-130 M2 T2 (D7, P7): `create_run` stores `run.target_id` and `run.target_source` as the
+/// request names them, and `run` reads both back; a request with no target stores `NULL`/`NULL`.
+async fn create_run_records_the_target_and_source<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_run_records_the_target_and_source";
+    let chosen = ResolvedTarget {
+        target: seed::LOCAL_TARGET_ID,
+        source: TargetSource::Project,
+    };
+    let targeted = NewRun {
+        target: Some(chosen),
+        ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+    };
+    let created = store.create_run(targeted).await.expect(CASE);
+    assert_eq!(
+        (created.target_id, created.target_source),
+        (Some(seed::LOCAL_TARGET_ID), Some(TargetSource::Project)),
+        "{CASE}: the returned row carries the target and its source"
+    );
+    let read = run_row(CASE, store, created.id).await;
+    assert_eq!(
+        (read.target_id, read.target_source),
+        (Some(seed::LOCAL_TARGET_ID), Some(TargetSource::Project)),
+        "{CASE}: `run` reads both back"
+    );
+    assert_eq!(
+        read, created,
+        "{CASE}: `run` answers the row create_run returned"
+    );
+
+    let untargeted = store
+        .create_run(new_run(ids::PROJECT_AGY, ids::AGY_FEAT_1, Vec::new()))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (untargeted.target_id, untargeted.target_source),
+        (None, None),
+        "{CASE}: no target is NULL/NULL"
+    );
+    let read = run_row(CASE, store, untargeted.id).await;
+    assert_eq!(
+        (read.target_id, read.target_source),
+        (None, None),
+        "{CASE}: `run` reads NULL/NULL back"
+    );
+}
+
+/// MOD-130 M2 T2 (P8): `create_run` refuses a target that names no row with
+/// `references_no_row("run.target_id", ..)` and a retired one with `target_retired`, writing no
+/// run either way.
+async fn create_run_refuses_an_unknown_or_retired_target<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_run_refuses_an_unknown_or_retired_target";
+    let before = store.runs(ids::HTUI_ANA_2).await.expect(CASE);
+
+    let unknown = TargetId::new();
+    let request = NewRun {
+        target: Some(ResolvedTarget {
+            target: unknown,
+            source: TargetSource::Item,
+        }),
+        ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+    };
+    let id = request.id;
+    constraint_exactly(
+        CASE,
+        store.create_run(request).await,
+        &references_no_row("run.target_id", unknown, "target"),
+        "a target that names no row",
+    );
+    assert!(
+        matches!(store.run(id).await, Ok(None)),
+        "{CASE}: the unknown target's refusal wrote no run"
+    );
+
+    let created = store
+        .create_target(new_target("gone docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let retired = applied(
+        CASE,
+        store
+            .retire_target(created.id, created.updated_at)
+            .await
+            .expect(CASE),
+    );
+    let request = NewRun {
+        target: Some(ResolvedTarget {
+            target: retired.id,
+            source: TargetSource::Workflow,
+        }),
+        ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+    };
+    let id = request.id;
+    constraint_exactly(
+        CASE,
+        store.create_run(request).await,
+        &target_retired("gone docker"),
+        "a retired target",
+    );
+    assert!(
+        matches!(store.run(id).await, Ok(None)),
+        "{CASE}: the retired target's refusal wrote no run"
+    );
+    assert_eq!(
+        store.runs(ids::HTUI_ANA_2).await.expect(CASE),
+        before,
+        "{CASE}: the item's runs are unchanged"
+    );
+}
+
+/// MOD-130 M2 T2 (P9): a target a run names is `target_has_runs` on delete, in both stores.
+async fn delete_target_refuses_a_target_with_runs<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_target_refuses_a_target_with_runs";
+    let used = store
+        .create_target(new_target("run docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    store
+        .create_run(NewRun {
+            target: Some(ResolvedTarget {
+                target: used.id,
+                source: TargetSource::Item,
+            }),
+            ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+        })
+        .await
+        .expect(CASE);
+    constraint_exactly(
+        CASE,
+        store.delete_target(used.id).await,
+        &target_has_runs("run docker", 1),
+        "a delete of a target a run names",
+    );
+    assert_eq!(
+        store.target(used.id).await.expect(CASE),
+        used,
+        "{CASE}: the refusal deleted nothing"
     );
 }
 

@@ -1292,6 +1292,7 @@ fn race_run(item: ItemId) -> NewRun {
         repo_scope: Vec::new(),
         queued_at: Utc::now(),
         batch_id: None,
+        target: None,
     }
 }
 
@@ -8738,13 +8739,13 @@ async fn finish_chat_run_takes_the_step_first() {
     .await;
     answer.expect("the close lands");
     assert_eq!(
-        db.store
-            .run(run)
-            .await
-            .expect("read the run")
-            .map(|r| r.status),
-        Some(RunStatus::Done),
-        "the chat run is closed"
+        db.store.run(run).await.expect("read the run").map(|r| (
+            r.status,
+            r.target_id,
+            r.target_source
+        )),
+        Some((RunStatus::Done, None, None)),
+        "the chat run is closed, and records no target (MOD-130 M2 D17)"
     );
 
     db.drop_db().await;
@@ -11844,6 +11845,8 @@ fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
         lease_box_id: None,
         lease_expires_at: None,
         updated_at: chat_at,
+        target_id: None,
+        target_source: None,
     });
     htui_core::store::MemStore::from_demo(data)
 }
@@ -15472,6 +15475,129 @@ async fn a_level_set_behind_a_retire_is_refused() {
     db.drop_db().await;
 }
 
+/// MOD-130 M2 R1 F2: `create_run` behind a retire or a delete holding the target's row lock.
+/// Opens the racing transaction, locks the target as `retire_target` and `delete_target` lock
+/// it, runs `statement` on it, spawns a `create_run` naming the target, checks it waits, commits,
+/// and answers what `create_run` answered, after checking it wrote no run.
+async fn create_run_behind(
+    db: &common::TestDb,
+    target: TargetId,
+    statement: &str,
+) -> htui_core::store::Result<htui_core::model::Run> {
+    let runs_before = db.store.runs(ids::HTUI_ANA_2).await.expect("runs").len();
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("the racing connection");
+    sqlx::query("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM target WHERE id = $1 FOR UPDATE")
+        .bind(target.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("lock the target");
+    sqlx::query(AssertSqlSafe(statement.to_owned()))
+        .bind(target.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing statement");
+
+    let creator = {
+        let store = db.store.clone();
+        let new = NewRun {
+            target: Some(htui_core::model::ResolvedTarget {
+                target,
+                source: htui_core::model::TargetSource::Item,
+            }),
+            ..race_run(ids::HTUI_ANA_2)
+        };
+        tokio::spawn(async move { store.create_run(new).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !creator.is_finished(),
+        "create_run waits on the target's row lock ({statement})"
+    );
+    sqlx::query("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("commit the race");
+    racer.close().await.expect("close the racing connection");
+
+    let answer = creator.await.expect("the create_run task");
+    assert_eq!(
+        db.store.runs(ids::HTUI_ANA_2).await.expect("runs").len(),
+        runs_before,
+        "a refused create_run writes no run ({statement})"
+    );
+    answer
+}
+
+/// MOD-130 M2 R1 F2 (P8): a `create_run` that waits behind a retire holding the target's row
+/// lock sees the retire, and answers `target_retired`; no run is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_run_behind_a_retire_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "racing run docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create a target");
+
+    match create_run_behind(
+        &db,
+        target.id,
+        "UPDATE target SET retired_at = now() WHERE id = $1",
+    )
+    .await
+    {
+        Err(htui_core::store::StoreError::Constraint(sentence)) => {
+            assert_eq!(sentence, target_retired("racing run docker"));
+        }
+        other => panic!("a create_run behind a retire is refused, got {other:?}"),
+    }
+    db.drop_db().await;
+}
+
+/// MOD-130 M2 R1 F2 (P8): a `create_run` that waits behind a delete holding the target's row
+/// lock sees no row, and answers `references_no_row("run.target_id", ..)`, never a raw `23503`;
+/// no run is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_run_behind_a_delete_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "deleted run docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create a target");
+
+    match create_run_behind(&db, target.id, "DELETE FROM target WHERE id = $1").await {
+        Err(htui_core::store::StoreError::Constraint(sentence)) => {
+            assert_eq!(
+                sentence,
+                htui_core::store::references_no_row("run.target_id", target.id, "target")
+            );
+        }
+        other => panic!("a create_run behind a delete is refused, got {other:?}"),
+    }
+    db.drop_db().await;
+}
+
 /// MOD-130 M1 R1 (blueprint B7): an item writer naming a target reads it `FOR SHARE`, so an
 /// `update_item` or a `mint_item` that waits behind a retire holding the target's row lock sees
 /// the retire and answers `target_retired`, never storing a retired target.
@@ -15654,6 +15780,142 @@ async fn a_container_attached_under_another_machine_is_refused() {
         db.store.target(spare.id).await.expect("read"),
         spare,
         "the spare target stays unbound"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-130 M2 P4: the worker's `target_binding` on Postgres answers the target row, the child box
+/// its `box_id` names, and the machine that child runs on; an unbound target has neither box, and
+/// an unknown id is `None`. There is no `WorkerStore` conformance path (C12), so it is pinned here.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_target_binding_reads_the_target_its_box_and_its_machine() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let docker = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "bound docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create");
+    let child = BoxId::new();
+    db.store
+        .attach_child_box(NewChildBox {
+            id: child,
+            parent: ids::BOX,
+            hostname: "dev-rust".to_owned(),
+            target: docker.id,
+        })
+        .await
+        .expect("attach under the fixture machine");
+
+    let binding = htui_core::store::WorkerStore::target_binding(&db.store, docker.id)
+        .await
+        .expect("read must not fail")
+        .expect("the target exists");
+    assert_eq!(
+        binding.target,
+        db.store.target(docker.id).await.expect("the target row"),
+        "the target row, as the read store has it"
+    );
+    let bound = binding.bound.expect("the child box is read");
+    assert_eq!(bound.id, child);
+    assert_eq!(
+        Some(bound),
+        db.store.box_row(child).await.expect("the child row"),
+        "the bound row is the box row"
+    );
+    assert_eq!(
+        binding.host,
+        db.store.box_row(ids::BOX).await.expect("the machine row"),
+        "a container's host is its parent machine"
+    );
+    assert!(binding.host.is_some(), "the fixture machine exists");
+
+    let spare = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "spare ssh".to_owned(),
+            kind: TargetKind::Ssh,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create");
+    let unbound = htui_core::store::WorkerStore::target_binding(&db.store, spare.id)
+        .await
+        .expect("read must not fail")
+        .expect("the target exists");
+    assert_eq!(unbound.target, spare);
+    assert_eq!(
+        (unbound.bound, unbound.host),
+        (None, None),
+        "an unbound target"
+    );
+
+    let local =
+        htui_core::store::WorkerStore::target_binding(&db.store, htui_core::seed::LOCAL_TARGET_ID)
+            .await
+            .expect("read must not fail")
+            .expect("the seeded local target exists");
+    assert_eq!(local.target.kind, TargetKind::Local);
+    assert_eq!(
+        (local.bound, local.host),
+        (None, None),
+        "local binds no box"
+    );
+
+    assert_eq!(
+        htui_core::store::WorkerStore::target_binding(&db.store, TargetId::new())
+            .await
+            .expect("read must not fail"),
+        None,
+        "an unknown id"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-130 M2 P4: the worker's `scope_project` on Postgres answers as the `ReadStore` one: a
+/// workspace's scope row, and `None` for an unknown workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_scope_project_answers_as_the_read_store() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let workspace = db
+        .store
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "scoped".to_owned(),
+            name: "Scoped".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the workspace is created")
+        .id;
+    for id in [workspace, WorkspaceId::new()] {
+        assert_eq!(
+            htui_core::store::WorkerStore::scope_project(&db.store, id)
+                .await
+                .expect("read must not fail"),
+            db.store
+                .scope_project(id)
+                .await
+                .expect("read must not fail"),
+            "workspace {id}"
+        );
+    }
+    assert!(
+        htui_core::store::WorkerStore::scope_project(&db.store, workspace)
+            .await
+            .expect("read must not fail")
+            .is_some(),
+        "a workspace has its scope row"
     );
     db.drop_db().await;
 }

@@ -22,7 +22,8 @@
 //! `pending_stops`; MOD-144 R1 adds the write
 //! `block_if_idle`; MOD-125 M3 the read `pending_resumes` and the writes `resume_run`,
 //! `cancel_stopped_run` and `record_opening`; MOD-133 the read `integrations` and the writes
-//! `take_integrations` and `settle_integration`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
+//! `take_integrations` and `settle_integration`; MOD-130 M2 the reads `scope_project` and
+//! `target_binding`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`;
 //! MOD-12 M2 adds two (`batch_spend`, `project_settings`), 31.
@@ -53,8 +54,8 @@ use crate::model::{
     StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
     UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
-use crate::model::{Integration, LandOutcome};
-use crate::store::error::Result;
+use crate::model::{Integration, LandOutcome, TargetBinding, TargetId};
+use crate::store::error::{Result, StoreError};
 use crate::store::mem::MemStore;
 use crate::store::traits::{ParkOutcome, ReadStore, StepFence, WriteStore};
 
@@ -604,6 +605,20 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         &self,
         run: RunId,
     ) -> impl Future<Output = Result<Option<(BatchId, Option<i64>)>>> + Send;
+    /// [`ReadStore::scope_project`] (MOD-130 M2, P4): the workspace level of the target cascade
+    /// reads the run's workspace's scope row (D6).
+    fn scope_project(
+        &self,
+        workspace: WorkspaceId,
+    ) -> impl Future<Output = Result<Option<ProjectId>>> + Send;
+    /// The target row `id`, the `box` row its `box_id` names, and the machine that box runs on
+    /// (its parent when it is a container, else the bound row itself); `None` when no target has
+    /// the id (MOD-130 M2, P4). Takes no locks: `create_run` re-reads the target under its own
+    /// (P8).
+    fn target_binding(
+        &self,
+        id: TargetId,
+    ) -> impl Future<Output = Result<Option<TargetBinding>>> + Send;
 }
 
 /// The supervisor's source (plan D4): the process's store and every read the runtime makes.
@@ -1219,6 +1234,33 @@ impl WorkerStore for MemStore {
     }
     async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
         MemStore::run_batch_spend(self, run).await
+    }
+    async fn scope_project(&self, workspace: WorkspaceId) -> Result<Option<ProjectId>> {
+        ReadStore::scope_project(self, workspace).await
+    }
+    async fn target_binding(&self, id: TargetId) -> Result<Option<TargetBinding>> {
+        let target = match ReadStore::target(self, id).await {
+            Ok(target) => target,
+            // MOD-130 M2 R1 L5: only the target's own absence is `None`; any other error is
+            // the caller's.
+            Err(StoreError::NotFound {
+                entity: "target", ..
+            }) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let bound = match target.box_id {
+            Some(id) => MemStore::box_row(self, id).await?,
+            None => None,
+        };
+        let host = match bound.as_ref().and_then(|row| row.parent_box_id) {
+            Some(parent) => MemStore::box_row(self, parent).await?,
+            None => bound.clone(),
+        };
+        Ok(Some(TargetBinding {
+            target,
+            bound,
+            host,
+        }))
     }
 }
 

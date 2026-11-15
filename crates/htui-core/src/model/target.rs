@@ -3,12 +3,16 @@
 //! A row of `target` names a kind and a locator (names and addresses, never secrets). Its
 //! status is derived at read time and never stored (D4).
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::box_::BoxRow;
+use crate::model::box_::{BoxKind, BoxRow};
 use crate::model::ids::{BoxId, TargetId};
+use crate::seed::LOCAL_TARGET_ID;
+use crate::store::StoreError;
 use crate::store::traits::{has_nul, json_has_nul, target_locator_refused, target_name_refused};
 
 str_enum!(
@@ -73,21 +77,219 @@ impl DefaultTarget {
     /// [`set_default_target`](crate::store::WriteStore::set_default_target) writes the row.
     ///
     /// # Errors
-    /// [`StoreError::Backend`](crate::store::StoreError::Backend) for a malformed value.
-    pub fn parse(
-        value: &Value,
-        updated_at: DateTime<Utc>,
-    ) -> Result<Self, crate::store::StoreError> {
-        value
-            .as_str()
-            .and_then(|text| text.parse::<TargetId>().ok())
-            .map(|target| Self { target, updated_at })
-            .ok_or_else(|| {
-                crate::store::StoreError::Backend(format!(
-                    "app_setting `{DEFAULT_TARGET_KEY}` holds {value}, not a target id"
-                ))
-            })
+    /// [`StoreError::Backend`] for a malformed value.
+    pub fn parse(value: &Value, updated_at: DateTime<Utc>) -> Result<Self, StoreError> {
+        default_target_value(value).map(|target| Self { target, updated_at })
     }
+}
+
+/// The target id a [`DEFAULT_TARGET_KEY`] value names: the one rule of [`DefaultTarget::parse`]
+/// and [`default_target_in`], so their sentence cannot drift.
+fn default_target_value(value: &Value) -> Result<TargetId, StoreError> {
+    value
+        .as_str()
+        .and_then(|text| text.parse::<TargetId>().ok())
+        .ok_or_else(|| {
+            StoreError::Backend(format!(
+                "app_setting `{DEFAULT_TARGET_KEY}` holds {value}, not a target id"
+            ))
+        })
+}
+
+str_enum!(
+    /// `run.target_source` (MOD-130 M2, D7): the cascade level that answered.
+    TargetSource {
+        /// The item's own target.
+        Item => "item",
+        /// The target of the run's step graph (D11).
+        Workflow => "workflow",
+        /// The item's project row (D5).
+        Project => "project",
+        /// The scope project row of the run's workspace (D5, D6).
+        Workspace => "workspace",
+        /// The Settings default, `app_setting` [`DEFAULT_TARGET_KEY`] (D3).
+        Settings => "settings",
+        /// No level named one: [`LOCAL_TARGET_ID`] (D2).
+        Default => "default",
+    }
+);
+
+impl TargetSource {
+    /// MOD-130 M2 R1 F1: the phrase a target refusal names this level with
+    /// (`…; chosen by its project`). [`TargetSource::Default`] is the local target and cannot
+    /// refuse in practice; should it, it is `the built-in default`.
+    #[must_use]
+    pub const fn chosen_by(self) -> &'static str {
+        match self {
+            Self::Item => "the item",
+            Self::Workflow => "its workflow",
+            Self::Project => "its project",
+            Self::Workspace => "its workspace",
+            Self::Settings => "the Settings default",
+            Self::Default => "the built-in default",
+        }
+    }
+}
+
+/// The cascade's levels, each `None` = inherit (MOD-130 M2, D3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TargetLevels {
+    /// `item.target_id`.
+    pub item: Option<TargetId>,
+    /// `step_graph.target_id` of the graph the run resolves (D11).
+    pub workflow: Option<TargetId>,
+    /// The item's `project.target_id`; `None` for an item filed on a scope row (D5).
+    pub project: Option<TargetId>,
+    /// The scope project row's `target_id` (D5, D6).
+    pub workspace: Option<TargetId>,
+    /// The Settings default target (D3).
+    pub settings: Option<TargetId>,
+}
+
+/// What [`resolve_target`] answers and a run records (MOD-130 M2, D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedTarget {
+    /// `run.target_id`.
+    pub target: TargetId,
+    /// `run.target_source`: the level that answered.
+    pub source: TargetSource,
+}
+
+/// First `Some` in item, workflow, project, workspace, settings order; none → [`LOCAL_TARGET_ID`]
+/// with [`TargetSource::Default`] (MOD-130 M2, D2, D3).
+#[must_use]
+pub fn resolve_target(levels: &TargetLevels) -> ResolvedTarget {
+    let TargetLevels {
+        item,
+        workflow,
+        project,
+        workspace,
+        settings,
+    } = *levels;
+    [
+        (item, TargetSource::Item),
+        (workflow, TargetSource::Workflow),
+        (project, TargetSource::Project),
+        (workspace, TargetSource::Workspace),
+        (settings, TargetSource::Settings),
+    ]
+    .into_iter()
+    .find_map(|(level, source)| level.map(|target| ResolvedTarget { target, source }))
+    .unwrap_or(ResolvedTarget {
+        target: LOCAL_TARGET_ID,
+        source: TargetSource::Default,
+    })
+}
+
+/// The rows `target_binding` reads (MOD-130 M2, P4): the target, the box its `box_id` names, and
+/// the machine that box runs on (its parent for a container, else the bound row itself).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetBinding {
+    /// The `target` row.
+    pub target: Target,
+    /// The `box` row of `target.box_id`.
+    pub bound: Option<BoxRow>,
+    /// The machine `bound` runs on: its parent when it is a container, else `bound` itself.
+    pub host: Option<BoxRow>,
+}
+
+/// Why a run cannot start on a target (MOD-130 M2, D1, D10, D14). `Display` is the sentence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TargetRefusal {
+    /// The target is retired (D14).
+    #[error("target {name} is retired; choose another target or inherit")]
+    Retired {
+        /// `target.name`.
+        name: String,
+    },
+    /// The target's kind does not run in this build (D1).
+    #[error("target {name} is {kind}, which this build cannot run yet; {owner} brings it")]
+    NotRunnable {
+        /// `target.name`.
+        name: String,
+        /// `target.kind`.
+        kind: TargetKind,
+        /// The handoff item that brings the kind.
+        owner: &'static str,
+    },
+    /// The target runs on a box that is neither this box nor a child of it (D10).
+    #[error(
+        "target {name} belongs to box {owner}; start the run there (MOD-43) or choose another target"
+    )]
+    BoundElsewhere {
+        /// `target.name`.
+        name: String,
+        /// The machine the target runs on.
+        owner: BoxId,
+    },
+    /// The target's derived status is not `ready` (D4).
+    #[error("target {name} is {status}; probe it before starting a run on it")]
+    NotReady {
+        /// `target.name`.
+        name: String,
+        /// The derived status.
+        status: TargetStatus,
+    },
+}
+
+/// Why a run on `binding` cannot start on box `here`, or `None` (MOD-130 M2, D1, D10). First
+/// match wins: retired; kind not in `runnable` (owner from [`TargetKind::owner`]); `host` (or
+/// `bound` when it is a machine) is not `here`; [`Target::status_with`] is not `Ready`.
+#[must_use]
+pub fn run_start_refusal(
+    binding: &TargetBinding,
+    here: BoxId,
+    runnable: &[TargetKind],
+) -> Option<TargetRefusal> {
+    let target = &binding.target;
+    let name = || target.name.clone();
+    if target.retired_at.is_some() {
+        return Some(TargetRefusal::Retired { name: name() });
+    }
+    if !runnable.contains(&target.kind) {
+        return Some(TargetRefusal::NotRunnable {
+            name: name(),
+            kind: target.kind,
+            owner: target.kind.owner().unwrap_or("a later item"),
+        });
+    }
+    let machine = binding.host.as_ref().or_else(|| {
+        binding
+            .bound
+            .as_ref()
+            .filter(|bound| bound.kind == BoxKind::Machine)
+    });
+    if let Some(machine) = machine.filter(|machine| machine.id != here) {
+        return Some(TargetRefusal::BoundElsewhere {
+            name: name(),
+            owner: machine.id,
+        });
+    }
+    match target.status_with(runnable, binding.bound.as_ref(), binding.host.as_ref()) {
+        TargetStatus::Ready => None,
+        status => Some(TargetRefusal::NotReady {
+            name: name(),
+            status,
+        }),
+    }
+}
+
+/// The box the work runs on (MOD-130 M2): `binding.target.box_id`, else `here` (local).
+#[must_use]
+pub fn runs_on(binding: &TargetBinding, here: BoxId) -> BoxId {
+    binding.target.box_id.unwrap_or(here)
+}
+
+/// The Settings level of the cascade (MOD-130 M2, P5, D3): the [`DEFAULT_TARGET_KEY`] entry of
+/// the `app_setting` map, `None` when absent. Same rule as [`DefaultTarget::parse`].
+///
+/// # Errors
+/// [`StoreError::Backend`] naming the key for a value that is not a JSON string holding a
+/// target id.
+pub fn default_target_in(app: &BTreeMap<String, Value>) -> Result<Option<TargetId>, StoreError> {
+    app.get(DEFAULT_TARGET_KEY)
+        .map(default_target_value)
+        .transpose()
 }
 
 /// The longest target name, in chars (MOD-130 M1, P9).
@@ -329,7 +531,7 @@ fn url_has_password(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::box_::{BoxKind, OsFamily};
+    use crate::model::box_::OsFamily;
     use crate::model::ids::UserId;
     use serde_json::json;
 
@@ -592,6 +794,350 @@ mod tests {
         }
         for &status in TargetStatus::ALL {
             assert_eq!(status.as_str().parse::<TargetStatus>(), Ok(status));
+        }
+    }
+
+    fn binding(target: Target, bound: Option<BoxRow>, host: Option<BoxRow>) -> TargetBinding {
+        TargetBinding {
+            target,
+            bound,
+            host,
+        }
+    }
+
+    /// `chk_run_target_source`'s list in `0040_execution_targets.sql`, in order (MOD-130 M2, D7).
+    #[test]
+    fn target_source_matches_the_check_list() {
+        let sources: Vec<_> = TargetSource::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            sources,
+            [
+                "item",
+                "workflow",
+                "project",
+                "workspace",
+                "settings",
+                "default"
+            ]
+        );
+        for &source in TargetSource::ALL {
+            assert_eq!(source.as_str().parse::<TargetSource>(), Ok(source));
+            assert_eq!(
+                serde_json::to_value(source).expect("a source serialises"),
+                json!(source.as_str())
+            );
+            assert_eq!(
+                serde_json::from_value::<TargetSource>(json!(source.as_str()))
+                    .expect("a source deserialises"),
+                source
+            );
+        }
+    }
+
+    /// MOD-130 M2 R1 F1: the phrase a target refusal names its level with, one per source.
+    #[test]
+    fn chosen_by_names_every_level() {
+        let phrases: Vec<_> = TargetSource::ALL
+            .iter()
+            .map(|source| (source.as_str(), source.chosen_by()))
+            .collect();
+        assert_eq!(
+            phrases,
+            [
+                ("item", "the item"),
+                ("workflow", "its workflow"),
+                ("project", "its project"),
+                ("workspace", "its workspace"),
+                ("settings", "the Settings default"),
+                ("default", "the built-in default"),
+            ]
+        );
+    }
+
+    /// D3: all 32 combinations; the first level set wins, none is the local target (D2).
+    #[test]
+    fn resolve_target_takes_the_first_level_that_names_one() {
+        let ids: [TargetId; 5] = std::array::from_fn(|_| TargetId::new());
+        let sources = [
+            TargetSource::Item,
+            TargetSource::Workflow,
+            TargetSource::Project,
+            TargetSource::Workspace,
+            TargetSource::Settings,
+        ];
+        for mask in 0u8..32 {
+            let set = |level: usize| (mask & (1 << level) != 0).then_some(ids[level]);
+            let levels = TargetLevels {
+                item: set(0),
+                workflow: set(1),
+                project: set(2),
+                workspace: set(3),
+                settings: set(4),
+            };
+            let want = (0..5).find(|&level| mask & (1 << level) != 0).map_or(
+                ResolvedTarget {
+                    target: LOCAL_TARGET_ID,
+                    source: TargetSource::Default,
+                },
+                |level| ResolvedTarget {
+                    target: ids[level],
+                    source: sources[level],
+                },
+            );
+            assert_eq!(resolve_target(&levels), want, "mask {mask:05b}");
+        }
+    }
+
+    /// MOD-130 M2: retired, then not runnable, then bound elsewhere, then not ready.
+    #[test]
+    fn run_start_refusal_follows_its_order() {
+        let here_box = a_box(&["docker"], &[]);
+        let here = here_box.id;
+        let all = TargetKind::ALL;
+
+        // Retired comes first, even on local.
+        let mut retired = target(TargetKind::Local);
+        retired.retired_at = Some(at());
+        assert_eq!(
+            run_start_refusal(&binding(retired.clone(), None, None), here, RUNNABLE_KINDS),
+            Some(TargetRefusal::Retired {
+                name: retired.name.clone()
+            })
+        );
+        let mut retired_docker = target(TargetKind::Docker);
+        retired_docker.retired_at = Some(at());
+        assert_eq!(
+            run_start_refusal(&binding(retired_docker.clone(), None, None), here, &[]),
+            Some(TargetRefusal::Retired {
+                name: retired_docker.name.clone()
+            })
+        );
+
+        // Not runnable names the item that brings the kind.
+        for (kind, owner) in [
+            (TargetKind::Docker, "MOD-44"),
+            (TargetKind::Ssh, "MOD-131"),
+            (TargetKind::SshDocker, "MOD-131"),
+            (TargetKind::Enrolled, "MOD-47"),
+        ] {
+            let row = target(kind);
+            assert_eq!(
+                run_start_refusal(
+                    &binding(row.clone(), Some(here_box.clone()), Some(here_box.clone())),
+                    here,
+                    RUNNABLE_KINDS
+                ),
+                Some(TargetRefusal::NotRunnable {
+                    name: row.name.clone(),
+                    kind,
+                    owner
+                }),
+                "{kind}"
+            );
+        }
+        // Local outside the runnable set has no owner and never panics.
+        let local = target(TargetKind::Local);
+        assert_eq!(
+            run_start_refusal(&binding(local.clone(), None, None), here, &[]),
+            Some(TargetRefusal::NotRunnable {
+                name: local.name.clone(),
+                kind: TargetKind::Local,
+                owner: "a later item"
+            })
+        );
+
+        // A container whose machine is another box.
+        let elsewhere = a_box(&["docker"], &[]);
+        let mut child_elsewhere = a_box(&[], &[]);
+        child_elsewhere.kind = BoxKind::Container;
+        child_elsewhere.parent_box_id = Some(elsewhere.id);
+        let mut docker = target(TargetKind::Docker);
+        docker.box_id = Some(child_elsewhere.id);
+        docker.probed_at = Some(at());
+        assert_eq!(
+            run_start_refusal(
+                &binding(
+                    docker.clone(),
+                    Some(child_elsewhere.clone()),
+                    Some(elsewhere.clone())
+                ),
+                here,
+                all
+            ),
+            Some(TargetRefusal::BoundElsewhere {
+                name: docker.name.clone(),
+                owner: elsewhere.id
+            })
+        );
+        // An ssh target bound to a machine that is not here, with no host row read.
+        let mut ssh = target(TargetKind::Ssh);
+        ssh.box_id = Some(elsewhere.id);
+        ssh.probed_at = Some(at());
+        assert_eq!(
+            run_start_refusal(
+                &binding(ssh.clone(), Some(elsewhere.clone()), None),
+                here,
+                all
+            ),
+            Some(TargetRefusal::BoundElsewhere {
+                name: ssh.name.clone(),
+                owner: elsewhere.id
+            })
+        );
+        assert_eq!(
+            run_start_refusal(
+                &binding(
+                    ssh.clone(),
+                    Some(elsewhere.clone()),
+                    Some(elsewhere.clone())
+                ),
+                here,
+                all
+            ),
+            Some(TargetRefusal::BoundElsewhere {
+                name: ssh.name.clone(),
+                owner: elsewhere.id
+            })
+        );
+
+        // A container on a child of here: unprobed is not ready; probed with docker runs.
+        let mut child_here = a_box(&[], &[]);
+        child_here.kind = BoxKind::Container;
+        child_here.parent_box_id = Some(here);
+        let mut fresh = target(TargetKind::Docker);
+        fresh.box_id = Some(child_here.id);
+        assert_eq!(
+            run_start_refusal(
+                &binding(
+                    fresh.clone(),
+                    Some(child_here.clone()),
+                    Some(here_box.clone())
+                ),
+                here,
+                all
+            ),
+            Some(TargetRefusal::NotReady {
+                name: fresh.name.clone(),
+                status: TargetStatus::Unprepared
+            })
+        );
+        let mut probed = fresh.clone();
+        probed.probed_at = Some(at());
+        assert_eq!(
+            run_start_refusal(
+                &binding(probed, Some(child_here.clone()), Some(here_box.clone())),
+                here,
+                all
+            ),
+            None
+        );
+
+        // Local runs.
+        assert_eq!(
+            run_start_refusal(
+                &binding(target(TargetKind::Local), None, None),
+                here,
+                RUNNABLE_KINDS
+            ),
+            None
+        );
+    }
+
+    /// The sentences are the contract (MOD-130 M2, P6): pinned verbatim.
+    #[test]
+    fn refusal_sentences_are_pinned() {
+        let owner = BoxId::from_uuid(uuid::Uuid::from_u128(
+            0x0000_0000_0000_4000_8000_0000_0000_00b0,
+        ));
+        for (refusal, want) in [
+            (
+                TargetRefusal::Retired {
+                    name: "old box".to_owned(),
+                },
+                "target old box is retired; choose another target or inherit",
+            ),
+            (
+                TargetRefusal::NotRunnable {
+                    name: "rust".to_owned(),
+                    kind: TargetKind::Docker,
+                    owner: "MOD-44",
+                },
+                "target rust is docker, which this build cannot run yet; MOD-44 brings it",
+            ),
+            (
+                TargetRefusal::NotRunnable {
+                    name: "far".to_owned(),
+                    kind: TargetKind::SshDocker,
+                    owner: "MOD-131",
+                },
+                "target far is ssh_docker, which this build cannot run yet; MOD-131 brings it",
+            ),
+            (
+                TargetRefusal::BoundElsewhere {
+                    name: "rust".to_owned(),
+                    owner,
+                },
+                "target rust belongs to box 00000000-0000-4000-8000-0000000000b0; start the run \
+                 there (MOD-43) or choose another target",
+            ),
+            (
+                TargetRefusal::NotReady {
+                    name: "rust".to_owned(),
+                    status: TargetStatus::Unprepared,
+                },
+                "target rust is unprepared; probe it before starting a run on it",
+            ),
+            (
+                TargetRefusal::NotReady {
+                    name: "rust".to_owned(),
+                    status: TargetStatus::Unreachable,
+                },
+                "target rust is unreachable; probe it before starting a run on it",
+            ),
+        ] {
+            assert_eq!(refusal.to_string(), want);
+        }
+    }
+
+    /// MOD-130 M2: a bound target runs on its box; local runs here.
+    #[test]
+    fn runs_on_is_the_bound_box_else_here() {
+        let here = BoxId::new();
+        assert_eq!(
+            runs_on(&binding(target(TargetKind::Local), None, None), here),
+            here
+        );
+        let child = a_box(&[], &[]);
+        let mut docker = target(TargetKind::Docker);
+        docker.box_id = Some(child.id);
+        assert_eq!(
+            runs_on(&binding(docker, Some(child.clone()), None), here),
+            child.id
+        );
+    }
+
+    /// P5: the Settings level is read from the `app_setting` map with `DefaultTarget::parse`'s rule.
+    #[test]
+    fn default_target_in_reads_the_setting() {
+        let mut app = BTreeMap::new();
+        assert_eq!(default_target_in(&app), Ok(None));
+        app.insert("other".to_owned(), json!(3));
+        assert_eq!(default_target_in(&app), Ok(None));
+        let id = TargetId::new();
+        app.insert(DEFAULT_TARGET_KEY.to_owned(), DefaultTarget::value(id));
+        assert_eq!(default_target_in(&app), Ok(Some(id)));
+        for bad in [json!(3), json!("not an id"), json!(null)] {
+            app.insert(DEFAULT_TARGET_KEY.to_owned(), bad.clone());
+            let err = default_target_in(&app).expect_err("a malformed value is refused");
+            let StoreError::Backend(text) = &err else {
+                panic!("{bad}: {err:?}");
+            };
+            assert!(text.contains("default_target"), "{text}");
+            assert_eq!(
+                Some(err),
+                DefaultTarget::parse(&bad, at()).err(),
+                "the two readers share one sentence"
+            );
         }
     }
 }

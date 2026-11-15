@@ -162,6 +162,10 @@ pub struct Resolved {
     pub snapshot: GraphSnapshot,
     /// `run.repo_scope` (ANA-2 §4.7), from [`crate::overlap::resolve`].
     pub repo_scope: Vec<RepoId>,
+    /// The workflow level of the target cascade (MOD-130 M2, P3, D11): `step_graph.target_id` of
+    /// the graph resolved (the item's override, else its kind's default). Not in the snapshot:
+    /// the target is a run column.
+    pub workflow_target: Option<htui_core::model::TargetId>,
 }
 
 /// MOD-141 M2 D4: the run limits [`resolve`] freezes into [`SnapshotSettings`], over the same
@@ -852,6 +856,7 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
     Ok(Resolution::Resolved(Box::new(Resolved {
         snapshot,
         repo_scope,
+        workflow_target: graph.target_id,
     })))
 }
 
