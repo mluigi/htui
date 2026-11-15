@@ -75,6 +75,9 @@ pub struct ProjectEntry {
     pub project: Project,
     /// Its settings, in [`project_keys`] order.
     pub values: Vec<ProjectValue>,
+    /// Whether any repo of the project carries a non-blank remote URL (MOD-133 M2 E7): without
+    /// one the `integrate` row refuses to step to `push`.
+    pub has_remote: bool,
 }
 
 /// One key's value on the `Project` rung.
@@ -133,7 +136,8 @@ pub fn project_keys() -> impl Iterator<Item = SettingKey> {
 /// `Backend`/`PgStore` read that the [`Writer`] this runs over does not carry (MOD-164 D7).
 ///
 /// N+1 reads on purpose (D3, M3 D5's trade, same words): fourteen `setting(App, _)` plus, per
-/// project, one `project()` and one `setting(Project(id), _)` per project key. They happen per
+/// project, one `project()`, one `setting(Project(id), _)` per project key and one `repos()` for
+/// [`ProjectEntry::has_remote`]. They happen per
 /// event — activation, a scope change, after a write — never per keystroke.
 ///
 /// A project that vanishes between its `project()` and its `setting()` calls yields `value: None`
@@ -176,7 +180,16 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
                 value: stored.and_then(|row| row.value),
             });
         }
-        projects.push(ProjectEntry { project, values });
+        let has_remote = store.repos(*id).await?.iter().any(|repo| {
+            repo.remote_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty())
+        });
+        projects.push(ProjectEntry {
+            project,
+            values,
+            has_remote,
+        });
     }
 
     Ok(SettingsSnapshot {

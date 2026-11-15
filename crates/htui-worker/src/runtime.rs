@@ -3708,8 +3708,12 @@ async fn stopped_workspace_refusal<H: htui_core::store::WorkerHost>(
     }
 }
 
-/// `Unblock` (D161): a reopen needs no run; the other two cases lock the run they name and check
-/// the case again under the lock (§8.6).
+/// `Unblock` (D161): a reopen needs no run; the follow and resume cases lock the run they name
+/// and check the case again under the lock (§8.6). A landing retry (MOD-133 M2 E6) takes no run
+/// lock either: its reset is a compare-and-set on `refused` of exactly the run the case named, and
+/// the run's walk token, held across the reset and the land, keeps the sweep's land arm off it.
+/// After the answer, a process that executes the box lands the reset records at once, in this
+/// same task ([`executes_this_box`]); any other process leaves them to the executing one's sweep.
 async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>, item: ItemId) {
     let _ = ctx.tag.item.set(item);
     let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
@@ -3734,6 +3738,32 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
                 Ok(outcome) => ctx.done(outcome),
                 Err(err) => ctx.refuse(err.to_string()),
             };
+        }
+        UnblockCase::RetryLanding(run) => {
+            // MOD-133 M2 R1 (F1): the run counts as live in this process's walks from before the
+            // reset to after the land, as a walk's own land does: the sweep's land arm skips a
+            // live run, so it never takes the reset record while this task pushes it under the
+            // same lease owner.
+            let walk = ctx.shared.walks.child(run);
+            // F3: exactly the run the case named, with no second derivation, which a concurrent
+            // write could have moved to a case that needs the run lock. A stale press (nothing
+            // `refused` any more) is the engine's `nothing_is_refused` refusal.
+            if let Err(err) = engine.retry_landing(item, run).await {
+                return ctx.refuse(err.to_string());
+            }
+            ctx.done(CommandOutcome::Unblocked {
+                item,
+                case,
+                rest: None,
+            });
+            // The answer is sent; the engine borrows `kit`, so the landing stays in this task.
+            if executes_this_box(&ctx).await
+                && let Err(err) = Box::pin(engine.land(Some(run))).await
+            {
+                tracing::warn!(%run, %err, "landing the retried run failed; the sweep retries it");
+            }
+            drop(walk);
+            return;
         }
         UnblockCase::FollowRun(run) | UnblockCase::Resume(run) => run,
     };
@@ -3767,6 +3797,27 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
         Some(Err(err)) => ctx.refuse(err.to_string()),
     }
     drop(guard);
+}
+
+/// MOD-133 M2 E6: whether this process executes its box, read as [`sweep_once`] reads it
+/// (`registered_box`, the box row, [`Executor::of`]): an `Unblock` that reset a refused landing
+/// lands it at once only then; otherwise the executing process's sweep does (I-1). `false` when
+/// the box cannot be read: the sweep is the recovery path.
+async fn executes_this_box<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: &TaskCtx<H, P>,
+) -> bool {
+    let host = &ctx.host;
+    let Ok(box_id) = registered_box(host).await else {
+        return false;
+    };
+    match host.box_row(box_id).await {
+        Ok(Some(row)) => ctx.shared.role.executes(&Executor::of(&row.settings)),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::debug!(%err, "the retried landing could not read this box's executor");
+            false
+        }
+    }
 }
 
 /// D177 (R-25): a terminal run's cleanup, again, under the run's lock.

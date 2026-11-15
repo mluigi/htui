@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::model::ids::{ArtifactLinkId, DocumentId, ItemId, ProjectId, StepId};
-use crate::model::item::{ItemState, Status};
+use crate::model::item::{ItemState, RunLanding, Status};
 use crate::model::run::RunStatus;
 
 str_enum!(
@@ -252,13 +252,17 @@ pub struct LinkNode {
     /// Appended, never inserted.
     #[serde(default)]
     pub latest_run_status: Option<RunStatus>,
+    /// MOD-133 M2 E3: the landing of the same run's integration records. Appended, never
+    /// inserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run_landing: Option<RunLanding>,
 }
 
 impl LinkNode {
     /// The item's derived display state (MOD-144).
     #[must_use]
     pub const fn state(&self) -> ItemState {
-        ItemState::of(self.status, self.latest_run_status)
+        ItemState::of_landing(self.status, self.latest_run_status, self.latest_run_landing)
     }
 }
 
@@ -351,13 +355,17 @@ pub struct UpstreamEntry {
     /// Appended, never inserted.
     #[serde(default)]
     pub latest_run_status: Option<RunStatus>,
+    /// MOD-133 M2 E3: the landing of the same run's integration records. Appended, never
+    /// inserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run_landing: Option<RunLanding>,
 }
 
 impl UpstreamEntry {
     /// The item's derived display state (MOD-144): what the prompt's upstream section prints.
     #[must_use]
     pub const fn state(&self) -> ItemState {
-        ItemState::of(self.status, self.latest_run_status)
+        ItemState::of_landing(self.status, self.latest_run_status, self.latest_run_landing)
     }
 
     /// `docs/ANA-5.md` §4.7 rule 2: sort by `(depth, qualified_key bytes, item_id)`.
@@ -406,6 +414,7 @@ mod tests {
             in_scope: true,
             summary: Some(format!("{key} summary")),
             latest_run_status: Some(RunStatus::Done),
+            latest_run_landing: None,
         }
     }
 

@@ -93,11 +93,16 @@ impl BodyTab {
     /// The item's derived state: its stored status over its latest graph run. `None` for an `open`
     /// item until the `Runs` reply lands (or when the read failed): its runs decide between
     /// `open`, `running`, `needs you` and the rest, so the pane must not guess `open`. A `blocked`
-    /// or `closed` item reads its status at once, whatever its runs.
+    /// or `closed` item reads its status at once, whatever its runs. A `done` latest run reads
+    /// `landing` or `landing refused` by the landing the framing told (MOD-133 M2 E2).
     fn state(&self, item: &Item) -> Option<ItemState> {
         match (item.status, self.latest) {
             (Status::Open, None) => None,
-            (status, latest) => Some(ItemState::of(status, latest.flatten())),
+            (status, latest) => Some(ItemState::of_landing(
+                status,
+                latest.flatten(),
+                self.told.landing(),
+            )),
         }
     }
 }
@@ -451,6 +456,48 @@ mod tests {
             rows(&pane, &shell, 43, 30)[0],
             "\u{2298} blocked \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
             "a blocked item needs no runs to read `blocked`"
+        );
+    }
+
+    /// MOD-133 M2 E2: an `open` item whose latest graph run is `done` reads its landing from the
+    /// list's summary, told with the framing (no store read): `landing` while a record is not
+    /// landed, `landing refused` while one is refused, `done` once all landed.
+    #[tokio::test]
+    async fn a_done_run_reads_its_landing_from_the_framing() {
+        use crate::ui::kit::pane::Focus;
+        use crate::ui::tabs::backlog::detail::ListCue;
+        use htui_core::model::RunLanding;
+
+        let shell = Shell::new();
+        let store = MemStore::demo();
+        let mut pane = BodyTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        let item = store.item(ids::HTUI_FEAT_1).await.expect("the item");
+        pane.on_reply(&StoreReply::Item(Box::new(item)), &mut shell.ctx());
+        let mut runs = store.runs(ids::HTUI_FEAT_1).await.expect("FEAT-1's runs");
+        for run in &mut runs {
+            run.status = RunStatus::Done;
+        }
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        let meta = |pane: &BodyTab, landing: Option<RunLanding>| {
+            pane.framing(Framing {
+                focus: Focus::Unfocused,
+                list: ListCue::default(),
+                landing,
+            });
+            rows(pane, &shell, 60, 30)[0].clone()
+        };
+        assert_eq!(
+            meta(&pane, None),
+            "\u{25cf} done \u{b7} rust \u{b7} priority 2 \u{b7} version 1"
+        );
+        assert_eq!(
+            meta(&pane, Some(RunLanding::Pending)),
+            "\u{21e1} landing \u{b7} rust \u{b7} priority 2 \u{b7} version 1"
+        );
+        assert_eq!(
+            meta(&pane, Some(RunLanding::Refused)),
+            "\u{21af} landing refused \u{b7} rust \u{b7} priority 2 \u{b7} version 1"
         );
     }
 

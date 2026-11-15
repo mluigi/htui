@@ -32,10 +32,24 @@ pub const TABLE: &[(ItemState, StatusMark)] = &[
         },
     ),
     (
+        ItemState::LandRefused,
+        StatusMark {
+            glyph: "↯",
+            word: "landing refused",
+        },
+    ),
+    (
         ItemState::Running,
         StatusMark {
             glyph: "◐",
             word: "running",
+        },
+    ),
+    (
+        ItemState::Landing,
+        StatusMark {
+            glyph: "⇡",
+            word: "landing",
         },
     ),
     (
@@ -144,7 +158,9 @@ mod tests {
             [
                 ("⚠", "needs you"),
                 ("✗", "failed"),
+                ("↯", "landing refused"),
                 ("◐", "running"),
+                ("⇡", "landing"),
                 ("■", "stopped"),
                 ("⊘", "blocked"),
                 ("◌", "queued"),
@@ -177,6 +193,8 @@ mod tests {
 
     #[test]
     fn an_item_state_reads_as_its_run_status() {
+        // `Landing` and `LandRefused` have no run counterpart: the run is `done`, its landing is
+        // not (MOD-133 E2), so they are not in this table.
         for (state, run) in [
             (ItemState::Running, RunStatus::Running),
             (ItemState::NeedsYou, RunStatus::AwaitingApproval),

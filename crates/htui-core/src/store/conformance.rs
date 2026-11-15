@@ -62,7 +62,8 @@ use crate::model::{
 use crate::model::{IndexChanges, ProjectChanges};
 use crate::model::{IndexedCollection, IndexerLease, LeaseTake, LeaseTurn};
 use crate::model::{
-    IntegrateMode, IntegrateSnapshot, Integration, IntegrationState, LandOutcome, Repo,
+    IntegrateMode, IntegrateSnapshot, Integration, IntegrationState, LandOutcome, RefusedLanding,
+    Repo, RunLanding,
 };
 use crate::model::{ItemState, latest_graph_run};
 use crate::model::{
@@ -494,6 +495,10 @@ pub const CASES: &[&str] = &[
     "settle_integration_lands_or_refuses_once",
     "an_unlanded_integration_holds_its_dependents",
     "update_repo_sets_and_clears_integrate",
+    // MOD-133 M2: the landing state, the refused waiting row and the retry (E1-E5)
+    "the_latest_done_runs_landing_derives_the_item_state",
+    "waiting_candidates_hold_an_open_item_over_a_refused_landing",
+    "retry_landing_resets_only_refused_records",
     // MOD-130 M1: execution targets (D1-D4, P2, P10)
     "the_local_target_is_seeded",
     // MOD-130 M1 T2: create, edit and bind targets (P4-P6, P9, blueprint B2-B4, B10)
@@ -1601,6 +1606,19 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "update_repo_sets_and_clears_integrate" => {
             boxed(update_repo_sets_and_clears_integrate, store).await;
+        }
+        "the_latest_done_runs_landing_derives_the_item_state" => {
+            boxed(the_latest_done_runs_landing_derives_the_item_state, store).await;
+        }
+        "waiting_candidates_hold_an_open_item_over_a_refused_landing" => {
+            boxed(
+                waiting_candidates_hold_an_open_item_over_a_refused_landing,
+                store,
+            )
+            .await;
+        }
+        "retry_landing_resets_only_refused_records" => {
+            boxed(retry_landing_resets_only_refused_records, store).await;
         }
         "the_local_target_is_seeded" => boxed(the_local_target_is_seeded, store).await,
         "create_target_round_trips_every_kind_but_local" => {
@@ -22043,6 +22061,632 @@ async fn update_repo_sets_and_clears_integrate<S: WriteStore>(store: &S) {
     assert_eq!(
         cleared.integrate, None,
         "{CASE}: `Some(None)` clears it back to the project's default"
+    );
+}
+
+// ---- MOD-133 M2: the landing state, the refused waiting row and the retry (E1-E5) ---------
+//
+// An item whose latest graph run is `done` reads `landing` while a record of **that run** is not
+// landed, `landing refused` when one is refused; a refused record is a waiting row, and
+// `retry_landing` puts it back to `pending` for its box to land again.
+
+/// MOD-133 M2: takes `run`'s pending records under `owner` and settles `repo`'s with `outcome`.
+async fn settle_landing<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    repo: RepoId,
+    owner: Uuid,
+    outcome: &LandOutcome,
+) {
+    store
+        .take_integrations(ids::BOX, owner, LEASE, Some(run))
+        .await
+        .expect(case);
+    assert!(
+        store
+            .settle_integration(run, repo, owner, outcome)
+            .await
+            .expect(case),
+        "{case}: the record of {repo} settles as {outcome:?}"
+    );
+}
+
+/// MOD-133 M2: a refusal with a typed reason naming `what`.
+fn landing_refusal(what: &str) -> LandOutcome {
+    LandOutcome::Refused {
+        reason: format!("non_fast_forward: {what} on the remote has moved"),
+    }
+}
+
+/// MOD-133 M2: a landed outcome.
+fn landing_landed() -> LandOutcome {
+    LandOutcome::Landed {
+        hash: "4444444444444444444444444444444444444444".to_owned(),
+    }
+}
+
+/// MOD-133 M2 E1-E3: an item whose latest graph run is `done` reads `landing` with an unlanded
+/// record, `landing refused` with a refused one (refused wins over pending), and `done` with every
+/// record landed or with none; an older run's records never count, and a newer run that is not
+/// `done` reads its own state. `items` (and its `latest_run_landing`), the `states` filter, the
+/// link graph's node and coverage all carry it.
+async fn the_latest_done_runs_landing_derives_the_item_state<S: WriteStore>(store: &S) {
+    const CASE: &str = "the_latest_done_runs_landing_derives_the_item_state";
+    let owner = Uuid::now_v7();
+    let first = integration_repo(CASE, store, "landing-a").await;
+    let second = integration_repo(CASE, store, "landing-b").await;
+    let both = [
+        (&first, IntegrateMode::Push),
+        (&second, IntegrateMode::Push),
+    ];
+    let changed = [first.id, second.id];
+    let mut rows: Vec<(ItemId, ItemState, Option<RunLanding>, &str)> = Vec::new();
+
+    let pending = minted(CASE, store, "pending landing").await;
+    integrated_run(
+        CASE,
+        store,
+        pending,
+        &both,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    rows.push((
+        pending,
+        ItemState::Landing,
+        Some(RunLanding::Pending),
+        "two pending records",
+    ));
+
+    let refused = minted(CASE, store, "refused landing").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        refused,
+        &both,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    settle_landing(CASE, store, run, first.id, owner, &landing_refusal("main")).await;
+    rows.push((
+        refused,
+        ItemState::LandRefused,
+        Some(RunLanding::Refused),
+        "a refused record beside a pending one: refused wins",
+    ));
+
+    let landed = minted(CASE, store, "landed").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        landed,
+        &both,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    for repo in changed {
+        settle_landing(CASE, store, run, repo, owner, &landing_landed()).await;
+    }
+    rows.push((landed, ItemState::Done, None, "every record landed"));
+
+    let local = minted(CASE, store, "local").await;
+    integrated_run(
+        CASE,
+        store,
+        local,
+        &[],
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    rows.push((local, ItemState::Done, None, "no records (`local`)"));
+
+    let older = minted(CASE, store, "older refusal").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        older,
+        &both,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    settle_landing(CASE, store, run, first.id, owner, &landing_refusal("main")).await;
+    integrated_run(
+        CASE,
+        store,
+        older,
+        &[],
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    rows.push((
+        older,
+        ItemState::Done,
+        None,
+        "a newer `done` run with no records: the older run's refusal never counts",
+    ));
+
+    let reworked = minted(CASE, store, "reworked").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        reworked,
+        &both,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    settle_landing(CASE, store, run, first.id, owner, &landing_refusal("main")).await;
+    integrated_run(
+        CASE,
+        store,
+        reworked,
+        &both,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Failed,
+    )
+    .await;
+    rows.push((
+        reworked,
+        ItemState::Failed,
+        None,
+        "a newer `failed` run: the landing is the latest run's only",
+    ));
+
+    let listed = store
+        .items(&platform_scope(), &ItemFilter::default())
+        .await
+        .expect(CASE);
+    for &(item, state, landing, why) in &rows {
+        let summary = listed
+            .iter()
+            .find(|row| row.id == item)
+            .unwrap_or_else(|| panic!("{CASE}: {item} is listed"));
+        assert_eq!(
+            (summary.state(), summary.latest_run_landing),
+            (state, landing),
+            "{CASE}: `items` carries the landing: {why}"
+        );
+        let filtered = store
+            .items(
+                &platform_scope(),
+                &ItemFilter {
+                    states: Some(vec![state]),
+                    ..ItemFilter::default()
+                },
+            )
+            .await
+            .expect(CASE);
+        assert!(
+            filtered.iter().any(|row| row.id == item),
+            "{CASE}: the `states` filter keeps a `{state}` item: {why}"
+        );
+        assert!(
+            filtered.iter().all(|row| row.state() == state),
+            "{CASE}: and only `{state}` items"
+        );
+        let graph = store.links(item, 0).await.expect(CASE);
+        assert_eq!(
+            graph
+                .node(item)
+                .map(|node| (node.state(), node.latest_run_landing)),
+            Some((state, landing)),
+            "{CASE}: the link graph's node carries the landing: {why}"
+        );
+        store
+            .cite(item, ids::REQ_ENT_2, CitationKind::Addresses, None)
+            .await
+            .expect(CASE);
+    }
+    let coverage = store
+        .requirement_coverage(ids::REQ_ENT_2)
+        .await
+        .expect(CASE);
+    for &(item, state, _, why) in &rows {
+        let row = coverage
+            .iter()
+            .find(|row| row.item.id == item)
+            .unwrap_or_else(|| panic!("{CASE}: {item} covers R-ENT-2"));
+        assert_eq!(
+            row.item.state(),
+            state,
+            "{CASE}: coverage carries the landing: {why}"
+        );
+    }
+    let both_states = store
+        .items(
+            &platform_scope(),
+            &ItemFilter {
+                states: Some(vec![ItemState::Landing, ItemState::LandRefused]),
+                ..ItemFilter::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    let mut answered = row_ids(&both_states);
+    answered.sort_unstable();
+    let mut expected = vec![pending, refused];
+    expected.sort_unstable();
+    assert_eq!(
+        answered, expected,
+        "{CASE}: the fixture holds no landing item (plan E9), so the filter answers the two \
+         planted ones"
+    );
+}
+
+/// MOD-133 M2 E4: an `open` item whose latest graph run is `done` and holds a `refused` record is
+/// a waiting candidate with no active run and `refused` holding exactly that run's refused
+/// records, by repo name; an item with only pending or landed records, or whose refusal belongs to
+/// an older run, is not one; a `blocked` item over a refusal is a candidate for its block, with
+/// `refused` empty.
+async fn waiting_candidates_hold_an_open_item_over_a_refused_landing<S: WriteStore>(store: &S) {
+    const CASE: &str = "waiting_candidates_hold_an_open_item_over_a_refused_landing";
+    let owner = Uuid::now_v7();
+    let beta = integration_repo(CASE, store, "beta-refused").await;
+    let alpha = integration_repo(CASE, store, "alpha-refused").await;
+    let gamma = integration_repo(CASE, store, "gamma-pending").await;
+    let three = [
+        (&beta, IntegrateMode::Push),
+        (&alpha, IntegrateMode::Push),
+        (&gamma, IntegrateMode::Push),
+    ];
+    let changed = [beta.id, alpha.id, gamma.id];
+
+    let refused = minted(CASE, store, "refused landing").await;
+    let refused_run = integrated_run(
+        CASE,
+        store,
+        refused,
+        &three,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    for repo in [&beta, &alpha] {
+        settle_landing(
+            CASE,
+            store,
+            refused_run,
+            repo.id,
+            owner,
+            &landing_refusal(&repo.name),
+        )
+        .await;
+    }
+    let pending = minted(CASE, store, "pending landing").await;
+    integrated_run(
+        CASE,
+        store,
+        pending,
+        &three,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    let landed = minted(CASE, store, "landed").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        landed,
+        &three,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    for repo in changed {
+        settle_landing(CASE, store, run, repo, owner, &landing_landed()).await;
+    }
+    let older = minted(CASE, store, "older refusal").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        older,
+        &three,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    settle_landing(CASE, store, run, alpha.id, owner, &landing_refusal("main")).await;
+    integrated_run(
+        CASE,
+        store,
+        older,
+        &[],
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    let blocked = minted(CASE, store, "blocked over a refusal").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        blocked,
+        &three,
+        &changed,
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    settle_landing(CASE, store, run, alpha.id, owner, &landing_refusal("main")).await;
+    assert!(
+        store
+            .transition(blocked, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: open -> blocked"
+    );
+
+    let candidates = store
+        .waiting_candidates(&platform_scope())
+        .await
+        .expect(CASE);
+    let candidate = candidates
+        .iter()
+        .find(|row| row.item.id == refused)
+        .unwrap_or_else(|| panic!("{CASE}: the open item over a refused landing is listed"));
+    let records = store.integrations(refused_run).await.expect(CASE);
+    let queued_at = store
+        .run(refused_run)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the refused run exists"))
+        .queued_at;
+    let expected: Vec<RefusedLanding> = [&alpha, &beta]
+        .into_iter()
+        .map(|repo| {
+            let record = records
+                .iter()
+                .find(|row| row.repo_id == repo.id)
+                .unwrap_or_else(|| panic!("{CASE}: the record of `{}` exists", repo.name));
+            RefusedLanding {
+                run: refused_run,
+                repo: repo.id,
+                repo_name: repo.name.clone(),
+                mode: IntegrateMode::Push,
+                target_branch: repo.default_branch.clone(),
+                refusal: record
+                    .refusal
+                    .clone()
+                    .unwrap_or_else(|| panic!("{CASE}: `{}` is refused", repo.name)),
+                since: record.updated_at,
+                run_queued_at: queued_at,
+            }
+        })
+        .collect();
+    assert_eq!(
+        candidate.refused, expected,
+        "{CASE}: `refused` holds the latest run's refused records by repo name, never the \
+         pending one"
+    );
+    assert!(
+        candidate.runs.is_empty(),
+        "{CASE}: its runs are the active ones, and the done run is not active"
+    );
+    for (item, why) in [
+        (pending, "only pending records"),
+        (landed, "every record landed"),
+        (older, "the refusal belongs to an older run"),
+    ] {
+        assert!(
+            !candidates.iter().any(|row| row.item.id == item),
+            "{CASE}: not a candidate: {why}"
+        );
+    }
+    let blocked_row = candidates
+        .iter()
+        .find(|row| row.item.id == blocked)
+        .unwrap_or_else(|| panic!("{CASE}: a blocked item is a candidate for its block"));
+    assert_eq!(
+        blocked_row.refused,
+        Vec::new(),
+        "{CASE}: `refused` is empty for every candidate but an open one over a refusal"
+    );
+    assert!(
+        candidates
+            .iter()
+            .filter(|row| row.item.id != refused)
+            .all(|row| row.refused.is_empty()),
+        "{CASE}: no other candidate holds a refusal"
+    );
+}
+
+/// MOD-133 M2 E5: `retry_landing` puts every `refused` record of the run back to `pending` with
+/// its refusal cleared, so it is takeable again; leaves a landed and a pending record alone, and
+/// answers how many moved: `0` on a second press and for an unknown run. After it the item reads
+/// `landing`, is no longer a refused waiting candidate, and still holds its dependent. (A refused
+/// record holds no lease through the public API, since the refusing settle clears it, so this case
+/// cannot tell whether `retry_landing` clears one; it claims nothing about it.)
+async fn retry_landing_resets_only_refused_records<S: WriteStore>(store: &S) {
+    const CASE: &str = "retry_landing_resets_only_refused_records";
+    let owner = Uuid::now_v7();
+    let other = Uuid::now_v7();
+    let target = minted(CASE, store, "retried").await;
+    let dependent = minted(CASE, store, "its dependent").await;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, dependent, None).await;
+    propose_unleased(store, dependent, LinkKind::BlockedBy, target, step)
+        .await
+        .expect(CASE);
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    let landed = integration_repo(CASE, store, "retry-landed").await;
+    let refused = integration_repo(CASE, store, "retry-refused").await;
+    let pending = integration_repo(CASE, store, "retry-pending").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        target,
+        &[
+            (&landed, IntegrateMode::Push),
+            (&refused, IntegrateMode::Push),
+            (&pending, IntegrateMode::Push),
+        ],
+        &[landed.id, refused.id, pending.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    settle_landing(CASE, store, run, landed.id, owner, &landing_landed()).await;
+    settle_landing(
+        CASE,
+        store,
+        run,
+        refused.id,
+        owner,
+        &landing_refusal("main"),
+    )
+    .await;
+    let row_of = async |repo: RepoId| -> Integration {
+        store
+            .integrations(run)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .find(|row| row.repo_id == repo)
+            .unwrap_or_else(|| panic!("{CASE}: the record of {repo} exists"))
+    };
+    let upstream_state = async || -> Option<ItemState> {
+        store
+            .upstream_summaries(dependent, 1, &platform_prompt_scope())
+            .await
+            .expect(CASE)
+            .into_iter()
+            .find(|entry| entry.item_id == target)
+            .map(|entry| entry.state())
+    };
+    let before_refused = row_of(refused.id).await;
+    let before_landed = row_of(landed.id).await;
+    let before_pending = row_of(pending.id).await;
+    assert_eq!(
+        upstream_state().await,
+        Some(ItemState::LandRefused),
+        "{CASE}: the upstream entry carries the refusal"
+    );
+    assert!(
+        store
+            .waiting_candidates(&platform_scope())
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.item.id == target && row.refused.len() == 1),
+        "{CASE}: the refusal waits on you"
+    );
+
+    assert_eq!(
+        store.retry_landing(run).await.expect(CASE),
+        1,
+        "{CASE}: one refused record moved"
+    );
+    let row = row_of(refused.id).await;
+    assert_eq!(
+        (
+            row.state,
+            row.refusal.as_deref(),
+            row.landed_hash.as_deref()
+        ),
+        (IntegrationState::Pending, None, None),
+        "{CASE}: the refused record is pending again, its refusal cleared"
+    );
+    assert!(
+        row.updated_at >= before_refused.updated_at,
+        "{CASE}: updated_at never moves back"
+    );
+    assert_eq!(
+        row_of(landed.id).await,
+        before_landed,
+        "{CASE}: a landed record is left alone"
+    );
+    assert_eq!(
+        row_of(pending.id).await,
+        before_pending,
+        "{CASE}: a pending record is left alone"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, other, LEASE, Some(run))
+                .await
+                .expect(CASE)
+        ),
+        vec![(run, refused.id)],
+        "{CASE}: the reset record is pending and takeable again; the pending one is still under \
+         the first owner's live lease"
+    );
+    assert_eq!(
+        store.retry_landing(run).await.expect(CASE),
+        0,
+        "{CASE}: a second press moves nothing and is not an error"
+    );
+    assert_eq!(
+        store.retry_landing(RunId::new()).await.expect(CASE),
+        0,
+        "{CASE}: an unknown run moves nothing"
+    );
+
+    let summary = store
+        .items(&platform_scope(), &ItemFilter::default())
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == target)
+        .unwrap_or_else(|| panic!("{CASE}: the target is listed"));
+    assert_eq!(
+        (summary.state(), summary.latest_run_landing),
+        (ItemState::Landing, Some(RunLanding::Pending)),
+        "{CASE}: after the retry the item reads `landing`"
+    );
+    assert_eq!(
+        upstream_state().await,
+        Some(ItemState::Landing),
+        "{CASE}: and so does its upstream entry"
+    );
+    assert!(
+        !store
+            .waiting_candidates(&platform_scope())
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.item.id == target),
+        "{CASE}: nothing is refused, so it waits on no one"
+    );
+    assert!(
+        !ready_ids(CASE, store).await.contains(&dependent),
+        "{CASE}: a landing target still holds its dependent"
     );
 }
 

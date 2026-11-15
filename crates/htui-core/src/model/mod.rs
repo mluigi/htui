@@ -149,7 +149,8 @@ pub use indexer::{
 };
 pub use integration::{IntegrateMode, Integration, IntegrationState, LandOutcome};
 pub use item::{
-    Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution, Status,
+    Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution,
+    RunLanding, Status,
 };
 pub use item_merge::{FieldState, Side, SpecField, SpecMerge};
 pub use item_spec::{EditReason, ItemSpec, SpecChanges, SpecContext, SpecError};
@@ -241,7 +242,7 @@ pub use target::{
 };
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
-pub use waiting::{WaitingCandidate, WaitingPermission};
+pub use waiting::{RefusedLanding, WaitingCandidate, WaitingPermission};
 pub use worker_log::{
     LogShipLevel, NewWorkerLog, WORKER_LOG_TEXT_MAX, WorkerLogLevel, WorkerLogLine,
 };
@@ -332,7 +333,9 @@ mod tests {
             &[
                 "needs_you",
                 "failed",
+                "land_refused",
                 "running",
+                "landing",
                 "stopped",
                 "blocked",
                 "queued",

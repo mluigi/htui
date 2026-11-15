@@ -79,6 +79,19 @@ expression: pretty(&answer)
       "age_seconds": 172800
     },
     {
+      "reason": "landing",
+      "item_key": "MOD-10",
+      "project": "htui",
+      "qualified_key": "htui:MOD-10",
+      "item_id": "00000000-0000-0000-0000-000000000107",
+      "run_id": "00000000-0000-0000-0000-000000000207",
+      "step_id": null,
+      "step": null,
+      "text": "`htui` (push to main): non_fast_forward: main moved - u retries the landing",
+      "since": "2026-09-03T04:00:00Z",
+      "age_seconds": 72000
+    },
+    {
       "reason": "interrupted",
       "item_key": "MOD-8",
       "project": "htui",

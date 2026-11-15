@@ -119,7 +119,7 @@ Decisions taken at the PRD gate (maintainer, 2026-11-14, recommended answers):
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Records, `push` and the landed check | a repo set to `push` (store/API level) has a finished run's target branch fast-forwarded on its remote by the executing box, once; a refusal parks the record with its reason and a note; dependents wait for landing at every readiness site; close-out lists the integration | complete | `.claude/plans/mod-133-m1-records-push-landed.plan.md` |
-| 2 | Settings, visibility and retry | the repo mode and project default are edited in Settings with refusal reasons (no remote → `local` only; `pull_request` until MOD-134); a refused integration shows its own waiting row and `Unblock` retries it; the item's display state says landing/refused | pending | — |
+| 2 | Settings, visibility and retry | the repo mode and project default are edited in Settings with refusal reasons (no remote → `local` only; `pull_request` until MOD-134); a refused integration shows its own waiting row and `Unblock` retries it; the item's display state says landing/refused | complete | `.claude/plans/mod-133-m2-settings-visibility-retry.plan.md` |
 | 3 | `pull_request` run branch | a `pull_request` run's steps land on `htui/item/<key>`, which is pushed after the run; the record waits for MOD-134 | pending | — |
 
 ## Open Questions
@@ -143,4 +143,4 @@ Decisions taken at the PRD gate (maintainer, 2026-11-14, recommended answers):
 | The new migration renumbers at merge (parallel branches) | high | low | the next free number at plan time, repinned at collect (HANDOFF live coordinates) |
 
 ---
-*Status: ACCEPTED at the PRD gate 2026-11-14 — milestone 1 complete 2026-11-15 (Unblock retry moved to M2 at planning: it touches `unblock_enabled` and the waiting views, which M2 owns).*
+*Status: ACCEPTED at the PRD gate 2026-11-14 — milestone 1 complete 2026-11-15 (Unblock retry moved to M2 at planning: it touches `unblock_enabled` and the waiting views, which M2 owns); milestone 2 complete 2026-11-15.*

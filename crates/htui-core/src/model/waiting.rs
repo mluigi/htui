@@ -8,16 +8,18 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::ids::{ItemId, ProjectId, RunId};
+use crate::model::ids::{ItemId, ProjectId, RepoId, RunId};
+use crate::model::integration::IntegrateMode;
 use crate::model::item::Item;
 use crate::model::relay::StepPermission;
 use crate::model::run::{Run, RunStep};
 use crate::model::scope::Scope;
 
 /// One item of [`crate::store::ReadStore::waiting_candidates`] (MOD-69 plan D2): an item in scope
-/// that is `blocked`, or that owns a run at `awaiting_approval` (MOD-144), with its **active**
-/// runs (`RunStatus::is_active`: `queued | running | awaiting_approval | stopped`) and each such
-/// run's steps.
+/// that is `blocked`, or that owns a run at `awaiting_approval` (MOD-144), or (MOD-133 M2 E4)
+/// that is `open` with a latest graph run that is `done` and holds a `refused` integration record,
+/// with its **active** runs (`RunStatus::is_active`: `queued | running | awaiting_approval |
+/// stopped`), each such run's steps, and that latest run's refused records.
 ///
 /// Derives no `Eq`: `Item`, `Run` and `RunStep` derive none (they hold `serde_json::Value`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,19 +32,48 @@ pub struct WaitingCandidate {
     /// `unblock_enabled` is sensitive to, blueprint H-1), each with its steps in
     /// `(position, attempt, fanout_index)` order.
     pub runs: Vec<(Run, Vec<RunStep>)>,
+    /// MOD-133 M2 E4: the `refused` records of the item's latest graph run, by repo name, when
+    /// the item is `open` and that run is `done`; empty for every other candidate. The done run is
+    /// not among `runs` (it is not active), so each record names it.
+    #[serde(default)]
+    pub refused: Vec<RefusedLanding>,
+}
+
+/// MOD-133 M2 E4: one `refused` integration record of a candidate's latest graph run, with what
+/// the `landing` waiting row words and sorts it by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedLanding {
+    /// `integration.run_id`: the item's latest graph run, `done`.
+    pub run: RunId,
+    /// `integration.repo_id`.
+    pub repo: RepoId,
+    /// `repo.name`.
+    pub repo_name: String,
+    /// `integration.mode`.
+    pub mode: IntegrateMode,
+    /// `integration.target_branch`.
+    pub target_branch: String,
+    /// `integration.refusal`: the typed reason.
+    pub refusal: String,
+    /// `integration.updated_at`: when it was refused.
+    pub since: DateTime<Utc>,
+    /// `run.queued_at` of that run.
+    pub run_queued_at: DateTime<Utc>,
 }
 
 impl WaitingCandidate {
-    /// Groups three flat reads into candidates and sorts them ([`Self::sort_canonical`]): every
-    /// backend reads items, runs and steps separately and calls this, so the grouping and the order
-    /// cannot differ between them (blueprint A-8). A run whose item is not in `items`, and a step
-    /// whose run is not in `runs`, is dropped; an item with no run keeps `runs: []`.
+    /// Groups four flat reads into candidates and sorts them ([`Self::sort_canonical`]): every
+    /// backend reads items, runs, steps and refused records separately and calls this, so the
+    /// grouping and the order cannot differ between them (blueprint A-8). A run whose item is not
+    /// in `items`, a step whose run is not in `runs`, and a refused record whose item is not in
+    /// `items` is dropped; an item with no run keeps `runs: []`, one with no refusal `refused: []`.
     #[must_use]
     pub fn assemble(
         scope: &Scope,
         items: Vec<Item>,
         runs: Vec<Run>,
         steps: Vec<RunStep>,
+        refused: Vec<(ItemId, RefusedLanding)>,
     ) -> Vec<Self> {
         let mut steps_of: BTreeMap<RunId, Vec<RunStep>> = BTreeMap::new();
         for step in steps {
@@ -54,11 +85,20 @@ impl WaitingCandidate {
             let steps = steps_of.remove(&run.id).unwrap_or_default();
             runs_of.entry(item).or_default().push((run, steps));
         }
+        let mut refused_of: BTreeMap<ItemId, Vec<RefusedLanding>> = BTreeMap::new();
+        for (item, record) in refused {
+            refused_of.entry(item).or_default().push(record);
+        }
         let mut rows: Vec<Self> = items
             .into_iter()
             .map(|item| {
                 let runs = runs_of.remove(&item.id).unwrap_or_default();
-                Self { item, runs }
+                let refused = refused_of.remove(&item.id).unwrap_or_default();
+                Self {
+                    item,
+                    runs,
+                    refused,
+                }
             })
             .collect();
         Self::sort_canonical(&mut rows, scope);
@@ -67,8 +107,9 @@ impl WaitingCandidate {
 
     /// Items by `(scope position of project_id, key_prefix bytes, key_number, id)` (a project not
     /// in `scope` last); each item's runs by `(queued_at, id)` **descending**; each run's steps by
-    /// `(position, attempt, fanout_index, id)`. Rust, not SQL: Postgres would order text by
-    /// collation and the mirror by bytes (the `UpstreamEntry::sort_canonical` reason).
+    /// `(position, attempt, fanout_index, id)`; its refused records by `(repo_name bytes, repo)`.
+    /// Rust, not SQL: Postgres would order text by collation and the mirror by bytes (the
+    /// `UpstreamEntry::sort_canonical` reason).
     pub fn sort_canonical(rows: &mut [Self], scope: &Scope) {
         let position = |project: ProjectId| {
             scope
@@ -83,6 +124,9 @@ impl WaitingCandidate {
             }
             row.runs
                 .sort_by_key(|(run, _)| Reverse((run.queued_at, run.id)));
+            row.refused.sort_by(|a, b| {
+                (a.repo_name.as_bytes(), a.repo).cmp(&(b.repo_name.as_bytes(), b.repo))
+            });
         }
         rows.sort_by(|a, b| {
             (
@@ -194,6 +238,20 @@ mod tests {
         RunId::from_uuid(Uuid::from_u128(n))
     }
 
+    /// A refused record of `run` in a repo named `repo_name`, refused at `since`.
+    fn refused(run: RunId, repo_name: &str, since: DateTime<Utc>) -> RefusedLanding {
+        RefusedLanding {
+            run,
+            repo: RepoId::new(),
+            repo_name: repo_name.to_owned(),
+            mode: IntegrateMode::Push,
+            target_branch: "main".to_owned(),
+            refusal: format!("non_fast_forward: {repo_name}"),
+            since,
+            run_queued_at: since - Duration::hours(1),
+        }
+    }
+
     #[test]
     fn waiting_candidates_assemble_by_item_and_drop_orphans() {
         let project = ProjectId::new();
@@ -209,6 +267,9 @@ mod tests {
         let new_steps = vec![step(a_new.id, 0, 1, 0), step(a_new.id, 1, 1, 0)];
         let orphan_step = step(orphan_run.id, 0, 1, 0);
         let lost_step = step(run_id(99), 0, 1, 0);
+        let done = run_id(5);
+        let (web, api) = (refused(done, "web", t), refused(done, "api", t));
+        let orphan_refusal = refused(run_id(6), "lost", t);
 
         let rows = WaitingCandidate::assemble(
             &scope(vec![project]),
@@ -221,6 +282,11 @@ mod tests {
                 lost_step,
                 new_steps[0].clone(),
             ],
+            vec![
+                (a.id, web.clone()),
+                (c.id, orphan_refusal),
+                (a.id, api.clone()),
+            ],
         );
 
         assert_eq!(
@@ -229,10 +295,12 @@ mod tests {
                 WaitingCandidate {
                     item: a,
                     runs: vec![(a_new, new_steps), (a_old, vec![old_step])],
+                    refused: vec![api, web],
                 },
                 WaitingCandidate {
                     item: b,
                     runs: vec![],
+                    refused: vec![],
                 },
             ],
         );
@@ -260,7 +328,11 @@ mod tests {
             item(project_b, "FEAT", 9),
         ]
         .into_iter()
-        .map(|item| WaitingCandidate { item, runs: vec![] })
+        .map(|item| WaitingCandidate {
+            item,
+            runs: vec![],
+            refused: vec![],
+        })
         .collect();
         if let Some(row) = rows.iter_mut().find(|row| row.item.title == "runs") {
             // Shuffled on purpose: neither the input reversed nor a stable

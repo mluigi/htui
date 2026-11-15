@@ -303,7 +303,7 @@ mod tests {
     use super::*;
     use crate::ui::kit::pane::Focus;
     use htui_core::fixtures::ids;
-    use htui_core::model::{RunStatus, Status};
+    use htui_core::model::{RunLanding, RunStatus, Status};
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier, Style};
 
@@ -334,6 +334,7 @@ mod tests {
             updated_at: htui_core::fixtures::demo_at(0, 0),
             touched_paths: Vec::new(),
             latest_run_status: latest,
+            latest_run_landing: None,
         }
     }
 
@@ -504,6 +505,45 @@ mod tests {
         let glyph = &buffer[(1 + 1 + 1 + 7 + 2, 2)];
         assert_eq!(glyph.symbol(), "\u{25d0}");
         assert_eq!(glyph.fg, Color::Blue, "{glyph:?}");
+    }
+
+    /// MOD-133 M2 E2: an open item over a `done` latest graph run reads its landing: `landing`
+    /// in the running colour while a record is unlanded, `landing refused` in the error colour
+    /// while one is refused, `done` once all landed; the titles keep one column.
+    #[test]
+    fn a_done_run_reads_its_landing() {
+        let done = |key: &str, number: i32, landing: Option<RunLanding>| ItemSummary {
+            latest_run_landing: landing,
+            ..summary(key, number, "t", Status::Open, Some(RunStatus::Done))
+        };
+        let items = vec![
+            done("FEAT-1", 1, Some(RunLanding::Pending)),
+            done("FEAT-2", 2, Some(RunLanding::Refused)),
+            done("FEAT-3", 3, None),
+        ];
+        let projects = htui();
+        let theme = Theme::default();
+        let buffer = drawn(&view(&items, &projects, None), &theme, 50, 6);
+        let rows: Vec<String> = (2..5)
+            .map(|y| {
+                row(&buffer, y)
+                    .trim_end_matches(['\u{2502}', ' '])
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "\u{2502}  FEAT-1  \u{21e1} landing          t",
+                "\u{2502}  FEAT-2  \u{21af} landing refused  t",
+                "\u{2502}  FEAT-3  \u{25cf} done             t",
+            ]
+        );
+        let glyph = |y: u16| buffer[(1 + 1 + 1 + 6 + 2, y)].clone();
+        assert_eq!(glyph(2).symbol(), "\u{21e1}");
+        assert_eq!(glyph(2).fg, theme.running.fg.unwrap_or_default());
+        assert_eq!(glyph(3).symbol(), "\u{21af}");
+        assert_eq!(glyph(3).fg, theme.error.fg.unwrap_or_default());
     }
 
     /// MOD-115 M4 E4: an empty list is `kit::empty`'s: what is missing and the next step, the key

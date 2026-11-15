@@ -40,7 +40,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-use htui_core::model::{AgentSummary, Scope};
+use htui_core::model::{AgentSummary, IntegrateMode, Scope};
 use htui_core::prompt::settings::{
     resolve_allow_env_files, resolve_box_hostname, resolve_budget, resolve_compete_fan_out,
     resolve_excerpt_caps, resolve_hops, resolve_light_model, resolve_max_skill_tokens,
@@ -159,6 +159,13 @@ const AGENT_MODEL_RANGE: &str = "cycles through the enabled agents' models, then
 /// lists a model or names a default one.
 const NO_LIGHT_MODELS: &str =
     "no enabled agent offers a model: probe one, or give it a default model, in Settings > Agents";
+
+/// What a [`SettingKind::Integrate`] row's pane says in place of a numeric range: how the edit
+/// act picks its value (MOD-133 M2 E7).
+const INTEGRATE_RANGE: &str = "cycles local, push, then not set (local)";
+
+/// A stored [`SettingKind::Integrate`] value [`IntegrateMode::project_default`] does not read.
+const NOT_A_MODE: &str = "not local, push or pull_request: a run of this project refuses to start";
 
 /// A stored [`SettingKind::AgentModel`] value its resolver does not read: a row the writer never
 /// validated, which the capture treats as not configured.
@@ -446,20 +453,97 @@ impl PromptSection {
             .map_or(&[], |snapshot| snapshot.agents.as_slice())
     }
 
-    /// Whether `row` is a [`SettingKind::AgentModel`] row, which the edit act cycles rather than
-    /// opening an editor on (MOD-164 D7).
+    /// Whether `row` is a [`SettingKind::AgentModel`] (MOD-164 D7) or a
+    /// [`SettingKind::Integrate`] (MOD-133 M2 E7) row, which the edit act cycles rather than
+    /// opening an editor on.
     fn is_choice(&self, row: Row) -> bool {
-        self.target_of(row)
-            .is_some_and(|opening| opening.target.key.spec().kind == SettingKind::AgentModel)
+        self.target_of(row).is_some_and(|opening| {
+            matches!(
+                opening.target.key.spec().kind,
+                SettingKind::AgentModel | SettingKind::Integrate
+            )
+        })
+    }
+
+    /// The edit act on a [`SettingKind::Integrate`] row (MOD-133 M2 E7): one write, never an
+    /// editor. `not set → local → push → not set`; `pull_request` is never offered, and a stored
+    /// one moves on as `push` does, to `not set`. A stored value the reader cannot read counts as
+    /// `not set`, so it is replaced by `local`. Stepping to `push` on a project no repo of which
+    /// carries a remote URL is refused in the notice, and the cycle steps past it to `not set`
+    /// instead (MOD-133 M2 R1), so a stored `local` can still be cleared.
+    fn cycle_integrate(&mut self, row: Row, ctx: &Ctx<'_>) {
+        let Row::Project { p, .. } = row else {
+            return;
+        };
+        let Some((target, expected, holds, current)) = self.target_of(row).map(|opening| {
+            let current = opening
+                .stored
+                .and_then(Value::as_str)
+                .and_then(|text| text.parse::<IntegrateMode>().ok());
+            (
+                opening.target,
+                opening.expected,
+                opening.stored.is_some(),
+                current,
+            )
+        }) else {
+            return;
+        };
+        let has_remote = self.project(p).is_some_and(|entry| entry.has_remote);
+        let next = match current {
+            None => Some(IntegrateMode::Local),
+            Some(IntegrateMode::Local) => Some(IntegrateMode::Push),
+            Some(IntegrateMode::Push | IntegrateMode::PullRequest) => None,
+        };
+        let (next, refusal) = match next.and_then(|mode| mode.selectable_refusal(has_remote)) {
+            Some(refusal) => (None, Some(refusal)),
+            None => (next, None),
+        };
+        self.notice = None;
+        match (next, expected) {
+            (Some(next), _) => self.send(
+                StoreRequest::SetSetting {
+                    scope: ctx.scope.clone(),
+                    rung: target.rung,
+                    key: target.key,
+                    value: Value::from(next.as_str()),
+                    expected,
+                },
+                ctx,
+            ),
+            // A project row always carries its project's token (D4).
+            (None, Some(expected)) if holds => self.send(
+                StoreRequest::ClearSetting {
+                    scope: ctx.scope.clone(),
+                    rung: target.rung,
+                    key: target.key,
+                    expected,
+                },
+                ctx,
+            ),
+            (None, _) => self.say(NOTHING_SET),
+        }
+        // Said after the write is sent, so the notice is the refusal, not `NOTHING_SET`.
+        if let Some(refusal) = refusal {
+            self.refuse(refusal);
+        }
     }
 
     /// The edit act on a [`SettingKind::AgentModel`] row (MOD-164 D7): one write, never an editor.
+    /// An [`SettingKind::Integrate`] row is handed to [`Self::cycle_integrate`].
     ///
     /// The next of [`light_models`] after the one the `App` rung resolves to, the first when it
     /// resolves to none or to a pair no enabled agent offers any more, and past the last a clear
     /// (`not set`), which deletes the row. With nothing to pick and nothing stored there is no
     /// write, and the notice says why.
     fn cycle_choice(&mut self, row: Row, ctx: &Ctx<'_>) {
+        if self
+            .target_of(row)
+            .is_some_and(|opening| opening.target.key.spec().kind == SettingKind::Integrate)
+        {
+            self.cycle_integrate(row, ctx);
+            return;
+        }
         let Some((target, expected, next)) = self.target_of(row).and_then(|opening| {
             let snapshot = self.snapshot.as_ref()?;
             let pairs = light_models(&snapshot.agents);
@@ -729,8 +813,8 @@ impl PromptSection {
             SettingKind::Boolean => parse_switch(&text)
                 .map(Value::Bool)
                 .ok_or_else(|| switch_sentence(target.key)),
-            // Never opened: the edit act cycles this row instead (MOD-164 D7).
-            SettingKind::AgentModel => Err(choice_sentence(target.key)),
+            // Never opened: the edit act cycles these rows instead (MOD-164 D7, MOD-133 M2 E7).
+            SettingKind::AgentModel | SettingKind::Integrate => Err(choice_sentence(target.key)),
         };
         match value {
             Ok(value) => {
@@ -1250,6 +1334,17 @@ fn effective(
                 resolved.map_or_else(|| NOT_SET.to_owned(), |light| light_text(&light, agents));
             (text, None, present)
         }
+        // MOD-133 M2 E7: the project default as runs read it; no key is `local`. A value the
+        // reader refuses is shown as stored, with what it does to a run under the row.
+        SettingKey::Integrate => {
+            match IntegrateMode::project_default(project.unwrap_or(&Value::Null)) {
+                Ok(mode) => (mode.as_str().to_owned(), None, present),
+                Err(raw) => {
+                    notes.push(NOT_A_MODE.to_owned());
+                    (raw, None, present)
+                }
+            }
+        }
         // `resolve_reserve_bp` is private, so the reserve reaches the screen through the one
         // public door that carries it (blueprint flag A) — still the reader's own arithmetic.
         SettingKey::PromptReserveFraction => (
@@ -1312,8 +1407,11 @@ static KEY_WIDTH: LazyLock<usize> = LazyLock::new(|| {
 /// A [`SettingKind::AgentModel`] row is its choice alone, `claude · haiku` or `not set` (MOD-164
 /// D7): the stored JSON would only repeat it, and it has no unit.
 fn value_text(key: SettingKey, stored: Option<&Value>, effective: &Effective) -> String {
-    if key.spec().kind == SettingKind::AgentModel {
-        return effective.text.clone();
+    match key.spec().kind {
+        SettingKind::AgentModel => return effective.text.clone(),
+        // MOD-133 M2 E7: the mode and which rung answered, `local (default)`; no unit.
+        SettingKind::Integrate => return format!("{} ({})", effective.text, effective.source),
+        SettingKind::Integer | SettingKind::Fraction | SettingKind::Boolean => {}
     }
     let held = stored.map_or_else(|| UNSET.to_owned(), Value::to_string);
     format!(
@@ -1329,7 +1427,10 @@ fn unit(key: SettingKey) -> &'static str {
     let spec = key.spec();
     match spec.kind {
         SettingKind::Fraction => FRACTION_UNIT,
-        SettingKind::Integer | SettingKind::Boolean | SettingKind::AgentModel => spec.unit,
+        SettingKind::Integer
+        | SettingKind::Boolean
+        | SettingKind::AgentModel
+        | SettingKind::Integrate => spec.unit,
     }
 }
 
@@ -1343,6 +1444,8 @@ fn range_text(key: SettingKey) -> String {
         SettingKind::Boolean => format!("{SWITCH_RANGE} \u{b7} rungs {}", spec.rungs),
         // The model's 1..=200 characters are the writer's; the row never types one.
         SettingKind::AgentModel => format!("{AGENT_MODEL_RANGE} \u{b7} rungs {}", spec.rungs),
+        // `min` 0 and `max` 2 are nominal: the three modes, one never offered here.
+        SettingKind::Integrate => format!("{INTEGRATE_RANGE} \u{b7} rungs {}", spec.rungs),
         SettingKind::Integer => format!(
             "range {}..={} {} \u{b7} rungs {}",
             spec.min, spec.max, spec.unit, spec.rungs

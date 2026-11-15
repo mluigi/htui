@@ -494,6 +494,7 @@ mod tests {
                 updated_at: Utc::now(),
                 touched_paths: Vec::new(),
                 latest_run_status: None,
+                latest_run_landing: None,
             },
             kind,
             resolution,

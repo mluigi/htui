@@ -284,10 +284,12 @@ pub const HIERARCHY_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
-/// Settings > Hierarchy, the editor form.
+/// Settings > Hierarchy, the editor form; the repo editor's `integrate` row is a choice
+/// (MOD-133 M2 E8), as `MEMORY_EDIT`'s kind is.
 pub const HIERARCHY_EDITOR: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsHierarchy, &[]),
     FIELD,
+    PICK,
     FORM_FIELDS,
     MODAL,
 ]);
@@ -1729,6 +1731,21 @@ mod tests {
             [Act::FormNextField, Act::FieldLineDown]
         );
         assert_eq!(resolve(MEMORY_RETIRE, "y"), [Act::ConfirmYes]);
+        // MOD-133 M2 E8: the repo editor's `integrate` row is a choice, so the Hierarchy editor
+        // resolves as the memory form (kind choice and text field) does.
+        assert_eq!(
+            resolve(HIERARCHY_EDITOR, "left"),
+            [Act::FieldLeft, Act::ChoicePrev]
+        );
+        for spec in [
+            "left", "right", "h", "l", "enter", "esc", "down", "up", "tab",
+        ] {
+            assert_eq!(
+                resolve(HIERARCHY_EDITOR, spec),
+                resolve(MEMORY_EDIT, spec),
+                "{spec}"
+            );
+        }
         // MOD-147 M3 D9: the Hierarchy owner documents pane; `o` opens it, and it captures input
         // so `h` cycles no section.
         assert_eq!(resolve(HIERARCHY_BROWSE, "o"), [Act::HierarchyDocuments]);

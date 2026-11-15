@@ -124,8 +124,8 @@ pub enum Command {
         /// Blueprint D185: a chat of this process is live **on this step**.
         chat_live: bool,
     },
-    /// §4.3 verdict 1's `unblock` (plan D161): one human action clears a `blocked` item, in one of
-    /// [`UnblockCase`]'s three ways.
+    /// §4.3 verdict 1's `unblock` (plan D161): one human action clears a held item, in one of
+    /// [`UnblockCase`]'s four ways.
     Unblock {
         /// The item to unblock.
         item: ItemId,
@@ -236,7 +236,7 @@ pub enum CommandOutcome {
         /// Where the walk rested.
         rest: Rest,
     },
-    /// [`Command::Unblock`]: which of the three cases cleared the item.
+    /// [`Command::Unblock`]: which of the four cases cleared the item.
     Unblocked {
         /// The item.
         item: ItemId,
@@ -325,7 +325,8 @@ impl OpeningPath {
     }
 }
 
-/// Which of §4.3 verdict 1's three ways `Unblock` clears an item (MOD-4 plan D161).
+/// Which of §4.3 verdict 1's ways `Unblock` clears an item (MOD-4 plan D161; the fourth is
+/// MOD-133 M2 E6's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnblockCase {
     /// The item is `blocked` and no run of it is live: back to `open`, and a new run may start.
@@ -337,6 +338,10 @@ pub enum UnblockCase {
     /// The item is `open` over this run, parked where a crashed command or a refused reconcile
     /// left it (R-7, plan D132): the run is resumed.
     Resume(RunId),
+    /// MOD-133 M2 E6: the item is `open`, no run of it is live, and its latest graph run, this
+    /// one, is `done` and holds a `refused` integration record: every refused record of the run
+    /// goes back to `pending`, and the box's executing process lands them.
+    RetryLanding(RunId),
 }
 
 /// MOD-130 M2 R1 F1: the note a target refusal writes on its item, and the tail of
@@ -652,7 +657,7 @@ pub enum EngineError {
         /// Its display state (MOD-144): the stored status over the latest graph run.
         state: ItemState,
         /// What holds it, in a sentence ([`nothing_is_blocked`], [`run_is_walking`],
-        /// [`run_waits_at_a_gate`]).
+        /// [`run_waits_at_a_gate`], [`nothing_is_refused`]).
         why: String,
     },
     /// Plan D166: `AcceptArtifact` on a step that was never promoted (ANA-2 §4.8).
@@ -783,6 +788,13 @@ fn exit_code_text(code: &Option<i32>) -> String {
 #[must_use]
 pub fn nothing_is_blocked() -> String {
     "nothing is blocked".to_owned()
+}
+
+/// [`EngineError::NotBlocked`]'s `why` when [`UnblockCase::RetryLanding`] found no `refused`
+/// record left to retry: another press, or another process, retried it first (MOD-133 M2 E6).
+#[must_use]
+pub fn nothing_is_refused() -> String {
+    "no landing is refused; it was retried already".to_owned()
 }
 
 /// [`EngineError::NotBlocked`]'s `why` when a run of the item is walking or queued.
@@ -1375,14 +1387,16 @@ pub fn accept_enabled(
     Ok(())
 }
 
-/// §4.3 verdict 1's `unblock` (MOD-4 plan D161, MOD-144): which of [`UnblockCase`]'s three cases
-/// the item is in. `runs` is every run of the item, each paired with whether it is resumable
-/// (`false` for a finished run). Only live runs decide the case; the latest graph run names the
-/// item's state in a refusal.
+/// §4.3 verdict 1's `unblock` (MOD-4 plan D161, MOD-144, MOD-133 M2 E6): which of
+/// [`UnblockCase`]'s four cases the item is in. `runs` is every run of the item, each paired with
+/// whether it is resumable (`false` for a finished run). `refused` is the item's latest graph run
+/// when it holds a `refused` integration record (the caller reads the records). Live runs decide
+/// the first three cases; the latest graph run names the item's state in a refusal.
 ///
 /// 1. `blocked` and no run is live: [`UnblockCase::Reopen`].
 /// 2. `blocked` and a live run is parked: [`UnblockCase::FollowRun`].
 /// 3. `open` over a parked run that is resumable: [`UnblockCase::Resume`].
+/// 4. `open`, no run live, and `refused` names a run: [`UnblockCase::RetryLanding`].
 ///
 /// An `open` item over a parked run that is not resumable waits at a gate; one over a `queued`,
 /// `running` or `stopped` run is walking (a stopped run resumes through MOD-125's resume).
@@ -1394,7 +1408,11 @@ pub fn accept_enabled(
 ///
 /// # Errors
 /// [`EngineError::NotBlocked`] for anything else, naming what holds the item.
-pub fn unblock_enabled(item: &Item, runs: &[(Run, bool)]) -> Result<UnblockCase, EngineError> {
+pub fn unblock_enabled(
+    item: &Item,
+    runs: &[(Run, bool)],
+    refused: Option<RunId>,
+) -> Result<UnblockCase, EngineError> {
     let active: Vec<&(Run, bool)> = runs
         .iter()
         .filter(|(run, _)| run.status.is_active())
@@ -1406,6 +1424,9 @@ pub fn unblock_enabled(item: &Item, runs: &[(Run, bool)]) -> Result<UnblockCase,
         (Status::Blocked, _, None) => return Ok(UnblockCase::Reopen),
         (Status::Blocked, Some((run, _)), _) => return Ok(UnblockCase::FollowRun(run.id)),
         (Status::Open, Some((run, true)), _) => return Ok(UnblockCase::Resume(run.id)),
+        (Status::Open, None, None) if let Some(run) = refused => {
+            return Ok(UnblockCase::RetryLanding(run));
+        }
         (Status::Open, Some((run, _)), _) => run_waits_at_a_gate(run.id),
         (Status::Blocked | Status::Open, None, Some((run, _))) => {
             run_is_walking(run.id, run.status)
@@ -2614,10 +2635,10 @@ mod tests {
         );
     }
 
-    /// MOD-4 plan D161's three cases in order, and the sentence naming what holds the item
+    /// MOD-4 plan D161's first three cases in order, and the sentence naming what holds the item
     /// otherwise, by the item's derived state (MOD-144).
     #[test]
-    fn unblock_names_its_three_cases_and_what_holds_the_item() {
+    fn unblock_names_its_first_three_cases_and_what_holds_the_item() {
         let parked = parked_run();
         let mut finished = parked.clone();
         finished.status = RunStatus::Failed;
@@ -2631,21 +2652,21 @@ mod tests {
 
         let blocked = item_at(Status::Blocked);
         assert!(matches!(
-            unblock_enabled(&blocked, &[]),
+            unblock_enabled(&blocked, &[], None),
             Ok(UnblockCase::Reopen)
         ));
         assert!(
             matches!(
-                unblock_enabled(&blocked, &[(finished.clone(), gate)]),
+                unblock_enabled(&blocked, &[(finished.clone(), gate)], None),
                 Ok(UnblockCase::Reopen)
             ),
             "a finished run is not active"
         );
         assert!(matches!(
-            unblock_enabled(&blocked, &[(finished, gate), (parked.clone(), gate)]),
+            unblock_enabled(&blocked, &[(finished, gate), (parked.clone(), gate)], None),
             Ok(UnblockCase::FollowRun(run)) if run == parked.id
         ));
-        let refused = unblock_enabled(&blocked, &[(running.clone(), crashed)])
+        let refused = unblock_enabled(&blocked, &[(running.clone(), crashed)], None)
             .expect_err("a walking run holds the item");
         assert_eq!(
             refused.to_string(),
@@ -2658,10 +2679,10 @@ mod tests {
         // MOD-144: an `open` item over a parked run reads `needs you`.
         let waiting = item_at(Status::Open);
         assert!(matches!(
-            unblock_enabled(&waiting, &[(parked.clone(), crashed)]),
+            unblock_enabled(&waiting, &[(parked.clone(), crashed)], None),
             Ok(UnblockCase::Resume(run)) if run == parked.id
         ));
-        let refused = unblock_enabled(&waiting, &[(parked.clone(), gate)])
+        let refused = unblock_enabled(&waiting, &[(parked.clone(), gate)], None)
             .expect_err("a real gate is answered, not unblocked");
         assert_eq!(
             refused.to_string(),
@@ -2677,7 +2698,7 @@ mod tests {
             (&running, ItemState::Running),
             (&stopped, ItemState::Stopped),
         ] {
-            let refused = unblock_enabled(&waiting, &[(walking.clone(), crashed)])
+            let refused = unblock_enabled(&waiting, &[(walking.clone(), crashed)], None)
                 .expect_err("a walking run holds the item");
             assert!(
                 matches!(&refused, EngineError::NotBlocked { state: got, why, .. }
@@ -2691,7 +2712,7 @@ mod tests {
             (Status::Closed, ItemState::Closed),
         ] {
             let refused =
-                unblock_enabled(&item_at(status), &[]).expect_err("nothing holds the item");
+                unblock_enabled(&item_at(status), &[], None).expect_err("nothing holds the item");
             assert!(
                 matches!(&refused, EngineError::NotBlocked { state: got, why, .. } if *got == state && *why == nothing_is_blocked()),
                 "{refused}"
@@ -2701,9 +2722,77 @@ mod tests {
         // A finished run is not live, but it names the state: `open` over `done` reads `done`.
         let mut done = parked.clone();
         done.status = RunStatus::Done;
-        let refused = unblock_enabled(&waiting, &[(done, gate)]).expect_err("nothing is blocked");
+        let refused =
+            unblock_enabled(&waiting, &[(done, gate)], None).expect_err("nothing is blocked");
         assert!(
             matches!(&refused, EngineError::NotBlocked { state: ItemState::Done, why, .. } if *why == nothing_is_blocked()),
+            "{refused}"
+        );
+    }
+
+    /// MOD-133 M2 E6: the fourth case. An `open` item with no live run whose latest graph run is
+    /// `done` and holds a `refused` record retries that run's landing; the first three cases keep
+    /// precedence over a refusal, and a live run still holds the item.
+    #[test]
+    fn unblock_retries_a_refused_landing_after_the_first_three_cases() {
+        let parked = parked_run();
+        // The done run is the older one, so a live run beside it is the latest graph run.
+        let mut done = parked.clone();
+        done.id = htui_core::model::RunId::new();
+        done.status = RunStatus::Done;
+        done.queued_at -= chrono::TimeDelta::seconds(60);
+        let running = newer(RunStatus::Running, 1);
+        let (gate, crashed) = (false, true);
+        let landed = Some(done.id);
+        let waiting = item_at(Status::Open);
+        let blocked = item_at(Status::Blocked);
+
+        assert!(matches!(
+            unblock_enabled(&waiting, &[(done.clone(), gate)], landed),
+            Ok(UnblockCase::RetryLanding(run)) if run == done.id
+        ));
+
+        // The first three cases come first.
+        assert!(matches!(
+            unblock_enabled(&blocked, &[(done.clone(), gate)], landed),
+            Ok(UnblockCase::Reopen)
+        ));
+        assert!(matches!(
+            unblock_enabled(&blocked, &[(done.clone(), gate), (parked.clone(), gate)], landed),
+            Ok(UnblockCase::FollowRun(run)) if run == parked.id
+        ));
+        assert!(matches!(
+            unblock_enabled(&waiting, &[(done.clone(), gate), (parked.clone(), crashed)], landed),
+            Ok(UnblockCase::Resume(run)) if run == parked.id
+        ));
+
+        // A live run still holds the item, at a gate or walking.
+        let refused = unblock_enabled(
+            &waiting,
+            &[(done.clone(), gate), (parked.clone(), gate)],
+            landed,
+        )
+        .expect_err("a real gate is answered, not unblocked");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { why, .. } if *why == run_waits_at_a_gate(parked.id)),
+            "{refused}"
+        );
+        let refused = unblock_enabled(
+            &waiting,
+            &[(done.clone(), gate), (running.clone(), crashed)],
+            landed,
+        )
+        .expect_err("a walking run holds the item");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { why, .. } if *why == run_is_walking(running.id, running.status)),
+            "{refused}"
+        );
+
+        // A closed item is never retried.
+        let refused = unblock_enabled(&item_at(Status::Closed), &[(done, gate)], landed)
+            .expect_err("a closed item is not held");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { state: ItemState::Closed, why, .. } if *why == nothing_is_blocked()),
             "{refused}"
         );
     }
@@ -2726,13 +2815,13 @@ mod tests {
 
         let rejected = [step.clone()];
         assert!(matches!(
-            unblock_enabled(&waiting, &[(parked.clone(), resumable(&at, &rejected))]),
+            unblock_enabled(&waiting, &[(parked.clone(), resumable(&at, &rejected))], None),
             Ok(UnblockCase::Resume(run)) if run == parked.id
         ));
 
         step.gate_outcome = None;
         let spent = [step];
-        let refused = unblock_enabled(&waiting, &[(parked.clone(), resumable(&at, &spent))])
+        let refused = unblock_enabled(&waiting, &[(parked.clone(), resumable(&at, &spent))], None)
             .expect_err("a step no rejection failed is not a crashed rejection");
         assert!(
             matches!(&refused, EngineError::NotBlocked { why, .. } if *why == run_waits_at_a_gate(parked.id)),

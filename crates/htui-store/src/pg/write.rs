@@ -10850,6 +10850,32 @@ impl WriteStore for PgStore {
         Ok(settled == 1)
     }
 
+    /// MOD-133 M2 E5: one `UPDATE` of `run`'s `refused` records back to `pending`, `refusal` and
+    /// the lease cleared (`chk_integration_refusal` holds: no `refused` row is left with a null
+    /// refusal, no `pending` one with a reason); `trg_integration_updated_at` moves `updated_at`.
+    /// A run with nothing refused moves nothing and answers `0`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn retry_landing(&self, run: RunId) -> Result<usize> {
+        let moved = sqlx::query!(
+            "UPDATE integration \
+                SET state            = 'pending', \
+                    refusal          = NULL, \
+                    lease_box_id     = NULL, \
+                    lease_owner      = NULL, \
+                    lease_expires_at = NULL \
+              WHERE run_id = $1 AND state = 'refused'",
+            run.as_uuid(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        Ok(usize::try_from(moved).unwrap_or(usize::MAX))
+    }
+
     /// `R-TUI-9`'s close-out: the summary, the commits and the item's move to `closed`, one
     /// transaction (plan D6), refused while any run of the item is still active.
     ///

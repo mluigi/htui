@@ -2828,7 +2828,9 @@ where
     /// it (R-4, MOD-144); [`UnblockCase::Resume`]
     /// resumes the parked run through [`Self::resume`] under [`Tails::Walk`] (R-7), and on a
     /// worker box ([`Tails::HandBack`]) only unparks it through [`Self::hand_back_resume`] and
-    /// hands it to the box's worker (MOD-41 plan D12). Each writes a note first.
+    /// hands it to the box's worker (MOD-41 plan D12); [`UnblockCase::RetryLanding`] puts the
+    /// run's `refused` integration records back to `pending` ([`Self::retry_landing`], MOD-133 M2
+    /// E6) and lands nothing itself: the caller, or the box's sweep, does. Each writes a note.
     async fn unblock(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
         let case = self.unblock_case(item).await?;
         let now = self.now();
@@ -2892,8 +2894,45 @@ where
                     Tails::HandBack => self.hand_back_resume(run).await?,
                 })
             }
+            UnblockCase::RetryLanding(run) => {
+                self.retry_landing(item, run).await?;
+                None
+            }
         };
         Ok(CommandOutcome::Unblocked { item, case, rest })
+    }
+
+    /// MOD-133 M2 E6: [`UnblockCase::RetryLanding`]'s write. Every `refused` record of `run` goes
+    /// back to `pending` in one compare-and-set (`WorkerStore::retry_landing`), and the item is
+    /// noted with how many. None moved is a stale press (another press or process retried them
+    /// first): [`EngineError::NotBlocked`] with [`crate::command::nothing_is_refused`], and no
+    /// note.
+    ///
+    /// Public for the worker's `Unblock` task (MOD-133 M2 R1): once [`Self::unblock_case`] named
+    /// the case, it retries exactly that run, so no second derivation can turn the press into a
+    /// case that needs the run lock.
+    pub async fn retry_landing(&self, item: ItemId, run: RunId) -> Result<(), EngineError> {
+        let now = self.now();
+        let moved = self.parts.store.retry_landing(run).await?;
+        if moved == 0 {
+            let row = self.item(item).await?;
+            let runs = self.parts.store.runs(item).await?;
+            let latest = htui_core::model::latest_graph_run(&runs).map(|run| run.status);
+            return Err(EngineError::NotBlocked {
+                item,
+                state: htui_core::model::ItemState::of(row.status, latest),
+                why: crate::command::nothing_is_refused(),
+            });
+        }
+        let id = run.to_string();
+        let short = &id[id.len().saturating_sub(8)..];
+        self.note(
+            item,
+            format!("unblocked: retrying the landing of {moved} repo(s) of run {short}"),
+            None,
+            now,
+        )
+        .await
     }
 
     /// `R-TUI-9`'s close-out (MOD-4 plan D167, blueprint D208, ANA-2 §4.10).
@@ -3729,10 +3768,11 @@ where
         Ok(swept)
     }
 
-    /// MOD-4 plan D161: which of `Unblock`'s three cases `item` is in, read-only — the item, then
+    /// MOD-4 plan D161: which of `Unblock`'s four cases `item` is in, read-only — the item, then
     /// every run of it (MOD-144, PD9: a finished one names the item's state in a refusal), each
     /// live one with whether it is [`resumable`] (over its cursor and its steps, MOD-37 R-31) and
-    /// each finished one `false`, handed to [`crate::command::unblock_enabled`].
+    /// each finished one `false`, and the latest graph run when it is `done` and holds a `refused`
+    /// integration record (MOD-133 M2 E6), handed to [`crate::command::unblock_enabled`].
     ///
     /// # Errors
     /// [`EngineError::NotBlocked`], and the store's and the snapshot's own.
@@ -3753,7 +3793,24 @@ where
             };
             runs.push((run, resumable));
         }
-        crate::command::unblock_enabled(&row, &runs)
+        let refused = self.refused_landing(&runs).await?;
+        crate::command::unblock_enabled(&row, &runs, refused)
+    }
+
+    /// MOD-133 M2 E6: the latest graph run of `runs` when it is `done` and holds a `refused`
+    /// integration record; `None` otherwise (and without a read when it is not `done`: records
+    /// are written by `finish_run(Done)` only).
+    async fn refused_landing(&self, runs: &[(Run, bool)]) -> Result<Option<RunId>, EngineError> {
+        let Some(latest) = htui_core::model::latest_graph_run(runs.iter().map(|(run, _)| run))
+            .filter(|run| run.status == RunStatus::Done)
+        else {
+            return Ok(None);
+        };
+        let records = self.parts.store.integrations(latest.id).await?;
+        Ok(records
+            .iter()
+            .any(|record| record.state == htui_core::model::IntegrationState::Refused)
+            .then_some(latest.id))
     }
 
     /// MOD-4 plan D167's first confirmation, read-only: [`crate::command::close_out_enabled`],
@@ -3808,7 +3865,7 @@ where
     /// ([`WorkerStore::take_integrations`](htui_core::store::WorkerStore::take_integrations)),
     /// then lands them ([`Self::land_taken`]). Called by the walk right after a run ends `done`,
     /// for that run; the worker's sweep lands the whole box. A `refused` record is never taken:
-    /// it waits for a human (Unblock retry is MOD-133 milestone 2).
+    /// it waits for a human, whose `Unblock` puts it back to `pending` (MOD-133 M2 E6).
     ///
     /// # Errors
     /// The store's own; an isolator's failure leaves its record `pending` and is logged.
@@ -21055,6 +21112,157 @@ mod tests {
         assert_send(&engine.dispatch(Command::CancelRun { run: ids::RUN_2 }));
         assert_send(&engine.resume(ids::RUN_2));
         assert_send(&engine.sweep_fenced(&Held(Vec::new())));
+    }
+
+    /// MOD-133 M2 E6: `Unblock` over a `done` run whose landing was refused retries it: the
+    /// refused record goes back to `pending` with its refusal cleared, the item is noted, and
+    /// nothing is landed by the command itself. A stale press (the record already moved) answers
+    /// `NotBlocked` with `nothing_is_refused` and writes no note.
+    #[tokio::test]
+    async fn unblock_retries_a_refused_landing_and_answers_a_stale_press() {
+        use htui_core::model::{IntegrateMode, IntegrationState, LandOutcome, RepoPatch};
+
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| phase.gate = Gate::Never)
+            .await;
+        harness
+            .orch
+            .script("review", 1, ScriptedStep::review("approve", "fine"));
+        let repo = RepoId::new();
+        let row = harness
+            .orch
+            .store
+            .create_repo(NewRepo {
+                id: repo,
+                project_id: ids::PROJECT_HTUI,
+                name: "htui".to_owned(),
+                remote_url: Some("https://forge.example/o/htui.git".to_owned()),
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the demo project has no repo yet");
+        let moved = harness
+            .orch
+            .store
+            .update_repo(
+                repo,
+                row.updated_at,
+                RepoPatch {
+                    integrate: Some(Some(IntegrateMode::Push)),
+                    ..RepoPatch::default()
+                },
+            )
+            .await
+            .expect("the repo is there");
+        assert!(matches!(moved, CasOutcome::Applied(_)), "{moved:?}");
+        let reason = "non_fast_forward: main on the remote has moved; merge it locally, then retry";
+        harness.orch.isolator.script_land(LandOutcome::Refused {
+            reason: reason.to_owned(),
+        });
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: Some(vec![repo]),
+                workspace: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(rest.run, RunStatus::Done);
+        let records = async || {
+            harness
+                .orch
+                .store
+                .integrations(run)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .map(|record| (record.state, record.refusal))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            records().await,
+            [(IntegrationState::Refused, Some(reason.to_owned()))]
+        );
+        let notes = async || {
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .map(|note| note.body)
+                .filter(|body| body.starts_with("unblocked"))
+                .collect::<Vec<_>>()
+        };
+
+        harness_engine!(harness.orch, engine);
+        assert_eq!(
+            engine
+                .unblock_case(ids::HTUI_FEAT_3)
+                .await
+                .expect("a refused landing is unblocked"),
+            crate::command::UnblockCase::RetryLanding(run)
+        );
+        let outcome = harness
+            .dispatch(Command::Unblock {
+                item: ids::HTUI_FEAT_3,
+            })
+            .await
+            .expect("the landing is retried");
+        assert!(
+            matches!(
+                outcome,
+                CommandOutcome::Unblocked {
+                    case: crate::command::UnblockCase::RetryLanding(id),
+                    rest: None,
+                    ..
+                } if id == run
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            records().await,
+            [(IntegrationState::Pending, None)],
+            "the refusal is cleared, and the record waits for a land pass"
+        );
+        assert_eq!(
+            harness.orch.isolator.land_requests().len(),
+            1,
+            "the command lands nothing itself"
+        );
+        let id = run.to_string();
+        let expected = [format!(
+            "unblocked: retrying the landing of 1 repo(s) of run {}",
+            &id[id.len() - 8..]
+        )];
+        assert_eq!(notes().await, expected);
+
+        // A stale press: the record moved between the case and the write.
+        let refused = engine
+            .retry_landing(ids::HTUI_FEAT_3, run)
+            .await
+            .expect_err("nothing is refused any more");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { state: ItemState::Done, why, .. } if *why == crate::command::nothing_is_refused()),
+            "{refused}"
+        );
+        assert_eq!(notes().await, expected, "a stale press writes no note");
+        let refused = engine
+            .unblock_case(ids::HTUI_FEAT_3)
+            .await
+            .expect_err("a pending landing is not held");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { why, .. } if *why == crate::command::nothing_is_blocked()),
+            "{refused}"
+        );
     }
 
     /// MOD-4 plan D161's read-only half: the item and its runs, each live one with its cursor

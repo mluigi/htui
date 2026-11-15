@@ -1113,9 +1113,14 @@ async fn the_mirror_derives_item_state_like_postgres() {
             "items for {filter:?}"
         );
         if let Some([state]) = filter.states.as_deref() {
-            assert!(
-                !mirrored.is_empty(),
-                "the demo holds a `{}` item",
+            // MOD-133 M2 E9: the demo holds no repo or integration record (plan D110), so no demo
+            // item reads `landing` or `landing refused`;
+            // `the_mirror_derives_the_landing_like_postgres` covers those two.
+            let landing = matches!(state, ItemState::Landing | ItemState::LandRefused);
+            assert_eq!(
+                mirrored.is_empty(),
+                landing,
+                "the demo holds a `{}` item unless it is a landing state",
                 state.word()
             );
             assert!(
@@ -3366,6 +3371,258 @@ async fn a_refused_integration_holds_its_dependent_offline() {
         .await
         .expect("the mirrored state");
     assert_eq!(state, "landed");
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-133 M2 T3 (E3, E4): the mirror derives `landing` and `landing refused` from the records of
+/// the latest graph run exactly as Postgres does, and lists a refused record's waiting candidate
+/// equal to Postgres'. `htui:ANA-1` (`RUN_3`, `done`) gets a `pending` record and reads `landing`;
+/// `agy:ANA-1` (`RUN_7`, `done`) gets two `refused` records and reads `landing refused`, and is a
+/// waiting candidate holding both; `htui:FEAT-1`'s older `done` run (`RUN_1`) gets a `refused`
+/// record too, which must not move it off `running` (its latest run is `RUN_4`): the same run's
+/// records only. The demo holds no repo (plan D110), so the case seeds them on Postgres.
+#[tokio::test]
+async fn the_mirror_derives_the_landing_like_postgres() {
+    use htui_core::model::{IntegrateMode, RunLanding};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let store = &db.store;
+    let repo = |project: ProjectId, name: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "INSERT INTO repo (project_id, name, is_primary) VALUES ($1, $2, false) \
+                 RETURNING id",
+            )
+            .bind(project.as_uuid())
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .expect("a repo for the records to key on")
+        }
+    };
+    let (htui, agy_web, agy_api) = (
+        repo(ids::PROJECT_HTUI, "htui").await,
+        repo(ids::PROJECT_AGY, "web").await,
+        repo(ids::PROJECT_AGY, "api").await,
+    );
+    let record =
+        |run: RunId, repo: uuid::Uuid, project: ProjectId, refusal: Option<&'static str>| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO integration (run_id, repo_id, project_id, mode, remote, \
+                                          target_branch, state, refusal) \
+                 VALUES ($1, $2, $3, 'push', 'https://forge.invalid/x.git', 'main', \
+                         CASE WHEN $4::text IS NULL THEN 'pending' ELSE 'refused' END, $4)",
+                )
+                .bind(run.as_uuid())
+                .bind(repo)
+                .bind(project.as_uuid())
+                .bind(refusal)
+                .execute(&pool)
+                .await
+                .expect("an integration record");
+            }
+        };
+    record(ids::RUN_3, htui, ids::PROJECT_HTUI, None).await;
+    record(
+        ids::RUN_7,
+        agy_web,
+        ids::PROJECT_AGY,
+        Some("non_fast_forward: main on the remote has moved; merge it locally, then retry"),
+    )
+    .await;
+    record(
+        ids::RUN_7,
+        agy_api,
+        ids::PROJECT_AGY,
+        Some("rejected: the remote refused the push"),
+    )
+    .await;
+    record(
+        ids::RUN_1,
+        htui,
+        ids::PROJECT_HTUI,
+        Some("rejected: an older run's refusal"),
+    )
+    .await;
+
+    let cache = open_cache(&db).await;
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+    assert_eq!(mirror_count(cache.pool(), "integration").await, 4);
+    let scope = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: all_projects(),
+    };
+
+    let mut filters = vec![
+        ItemFilter::default(),
+        ItemFilter {
+            states: Some(vec![ItemState::Landing, ItemState::LandRefused]),
+            ..ItemFilter::default()
+        },
+    ];
+    filters.extend(ItemState::ALL.iter().map(|state| ItemFilter {
+        states: Some(vec![*state]),
+        ..ItemFilter::default()
+    }));
+    for filter in &filters {
+        let mirrored = cache.items(&scope, filter).await.expect("cache items");
+        assert_eq!(
+            mirrored,
+            store.items(&scope, filter).await.expect("pg items"),
+            "items for {filter:?}"
+        );
+        if let Some([state]) = filter.states.as_deref() {
+            assert!(
+                mirrored.iter().all(|row| row.state() == *state),
+                "every row of {filter:?} reads `{}`",
+                state.word()
+            );
+        }
+    }
+    let listed = cache
+        .items(&scope, &ItemFilter::default())
+        .await
+        .expect("cache items");
+    let row = |id| {
+        listed
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| (row.latest_run_landing, row.state()))
+            .expect("listed")
+    };
+    assert_eq!(
+        row(ids::HTUI_ANA_1),
+        (Some(RunLanding::Pending), ItemState::Landing)
+    );
+    assert_eq!(
+        row(ids::AGY_ANA_1),
+        (Some(RunLanding::Refused), ItemState::LandRefused)
+    );
+    assert_eq!(
+        row(ids::HTUI_FEAT_1),
+        (None, ItemState::Running),
+        "an older run's refusal is not the latest run's"
+    );
+
+    for item in [ids::AGY_FIX_1, ids::HTUI_ANA_1, ids::HTUI_FEAT_1] {
+        let mirrored = canonical(cache.links(item, 2).await.expect("cache links"));
+        assert_eq!(
+            mirrored,
+            canonical(store.links(item, 2).await.expect("pg links")),
+            "links of {item}"
+        );
+        for node in &mirrored.nodes {
+            if node.item_id == ids::AGY_ANA_1 {
+                assert_eq!(node.state(), ItemState::LandRefused, "links of {item}");
+            }
+        }
+    }
+    for bound in [
+        PromptScope::project_only(ids::PROJECT_AGY),
+        PromptScope::project_only(ids::PROJECT_HTUI),
+    ] {
+        let mirrored = cache
+            .upstream_summaries(ids::AGY_FIX_1, 2, &bound)
+            .await
+            .expect("cache upstream_summaries");
+        assert_eq!(
+            mirrored,
+            store
+                .upstream_summaries(ids::AGY_FIX_1, 2, &bound)
+                .await
+                .expect("pg upstream_summaries"),
+            "upstream_summaries(agy:FIX-1, 2, {bound:?})"
+        );
+        let states: Vec<_> = mirrored
+            .iter()
+            .map(|entry| (entry.item_id, entry.state()))
+            .collect();
+        assert!(states.contains(&(ids::AGY_ANA_1, ItemState::LandRefused)));
+        assert!(states.contains(&(ids::HTUI_ANA_1, ItemState::Landing)));
+    }
+    let coverage = cache
+        .requirement_coverage(ids::REQ_ENT_1)
+        .await
+        .expect("cache requirement_coverage");
+    assert_eq!(
+        coverage,
+        store
+            .requirement_coverage(ids::REQ_ENT_1)
+            .await
+            .expect("pg requirement_coverage"),
+        "coverage rows, the landing included"
+    );
+    assert!(
+        coverage
+            .iter()
+            .any(|row| row.item.id == ids::HTUI_ANA_1 && row.item.state() == ItemState::Landing)
+    );
+
+    let mirrored = cache
+        .waiting_candidates(&scope)
+        .await
+        .expect("cache waiting_candidates");
+    assert_eq!(
+        mirrored,
+        store
+            .waiting_candidates(&scope)
+            .await
+            .expect("pg waiting_candidates")
+    );
+    let candidate = mirrored
+        .iter()
+        .find(|candidate| candidate.item.id == ids::AGY_ANA_1)
+        .expect("agy:ANA-1's refused landing waits");
+    assert!(
+        candidate.runs.is_empty(),
+        "the done run is not an active run"
+    );
+    let refused: Vec<_> = candidate
+        .refused
+        .iter()
+        .map(|r| {
+            (
+                r.run,
+                r.repo.as_uuid(),
+                r.repo_name.as_str(),
+                r.mode,
+                r.target_branch.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        [
+            (ids::RUN_7, agy_api, "api", IntegrateMode::Push, "main"),
+            (ids::RUN_7, agy_web, "web", IntegrateMode::Push, "main"),
+        ],
+        "that run's refused records, by repo name"
+    );
+    assert!(
+        candidate.refused[1]
+            .refusal
+            .starts_with("non_fast_forward: ")
+    );
+    assert!(
+        mirrored
+            .iter()
+            .all(|candidate| candidate.item.id == ids::AGY_ANA_1 || candidate.refused.is_empty()),
+        "only the refused landing's candidate holds records"
+    );
+    assert!(
+        !mirrored
+            .iter()
+            .any(|candidate| [ids::HTUI_ANA_1, ids::HTUI_FEAT_1].contains(&candidate.item.id)),
+        "a pending landing and an older run's refusal are not waiting"
+    );
 
     teardown(db, &[&cache]).await;
 }

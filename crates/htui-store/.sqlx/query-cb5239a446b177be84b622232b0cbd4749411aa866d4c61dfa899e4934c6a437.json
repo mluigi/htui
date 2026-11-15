@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE integration SET state            = 'pending', refusal          = NULL, lease_box_id     = NULL, lease_owner      = NULL, lease_expires_at = NULL WHERE run_id = $1 AND state = 'refused'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cb5239a446b177be84b622232b0cbd4749411aa866d4c61dfa899e4934c6a437"
+}

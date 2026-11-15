@@ -415,6 +415,9 @@ impl htui_core::store::WorkerStore for PgStore {
     ) -> Result<bool> {
         WriteStore::settle_integration(self, run, repo, owner, outcome).await
     }
+    async fn retry_landing(&self, run: RunId) -> Result<usize> {
+        WriteStore::retry_landing(self, run).await
+    }
     async fn close_out(
         &self,
         item: ItemId,
@@ -1034,6 +1037,9 @@ impl htui_core::store::WorkerStore for Writer {
         outcome: &LandOutcome,
     ) -> Result<bool> {
         WriteStore::settle_integration(self, run, repo, owner, outcome).await
+    }
+    async fn retry_landing(&self, run: RunId) -> Result<usize> {
+        WriteStore::retry_landing(self, run).await
     }
     async fn close_out(
         &self,

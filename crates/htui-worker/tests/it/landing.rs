@@ -8,10 +8,18 @@
 //! for any other owner, and nothing is noted). A record of a run another box executed is left
 //! alone, and a process whose role does not execute the box (I-1) lands nothing.
 //!
+//! MOD-133 M2 E6: `Unblock` on an item whose landing was refused puts the record back to `pending`;
+//! when the process that serves it executes the box, it lands the record at once, in the same task,
+//! after the answer. A process that does not (a TUI on a `worker` box) only resets it, and the
+//! executing process's sweep lands it.
+//!
 //! The ticker is one hour, so every sweep a case sees is an explicit `sweep_with`.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -31,8 +39,12 @@ use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::isolate::{
     ChangedPaths, EnvFiles, FanoutSlot, IsolatorFuture, LandRequest, PartTip, Prepared, ResetReport,
 };
+use htui_orch::{Command, CommandOutcome, UnblockCase};
 use htui_store::Backend;
-use htui_worker::{ReplySink, Role, RunReply, RunRuntime};
+use htui_worker::{
+    LiveChats, OrchReply, OrchRequest, ReplySink, Role, RunReply, RunRequest, RunRuntime,
+};
+use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 /// How long a case waits for the runtime to settle.
@@ -43,6 +55,13 @@ const REMOTE: &str = "https://bot:secret@forge.example/o/landed.git";
 
 /// The commit the run's one step made.
 const AFTER: &str = "1111111111111111111111111111111111111111";
+
+/// The refusal a case scripts for the first landing.
+const REFUSAL: &str =
+    "non_fast_forward: main on the remote has moved; merge it locally, then retry";
+
+/// The address an `Unblock` request is answered at.
+const UNBLOCK_ADDR: u64 = 7;
 
 /// The answers nobody reads: the sweep is unaddressed.
 #[derive(Debug, Clone, Default)]
@@ -274,6 +293,49 @@ impl Harness {
             .collect()
     }
 
+    /// `Unblock` on `item`, served by `runtime` and settled: the command's one answer.
+    async fn unblock(&self, runtime: &mut RunRuntime<Backend, TestSink>, item: ItemId) -> RunReply {
+        let sink = TestSink::default();
+        let request = RunRequest::Orch(OrchRequest::Command(Command::Unblock { item }));
+        let _ = runtime
+            .serve_request(
+                &Backend::memory(self.store.clone()),
+                &sink,
+                UNBLOCK_ADDR,
+                request,
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(
+            runtime.settle(PATIENCE).await.is_empty(),
+            "no task is stuck"
+        );
+        let answers: Vec<RunReply> = sink
+            .0
+            .lock()
+            .expect("the sink")
+            .iter()
+            .filter(|(to, _)| *to == UNBLOCK_ADDR)
+            .map(|(_, reply)| reply.clone())
+            .collect();
+        let [answer] = &answers[..] else {
+            panic!("one answer: {answers:?}");
+        };
+        answer.clone()
+    }
+
+    /// `item`'s note bodies written by `Unblock`.
+    async fn unblock_notes(&self, item: ItemId) -> Vec<String> {
+        self.store
+            .notes(item)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|note| note.body)
+            .filter(|body| body.starts_with("unblocked"))
+            .collect()
+    }
+
     /// Sets this box's executor.
     async fn executor(&self, executor: Executor) {
         let edited = self
@@ -378,18 +440,121 @@ async fn a_sweep_whose_role_does_not_execute_the_box_lands_nothing() {
     assert_eq!(h.states(run).await, [IntegrationState::Landed]);
 }
 
-/// The [`FakeIsolator`], whose `land` first reads whether this box still has an open batch: the
-/// sweep's admission closes an empty one (`drained`), so a `false` read means admission ran
-/// before the land arm.
-#[derive(Debug)]
-struct BatchWatch {
-    inner: Arc<FakeIsolator>,
-    store: MemStore,
-    /// One entry per `land`: whether the box's batch was still open then.
-    open_at_land: StdMutex<Vec<bool>>,
+/// Whether `answer` is `Unblocked` by a retry of `run`'s landing.
+fn retried(answer: &RunReply, run: RunId) -> bool {
+    matches!(
+        answer,
+        RunReply::Orch(OrchReply::Done(outcome))
+            if matches!(**outcome, CommandOutcome::Unblocked {
+                case: UnblockCase::RetryLanding(id),
+                rest: None,
+                ..
+            } if id == run)
+    )
 }
 
-impl Isolator for BatchWatch {
+/// MOD-133 M2 E6: a refused landing, retried by `Unblock` on the box's executing process (here the
+/// TUI on a `tui` box), is reset and landed once, in the same task; the next sweep takes nothing.
+#[tokio::test]
+async fn an_unblock_on_the_executing_process_lands_the_reset_record_once() {
+    let h = Harness::new().await;
+    let repo = h.push_repo("retried").await;
+    let item = h.item("refused, then retried").await;
+    let run = h.pushed_run(item, repo, ids::BOX).await;
+    h.isolator.script_land(LandOutcome::Refused {
+        reason: REFUSAL.to_owned(),
+    });
+    let mut runtime = h.runtime(Role::Tui);
+    h.sweep(&mut runtime).await;
+    assert_eq!(h.states(run).await, [IntegrationState::Refused]);
+    assert_eq!(h.isolator.land_requests().len(), 1);
+    let unblock = async || {
+        htui_worker::actions(
+            &Backend::memory(h.store.clone()),
+            item,
+            &LiveChats::default(),
+        )
+        .await
+        .expect("MemStore never fails a read")
+        .unblock
+    };
+    assert_eq!(unblock().await, Ok(()), "`u` reads the refused record");
+
+    let answer = h.unblock(&mut runtime, item).await;
+    assert!(retried(&answer, run), "{answer:?}");
+    assert_eq!(
+        h.isolator.land_requests().len(),
+        2,
+        "the reset record is landed once, by the Unblock's own task"
+    );
+    assert_eq!(h.states(run).await, [IntegrationState::Landed]);
+    let id = run.to_string();
+    assert_eq!(
+        h.unblock_notes(item).await,
+        [format!(
+            "unblocked: retrying the landing of 1 repo(s) of run {}",
+            &id[id.len() - 8..]
+        )]
+    );
+
+    h.sweep(&mut runtime).await;
+    assert_eq!(
+        h.isolator.land_requests().len(),
+        2,
+        "nothing is left for the sweep"
+    );
+    assert!(
+        unblock()
+            .await
+            .is_err_and(|why| why.ends_with("nothing is blocked")),
+        "a landed record holds nothing"
+    );
+}
+
+/// MOD-133 M2 E6, I-1: on a `worker` box the TUI's `Unblock` only resets the refused record; the
+/// worker's next sweep lands it.
+#[tokio::test]
+async fn a_tui_unblock_on_a_worker_box_only_resets_the_record() {
+    let h = Harness::new().await;
+    h.executor(Executor::Worker).await;
+    let repo = h.push_repo("handed over").await;
+    let item = h.item("refused on a worker box").await;
+    let run = h.pushed_run(item, repo, ids::BOX).await;
+    h.isolator.script_land(LandOutcome::Refused {
+        reason: REFUSAL.to_owned(),
+    });
+    let mut worker = h.runtime(Role::Worker);
+    h.sweep(&mut worker).await;
+    assert_eq!(h.states(run).await, [IntegrationState::Refused]);
+
+    let mut tui = h.runtime(Role::Tui);
+    let answer = h.unblock(&mut tui, item).await;
+    assert!(retried(&answer, run), "{answer:?}");
+    assert_eq!(
+        h.states(run).await,
+        [IntegrationState::Pending],
+        "reset, not landed: the TUI does not execute this box"
+    );
+    assert_eq!(h.isolator.land_requests().len(), 1);
+
+    h.sweep(&mut worker).await;
+    assert_eq!(h.states(run).await, [IntegrationState::Landed]);
+    assert_eq!(h.isolator.land_requests().len(), 2);
+}
+
+/// What a [`Watched`] isolator does before each `land` reaches the [`FakeIsolator`].
+trait BeforeLand: Send + Sync + std::fmt::Debug {
+    fn before(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// The [`FakeIsolator`], with a [`BeforeLand`] hook in front of its `land`.
+#[derive(Debug)]
+struct Watched<B> {
+    inner: Arc<FakeIsolator>,
+    before: B,
+}
+
+impl<B: BeforeLand> Isolator for Watched<B> {
     fn prepare<'a>(
         &'a self,
         run: RunId,
@@ -492,6 +657,24 @@ impl Isolator for BatchWatch {
 
     fn land<'a>(&'a self, request: &'a LandRequest) -> IsolatorFuture<'a, LandOutcome> {
         Box::pin(async move {
+            self.before.before().await;
+            self.inner.land(request).await
+        })
+    }
+}
+
+/// Before each `land`, whether this box still has an open batch: the sweep's admission closes an
+/// empty one (`drained`), so a `false` read means admission ran before the land arm.
+#[derive(Debug)]
+struct BatchWatch {
+    store: MemStore,
+    /// One entry per `land`: whether the box's batch was still open then.
+    open_at_land: StdMutex<Vec<bool>>,
+}
+
+impl BeforeLand for BatchWatch {
+    fn before(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
             let open = self
                 .store
                 .open_batch_of(ids::BOX)
@@ -502,9 +685,57 @@ impl Isolator for BatchWatch {
                 .lock()
                 .expect("no panic holds the watch")
                 .push(open);
-            self.inner.land(request).await
         })
     }
+}
+
+/// A gate a case holds shut: while `held`, each `land` is counted in `entries`, says so on
+/// `entered`, and waits for a permit of `release` (handed back, so one permit opens it for good).
+#[derive(Debug)]
+struct LandGate {
+    held: AtomicBool,
+    entries: AtomicUsize,
+    entered: Notify,
+    release: Semaphore,
+}
+
+impl LandGate {
+    fn new() -> Self {
+        Self {
+            held: AtomicBool::new(false),
+            entries: AtomicUsize::new(0),
+            entered: Notify::new(),
+            release: Semaphore::new(0),
+        }
+    }
+}
+
+impl BeforeLand for LandGate {
+    fn before(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if !self.held.load(Ordering::SeqCst) {
+                return;
+            }
+            self.entries.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            let _permit = self
+                .release
+                .acquire()
+                .await
+                .expect("the gate is never closed");
+        })
+    }
+}
+
+/// A runtime of `role` over `isolator` and the fakes, its ticker an hour.
+fn runtime_over(isolator: Arc<dyn Isolator>, role: Role) -> RunRuntime<Backend, TestSink> {
+    RunRuntime::with_parts(
+        isolator,
+        Arc::new(FakeVerifier::new()),
+        DriverFactory::new(),
+    )
+    .with_sweep_every(Duration::from_secs(3600))
+    .with_role(role)
 }
 
 /// F2 M1: the land arm runs after the sweep's admission and claims, so a remote that does not
@@ -521,25 +752,89 @@ async fn the_land_arm_runs_after_admission_and_claims() {
         .open_batch(ids::BOX, ids::USER, Utc::now())
         .await
         .expect("the batch opens");
-    let watch = Arc::new(BatchWatch {
+    let watch = Arc::new(Watched {
         inner: Arc::clone(&h.isolator),
-        store: h.store.clone(),
-        open_at_land: StdMutex::new(Vec::new()),
+        before: BatchWatch {
+            store: h.store.clone(),
+            open_at_land: StdMutex::new(Vec::new()),
+        },
     });
 
-    let mut runtime = RunRuntime::with_parts(
-        Arc::clone(&watch) as Arc<dyn Isolator>,
-        Arc::new(FakeVerifier::new()),
-        DriverFactory::new(),
-    )
-    .with_sweep_every(Duration::from_secs(3600))
-    .with_role(Role::Tui);
+    let mut runtime = runtime_over(Arc::clone(&watch) as Arc<dyn Isolator>, Role::Tui);
     h.sweep(&mut runtime).await;
 
     assert_eq!(h.states(run).await, [IntegrationState::Landed]);
     assert_eq!(
-        *watch.open_at_land.lock().expect("no panic holds the watch"),
+        *watch
+            .before
+            .open_at_land
+            .lock()
+            .expect("no panic holds the watch"),
         [false],
         "the batch was drained before the land arm ran"
     );
+}
+
+/// MOD-133 M2 R1 (F1): while the `Unblock`'s own land of the reset record is in flight, a sweep of
+/// the same process leaves the record to it (the run counts as live in the process's walks, which
+/// the land arm skips), so the record is pushed once, never twice under the one lease owner.
+#[tokio::test]
+async fn a_sweep_during_the_unblocks_land_leaves_the_record_to_it() {
+    let h = Harness::new().await;
+    let repo = h.push_repo("gated").await;
+    let item = h.item("refused, retried, swept").await;
+    let run = h.pushed_run(item, repo, ids::BOX).await;
+    h.isolator.script_land(LandOutcome::Refused {
+        reason: REFUSAL.to_owned(),
+    });
+    let gated = Arc::new(Watched {
+        inner: Arc::clone(&h.isolator),
+        before: LandGate::new(),
+    });
+    let mut runtime = runtime_over(Arc::clone(&gated) as Arc<dyn Isolator>, Role::Tui);
+    h.sweep(&mut runtime).await;
+    assert_eq!(h.states(run).await, [IntegrationState::Refused]);
+
+    gated.before.held.store(true, Ordering::SeqCst);
+    let backend = Backend::memory(h.store.clone());
+    let sink = TestSink::default();
+    let request = RunRequest::Orch(OrchRequest::Command(Command::Unblock { item }));
+    let _ = runtime
+        .serve_request(
+            &backend,
+            &sink,
+            UNBLOCK_ADDR,
+            request,
+            &LiveChats::default(),
+        )
+        .await;
+    tokio::time::timeout(PATIENCE, gated.before.entered.notified())
+        .await
+        .expect("the Unblock's own task lands the reset record");
+    runtime.sweep_with(&backend, &TestSink::default());
+    // A sweep that took the record too would reach the gate at once: the store is in memory.
+    let second =
+        tokio::time::timeout(Duration::from_secs(2), gated.before.entered.notified()).await;
+    gated.before.release.add_permits(1);
+    assert!(
+        runtime.settle(PATIENCE).await.is_empty(),
+        "no task is stuck"
+    );
+
+    assert!(
+        second.is_err(),
+        "the sweep landed the record while the Unblock's land was in flight"
+    );
+    assert_eq!(gated.before.entries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.isolator.land_requests().len(),
+        2,
+        "refused once, then landed once"
+    );
+    assert_eq!(h.states(run).await, [IntegrationState::Landed]);
+    let answers = sink.0.lock().expect("the sink").clone();
+    let [(UNBLOCK_ADDR, answer)] = &answers[..] else {
+        panic!("one answer: {answers:?}");
+    };
+    assert!(retried(answer, run), "{answer:?}");
 }

@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT i.id            AS \"item_id!: ItemId\",\n                   lr.id           AS \"run!: RunId\",\n                   g.repo_id       AS \"repo!: RepoId\",\n                   rp.name         AS \"repo_name!\",\n                   g.mode          AS \"mode!: IntegrateMode\",\n                   g.target_branch AS \"target_branch!\",\n                   g.refusal       AS \"refusal!\",\n                   g.updated_at    AS \"since!\",\n                   lr.queued_at    AS \"run_queued_at!\"\n              FROM item i\n              JOIN LATERAL (\n                    SELECT r.id, r.status, r.queued_at FROM run r\n                     WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'\n                     ORDER BY r.queued_at DESC, r.id DESC\n                     LIMIT 1\n                   ) lr ON true\n              JOIN integration g ON g.run_id = lr.id AND g.state = 'refused'\n              JOIN repo rp       ON rp.id = g.repo_id\n             WHERE i.id = ANY($1) AND i.status = 'open' AND lr.status = 'done'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id!: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "run!: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "repo!: RepoId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "repo_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "repo_name!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repo",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "mode!: IntegrateMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "target_branch!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "target_branch"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "refusal!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "refusal"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "since!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "run_queued_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "queued_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "338930c905274a938aea7a0a2fd58e044c092d7cced299d695647c380edb0c80"
+}

@@ -47,7 +47,7 @@ Earlier completions, MOD-149, MOD-122, TOOL-17, MOD-164, MOD-152, TOOL-16, TOOL-
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
-text and others; `R-ENT-8`'s, §10.11 and, on `hr/MOD-133`, §10.2 `R-ORCH-14` and §10.9 `R-ORCH-11` already applied) and ANA-40's (`R-TUI-7` and others). Open
+text and others; `R-ENT-8`'s, §10.11 and, with MOD-133, §10.2 `R-ORCH-14` and §10.9 `R-ORCH-11` already applied) and ANA-40's (`R-TUI-7` and others). Open
 from ANA-29: **MOD-94** behind a maintainer decision. **MOD-99** (hard-coded Sentry DSN in a public
 repo) owes key rotation and a history rewrite, after the live `hr` branches merge. Owed on the host: the
 Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-17's `gate.ps1` test step and `-SelfTest`, TOOL-14's `gate.ps1
@@ -64,7 +64,7 @@ MOD-152's, MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`,
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), MOD-133 M1 and MOD-130 M1 (merged on main 2026-11-15), and MOD-159 (done 2026-11-15, `docs/decisions/mod/mod-159.md`; M1 and M2 on main, M3 on `hr/MOD-159`): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 343), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection,
+Live coordinates after MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), MOD-133 M1, MOD-130 M1, MOD-130 M2 and MOD-133 M2 (merged on main 2026-11-15), and MOD-159 (done 2026-11-15, `docs/decisions/mod/mod-159.md`; M1 and M2 on main, M3 on `hr/MOD-159`): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 349 after MOD-130 M2 and MOD-133 M2, neither with a migration), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection,
 `pass_requested_at` written since M3; not mirrored; `0036` on its branch; collections `htui_ws_<uuid>` per workspace and
 `htui_global`; the API MOD-112 (4), MOD-161 and MOD-167 plug into is `IndexerLeaseStore` (take, renew, release,
 `request_indexer_pass`, `claim_indexer_pass`), `take_or_request_pass` → `LeaseTurn::{Ours, Requested, Held}`,
@@ -489,8 +489,21 @@ items it follows are done.
   close-out table. Requirement edits ANA-34 §10.2 and §10.9 applied. Migration `0039_integration`, cache
   `0013_integration` (live coordinates above). Owed on the host: a real-network push over ssh and https
   with the box's credentials (tests use local bare remotes only), and the merged-tree Postgres gate.
-  Remaining: M2 Settings fields, the refused waiting row and `Unblock` retry, the item display state;
-  M3 the `pull_request` run branch.
+  **Phase 2 landed (`56c0e5cb..4665aba2` on `hr/MOD-133`, 2026-11-15, merged on main 2026-11-15):** M2 Settings, visibility and
+  retry (plan `.claude/plans/mod-133-m2-settings-visibility-retry.plan.md`). The project default is the
+  project-only registry key `integrate` (`SettingKey::Integrate`, Settings > Prompt; cycles not set,
+  `local`, `push`); the repo mode is an `integrate` choice row of the Hierarchy repo editor; both refuse
+  `pull_request` (MOD-134) and a non-`local` mode without a remote URL (`IntegrateMode::selectable_refusal`).
+  Derived display states `landing` (`⇡`) and `landing refused` (`↯`) from the latest graph run's records
+  (`RunLanding`, `ItemState::of_landing`; `is_finished` is `done | landing | landing refused`, close-out
+  law unchanged for MOD-135), on Pg, Mem and the cache. A refused record is a `landing` waiting row, and
+  `Unblock` retries it (`UnblockCase::RetryLanding`, `WriteStore::retry_landing`; the executing process
+  lands at once under a walk token, other boxes by their sweep). No migration; conformance `CASES` 346
+  (349 on main with MOD-130 M2's three).
+  No demo item reads the landing states (the demo has no repos). Review fix round R1 (sweep/Unblock
+  double push, `Q` on a landing item, three lows). Commit `a4a22aa3` alone does not compile `htui`
+  (the next commit does; a squash at collect is the maintainer's call).
+  Remaining: M3 the `pull_request` run branch.
 - [ ] **MOD-134 - Forge adapter and push/forge credentials** (from ANA-34, `docs/ANA-34.md` §7.4,
   §7.5). `R-ORCH-14`, `R-BOX-4`, `R-STO-1`, `R-SEC-2`, `R-SEC-3`, `R-SEC-4`. A forge adapter with four
   verbs (push a branch, open or update a PR, set auto-merge, read PR state); OneDev REST first

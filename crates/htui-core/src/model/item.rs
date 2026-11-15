@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{BoxId, ItemId, ItemKindId, ProjectId, StepGraphId, TargetId, UserId};
+use crate::model::integration::IntegrationState;
 use crate::model::run::RunStatus;
 
 str_enum!(
@@ -46,8 +47,14 @@ str_enum!(
         NeedsYou => "needs_you",
         /// `open` over a `failed` latest graph run.
         Failed => "failed",
+        /// `open` over a `done` latest graph run with a `refused` integration record (MOD-133
+        /// M2): the work did not reach its remote, and Unblock retries it. Word `landing refused`.
+        LandRefused => "land_refused",
         /// `open` over a `running` latest graph run.
         Running => "running",
+        /// `open` over a `done` latest graph run with an integration record not yet landed and
+        /// none refused (MOD-133 M2): its box is landing the work.
+        Landing => "landing",
         /// `open` over a `stopped` latest graph run (MOD-125: live, resumable, holds no slot).
         Stopped => "stopped",
         /// `item.status = 'blocked'`, whatever its runs did.
@@ -56,7 +63,8 @@ str_enum!(
         Queued => "queued",
         /// `open` with no non-cancelled graph run.
         Open => "open",
-        /// `open` over a `done` latest graph run: finished.
+        /// `open` over a `done` latest graph run with every integration record landed, or none
+        /// (every `local` run): finished.
         Done => "done",
         /// `item.status = 'closed'`.
         Closed => "closed",
@@ -64,36 +72,87 @@ str_enum!(
 );
 
 impl ItemState {
-    /// `closed`, `blocked`, else the latest non-cancelled graph run's state, else `open`.
+    /// `closed`, `blocked`, else the latest non-cancelled graph run's state, else `open`:
+    /// [`ItemState::of_landing`] with no landing, which is what a reader that holds no
+    /// integration records derives (a `done` run reads `done`).
     #[must_use]
     pub const fn of(status: Status, latest: Option<RunStatus>) -> Self {
-        match (status, latest) {
-            (Status::Closed, _) => Self::Closed,
-            (Status::Blocked, _) => Self::Blocked,
-            (Status::Open, Some(RunStatus::AwaitingApproval)) => Self::NeedsYou,
-            (Status::Open, Some(RunStatus::Failed)) => Self::Failed,
-            (Status::Open, Some(RunStatus::Running)) => Self::Running,
-            (Status::Open, Some(RunStatus::Stopped)) => Self::Stopped,
-            (Status::Open, Some(RunStatus::Queued)) => Self::Queued,
-            (Status::Open, Some(RunStatus::Done)) => Self::Done,
+        Self::of_landing(status, latest, None)
+    }
+
+    /// MOD-133 M2 E2: `closed` wins, then `blocked`; over a `done` latest graph run a
+    /// [`RunLanding::Refused`] reads `land_refused` and a [`RunLanding::Pending`] `landing`;
+    /// everything else is [`ItemState::of`]'s answer, whatever `landing` says.
+    #[must_use]
+    pub const fn of_landing(
+        status: Status,
+        latest: Option<RunStatus>,
+        landing: Option<RunLanding>,
+    ) -> Self {
+        match (status, latest, landing) {
+            (Status::Closed, _, _) => Self::Closed,
+            (Status::Blocked, _, _) => Self::Blocked,
+            (Status::Open, Some(RunStatus::AwaitingApproval), _) => Self::NeedsYou,
+            (Status::Open, Some(RunStatus::Failed), _) => Self::Failed,
+            (Status::Open, Some(RunStatus::Running), _) => Self::Running,
+            (Status::Open, Some(RunStatus::Stopped), _) => Self::Stopped,
+            (Status::Open, Some(RunStatus::Queued), _) => Self::Queued,
+            (Status::Open, Some(RunStatus::Done), Some(RunLanding::Refused)) => Self::LandRefused,
+            (Status::Open, Some(RunStatus::Done), Some(RunLanding::Pending)) => Self::Landing,
+            (Status::Open, Some(RunStatus::Done), None) => Self::Done,
             // "Latest" skips cancelled runs; a caller passing one gets what a cancel leaves.
-            (Status::Open, Some(RunStatus::Cancelled) | None) => Self::Open,
+            (Status::Open, Some(RunStatus::Cancelled) | None, _) => Self::Open,
         }
     }
 
-    /// The redesign's word: `needs you` (a space); every other state its `as_str`.
+    /// The redesign's word: `needs you` and `landing refused` (a space); every other state its
+    /// `as_str`.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
             Self::NeedsYou => "needs you",
+            Self::LandRefused => "landing refused",
             other => other.as_str(),
         }
     }
 
-    /// Finished: the latest graph run is `done` (MOD-133 adds "and landed").
+    /// Finished: the latest graph run is `done`, landed or not (`done`, `landing`, `landing
+    /// refused`). Whether `done` also requires landed is the close-out law's, MOD-135's; both
+    /// stores' `close_out` read `latest == done`, so close-out does not move with the landing.
     #[must_use]
     pub const fn is_finished(self) -> bool {
-        matches!(self, Self::Done)
+        matches!(self, Self::Done | Self::Landing | Self::LandRefused)
+    }
+}
+
+str_enum!(
+    /// MOD-133 M2 E1: the aggregate landing of one run's `integration` records, the one an item
+    /// whose latest graph run is `done` reads its state from ([`ItemState::of_landing`]). Named
+    /// `RunLanding` because htui-orch already has a `Landing`.
+    RunLanding {
+        /// A record is not landed and none is refused: the box is landing the work.
+        Pending => "pending",
+        /// A record is refused: Unblock retries it.
+        Refused => "refused",
+    }
+);
+
+impl RunLanding {
+    /// Any `refused` record → [`RunLanding::Refused`]; else any record not
+    /// [`IntegrationState::is_landed`] (`pending`, `pr_open`, `pr_closed`; MOD-134 refines the PR
+    /// states) → [`RunLanding::Pending`]; else (all landed, or no records) → `None`.
+    #[must_use]
+    pub fn of(states: impl IntoIterator<Item = IntegrationState>) -> Option<Self> {
+        let mut landing = None;
+        for state in states {
+            if state == IntegrationState::Refused {
+                return Some(Self::Refused);
+            }
+            if !state.is_landed() {
+                landing = Some(Self::Pending);
+            }
+        }
+        landing
     }
 }
 
@@ -200,8 +259,8 @@ pub struct Item {
 }
 
 impl Item {
-    /// The list projection of this item: the item row alone, so `latest_run_status` is `None`;
-    /// a store fills it.
+    /// The list projection of this item: the item row alone, so `latest_run_status` and
+    /// `latest_run_landing` are `None`; a store fills them.
     #[must_use]
     pub fn summary(&self) -> ItemSummary {
         ItemSummary {
@@ -218,6 +277,7 @@ impl Item {
             updated_at: self.updated_at,
             touched_paths: self.touched_paths.clone(),
             latest_run_status: None,
+            latest_run_landing: None,
         }
     }
 }
@@ -255,14 +315,19 @@ pub struct ItemSummary {
     /// `(queued_at, id)`; `None` when it has none. Appended, never inserted (plan D10).
     #[serde(default)]
     pub latest_run_status: Option<RunStatus>,
+    /// MOD-133 M2 E3: the [`RunLanding`] of the records of **the same run** `latest_run_status`
+    /// reads; `None` with no run, a run that wrote no record, or every record landed. Appended,
+    /// never inserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run_landing: Option<RunLanding>,
 }
 
 impl ItemSummary {
-    /// The derived display state (MOD-144): [`ItemState::of`] the stored status and the latest
-    /// graph run's.
+    /// The derived display state (MOD-144, MOD-133 M2): [`ItemState::of_landing`] the stored
+    /// status, the latest graph run's and its landing.
     #[must_use]
     pub const fn state(&self) -> ItemState {
-        ItemState::of(self.status, self.latest_run_status)
+        ItemState::of_landing(self.status, self.latest_run_status, self.latest_run_landing)
     }
 }
 
@@ -377,7 +442,8 @@ pub struct ItemRevision {
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemState, Resolution, Status};
+    use super::{ItemState, Resolution, RunLanding, Status};
+    use crate::model::integration::IntegrationState;
     use crate::model::run::RunStatus;
 
     /// ANA-35 §7.1's item table (MOD-144), transcribed from the document rather than from
@@ -489,6 +555,85 @@ mod tests {
         }
     }
 
+    /// MOD-133 M2 E2: the landing moves only an `open` item over a `done` latest graph run:
+    /// `refused` reads `landing refused`, `pending` reads `landing`; every other `(status, latest)`
+    /// reads exactly what [`ItemState::of`] answers, whatever the landing.
+    #[test]
+    fn item_state_of_landing_moves_only_an_open_done_item() {
+        let landings = [None, Some(RunLanding::Pending), Some(RunLanding::Refused)];
+        for &status in Status::ALL {
+            let latest = core::iter::once(None).chain(RunStatus::ALL.iter().copied().map(Some));
+            for run in latest {
+                for landing in landings {
+                    let expected = match (status, run, landing) {
+                        (Status::Open, Some(RunStatus::Done), Some(RunLanding::Refused)) => {
+                            ItemState::LandRefused
+                        }
+                        (Status::Open, Some(RunStatus::Done), Some(RunLanding::Pending)) => {
+                            ItemState::Landing
+                        }
+                        _ => ItemState::of(status, run),
+                    };
+                    assert_eq!(
+                        ItemState::of_landing(status, run, landing),
+                        expected,
+                        "ItemState::of_landing({status}, {run:?}, {landing:?})"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            ItemState::of_landing(Status::Open, Some(RunStatus::Done), None),
+            ItemState::Done,
+            "all landed, or no records (`local`), is `done`"
+        );
+        assert_eq!(
+            ItemState::of_landing(
+                Status::Closed,
+                Some(RunStatus::Done),
+                Some(RunLanding::Refused)
+            ),
+            ItemState::Closed,
+            "`closed` wins"
+        );
+        assert_eq!(
+            ItemState::of_landing(
+                Status::Blocked,
+                Some(RunStatus::Done),
+                Some(RunLanding::Pending)
+            ),
+            ItemState::Blocked,
+            "then `blocked`"
+        );
+    }
+
+    /// MOD-133 M2 E1: any `refused` record is `Refused`; else any record not landed is `Pending`;
+    /// all landed, or none, is `None`.
+    #[test]
+    fn run_landing_of_reads_refused_then_unlanded() {
+        use IntegrationState::{Landed, Pending, PrClosed, PrMerged, PrOpen, Refused};
+        for (states, expected) in [
+            (vec![], None),
+            (vec![Landed], None),
+            (vec![Landed, PrMerged], None),
+            (vec![Pending], Some(RunLanding::Pending)),
+            (vec![Landed, PrOpen], Some(RunLanding::Pending)),
+            (vec![PrClosed, Landed], Some(RunLanding::Pending)),
+            (vec![Refused], Some(RunLanding::Refused)),
+            (vec![Pending, Refused, Landed], Some(RunLanding::Refused)),
+            (vec![Landed, Refused], Some(RunLanding::Refused)),
+        ] {
+            assert_eq!(RunLanding::of(states.clone()), expected, "{states:?}");
+        }
+        assert_eq!(
+            RunLanding::ALL
+                .iter()
+                .map(|landing| landing.as_str())
+                .collect::<Vec<_>>(),
+            ["pending", "refused"]
+        );
+    }
+
     #[test]
     fn item_state_all_is_the_attention_order() {
         assert_eq!(
@@ -496,7 +641,9 @@ mod tests {
             [
                 ItemState::NeedsYou,
                 ItemState::Failed,
+                ItemState::LandRefused,
                 ItemState::Running,
+                ItemState::Landing,
                 ItemState::Stopped,
                 ItemState::Blocked,
                 ItemState::Queued,
@@ -508,13 +655,16 @@ mod tests {
     }
 
     /// B1: `as_str` equals `RunStatus::as_str` where both name a run state, so SQL derives the
-    /// state with one `CASE`; the word spells `needs you` with a space.
+    /// state with one `CASE`; the word spells `needs you` and `landing refused` with a space.
     #[test]
     fn item_state_word_spells_needs_you() {
         assert_eq!(ItemState::NeedsYou.as_str(), "needs_you");
         assert_eq!(ItemState::NeedsYou.word(), "needs you");
+        assert_eq!(ItemState::LandRefused.as_str(), "land_refused");
+        assert_eq!(ItemState::LandRefused.word(), "landing refused");
+        assert_eq!(ItemState::Landing.word(), "landing");
         for &state in ItemState::ALL {
-            if state != ItemState::NeedsYou {
+            if !matches!(state, ItemState::NeedsYou | ItemState::LandRefused) {
                 assert_eq!(state.word(), state.as_str());
             }
         }
@@ -530,8 +680,11 @@ mod tests {
                 run.as_str()
             );
         }
-        assert!(ItemState::Done.is_finished());
-        assert_eq!(ItemState::ALL.iter().filter(|s| s.is_finished()).count(), 1);
+        // MOD-133 M2 E2: the run finished, landed or not (the close-out law is MOD-135's).
+        for state in [ItemState::Done, ItemState::Landing, ItemState::LandRefused] {
+            assert!(state.is_finished(), "{state}");
+        }
+        assert_eq!(ItemState::ALL.iter().filter(|s| s.is_finished()).count(), 3);
     }
 
     #[test]

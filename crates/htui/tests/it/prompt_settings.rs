@@ -27,7 +27,7 @@ use htui::ui::tabs::settings::{
     AgentsSection, HierarchySection, KindsSection, PromptSection, SettingsSection, SettingsTab,
 };
 use htui_core::fixtures::ids;
-use htui_core::model::{AgentId, AgentSummary, ProjectId, Scope, WorkspaceId};
+use htui_core::model::{AgentId, AgentSummary, IntegrateMode, ProjectId, Scope, WorkspaceId};
 use htui_core::prompt::settings::{resolve_allow_env_files, resolve_box_hostname};
 use htui_core::prompt::{
     BudgetSource, DEFAULTS, LightModel, Rungs, SettingKey, resolve_light_model,
@@ -157,7 +157,7 @@ fn prompt_settings_names_are_stable() {
 /// agent registry the `light_model` row cycles through (MOD-164 D7), and one project
 /// entry per scope project carrying exactly the keys the `Project` rung accepts, in
 /// [`project_keys`] order — `allow_env_files` first (MOD-89 D4), then `box_hostname` (MOD-33
-/// D276), then `memory_capture` (MOD-163 D19).
+/// D276), then `integrate` (MOD-133 M2 E7), then `memory_capture` (MOD-163 D19).
 ///
 /// The demo project's own blob already holds `token_budget`, so the fifth project value is a
 /// stored number rather than `None` — which is what makes the `project_key` mapping of D2
@@ -195,15 +195,49 @@ async fn the_demo_snapshot_has_eleven_app_entries_and_five_keys_per_project() {
         vec![
             SettingKey::AllowEnvFiles,
             SettingKey::BoxHostname,
+            SettingKey::Integrate,
             SettingKey::MemoryCapture,
             SettingKey::UpstreamHops,
             SettingKey::TokenBudget
         ]
     );
-    for value in &project.values[0..=3] {
+    for value in &project.values[0..=4] {
         assert_eq!(value.value, None, "`{:?}` holds nothing", value.key);
     }
-    assert_eq!(project.values[4].value, Some(json!(120_000)));
+    assert_eq!(project.values[5].value, Some(json!(120_000)));
+    assert!(
+        !project.has_remote,
+        "the demo holds no repo, so no remote (MOD-133 M2 E9)"
+    );
+}
+
+/// MOD-133 M2 E7: `has_remote` is whether any repo of the project carries a non-blank remote URL;
+/// a repo without one, or with a blank one, does not count.
+#[tokio::test]
+async fn has_remote_reads_the_projects_repos() {
+    let backend = demo();
+    for (name, remote, expected) in [
+        ("bare", None, false),
+        ("blank", Some("  "), false),
+        ("core", Some("https://example.com/o/core.git"), true),
+    ] {
+        serve(
+            &backend,
+            &StoreRequest::CreateRepo {
+                project: ids::PROJECT_VULKAN,
+                name: name.to_owned(),
+                remote_url: remote.map(str::to_owned),
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            },
+        )
+        .await;
+        let snapshot = demo_settings(&backend).await;
+        assert_eq!(
+            snapshot.projects[0].has_remote, expected,
+            "after `{name}` ({remote:?})"
+        );
+    }
 }
 
 /// `app_map` is the shape `Backend::app_settings` hands the resolvers: only the entries that carry
@@ -403,8 +437,8 @@ async fn set_setting_on_project_stores_under_the_project_key_and_keeps_foreign_k
     assert_eq!(blob.get("keep_raw_events"), Some(&json!(false)));
     assert_eq!(blob.get("token_budget"), Some(&json!(120_000)));
 
-    assert_eq!(entry.values[3].key, SettingKey::UpstreamHops);
-    assert_eq!(entry.values[3].value, Some(json!(2)));
+    assert_eq!(entry.values[4].key, SettingKey::UpstreamHops);
+    assert_eq!(entry.values[4].value, Some(json!(2)));
     assert_ne!(
         entry.project.updated_at, token,
         "the project's own token is what a project-rung write moves"
@@ -1856,6 +1890,205 @@ async fn a_malformed_light_model_is_refused_by_the_seam() {
     );
 }
 
+/// `snapshot` with the demo project's `integrate` holding `held` (in the blob and in its row) and
+/// `has_remote` as given, as a re-read would carry them.
+fn with_integrate(
+    snapshot: &SettingsSnapshot,
+    held: Option<IntegrateMode>,
+    has_remote: bool,
+) -> SettingsSnapshot {
+    let mut next = snapshot.clone();
+    let entry = &mut next.projects[0];
+    entry.has_remote = has_remote;
+    let value = held.map(|mode| json!(mode.as_str()));
+    let blob = entry
+        .project
+        .settings
+        .as_object_mut()
+        .expect("the demo project's settings are an object");
+    match &value {
+        Some(value) => blob.insert(IntegrateMode::PROJECT_SETTING.to_owned(), value.clone()),
+        None => blob.remove(IntegrateMode::PROJECT_SETTING),
+    };
+    entry
+        .values
+        .iter_mut()
+        .find(|row| row.key == SettingKey::Integrate)
+        .expect("the project rung lists `integrate`")
+        .value = value;
+    next
+}
+
+/// MOD-133 M2 E7: unset, the project default reads `local (default)`: no number, no unit, and the
+/// help names `pull_request`'s milestone and the repo override.
+#[tokio::test]
+async fn the_integrate_row_reads_local_by_default() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, project_row(SettingKey::Integrate));
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(
+        row_of(&frame, SettingKey::Integrate, 0)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["integrate", "local", "(default)"],
+        "{frame}"
+    );
+    let words = flat(&frame);
+    assert!(words.contains("MOD-134"), "{frame}");
+    assert!(words.contains("a repo may override it"), "{frame}");
+}
+
+/// MOD-133 M2 E7: the edit act opens no editor on `integrate`; it cycles `not set → local → push
+/// → not set`, one write per press against the project's token, and never offers `pull_request`.
+#[tokio::test]
+async fn the_edit_act_cycles_integrate_local_push_then_not_set() {
+    let snapshot = with_integrate(&demo_settings(&demo()).await, None, true);
+    let token = project_token(&snapshot);
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, project_row(SettingKey::Integrate));
+
+    for (held, next) in [
+        (None, IntegrateMode::Local),
+        (Some(IntegrateMode::Local), IntegrateMode::Push),
+    ] {
+        feed(&bench, &mut section, &with_integrate(&snapshot, held, true));
+        assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+        assert!(!section.captures_input(), "a choice opens no editor");
+        let asked = bench.drained();
+        let [
+            Action::Store(StoreRequest::SetSetting {
+                rung,
+                key,
+                value,
+                expected,
+                ..
+            }),
+        ] = asked.as_slice()
+        else {
+            panic!("from {held:?} one write of {next}: {asked:?}");
+        };
+        assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
+        assert_eq!(*key, SettingKey::Integrate);
+        assert_eq!(*value, json!(next.as_str()));
+        assert_eq!(*expected, Some(token));
+    }
+
+    feed(
+        &bench,
+        &mut section,
+        &with_integrate(&snapshot, Some(IntegrateMode::Push), true),
+    );
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(
+        row_of(&frame, SettingKey::Integrate, 0)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["integrate", "push", "(project)"],
+        "{frame}"
+    );
+    bench.key(&mut section, "e");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::ClearSetting {
+            rung,
+            key,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("past `push` is `not set`, a clear: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, SettingKey::Integrate);
+    assert_eq!(*expected, token);
+}
+
+/// MOD-133 M2 E7, R1 (F5): stepping to `push` on a project no repo of which carries a remote URL
+/// is refused in the notice with `IntegrateMode::Push`'s own sentence, and the cycle steps past it
+/// to `not set` instead: a stored `local` is cleared, so it never sticks.
+#[tokio::test]
+async fn push_without_a_remote_is_refused_and_local_steps_to_not_set() {
+    let snapshot = with_integrate(
+        &demo_settings(&demo()).await,
+        Some(IntegrateMode::Local),
+        false,
+    );
+    let token = project_token(&snapshot);
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, project_row(SettingKey::Integrate));
+
+    bench.key(&mut section, "e");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::ClearSetting {
+            rung,
+            key,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`push` is refused, so `local` steps to `not set`, a clear: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, SettingKey::Integrate);
+    assert_eq!(*expected, token);
+    let sentence = IntegrateMode::Push
+        .selectable_refusal(false)
+        .expect("push without a remote is refused");
+    let frame = bench.render_section(&section, 100);
+    assert!(flat(&frame).contains(&sentence), "{frame}");
+    assert!(
+        error_text(&bench, &section, 100)
+            .iter()
+            .any(|line| line.contains("needs a remote URL")),
+        "the refusal is an error"
+    );
+}
+
+/// MOD-133 M2 E7: the seam takes `local` and `push` (whether a repo has a remote is the form's
+/// check) and refuses `pull_request` with the form's sentence.
+#[tokio::test]
+async fn the_seam_stores_integrate_and_refuses_pull_request() {
+    let backend = demo();
+    let before = demo_settings(&backend).await;
+    let after = applied(
+        &backend,
+        set_project(SettingKey::Integrate, json!("push"), project_token(&before)),
+    )
+    .await;
+    assert_eq!(
+        after.projects[0].project.settings[IntegrateMode::PROJECT_SETTING],
+        json!("push")
+    );
+    assert_eq!(
+        IntegrateMode::project_default(&after.projects[0].project.settings),
+        Ok(IntegrateMode::Push),
+        "the reader runs read it"
+    );
+
+    let (request, message) = refusal(
+        serve(
+            &backend,
+            &set_project(
+                SettingKey::Integrate,
+                json!("pull_request"),
+                project_token(&after),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(request, "set_setting");
+    let sentence = IntegrateMode::PullRequest
+        .selectable_refusal(true)
+        .expect("pull_request is refused");
+    assert!(
+        message.contains(&sentence),
+        "the seam's own sentence: {message}"
+    );
+}
+
 /// D11 for the switch: anything but on/off/true/false is refused by shape and asks nothing.
 #[tokio::test]
 async fn a_switch_that_is_not_on_or_off_is_refused_locally() {
@@ -2947,12 +3180,13 @@ async fn the_section_scrolls_its_cursor_and_help_into_view() {
 /// MOD-81: the section at 80 columns, through the shell. The value rows fit the pane instead of
 /// being cut at its right edge, so every row ends with its unit.
 ///
-/// 25 rows rather than 24 since MOD-122's `log_retention_days` (M3 T7): the case is about the
-/// width, and the whole demo tree has to be on screen for the row count below to hold.
+/// 26 rows rather than 24 since MOD-122's `log_retention_days` (M3 T7) and MOD-133's project
+/// `integrate` (M2 E7): the case is about the width, and the whole demo tree has to be on screen
+/// for the row count below to hold.
 #[tokio::test]
 async fn the_section_at_80_columns() {
     let mut harness = Harness::over(MemStore::demo())
-        .size(80, 25)
+        .size(80, 26)
         .with_tab(Box::new(SettingsTab::with_sections(vec![
             Box::new(AgentsSection::new()),
             Box::new(HierarchySection::new()),
@@ -2974,11 +3208,18 @@ async fn the_section_at_80_columns() {
         .filter_map(row_text)
         .filter(|row| row.contains(" | "))
         .collect();
-    // Every value row but `light_model`, which reads `not set` alone (MOD-164 D7).
+    // Every value row but `light_model`, which reads `not set` alone (MOD-164 D7), and
+    // `integrate`, which reads `local (default)` alone (MOD-133 M2 E7).
     assert_eq!(
         rows.len(),
-        SettingKey::app_keys().count() + project_keys().count() - 1,
+        SettingKey::app_keys().count() + project_keys().count() - 2,
         "{frame}"
+    );
+    assert!(
+        body(&frame).into_iter().filter_map(row_text).any(|row| {
+            row.trim_end().ends_with("local (default)") && row.trim_start().starts_with("integrate")
+        }),
+        "the project default row fits too: {frame}"
     );
     assert!(
         body(&frame)

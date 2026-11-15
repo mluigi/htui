@@ -450,6 +450,7 @@ fn the_drop_that_empties_the_upstream_section_is_counted() {
         in_scope: true,
         summary: Some(format!("{key} summary\n")),
         latest_run_status: None,
+        latest_run_landing: None,
     };
     let mut spec = fixtures::phase_oversize();
     // Every row at depth 2, so rung (b) drops them all and the last drop empties the section.
