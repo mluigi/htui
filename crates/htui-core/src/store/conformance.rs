@@ -37260,7 +37260,7 @@ async fn run_memory_refuses_evidence_outside_the_run<S: WriteStore>(store: &S) {
 /// `trim_record` as the assembler writes it when the prompt showed `shown` (MOD-163 D17).
 fn trim_showing(shown: &[Value]) -> Value {
     json!({
-        "v": 5,
+        "v": 6,
         "sections": [],
         "memory": { "shown": shown, "total": 3 },
     })

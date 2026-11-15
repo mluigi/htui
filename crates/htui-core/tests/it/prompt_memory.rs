@@ -662,9 +662,9 @@ fn shown(index: usize) -> Value {
 }
 
 #[test]
-fn trim_record_v5_records_the_entries_shown_after_trimming() {
+fn trim_record_v6_records_the_entries_shown_after_trimming() {
     let full = record_value(&ok(&spec()));
-    assert_eq!(full["v"], json!(5));
+    assert_eq!(full["v"], json!(6));
     assert_eq!(
         full["memory"],
         json!({ "shown": [shown(0), shown(1)], "total": 3 }),
@@ -675,7 +675,7 @@ fn trim_record_v5_records_the_entries_shown_after_trimming() {
 
     let bare = trimmable();
     let one = record_value(&ok(&at_target(&bare, full_cost(&bare) - 10)));
-    assert_eq!(one["v"], json!(5));
+    assert_eq!(one["v"], json!(6));
     assert_eq!(one["memory"], json!({ "shown": [shown(0)], "total": 3 }));
 
     let none = record_value(&ok(&at_target(&bare, full_cost(&bare) - 219)));
@@ -685,7 +685,7 @@ fn trim_record_v5_records_the_entries_shown_after_trimming() {
 #[test]
 fn the_memory_key_is_absent_without_memory_and_empty_when_the_cap_took_all() {
     let plain = record_value(&ok(&fixtures::phase_implement_attempt2()));
-    assert_eq!(plain["v"], json!(5));
+    assert_eq!(plain["v"], json!(6));
     assert!(plain.get("memory").is_none(), "{plain}");
 
     let mut capped = spec();

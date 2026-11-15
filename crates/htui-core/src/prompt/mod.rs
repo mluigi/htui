@@ -52,7 +52,8 @@ pub use settings::{
 };
 pub use template::{ParsedTemplate, Placeholder, Span, TemplateError, TemplateRole, parse};
 pub use trim::{
-    MemoryAudit, MemoryShown, Section, SectionEntry, TrimRecord, TrimStrategy, UndigestedSpan,
+    McpChoice, McpOutcome, MemoryAudit, MemoryShown, Section, SectionEntry, SkipReason, TrimRecord,
+    TrimStrategy, UndigestedSpan,
 };
 
 use std::collections::BTreeMap;

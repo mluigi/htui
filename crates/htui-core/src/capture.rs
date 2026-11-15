@@ -44,7 +44,7 @@ pub const CAPTURE_TEMPLATE: &str = "capture";
 
 /// `trim_record.v` as `assemble` writes it (`prompt/trim.rs` `RECORD_VERSION`, private there).
 /// `tests/capture.rs` pins the two equal.
-const TRIM_RECORD_VERSION: u8 = 5;
+const TRIM_RECORD_VERSION: u8 = 6;
 
 /// A tail longer than this many characters cannot fit the pack at any `chars-v2` rate, so the
 /// search starts here rather than at a megabyte of build log.
@@ -429,6 +429,7 @@ pub fn capture_prompt(pack: &EvidencePack) -> AssembledPrompt {
         estimated_after: tokens,
         sections: sections.clone(),
         skill_choices: Vec::new(),
+        mcp_choices: Vec::new(),
         undigested: Vec::new(),
         memory: None,
         excerpts: ExcerptAudit::default(),

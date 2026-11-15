@@ -266,8 +266,8 @@ fn the_record_is_v5_with_undigested() {
         .expect("the record scrubs");
     assert_eq!(
         record["v"],
-        json!(5),
-        "MOD-163 D17 bumped the record to v 5"
+        json!(6),
+        "MOD-127 M2 D10 bumped the record to v 6"
     );
     assert_eq!(record["undigested"], json!(["box.hostname"]));
     for spec in [
