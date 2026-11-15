@@ -9,9 +9,9 @@ use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, Se
 use htui_agent::error::DriverError;
 use htui_agent::event::DoneEvent;
 use htui_core::model::{
-    DocumentHead, DocumentId, Item, ItemId, KeyQualifier, NewDocument, ProjectId, Run, RunId,
-    RunStatus, RunStep, Scope, SnapshotPhase, StepId, StepStatus, WaitingCandidate,
-    WaitingPermission,
+    DocumentHead, DocumentId, IntegrationState, Item, ItemId, KeyQualifier, NewDocument, ProjectId,
+    Run, RunId, RunStatus, RunStep, Scope, SnapshotPhase, StepId, StepStatus, WaitingCandidate,
+    WaitingPermission, latest_graph_run,
 };
 use htui_core::store::{Result as StoreResult, StepFence, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
@@ -283,8 +283,13 @@ pub async fn actions<H: htui_core::store::WorkerHost>(
         let steps = host.run_steps(run.id).await?;
         runs.push((run, steps));
     }
+    // MOD-133 M2 E6: online only; offline, `u` is refused below whatever the case.
+    let refused = match host.writer() {
+        Some(writer) => refused_landing(&writer, &runs).await?,
+        None => None,
+    };
 
-    let mut actions = verdicts(&row, &runs, &heads, live);
+    let mut actions = verdicts(&row, &runs, &heads, live, refused);
     if !online {
         let offline = || Err(DATABASE_UNREACHABLE.to_owned());
         actions.run = offline();
@@ -308,6 +313,25 @@ pub async fn actions<H: htui_core::store::WorkerHost>(
     Ok(actions)
 }
 
+/// MOD-133 M2 E6: the latest graph run of `runs` when it is `done` and holds a `refused`
+/// integration record, as `Engine::unblock_case` reads it; `None` otherwise, with no read when the
+/// run is not `done` (only `finish_run(Done)` writes records).
+async fn refused_landing<S: htui_core::store::WorkerStore>(
+    writer: &S,
+    runs: &[(Run, Vec<RunStep>)],
+) -> StoreResult<Option<RunId>> {
+    let Some(latest) = latest_graph_run(runs.iter().map(|(run, _)| run))
+        .filter(|run| run.status == RunStatus::Done)
+    else {
+        return Ok(None);
+    };
+    let records = htui_core::store::WorkerStore::integrations(writer, latest.id).await?;
+    Ok(records
+        .iter()
+        .any(|record| record.state == IntegrationState::Refused)
+        .then_some(latest.id))
+}
+
 /// An item the mirror does not hold, off the server: nothing is enabled.
 pub(crate) fn unreachable_actions(item: ItemId, key: String) -> ItemActions {
     let offline = || Err(DATABASE_UNREACHABLE.to_owned());
@@ -322,12 +346,14 @@ pub(crate) fn unreachable_actions(item: ItemId, key: String) -> ItemActions {
     }
 }
 
-/// The guards themselves, over rows already read.
+/// The guards themselves, over rows already read. `refused` is the latest graph run when it holds
+/// a `refused` integration record ([`refused_landing`]), which `u` retries.
 fn verdicts(
     item: &Item,
     runs: &[(Run, Vec<RunStep>)],
     heads: &[DocumentHead],
     live: &LiveChats,
+    refused: Option<RunId>,
 ) -> ItemActions {
     let sentence = |err: EngineError| err.to_string();
     let rows = || runs.iter().map(|(run, _)| run);
@@ -427,7 +453,7 @@ fn verdicts(
             );
         }
     }
-    actions.unblock = unblock_case(item, runs).map(drop);
+    actions.unblock = unblock_case(item, runs, refused).map(drop);
     actions
 }
 
@@ -475,8 +501,14 @@ fn selectable_slots(run: &Run, steps: &[RunStep]) -> BTreeSet<(i32, i32)> {
 /// as [`verdicts`] always has. `runs` is every run of the item in `ReadStore::runs` order (newest
 /// first), which `unblock_enabled` is sensitive to (blueprint H-1): a finished run goes in as not
 /// resumable, so the refusal names the state its latest graph run gives the item (MOD-144 PD9).
-/// The waiting list passes a candidate's live runs only and discards the refusal.
-fn unblock_case(item: &Item, runs: &[(Run, Vec<RunStep>)]) -> Result<UnblockCase, String> {
+/// The waiting list passes a candidate's live runs only and discards the refusal. `refused` is the
+/// run whose refused landing `u` retries (MOD-133 M2 E6): the waiting list reads it from the
+/// candidate's refused records, [`actions`] from the store.
+fn unblock_case(
+    item: &Item,
+    runs: &[(Run, Vec<RunStep>)],
+    refused: Option<RunId>,
+) -> Result<UnblockCase, String> {
     let mut all = Vec::with_capacity(runs.len());
     for (run, steps) in runs {
         let resumable = if run.status.is_active() {
@@ -488,7 +520,7 @@ fn unblock_case(item: &Item, runs: &[(Run, Vec<RunStep>)]) -> Result<UnblockCase
         };
         all.push((run.clone(), resumable));
     }
-    unblock_enabled(item, &all).map_err(|err| err.to_string())
+    unblock_enabled(item, &all, refused).map_err(|err| err.to_string())
 }
 
 /// Why a row of the waiting-on-you list waits on a person (MOD-69 plan D3). Declaration order is
@@ -503,6 +535,9 @@ pub enum WaitingReason {
     Selection,
     /// `u` clears the item: reopen it, follow its parked run, or resume the run.
     Unblock,
+    /// MOD-133 M2 E4: the item's latest graph run is `done` and the landing of one or more of its
+    /// repos was refused: `u` retries it.
+    Landing,
     /// A run parked by an interrupt (the engine's `park_interrupted`: the run `awaiting_approval`
     /// over a `failed` step with no gate outcome and an `interrupted…` note), which no rule above
     /// lists: retry, promote or cancel it from the Runs pane (MOD-69 review H1).
@@ -520,6 +555,7 @@ impl WaitingReason {
             Self::JudgeFailed => "judge failed",
             Self::Selection => "selection",
             Self::Unblock => "unblock",
+            Self::Landing => "landing",
             Self::Interrupted => "interrupted",
             Self::Permission => "permission",
         }
@@ -540,7 +576,8 @@ pub struct WaitingRow {
     /// the prefix, else bare. The overlay and `htui waiting` draw it; `Enter` still reveals by
     /// `item`.
     pub display_key: String,
-    /// The run the row is about; `None` for a Reopen row.
+    /// The run the row is about; `None` for a Reopen row. A `landing` row's run is the item's
+    /// `done` latest graph run.
     pub run: Option<RunId>,
     /// The step `Enter` puts the cursor on; `None` focuses the run (or, with no run, nothing).
     pub step: Option<StepId>,
@@ -553,7 +590,8 @@ pub struct WaitingRow {
     pub text: String,
     /// When the row began waiting, as the store last stamped it (MOD-92 D5): the parked step's
     /// `updated_at` for a gate, the judge's for a failed judge, the run's for a selection, an
-    /// interrupted run and an Unblock row over a run, the item's for a Reopen row, and the request's
+    /// interrupted run and an Unblock row over a run, the item's for a Reopen row, the newest
+    /// refused record's for a landing row, and the request's
     /// `created_at` for a permission. The store's clock (`set_updated_at()`'s `clock_timestamp()`); a
     /// later edit of that row moves it. The overlay does not show it; `htui waiting --json` does.
     pub since: DateTime<Utc>,
@@ -601,6 +639,8 @@ const REOPEN_TEXT: &str = "blocked, no active run: u reopens it";
 const FOLLOW_TEXT: &str = "blocked over a parked run: u follows it";
 /// [`UnblockCase::Resume`]'s row text.
 const RESUME_TEXT: &str = "parked by an interrupted command: u resumes it";
+/// What a landing row's text appends to its refusals: [`UnblockCase::RetryLanding`]'s move.
+const LANDING_HINT: &str = " - u retries the landing";
 /// An Interrupted row's text when its rest step carries no note (MOD-69 review H1).
 const INTERRUPTED_TEXT: &str = "interrupted";
 
@@ -628,11 +668,13 @@ pub fn waiting(
             .unwrap_or(usize::MAX)
     };
     let mut keyed: Vec<(RowKey, WaitingRow)> = Vec::new();
+    // A row's run as its key and its row read it: `(queued_at, id)`.
+    let at = |run: &Run| (run.queued_at, run.id);
 
     for candidate in candidates {
         let item = &candidate.item;
         let first = keyed.len();
-        let row = |run: Option<&Run>,
+        let row = |run: Option<(DateTime<Utc>, RunId)>,
                    step: Option<&RunStep>,
                    step_label: String,
                    reason: WaitingReason,
@@ -644,7 +686,7 @@ pub fn waiting(
                 key_number: item.key_number,
                 item: item.id,
                 run_missing: run.is_none(),
-                run: run.map(|run| (run.queued_at, run.id)),
+                run,
                 step_missing: step.is_none(),
                 step: step.map(|step| (step.position, step.attempt, step.fanout_index)),
                 reason,
@@ -654,7 +696,7 @@ pub fn waiting(
                 item_key: item.key.clone(),
                 project: item.project_id,
                 display_key: keys.display(item.project_id, &item.key),
-                run: run.map(|run| run.id),
+                run: run.map(|(_, id)| id),
                 step: step.map(|step| step.id),
                 step_label,
                 reason,
@@ -677,7 +719,7 @@ pub fn waiting(
                     _ => GATE_TEXT.to_owned(),
                 };
                 keyed.push(row(
-                    Some(run),
+                    Some(at(run)),
                     Some(step),
                     label_of(step, steps),
                     WaitingReason::Gate,
@@ -703,7 +745,7 @@ pub fn waiting(
                     });
                 if let Some((judge, note)) = failed_judge {
                     keyed.push(row(
-                        Some(run),
+                        Some(at(run)),
                         Some(judge),
                         label_of(judge, steps),
                         WaitingReason::JudgeFailed,
@@ -712,7 +754,7 @@ pub fn waiting(
                     ));
                 } else if let Some(first) = group_at(steps, position, attempt).first() {
                     keyed.push(row(
-                        Some(run),
+                        Some(at(run)),
                         Some(first),
                         label_of(first, steps),
                         WaitingReason::Selection,
@@ -730,20 +772,52 @@ pub fn waiting(
                 .map(|(run, _)| run)
                 .find(|run| run.id == id)
         };
-        let unblock = match unblock_case(item, &candidate.runs) {
+        let refused = candidate.refused.first().map(|record| record.run);
+        let unblock = match unblock_case(item, &candidate.runs, refused) {
             Ok(UnblockCase::Reopen) => Some((None, REOPEN_TEXT)),
             Ok(UnblockCase::FollowRun(id)) => run_of(id).map(|run| (Some(run), FOLLOW_TEXT)),
             Ok(UnblockCase::Resume(id)) => run_of(id).map(|run| (Some(run), RESUME_TEXT)),
-            Err(_) => None,
+            // The `landing` row below is that case's one row.
+            Ok(UnblockCase::RetryLanding(_)) | Err(_) => None,
         };
         if let Some((run, text)) = unblock {
             keyed.push(row(
-                run,
+                run.map(at),
                 None,
                 String::new(),
                 WaitingReason::Unblock,
                 text.to_owned(),
                 run.map_or(item.updated_at, |run| run.updated_at),
+            ));
+        }
+
+        // MOD-133 M2 E4: one row per candidate whose latest graph run had a landing refused,
+        // never one per record (a row is `(item, run, step, reason)`): every refused repo in its
+        // text, since the newest refusal. The run is `done`, so not among `candidate.runs`.
+        if let Some(record) = candidate.refused.first() {
+            let refusals: Vec<String> = candidate
+                .refused
+                .iter()
+                .map(|record| {
+                    format!(
+                        "`{}` ({} to {}): {}",
+                        record.repo_name, record.mode, record.target_branch, record.refusal
+                    )
+                })
+                .collect();
+            let since = candidate
+                .refused
+                .iter()
+                .map(|record| record.since)
+                .max()
+                .unwrap_or(record.since);
+            keyed.push(row(
+                Some((record.run_queued_at, record.run)),
+                None,
+                String::new(),
+                WaitingReason::Landing,
+                format!("{}{LANDING_HINT}", refusals.join("; ")),
+                since,
             ));
         }
 
@@ -770,7 +844,7 @@ pub fn waiting(
                 .filter(|note| !note.is_empty())
                 .unwrap_or_else(|| INTERRUPTED_TEXT.to_owned());
             keyed.push(row(
-                Some(run),
+                Some(at(run)),
                 rest,
                 rest.map_or_else(String::new, |step| label_of(step, steps)),
                 WaitingReason::Interrupted,
@@ -824,9 +898,11 @@ pub fn waiting(
     keyed.sort_by(|(a, a_row), (b, b_row)| a.cmp(b).then_with(|| a_row.text.cmp(&b_row.text)));
     let rows: Vec<WaitingRow> = keyed.into_iter().map(|(_, row)| row).collect();
     // Plan D5, blueprint H-19: a run owning several rows counts once; `saturating_sub` also
-    // absorbs the race between `active_runs` and the candidate read.
+    // absorbs the race between `active_runs` and the candidate read. A `landing` row's run is
+    // `done`, never one of the active runs counted (MOD-133 M2 E4).
     let owning = rows
         .iter()
+        .filter(|row| row.reason != WaitingReason::Landing)
         .filter_map(|row| row.run)
         .collect::<BTreeSet<_>>()
         .len();
@@ -1039,10 +1115,10 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use htui_core::fixtures::{demo_at, demo_data, ids};
     use htui_core::model::{
-        GateOutcome, GraphSnapshot, Item, ItemId, ItemState, KeyQualifier, PermissionId,
-        PermissionStatus, ProjectId, RelaySessionId, Run, RunId, RunMode, RunStatus, RunStep,
-        Scope, Status, StepId, StepPermission, StepStatus, WaitingCandidate, WaitingPermission,
-        latest_graph_run,
+        GateOutcome, GraphSnapshot, IntegrateMode, Item, ItemId, ItemState, KeyQualifier,
+        PermissionId, PermissionStatus, ProjectId, RefusedLanding, RelaySessionId, RepoId, Run,
+        RunId, RunMode, RunStatus, RunStep, Scope, Status, StepId, StepPermission, StepStatus,
+        WaitingCandidate, WaitingPermission, latest_graph_run,
     };
     use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
     use htui_orch::conformance::Orchestrate as _;
@@ -1053,9 +1129,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Enabled, FOLLOW_TEXT, GATE_TEXT, ItemActions, LiveChats, PERMISSION_TEXT, REOPEN_TEXT,
-        RESUME_TEXT, SELECTION_TEXT, WaitingReason, WaitingRow, WaitingView, selectable_slots,
-        unblock_case, verdicts, waiting,
+        Enabled, FOLLOW_TEXT, GATE_TEXT, ItemActions, LANDING_HINT, LiveChats, PERMISSION_TEXT,
+        REOPEN_TEXT, RESUME_TEXT, SELECTION_TEXT, WaitingReason, WaitingRow, WaitingView,
+        selectable_slots, unblock_case, verdicts, waiting,
     };
     use std::collections::BTreeSet;
 
@@ -1074,7 +1150,7 @@ mod tests {
             let steps = store.run_steps(run.id).await.expect(read);
             runs.push((run, steps));
         }
-        verdicts(&row, &runs, &heads, &LiveChats::default()).unblock
+        verdicts(&row, &runs, &heads, &LiveChats::default(), None).unblock
     }
 
     /// `FEAT-3` freed of its seeded `RUN_2` and started: the walk parks at `prd`'s gate.
@@ -1473,9 +1549,21 @@ mod tests {
         }
     }
 
-    /// `verdicts` over the candidate as the list reads it: no heads, no live chat.
+    /// `verdicts` over the candidate as the list reads it: no heads, no live chat, and its
+    /// refused landing's run (MOD-133 M2 E6).
     fn verdict(candidate: &WaitingCandidate) -> ItemActions {
-        verdicts(&candidate.item, &candidate.runs, &[], &LiveChats::default())
+        verdicts(
+            &candidate.item,
+            &candidate.runs,
+            &[],
+            &LiveChats::default(),
+            refused_run(candidate),
+        )
+    }
+
+    /// The run of `candidate`'s refused landing, as the waiting list reads it.
+    fn refused_run(candidate: &WaitingCandidate) -> Option<RunId> {
+        candidate.refused.first().map(|record| record.run)
     }
 
     /// The list of one `htui` candidate, online with no permission, under two active runs.
@@ -1520,6 +1608,14 @@ mod tests {
         step: Option<StepId>,
         reason: WaitingReason,
     ) -> DateTime<Utc> {
+        if reason == WaitingReason::Landing {
+            return candidate
+                .refused
+                .iter()
+                .map(|record| record.since)
+                .max()
+                .expect("a landing row's candidate holds a refusal");
+        }
         let run = run.map(|id| {
             candidate
                 .runs
@@ -1546,6 +1642,29 @@ mod tests {
             (WaitingReason::Unblock, None, _) => candidate.item.updated_at,
             _ => panic!("no D5 rule for a {reason:?} row over {run:?} and {step:?}"),
         }
+    }
+
+    /// MOD-133 M2 E4: an `open` item whose latest graph run (`done`, not among its active runs)
+    /// had two repos' landings refused, by repo name.
+    fn landing_refused() -> WaitingCandidate {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
+        let done = run(9, &item, RunStatus::Done, Some(snapshot(1)), 1);
+        let record = |repo: &str, target: &str, refusal: &str, hour| RefusedLanding {
+            run: done.id,
+            repo: RepoId::new(),
+            repo_name: repo.to_owned(),
+            mode: IntegrateMode::Push,
+            target_branch: target.to_owned(),
+            refusal: refusal.to_owned(),
+            since: demo_at(2, hour),
+            run_queued_at: done.queued_at,
+        };
+        let mut candidate = candidate(&item, Vec::new());
+        candidate.refused = vec![
+            record("api", "main", "non_fast_forward: main moved", 9),
+            record("web", "release", "not_on_target: release lacks the work", 8),
+        ];
+        candidate
     }
 
     /// An escalated item: `blocked` over a parked run whose `plan` was rejected.
@@ -1894,6 +2013,37 @@ mod tests {
         );
     }
 
+    /// MOD-133 M2 E4: one `landing` row per run, never one per record: every refused repo in its
+    /// text, then the Unblock hint; `u` retries it. Its run is the done one, which is not active,
+    /// so the row takes nothing from the working count.
+    #[test]
+    fn a_refused_landing_is_one_landing_row_naming_every_repo() {
+        let landing = landing_refused();
+        let run = landing.refused[0].run;
+
+        let view = one(&landing);
+        assert_eq!(
+            view.rows,
+            [row(
+                &landing,
+                Some(run),
+                None,
+                "",
+                WaitingReason::Landing,
+                &format!(
+                    "`api` (push to main): non_fast_forward: main moved; `web` (push to release): \
+                     not_on_target: release lacks the work{LANDING_HINT}"
+                )
+            )]
+        );
+        assert_eq!(view.working, 2, "a done run is not a working one");
+        assert_eq!(verdict(&landing).unblock, Ok(()));
+        assert_eq!(
+            unblock_case(&landing.item, &landing.runs, refused_run(&landing)),
+            Ok(UnblockCase::RetryLanding(run))
+        );
+    }
+
     #[test]
     fn a_crashed_rejection_is_a_resume_row() {
         let crashed = crashed_rejection();
@@ -2075,6 +2225,20 @@ mod tests {
         );
     }
 
+    /// MOD-133 M2 E4: a `landing` row is since its newest refusal.
+    #[test]
+    fn a_landing_row_is_since_its_newest_refusal() {
+        let landing = stamped(landing_refused());
+        let rows = sinces(&landing);
+
+        assert_eq!(
+            rows.iter()
+                .map(|(reason, _, since)| (*reason, *since))
+                .collect::<Vec<_>>(),
+            [(WaitingReason::Landing, demo_at(2, 9))]
+        );
+    }
+
     #[test]
     fn a_reopen_row_is_since_the_items_last_change() {
         let reopen = stamped(reopen());
@@ -2212,7 +2376,10 @@ mod tests {
             WaitingReason::JudgeFailed => Some(ActivityKind::JudgeFailed),
             WaitingReason::Selection => Some(ActivityKind::Selection),
             WaitingReason::Interrupted => Some(ActivityKind::Interrupted),
-            WaitingReason::Gate | WaitingReason::Unblock | WaitingReason::Permission => None,
+            WaitingReason::Gate
+            | WaitingReason::Unblock
+            | WaitingReason::Landing
+            | WaitingReason::Permission => None,
         };
         let id = |candidate: &WaitingCandidate, index: usize| Some(step_of(candidate, index).id);
 
@@ -2239,6 +2406,7 @@ mod tests {
             }
         });
         add("reopen", reopen(), &|_| Parity::NoRunRule);
+        add("landing_refused", landing_refused(), &|_| Parity::NoRunRule);
         add(
             "over_a_gate(blocked)",
             over_a_gate(Status::Blocked),
@@ -2687,26 +2855,32 @@ mod tests {
         let reopen = reopen();
         let open = over_a_gate(Status::Open);
 
-        for candidate in [&escalation, &crashed, &reopen, &open] {
+        let landing = landing_refused();
+
+        for candidate in [&escalation, &crashed, &reopen, &open, &landing] {
             assert_eq!(
-                unblock_case(&candidate.item, &candidate.runs).map(drop),
+                unblock_case(&candidate.item, &candidate.runs, refused_run(candidate)).map(drop),
                 verdict(candidate).unblock,
                 "{candidate:?}"
             );
         }
         assert_eq!(
-            unblock_case(&escalation.item, &escalation.runs),
+            unblock_case(&escalation.item, &escalation.runs, None),
             Ok(UnblockCase::FollowRun(run_of(&escalation).id))
         );
         assert_eq!(
-            unblock_case(&crashed.item, &crashed.runs),
+            unblock_case(&crashed.item, &crashed.runs, None),
             Ok(UnblockCase::Resume(run_of(&crashed).id))
         );
         assert_eq!(
-            unblock_case(&reopen.item, &reopen.runs),
+            unblock_case(&reopen.item, &reopen.runs, None),
             Ok(UnblockCase::Reopen)
         );
-        assert!(unblock_case(&open.item, &open.runs).is_err());
+        assert!(unblock_case(&open.item, &open.runs, None).is_err());
+        assert_eq!(
+            unblock_case(&landing.item, &landing.runs, refused_run(&landing)),
+            Ok(UnblockCase::RetryLanding(landing.refused[0].run))
+        );
     }
 
     /// MOD-125 M3 D6: a run's cancel greys by `cancel_enabled`, which admits every live status,
@@ -2717,11 +2891,17 @@ mod tests {
         let cancel = |status: RunStatus| {
             let row = run(1, &open, status, Some(snapshot(1)), 1);
             let id = row.id;
-            verdicts(&open, &[(row, Vec::new())], &[], &LiveChats::default())
-                .runs
-                .remove(&id)
-                .expect("the run has its actions")
-                .cancel
+            verdicts(
+                &open,
+                &[(row, Vec::new())],
+                &[],
+                &LiveChats::default(),
+                None,
+            )
+            .runs
+            .remove(&id)
+            .expect("the run has its actions")
+            .cancel
         };
         for live in [
             RunStatus::Queued,
@@ -2759,7 +2939,7 @@ mod tests {
                     (run(n, item, *status, Some(snapshot(1)), hour), Vec::new())
                 })
                 .collect();
-            verdicts(item, &runs, &[], &LiveChats::default()).run
+            verdicts(item, &runs, &[], &LiveChats::default(), None).run
         };
         let open = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
 
@@ -2801,12 +2981,12 @@ mod tests {
                 vec![(run(1, &open, settled, Some(snapshot(1)), 1), Vec::new())],
             );
             assert_eq!(
-                unblock_case(&candidate.item, &candidate.runs),
+                unblock_case(&candidate.item, &candidate.runs, None),
                 Err(format!("item {} is `{word}`; nothing is blocked", open.id))
             );
             assert_eq!(
                 verdict(&candidate).unblock,
-                unblock_case(&candidate.item, &candidate.runs).map(drop)
+                unblock_case(&candidate.item, &candidate.runs, None).map(drop)
             );
         }
     }
