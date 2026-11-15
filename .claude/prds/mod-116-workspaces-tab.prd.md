@@ -157,7 +157,7 @@ Decided from the item and requirements (no question needed):
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Moving Workspaces to tab 1 shifts every digit and many snapshots | High | Wide, shallow snapshot churn; the person's habits change | Design asked for it (findings §3.1); review every snapshot change; the snapshot-impact memory |
-| Clone or init hangs on a prompt or a slow network | Medium | Frozen form | Run on the store worker, `GIT_TERMINAL_PROMPT=0`, a timeout, a cancellable progress line |
+| Clone or init hangs on a prompt or a slow network | Medium | Frozen form | Run off the UI thread, `GIT_TERMINAL_PROMPT=0`, a 10-minute timeout, a progress line; no cancel (maintainer, 2026-11-15, M3 OQ1): `Esc` closes the form and the clone finishes in the background |
 | Two TUIs disagree on which workspace is "open" | Medium | Confusing state on one of them | open is per process by design; the others read as background or stopped |
 | Removing Hierarchy's workspace row breaks a flow (first start with no workspace) | Medium | No way to create the first workspace | The startup path opens the Workspaces tab's new-workspace form instead of the switcher |
 | Parallel items touch the same files (MOD-127, MOD-130 M2+ in wave 1) | Medium | Merge conflicts at collect | Keep store additions additive; note touched files in the plan |
