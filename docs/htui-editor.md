@@ -138,7 +138,7 @@ Windows `Ctrl+\` arrives as itself, so there only a physical `Ctrl+4` toggles th
 | | Pane title | Status line |
 |---|---|---|
 | the editor has the keys | `<value> · Ctrl+4 to htui` | `the editor has the keys · Ctrl+4 to htui` |
-| htui has the keys, on the editor's tab | `<value> · htui has the keys` | `Ctrl+4 to the editor · Ctrl+x abort · Tab/Shift+Tab switch tabs · q quit · ? help` |
+| htui has the keys, on the editor's tab | `<value> · htui has the keys` | `Ctrl+4 to the editor · Ctrl+x abort · Ctrl+PgDn/Ctrl+PgUp switch tabs · q quit · ? help` |
 | a modal pop-up over the editor's tab | `<value> · htui has the keys` | `the editor is open: close this first` |
 | on another tab | (the pane is not drawn) | `editing in <Tab> · Ctrl+4 back · `, then that tab's own line |
 
@@ -157,9 +157,9 @@ Both keys are generated from htui's key catalogue (the `editor` context: `editor
 The editor waits in its pane, with the tab that asked for it; the rest of htui keeps working.
 
 **The editor's tab stays locked.** On that tab, while htui has the keys, only the editor's keys
-and the global keys act: `Ctrl+4`, `Ctrl+x`, `Tab`/`Shift+Tab` and `1` … `7` (switch tabs), `w`
-(the Workspaces tab), `Ctrl+F` (find), `Ctrl+W` (waiting), `Ctrl+Q` (queue), `q`, `?`/`F1` and
-`Ctrl+C`, or the keys `keys.toml` gives them. Every other key is refused with
+and the global keys act: `Ctrl+4`, `Ctrl+x`, `Ctrl+PgDn`/`Ctrl+PgUp` and `1` … `7` (switch
+tabs), `w` (the Workspaces tab), `Ctrl+F` (find), `Ctrl+W` (waiting), `Ctrl+Q` (queue), `q`,
+`?`/`F1` and `Ctrl+C`, or the keys `keys.toml` gives them. Every other key is refused with
 `the editor is open: Ctrl+4 to the editor · Ctrl+x abort` and never reaches the view: a `Ctrl+S`
 there would save the text the editor has not handed back yet. A paste is dropped there; while the
 editor has the keys it goes to the editor (as a bracketed paste when the editor asked for one).
@@ -167,7 +167,7 @@ editor has the keys it goes to the editor (as a bracketed paste when the editor 
 **Every other tab is free.** Switch away and that tab works as it does without an editor: its
 keys, pastes, pop-ups and mouse are its own, and `Ctrl+x` is that tab's key, if it has one (the
 abort acts only on the editor's tab). `Ctrl+4` from any tab brings the editor's tab back with the
-editor holding the keys (and closes the `?` box). Switching back by hand (`Tab`, a number key)
+editor holding the keys (and closes the `?` box). Switching back by hand (`Ctrl+PgDn`, a number key)
 lands on the editor's tab with htui holding the keys; `Ctrl+4` then hands them to the editor.
 
 **Nothing steers the editor's tab.** Two things that would reset or re-select it are refused
