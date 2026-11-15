@@ -9,8 +9,8 @@
 //!   $expected ON CONFLICT (skill_id, version) DO NOTHING`. The loser cannot see the winner's
 //!   uncommitted version, so it aims at the same number, blocks on the primary key, then inserts
 //!   nothing; the head read after it answers `Stale` with the winner's version.
-//! - `set_skill_binding` with `expected: None` is `INSERT … ON CONFLICT (skill_id, project_id,
-//!   phase_id) DO NOTHING`, which infers the `UNIQUE NULLS NOT DISTINCT` key, so two global
+//! - `set_skill_binding` with `expected: None` is `INSERT … ON CONFLICT (kind, ref_id,
+//!   workspace_id, project_id, item_kind_id, phase_id) DO NOTHING`, which infers the `UNIQUE NULLS NOT DISTINCT` key, so two global
 //!   attaches of one skill collide too: the second blocks on the first's uncommitted row (probed:
 //!   2.0 s against a 3 s hold), inserts nothing, and the key re-read answers `Stale` with the
 //!   winner's row.
@@ -30,7 +30,7 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Activation, Attachment, BindingChange, NewSkillVersion, SkillBindingId, SkillBindingKey,
 };
-use htui_core::store::{CasOutcome, WriteStore as _};
+use htui_core::store::{BindingHome, CasOutcome, WriteStore as _};
 use serde_json::json;
 
 /// An append authored by the fixture user, with a `{}` source.
@@ -147,7 +147,7 @@ async fn two_attaches_of_one_key_write_one_row() {
         .await
         .expect("open the winner's transaction");
     sqlx::query(
-        "INSERT INTO skill_binding (id, skill_id, project_id, phase_id, position) \
+        "INSERT INTO toolbox_binding (id, ref_id, project_id, phase_id, position) \
          VALUES ($1, $2, NULL, NULL, 7)",
     )
     .bind(winner_id.as_uuid())
@@ -193,7 +193,7 @@ async fn two_attaches_of_one_key_write_one_row() {
 
     let global = db
         .store
-        .skill_bindings(None)
+        .skill_bindings(BindingHome::Global)
         .await
         .expect("read the global attachments");
     assert_eq!(global, [row], "one row was written: the winner's");

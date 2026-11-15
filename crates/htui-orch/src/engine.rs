@@ -38,11 +38,11 @@ use htui_core::model::{
     FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, IfPredicate, Integration, Isolation,
     Item, ItemId, LandOutcome, NewCommandRun, NewNote, NewRun, NewRunPlan, NewRunStep, NodeRole,
     NoteId, PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, Project, ProjectId, ProjectSettings,
-    PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunPlanId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotEdge,
-    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOpening,
-    StepOutcome, StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome,
-    WorkspaceId, min_budget_micros, missing_tags_failure,
+    PromptScope, RelaySessionId, Repo, RepoId, Resolution, ResolveScope, Run, RunId, RunPlanId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate,
+    SnapshotEdge, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId,
+    StepOpening, StepOutcome, StepRole, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
+    VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -9968,7 +9968,11 @@ where
                 phase.name, snapshot.graph.name
             ));
         }
-        let skills = self.parts.graphs.bound_skills(project, phase_id).await?;
+        let skills = self
+            .parts
+            .graphs
+            .bound_skills(ResolveScope::project(project, phase_id))
+            .await?;
         Ok(skills)
     }
 

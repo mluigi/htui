@@ -87,10 +87,10 @@ use htui_core::store::traits::{
     document_already_pinned, document_outside_reach, document_ref_label,
 };
 use htui_core::store::{
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored, QueueTarget,
-    QueueToken, ReadStore as _, Result, SettingRung, StepFence, StoreError, StoredSetting,
-    TransitionLaw, UpdateOutcome, WriteStore, already_exists, branch_refusal, chat_step_status,
-    check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
+    BindingFacts, BindingHome, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored,
+    QueueTarget, QueueToken, ReadStore as _, Result, SettingRung, StepFence, StoreError,
+    StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists, branch_refusal,
+    chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
     failure_disagrees_with_status, finish_run_needs_a_terminal_status, graph_not_usable,
     illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held,
     item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal, new_skill_refusal,
@@ -1272,7 +1272,7 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                (SELECT count(*) FROM rp)                                      AS "repos!",
                (SELECT count(*) FROM repo_box_path
                  WHERE repo_id IN (SELECT id FROM rp))                        AS "repo_box_paths!",
-               (SELECT count(*) FROM skill_binding    WHERE project_id = $1)  AS "skill_bindings!",
+               (SELECT count(*) FROM toolbox_binding  WHERE project_id = $1)  AS "skill_bindings!",
                (SELECT count(*) FROM r)                                       AS "runs!",
                (SELECT count(*) FROM s)                                       AS "run_steps!",
                (SELECT count(*) FROM session_event
@@ -6610,13 +6610,13 @@ impl WriteStore for PgStore {
         self.skill_version_rows(skill).await
     }
 
-    /// The global rows, or one project's project and phase rows.
+    /// The global rows, one workspace's, or one project's project, item-kind and phase rows.
     ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>> {
-        self.skill_binding_rows(project).await
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
+        self.skill_binding_rows(home).await
     }
 
     /// D92: one explicit transaction of two `INSERT`s, so no skill exists without its version 1.
@@ -6784,8 +6784,8 @@ impl WriteStore for PgStore {
     }
 
     /// D90, D92: the row at `key` and the facts [`check_attachment`] needs are read first, then
-    /// one statement writes: an attach under `None` is `INSERT … ON CONFLICT (skill_id,
-    /// project_id, phase_id) DO NOTHING` (it infers the `NULLS NOT DISTINCT` key, probed), a change
+    /// one statement writes: an attach under `None` is `INSERT … ON CONFLICT (kind,
+    /// ref_id, workspace_id, project_id, item_kind_id, phase_id) DO NOTHING` (it infers the `NULLS NOT DISTINCT` key, probed), a change
     /// is `UPDATE … WHERE id AND updated_at`, a detach `DELETE … WHERE id AND updated_at`. The
     /// reads are advisory: the write's own `WHERE` or `ON CONFLICT` decides, and zero rows re-read
     /// the key for `Stale`, as `update_workspace`. A project or phase deleted between the reads
@@ -6836,6 +6836,32 @@ impl WriteStore for PgStore {
             }
             None => None,
         };
+        // MOD-127 D2: an unknown workspace or item kind is `NotFound`, as an unknown project or
+        // phase is; `check_attachment` then judges the shape and the kind's project.
+        let workspace_exists = match key.workspace {
+            Some(id) => {
+                self.workspace_row(id)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "workspace",
+                        id: id.to_string(),
+                    })?;
+                true
+            }
+            None => true,
+        };
+        let kind_project = match key.item_kind {
+            Some(id) => Some(
+                self.item_kind(id)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "item_kind",
+                        id: id.to_string(),
+                    })?
+                    .project_id,
+            ),
+            None => None,
+        };
 
         let attachment = match change {
             BindingChange::Detach => {
@@ -6843,7 +6869,7 @@ impl WriteStore for PgStore {
                     return Ok(CasOutcome::Applied(None));
                 };
                 let deleted = sqlx::query!(
-                    "DELETE FROM skill_binding WHERE id = $1 AND updated_at = $2",
+                    "DELETE FROM toolbox_binding WHERE id = $1 AND updated_at = $2",
                     row.id.as_uuid(),
                     row.updated_at,
                 )
@@ -6878,6 +6904,8 @@ impl WriteStore for PgStore {
             &BindingFacts {
                 key,
                 phase_project,
+                workspace_exists,
+                kind_project,
                 skill_name: &skill.name,
                 versions: &versions,
                 repos: &repos,
@@ -6891,15 +6919,18 @@ impl WriteStore for PgStore {
             None => sqlx::query_as!(
                 SkillBindingColumns,
                 r#"
-                INSERT INTO skill_binding
-                       (id, skill_id, project_id, phase_id, pinned_version, position, activation,
-                        globs, languages)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (skill_id, project_id, phase_id) DO NOTHING
+                INSERT INTO toolbox_binding
+                       (id, kind, ref_id, workspace_id, project_id, item_kind_id, phase_id,
+                        pinned_version, position, activation, globs, languages)
+                VALUES ($1, 'skill', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (kind, ref_id, workspace_id, project_id, item_kind_id, phase_id)
+                DO NOTHING
                 RETURNING id             AS "id: SkillBindingId",
-                          skill_id       AS "skill_id: SkillId",
+                          ref_id         AS "skill_id: SkillId",
+                          workspace_id   AS "workspace_id?: WorkspaceId",
                           project_id     AS "project_id?: ProjectId",
-                          phase_id       AS "phase_id: PhaseId",
+                          item_kind_id   AS "item_kind_id?: ItemKindId",
+                          phase_id       AS "phase_id?: PhaseId",
                           pinned_version,
                           position,
                           activation     AS "activation: Activation",
@@ -6909,7 +6940,9 @@ impl WriteStore for PgStore {
                 "#,
                 SkillBindingId::new().as_uuid(),
                 key.skill.as_uuid(),
+                key.workspace.map(WorkspaceId::as_uuid),
                 key.project.map(ProjectId::as_uuid),
+                key.item_kind.map(ItemKindId::as_uuid),
                 key.phase.map(PhaseId::as_uuid),
                 attachment.pinned_version,
                 attachment.position,
@@ -6924,7 +6957,7 @@ impl WriteStore for PgStore {
             Some(row) => sqlx::query_as!(
                 SkillBindingColumns,
                 r#"
-                UPDATE skill_binding SET
+                UPDATE toolbox_binding SET
                     pinned_version = $3,
                     position       = $4,
                     activation     = $5,
@@ -6932,9 +6965,11 @@ impl WriteStore for PgStore {
                     languages      = $7
                  WHERE id = $1 AND updated_at = $2
                 RETURNING id             AS "id: SkillBindingId",
-                          skill_id       AS "skill_id: SkillId",
+                          ref_id         AS "skill_id: SkillId",
+                          workspace_id   AS "workspace_id?: WorkspaceId",
                           project_id     AS "project_id?: ProjectId",
-                          phase_id       AS "phase_id: PhaseId",
+                          item_kind_id   AS "item_kind_id?: ItemKindId",
+                          phase_id       AS "phase_id?: PhaseId",
                           pinned_version,
                           position,
                           activation     AS "activation: Activation",

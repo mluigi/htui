@@ -49,7 +49,7 @@ use crate::model::{
     NewRunPlan, NewRunStep, Note, OpenPermission, PendingStop, PermissionChoice, PermissionId,
     PermissionStatus, PhaseAgent, PhaseId, PlanAdmission, Project, ProjectId, PromptScope,
     PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath,
-    RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
+    RepoId, Resolution, ResolveScope, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
     RunCommandStatus, RunId, RunMemoryWrite, RunPlan, RunStatus, RunStep, RunStepCommit,
     RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Status, StepGraphId,
     StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
@@ -687,8 +687,7 @@ pub trait WorkerHost: Clone + Send + Sync + 'static {
     /// `Backend::bound_skills`.
     fn bound_skills(
         &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
+        scope: ResolveScope,
     ) -> impl Future<Output = Result<Vec<BoundSkill>>> + Send;
     /// `Backend::missing_tags`.
     fn missing_tags(

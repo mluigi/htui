@@ -29,7 +29,7 @@ impl PgStore {
     /// those tables are left alone. `repo` stays on that list by plan D110, which dropped the
     /// fixture rows this milestone would otherwise have added.
     ///
-    /// `skill`, `skill_version`, `skill_binding` and `box_tool` came **off** it in milestone 9
+    /// `skill`, `skill_version`, `toolbox_binding` and `box_tool` came **off** it in milestone 9
     /// (blueprint E-7): the fixture carries those rows for `MemStore`, and a loader that skipped
     /// them would run `PgStore::bound_skills` and `PgStore::box_profile` against empty tables
     /// while `MemStore` answered from the fixture — two backends the conformance suite could not
@@ -372,23 +372,6 @@ impl PgStore {
             .map_err(map_sqlx)?;
         }
 
-        for row in &data.skill_bindings {
-            sqlx::query!(
-                "INSERT INTO skill_binding (id, skill_id, project_id, phase_id, pinned_version, \
-                 position, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                SkillBindingId::as_uuid(row.id),
-                SkillId::as_uuid(row.skill_id),
-                row.project_id.map(ProjectId::as_uuid),
-                row.phase_id.map(PhaseId::as_uuid),
-                row.pinned_version,
-                row.position,
-                row.updated_at,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
-        }
-
         for row in &data.kinds {
             sqlx::query!(
                 "INSERT INTO item_kind (id, project_id, prefix, name, description, \
@@ -399,6 +382,26 @@ impl PgStore {
                 row.name,
                 row.description,
                 StepGraphId::as_uuid(row.default_graph_id),
+                row.position,
+                row.updated_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        for row in &data.skill_bindings {
+            sqlx::query!(
+                "INSERT INTO toolbox_binding (id, kind, ref_id, workspace_id, project_id, \
+                 item_kind_id, phase_id, pinned_version, position, updated_at) \
+                 VALUES ($1, 'skill', $2, $3, $4, $5, $6, $7, $8, $9)",
+                SkillBindingId::as_uuid(row.id),
+                SkillId::as_uuid(row.skill_id),
+                row.workspace_id.map(WorkspaceId::as_uuid),
+                row.project_id.map(ProjectId::as_uuid),
+                row.item_kind_id.map(ItemKindId::as_uuid),
+                row.phase_id.map(PhaseId::as_uuid),
+                row.pinned_version,
                 row.position,
                 row.updated_at,
             )

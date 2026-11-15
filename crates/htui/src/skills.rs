@@ -22,7 +22,7 @@ use htui_core::model::{
     NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillBinding, SkillBindingKey,
     SkillId, SkillVersion, StepGraph, StepGraphPhase,
 };
-use htui_core::store::{CasOutcome, Result, StoreError, WriteStore as _};
+use htui_core::store::{BindingHome, CasOutcome, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
 
 use crate::skill_import::{self, SkillImports};
@@ -36,7 +36,7 @@ use crate::store_worker::{StoreReply, StoreRequest, WriteOutcome};
 pub struct SkillsSnapshot {
     /// The library in `name` byte order, each skill with every version.
     pub skills: Vec<SkillEntry>,
-    /// The global attachments (`skill_bindings(None)`), in D91 order.
+    /// The global attachments (`skill_bindings(BindingHome::Global)`), in D91 order.
     pub global: Vec<SkillBinding>,
     /// One entry per id of `scope.project_ids`, in that order.
     pub projects: Vec<ProjectSkills>,
@@ -135,8 +135,8 @@ pub enum StaleWhat {
     Binding(SkillBindingKey),
 }
 
-/// One read (D81, D97), through the writer: `skill_bindings(None)`; then per id of
-/// `scope.project_ids`, in that order, `skill_bindings(Some(p))`, `step_graphs(p)` without the
+/// One read (D81, D97), through the writer: `skill_bindings(BindingHome::Global)`; then per id of
+/// `scope.project_ids`, in that order, `skill_bindings(BindingHome::Project(p))`, `step_graphs(p)` without the
 /// override graphs, `phases(g)` per graph and `repos(p)`'s names; then `skills()` and
 /// `skill_versions(s)` per skill.
 ///
@@ -156,10 +156,12 @@ pub async fn snapshot(
     scope: &Scope,
     box_paths: &[RepoBoxPath],
 ) -> Result<SkillsSnapshot> {
-    let global = writer.skill_bindings(None).await?;
+    let global = writer.skill_bindings(BindingHome::Global).await?;
     let mut projects = Vec::with_capacity(scope.project_ids.len());
     for project in &scope.project_ids {
-        let bindings = writer.skill_bindings(Some(*project)).await?;
+        let bindings = writer
+            .skill_bindings(BindingHome::Project(*project))
+            .await?;
         let mut graphs = Vec::new();
         for graph in writer.step_graphs(*project).await? {
             if graph.is_override {

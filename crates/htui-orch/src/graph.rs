@@ -18,10 +18,10 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, EdgeId, Gate,
     GraphBody, GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, NodeBody,
     PhaseAgent, PhaseId, PhasePart, Project, ProjectCaps, ProjectId, ProjectSettings,
-    PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, RuntimeChanges, SkillBinding,
-    SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
-    SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId,
-    StepGraphPhase,
+    PromptTemplate, RepoId, ResolveScope, ResolvedGraph, ResolvedPhase, RunMode, RuntimeChanges,
+    SkillBinding, SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge,
+    SnapshotPersona, SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge,
+    StepGraphId, StepGraphPhase,
 };
 use htui_core::model::{
     EdgeKind, GraphScope, ItemFilter, NodeRole, PLAN_SUFFIX, Scope, SnapshotDivide, SnapshotEdge,
@@ -37,8 +37,8 @@ use htui_core::prompt::{
     settings::resolve_memory_capture,
 };
 use htui_core::store::{
-    BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode, WriteStore,
-    check_attachment, edge_predicate, forward_mask, graph_body_shape_refusal,
+    BindingFacts, BindingHome, CasOutcome, Result, StoreError, UpdateOutcome, WalkEdge, WalkNode,
+    WriteStore, check_attachment, edge_predicate, forward_mask, graph_body_shape_refusal,
     graph_body_topology_refusal, graph_body_walk_refusal, references_no_row, walk_refusal,
 };
 use serde_json::Value;
@@ -135,11 +135,7 @@ pub trait GraphSource: Sync {
     ///
     /// # Errors
     /// The backend's own failures; `Backend` offline refuses with `PROMPT_ON_SERVER_ONLY`.
-    async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> Result<Vec<BoundSkill>>;
+    async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>>;
 
     /// `R-ORCH-10`'s read (MOD-7 milestone 3, D75): the entries of `item.required_tags` that
     /// `box_id` has neither probed nor declared (`box.probed_tags ∪ box.declared_tags`), compared
@@ -1480,7 +1476,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
     // whole and leaves no orphan graph.
     let sources: Vec<PhaseId> = rows.iter().map(|node| node.phase.id).collect();
     let copies: Vec<SkillBinding> = store
-        .skill_bindings(Some(item.project_id))
+        .skill_bindings(BindingHome::Project(item.project_id))
         .await?
         .into_iter()
         .filter(|binding| {
@@ -1531,6 +1527,8 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                         phase: binding.phase_id,
                     },
                     phase_project: Some(item.project_id),
+                    workspace_exists: true,
+                    kind_project: None,
                     skill_name,
                     versions: &versions,
                     repos: &repos,
@@ -2231,8 +2229,8 @@ mod tests {
     use htui_core::model::{
         Activation, EdgeId, EdgeKind, Gate, GraphBody, GraphScope, IntegrateMode,
         IntegrateSnapshot, ItemFilter, ItemPatch, NewRepo, NewStepGraph, NodeBody, PersonaId,
-        PhasePatch, PromptTemplateId, RepoId, RepoPatch, RepoScope, RunScope, Scope, SkillBinding,
-        SkillBindingId, SnapshotPersona, Split, StepGraphEdge,
+        PhasePatch, PromptTemplateId, RepoId, RepoPatch, RepoScope, ResolveScope, RunScope, Scope,
+        SkillBinding, SkillBindingId, SnapshotPersona, Split, StepGraphEdge,
     };
     use htui_core::model::{
         EdgePredicate, NodeRole, PlanScope, RuntimeChanges, SnapshotDivide, SnapshotEdge,
@@ -2240,7 +2238,7 @@ mod tests {
     };
     use htui_core::store::traits::back_asks_you_beside_another_asks_you;
     use htui_core::store::{
-        MemStore, ReadStore, StoreError, UpdateOutcome, forward_edges_form_a_cycle,
+        BindingHome, MemStore, ReadStore, StoreError, UpdateOutcome, forward_edges_form_a_cycle,
         glob_names_unknown_repo, graph_body_walk_refusal, negative_position, references_no_row,
         split_fan_out_mismatch,
     };
@@ -2481,12 +2479,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
             self.store.agent_boxes(box_id).await
         }
 
-        async fn bound_skills(
-            &self,
-            project: ProjectId,
-            phase: Option<PhaseId>,
-        ) -> Result<Vec<BoundSkill>> {
-            self.store.bound_skills(project, phase).await
+        async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
+            self.store.bound_skills(scope).await
         }
 
         async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
@@ -3502,15 +3496,18 @@ question and not a test fix. Decide the version bump first, then paste the new d
         let source = TestSource::claude(&store);
 
         let source_rows = store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read");
         let project_level = store
-            .bound_skills(ids::PROJECT_HTUI, None)
+            .bound_skills(ResolveScope::project(ids::PROJECT_HTUI, None))
             .await
             .expect("MemStore never fails a read");
         let bound_before = store
-            .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+            .bound_skills(ResolveScope::project(
+                ids::PROJECT_HTUI,
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+            ))
             .await
             .expect("MemStore never fails a read");
         assert_ne!(
@@ -3556,7 +3553,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .find(|phase| phase.name == "implement")
             .expect("the feature graph has an implement phase");
         let after = store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read");
         let copies: Vec<&SkillBinding> = after
@@ -3594,7 +3591,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
         assert_eq!(
             store
-                .bound_skills(ids::PROJECT_HTUI, Some(implement.id))
+                .bound_skills(ResolveScope::project(ids::PROJECT_HTUI, Some(implement.id)))
                 .await
                 .expect("MemStore never fails a read"),
             bound_before,
@@ -3602,7 +3599,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
         assert_eq!(
             store
-                .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+                .bound_skills(ResolveScope::project(
+                    ids::PROJECT_HTUI,
+                    Some(ids::PHASE_HTUI_IMPLEMENT)
+                ))
                 .await
                 .expect("MemStore never fails a read"),
             bound_before,
@@ -3812,7 +3812,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect("MemStore never fails a read");
         let rows_before = store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read");
 
@@ -3841,7 +3841,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(graphs_after, graphs_before, "nor any other graph");
         assert_eq!(
             store
-                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
                 .await
                 .expect("MemStore never fails a read"),
             rows_before,
@@ -3878,7 +3878,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect("MemStore never fails a read");
         let rows_before = store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read");
 
@@ -3903,7 +3903,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(graphs_after, graphs_before, "nor any other graph");
         assert_eq!(
             store
-                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
                 .await
                 .expect("MemStore never fails a read"),
             rows_before,
@@ -4378,7 +4378,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .map(|phase| phase.id)
             .collect();
         let source_row = store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read")
             .into_iter()
@@ -4398,7 +4398,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .find(|phase| phase.name == "implement")
             .expect("the feature graph has an implement phase");
         let rows = store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read");
         assert!(
@@ -4500,7 +4500,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect("MemStore never fails a read");
         let rows_before = store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read");
         let pointed = feat_1(&store).await;
@@ -4529,7 +4529,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(body_after, body_before, "and so is its body");
         assert_eq!(
             store
-                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
                 .await
                 .expect("MemStore never fails a read"),
             rows_before,
@@ -4745,7 +4745,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             "fresh phase ids"
         );
         let copies: Vec<SkillBinding> = store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read")
             .into_iter()

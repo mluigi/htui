@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "DELETE FROM skill_binding WHERE id = $1 AND updated_at = $2",
+  "query": "DELETE FROM toolbox_binding WHERE id = $1 AND updated_at = $2",
   "describe": {
     "columns": [],
     "parameters": {
@@ -11,5 +11,5 @@
     },
     "nullable": []
   },
-  "hash": "a893986f0ffa8aa550a56a596458e7a56e0a2e144d52002febad4afa785550d7"
+  "hash": "2d17f8f2053bcc58353ab79082c8c39839ba2e609d6bcc4c202a19820588dc5c"
 }

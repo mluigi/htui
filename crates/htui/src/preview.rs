@@ -31,7 +31,7 @@
 //! four missing tables; `htui` is an online-only program and says so in one sentence.
 
 use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
-use htui_core::model::{ItemId, MemoryState, PromptScope, RepoId, Scope, StepFiles};
+use htui_core::model::{ItemId, MemoryState, PromptScope, RepoId, ResolveScope, Scope, StepFiles};
 use htui_core::prompt::excerpt::ExcerptSet;
 use htui_core::prompt::{
     AssembledPrompt, DEFAULT_TEMPLATES, InputDocument, MEMORY_TOKEN_CAP, PromptSpec, TemplateRef,
@@ -265,7 +265,9 @@ pub async fn build(
                 });
             }
         };
-    let skills = backend.bound_skills(row.project_id, phase).await?;
+    let skills = backend
+        .bound_skills(ResolveScope::project(row.project_id, phase))
+        .await?;
     // MOD-163 D18: what a run started now would freeze — the same `select`, over the project's
     // live `Active` entries. Read after the templates, so an offline arm refuses with the prompt
     // sentence before it gets here; a `None` ("not available here") is no memory, as the engine's

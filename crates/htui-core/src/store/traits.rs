@@ -85,9 +85,9 @@ use crate::model::{
     RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedInput, Run,
     RunCommand, RunCommandId, RunCommandStatus, RunId, RunMemoryWrite, RunPlan, RunStatus, RunStep,
     RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    SkillBinding, SkillBindingKey, SkillId, SkillLevel, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
     WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop,
 };
@@ -1270,12 +1270,13 @@ pub trait WriteStore: ReadStore {
     /// The backend's own failures only.
     async fn skill_versions(&self, skill: SkillId) -> Result<Vec<SkillVersion>>;
 
-    /// `None`: the global attachments; `Some(p)`: `p`'s project and phase attachments. Ordered by
-    /// `(skill_id, phase_id)` bytes, `NULL` phase first (D91).
+    /// The attachments at one [`BindingHome`] (MOD-127 D6): the global rows, one workspace's, or
+    /// one project's project, item-kind and phase rows. Ordered by `(skill_id, item_kind_id,
+    /// phase_id)` bytes, `NULL` first (D91, extended).
     ///
     /// # Errors
     /// The backend's own failures only.
-    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>>;
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>>;
 
     /// Inserts the skill and its version 1 together (D75, D77, OQ-16).
     ///
@@ -3696,6 +3697,59 @@ pub fn skill_version_key(skill: SkillId, version: i32) -> String {
     format!("{skill}/v{version}")
 }
 
+/// Where [`WriteStore::skill_bindings`] lists from (MOD-127 D6): the rows one scope owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingHome {
+    /// The global rows: no workspace, project, item kind or phase.
+    Global,
+    /// One workspace's rows.
+    Workspace(WorkspaceId),
+    /// One project's rows at its project, item-kind and phase levels.
+    Project(ProjectId),
+}
+
+impl BindingHome {
+    /// Whether `row` is listed at this home.
+    #[must_use]
+    pub fn lists(self, row: &SkillBinding) -> bool {
+        match self {
+            Self::Global => SkillBindingKey::of(row).level() == SkillLevel::Global,
+            Self::Workspace(id) => row.workspace_id == Some(id),
+            Self::Project(id) => row.project_id == Some(id),
+        }
+    }
+}
+
+/// MOD-127 D2: a workspace key beside another scope key.
+#[must_use]
+pub fn workspace_attachment_is_alone(workspace: WorkspaceId) -> String {
+    format!(
+        "a workspace attachment takes no other scope: workspace {workspace} was given a project, \
+         item kind or phase"
+    )
+}
+
+/// MOD-127 D2: an item-kind key with no project (item kinds are per project).
+#[must_use]
+pub fn item_kind_attachment_needs_a_project(item_kind: ItemKindId) -> String {
+    format!("an item-kind attachment needs its project: item_kind {item_kind} was given none")
+}
+
+/// MOD-127 D2: an item-kind key beside a phase key.
+#[must_use]
+pub fn item_kind_and_phase_exclude_each_other(item_kind: ItemKindId, phase: PhaseId) -> String {
+    format!(
+        "an attachment names an item kind or a phase, not both: item_kind {item_kind} and \
+         step_graph_phase {phase} were given"
+    )
+}
+
+/// MOD-127 D2: the item kind belongs to another project.
+#[must_use]
+pub fn item_kind_not_in_project(item_kind: ItemKindId, project: ProjectId) -> String {
+    format!("item_kind {item_kind} is not in project {project}")
+}
+
 /// D78: a phase key with no project.
 #[must_use]
 pub fn phase_attachment_needs_a_project(phase: PhaseId) -> String {
@@ -3727,6 +3781,12 @@ pub fn global_glob_names_a_repo(glob: &str, repo: &str) -> String {
     format!("glob `{glob}` names repo `{repo}`, but a global attachment belongs to no project")
 }
 
+/// MOD-127 D7: a qualified glob on a workspace row.
+#[must_use]
+pub fn workspace_glob_names_a_repo(glob: &str, repo: &str) -> String {
+    format!("glob `{glob}` names repo `{repo}`, but a workspace attachment belongs to no project")
+}
+
 /// D79 (OQ-18), verbatim.
 #[must_use]
 pub fn glob_names_unknown_repo(glob: &str, repo: &str, project_slug: &str) -> String {
@@ -3745,6 +3805,10 @@ pub struct BindingFacts<'a> {
     pub key: SkillBindingKey,
     /// The project owning `key.phase`'s graph (`None` when `key.phase` is `None`).
     pub phase_project: Option<ProjectId>,
+    /// Whether `key.workspace` names a workspace (`true` when `key.workspace` is `None`).
+    pub workspace_exists: bool,
+    /// The project owning `key.item_kind` (`None` when `key.item_kind` is `None` or names no kind).
+    pub kind_project: Option<ProjectId>,
     /// `skill.name`, for the pin sentence.
     pub skill_name: &'a str,
     /// Every version number the skill has.
@@ -3764,15 +3828,21 @@ pub struct StoredAttachment {
     pub languages: Vec<String>,
 }
 
-/// D78's `Constraint` chain, in order, first refusal wins:
+/// D78's `Constraint` chain, in order, first refusal wins (MOD-127 D2 and D7 added 0 to 2 and the
+/// workspace sentence of 6):
+/// 0. the key's shape: a workspace beside another key → [`workspace_attachment_is_alone`]; an item
+///    kind without a project → [`item_kind_attachment_needs_a_project`]; an item kind with a phase
+///    → [`item_kind_and_phase_exclude_each_other`];
 /// 1. `key.phase` without `key.project` → [`phase_attachment_needs_a_project`];
-/// 2. `phase_project != key.project` → [`phase_not_in_project`];
+///    then a workspace that does not exist → [`references_no_row`];
+/// 2. `kind_project != key.project` → [`item_kind_not_in_project`], then
+///    `phase_project != key.project` → [`phase_not_in_project`];
 /// 3. `pinned_version: Some(n)` not in `versions` → [`pin_names_no_version`];
 /// 4. `position < 0` → [`negative_position`];
 /// 5. [`canonical_globs`] → the
 ///    [`GlobError`](crate::model::GlobError)'s `Display` (languages, then globs);
-/// 6. per canonical glob with a qualifier: global key → [`global_glob_names_a_repo`]; repo not in
-///    `repos` → [`glob_names_unknown_repo`];
+/// 6. per canonical glob with a qualifier: global key → [`global_glob_names_a_repo`]; workspace key
+///    → [`workspace_glob_names_a_repo`]; repo not in `repos` → [`glob_names_unknown_repo`];
 /// 7. `Glob` with no canonical glob → [`GLOB_NEEDS_GLOBS`].
 ///
 /// # Errors
@@ -3782,6 +3852,29 @@ pub fn check_attachment(
     attachment: &Attachment,
 ) -> core::result::Result<StoredAttachment, String> {
     let key = facts.key;
+    if let Some(workspace) = key.workspace {
+        if key.project.is_some() || key.item_kind.is_some() || key.phase.is_some() {
+            return Err(workspace_attachment_is_alone(workspace));
+        }
+        if !facts.workspace_exists {
+            return Err(references_no_row(
+                "toolbox_binding.workspace_id",
+                workspace,
+                "workspace",
+            ));
+        }
+    }
+    if let Some(item_kind) = key.item_kind {
+        let Some(project) = key.project else {
+            return Err(item_kind_attachment_needs_a_project(item_kind));
+        };
+        if let Some(phase) = key.phase {
+            return Err(item_kind_and_phase_exclude_each_other(item_kind, phase));
+        }
+        if facts.kind_project != Some(project) {
+            return Err(item_kind_not_in_project(item_kind, project));
+        }
+    }
     if let Some(phase) = key.phase {
         let Some(project) = key.project else {
             return Err(phase_attachment_needs_a_project(phase));
@@ -3806,7 +3899,11 @@ pub fn check_attachment(
             continue;
         };
         if key.project.is_none() {
-            return Err(global_glob_names_a_repo(glob, &repo));
+            return Err(if key.workspace.is_some() {
+                workspace_glob_names_a_repo(glob, &repo)
+            } else {
+                global_glob_names_a_repo(glob, &repo)
+            });
         }
         if !facts.repos.contains(&repo) {
             return Err(glob_names_unknown_repo(glob, &repo, facts.project_slug));

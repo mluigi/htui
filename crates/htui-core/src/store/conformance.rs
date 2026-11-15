@@ -80,6 +80,7 @@ use crate::store::activity::ActivityStore;
 use crate::store::error::StoreError;
 use crate::store::index_changes::IndexChangesStore;
 use crate::store::indexer_lease::{IndexerLeaseStore, take_or_request_pass};
+use crate::store::traits::BindingHome;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL,
@@ -220,6 +221,10 @@ pub const CASES: &[&str] = &[
     "skill_version_append_is_a_compare_and_set_on_the_head",
     "skill_binding_attach_change_detach_are_compare_and_set",
     "skill_binding_refuses_by_rule",
+    "skill_binding_workspace_and_item_kind_levels_attach_change_detach",
+    "workspace_delete_takes_its_bindings",
+    "item_kind_delete_takes_its_bindings",
+    "project_delete_reach_counts_item_kind_bindings",
     "skill_binding_stores_expanded_globs_and_languages_as_typed",
     "a_stale_owner_writes_nothing_to_the_step",
     "the_new_owner_writes_the_step",
@@ -763,6 +768,22 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             .await;
         }
         "skill_binding_refuses_by_rule" => boxed(skill_binding_refuses_by_rule, store).await,
+        "skill_binding_workspace_and_item_kind_levels_attach_change_detach" => {
+            boxed(
+                skill_binding_workspace_and_item_kind_levels_attach_change_detach,
+                store,
+            )
+            .await;
+        }
+        "workspace_delete_takes_its_bindings" => {
+            boxed(workspace_delete_takes_its_bindings, store).await;
+        }
+        "item_kind_delete_takes_its_bindings" => {
+            boxed(item_kind_delete_takes_its_bindings, store).await;
+        }
+        "project_delete_reach_counts_item_kind_bindings" => {
+            boxed(project_delete_reach_counts_item_kind_bindings, store).await;
+        }
         "skill_binding_stores_expanded_globs_and_languages_as_typed" => {
             boxed(
                 skill_binding_stores_expanded_globs_and_languages_as_typed,
@@ -15231,6 +15252,23 @@ fn key(skill: SkillId, project: Option<ProjectId>, phase: Option<PhaseId>) -> Sk
     }
 }
 
+/// The natural key of one attachment at any of the five levels (MOD-127 D2).
+fn key_at(
+    skill: SkillId,
+    workspace: Option<WorkspaceId>,
+    project: Option<ProjectId>,
+    item_kind: Option<ItemKindId>,
+    phase: Option<PhaseId>,
+) -> SkillBindingKey {
+    SkillBindingKey {
+        skill,
+        workspace,
+        project,
+        item_kind,
+        phase,
+    }
+}
+
 /// A `Constraint` whose sentence carries `needle`, or a panic naming the case and what was tried.
 fn constraint_with<T: core::fmt::Debug>(
     case: &str,
@@ -15583,7 +15621,7 @@ async fn skill_binding_attach_change_detach_are_compare_and_set<S: WriteStore>(s
         "{CASE}: the attachment as given"
     );
     assert_eq!(
-        store.skill_bindings(None).await.expect(CASE),
+        store.skill_bindings(BindingHome::Global).await.expect(CASE),
         std::slice::from_ref(&row),
         "{CASE}: the global rows"
     );
@@ -15651,7 +15689,11 @@ async fn skill_binding_attach_change_detach_are_compare_and_set<S: WriteStore>(s
     );
     assert_eq!(gone, None, "{CASE}: a detach carries no row");
     assert!(
-        store.skill_bindings(None).await.expect(CASE).is_empty(),
+        store
+            .skill_bindings(BindingHome::Global)
+            .await
+            .expect(CASE)
+            .is_empty(),
         "{CASE}: the global row is gone"
     );
     let none = stale(
@@ -15700,7 +15742,7 @@ async fn skill_binding_attach_change_detach_are_compare_and_set<S: WriteStore>(s
         "{CASE}: `None` on the fixture's phase key finds its row"
     );
     let token = store
-        .skill_bindings(Some(ids::PROJECT_HTUI))
+        .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
         .await
         .expect(CASE)
         .into_iter()
@@ -15725,7 +15767,7 @@ async fn skill_binding_attach_change_detach_are_compare_and_set<S: WriteStore>(s
     assert_eq!(pinned.pinned_version, Some(2), "{CASE}: re-pinned to v2");
     assert_eq!(
         store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect(CASE)
             .into_iter()
@@ -15751,13 +15793,13 @@ async fn skill_binding_refuses_by_rule<S: WriteStore>(store: &S) {
         .expect(CASE);
     let read_all = || async {
         (
-            store.skill_bindings(None).await.expect(CASE),
+            store.skill_bindings(BindingHome::Global).await.expect(CASE),
             store
-                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
                 .await
                 .expect(CASE),
             store
-                .skill_bindings(Some(ids::PROJECT_AGY))
+                .skill_bindings(BindingHome::Project(ids::PROJECT_AGY))
                 .await
                 .expect(CASE),
         )
@@ -15770,7 +15812,79 @@ async fn skill_binding_refuses_by_rule<S: WriteStore>(store: &S) {
         edit(&mut change);
         BindingChange::Attach(change)
     };
-    let refusals: [(SkillBindingKey, BindingChange, &str, &str); 9] = [
+    let refusals: [(SkillBindingKey, BindingChange, &str, &str); 15] = [
+        (
+            key_at(
+                ids::SKILL_TESTS,
+                Some(ids::WORKSPACE_PLATFORM),
+                Some(ids::PROJECT_HTUI),
+                None,
+                None,
+            ),
+            with(|_| {}),
+            "takes no other scope",
+            "a workspace key with a project key",
+        ),
+        (
+            key_at(
+                ids::SKILL_TESTS,
+                Some(ids::WORKSPACE_PLATFORM),
+                None,
+                Some(ids::KIND_HTUI_FEAT),
+                None,
+            ),
+            with(|_| {}),
+            "takes no other scope",
+            "a workspace key with an item-kind key",
+        ),
+        (
+            key_at(
+                ids::SKILL_TESTS,
+                None,
+                Some(ids::PROJECT_AGY),
+                Some(ids::KIND_HTUI_FEAT),
+                None,
+            ),
+            with(|_| {}),
+            "is not in project",
+            "an item kind of another project",
+        ),
+        (
+            key_at(
+                ids::SKILL_TESTS,
+                None,
+                None,
+                Some(ids::KIND_HTUI_FEAT),
+                None,
+            ),
+            with(|_| {}),
+            "needs its project",
+            "an item kind without its project",
+        ),
+        (
+            key_at(
+                ids::SKILL_TESTS,
+                None,
+                Some(ids::PROJECT_HTUI),
+                Some(ids::KIND_HTUI_FEAT),
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+            ),
+            with(|_| {}),
+            "not both",
+            "an item kind with a phase",
+        ),
+        (
+            key_at(
+                ids::SKILL_TESTS,
+                Some(ids::WORKSPACE_PLATFORM),
+                None,
+                None,
+                None,
+            ),
+            with(|a| a.globs = vec!["core:**/*.rs".to_owned()]),
+            "workspace attachment",
+            "a qualified glob on a workspace row",
+        ),
         (
             key(
                 ids::SKILL_TESTS,
@@ -15876,6 +15990,36 @@ async fn skill_binding_refuses_by_rule<S: WriteStore>(store: &S) {
         "step_graph_phase",
         "an unknown phase",
     );
+    not_found_on(
+        CASE,
+        store
+            .set_skill_binding(
+                key_at(ids::SKILL_TESTS, Some(WorkspaceId::new()), None, None, None),
+                None,
+                fine(),
+            )
+            .await,
+        "workspace",
+        "an unknown workspace",
+    );
+    not_found_on(
+        CASE,
+        store
+            .set_skill_binding(
+                key_at(
+                    ids::SKILL_TESTS,
+                    None,
+                    Some(ids::PROJECT_HTUI),
+                    Some(ItemKindId::new()),
+                    None,
+                ),
+                None,
+                fine(),
+            )
+            .await,
+        "item_kind",
+        "an unknown item kind",
+    );
     let spent = store
         .set_skill_binding(
             key(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), None),
@@ -15919,6 +16063,452 @@ async fn skill_binding_refuses_by_rule<S: WriteStore>(store: &S) {
         landed.globs,
         ["core:**/*.rs"],
         "{CASE}: a qualifier naming a repo of the project lands"
+    );
+    let on_kind = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                key_at(
+                    ids::SKILL_TESTS,
+                    None,
+                    Some(ids::PROJECT_HTUI),
+                    Some(ids::KIND_HTUI_FEAT),
+                    None,
+                ),
+                None,
+                with(|a| {
+                    a.activation = Activation::Glob;
+                    a.globs = vec!["core:**/*.rs".to_owned()];
+                }),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    assert_eq!(
+        on_kind.globs,
+        ["core:**/*.rs"],
+        "{CASE}: a qualifier naming a repo of the project lands on an item-kind row too"
+    );
+}
+
+/// MOD-127 D2, D6: a workspace row and an item-kind row attach, change and detach as the older
+/// levels do (compare-and-set on `updated_at`, the id kept), each lists at its own home and not at
+/// the others, and a project's listing orders item-kind rows after the phase rows of one skill.
+async fn skill_binding_workspace_and_item_kind_levels_attach_change_detach<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "skill_binding_workspace_and_item_kind_levels_attach_change_detach";
+    let workspace = key_at(
+        ids::SKILL_TESTS,
+        Some(ids::WORKSPACE_PLATFORM),
+        None,
+        None,
+        None,
+    );
+    let on_kind = key_at(
+        ids::SKILL_TESTS,
+        None,
+        Some(ids::PROJECT_HTUI),
+        Some(ids::KIND_HTUI_FEAT),
+        None,
+    );
+
+    let ws_row = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                workspace,
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 3)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    assert_eq!(
+        (
+            ws_row.skill_id,
+            ws_row.workspace_id,
+            ws_row.project_id,
+            ws_row.item_kind_id,
+            ws_row.phase_id
+        ),
+        (
+            ids::SKILL_TESTS,
+            Some(ids::WORKSPACE_PLATFORM),
+            None,
+            None,
+            None
+        ),
+        "{CASE}: a workspace row carries only its workspace"
+    );
+    assert_eq!(
+        store
+            .skill_bindings(BindingHome::Workspace(ids::WORKSPACE_PLATFORM))
+            .await
+            .expect(CASE),
+        std::slice::from_ref(&ws_row),
+        "{CASE}: the workspace lists it"
+    );
+    assert!(
+        store
+            .skill_bindings(BindingHome::Workspace(ids::WORKSPACE_GRAPHICS))
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: another workspace does not"
+    );
+    assert!(
+        store
+            .skill_bindings(BindingHome::Global)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: the global listing does not"
+    );
+    assert!(
+        !store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == ws_row.id),
+        "{CASE}: a project's listing does not"
+    );
+    let again = stale(
+        CASE,
+        store
+            .set_skill_binding(
+                workspace,
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 5)),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        again.as_ref(),
+        Some(&ws_row),
+        "{CASE}: `None` finds the workspace row"
+    );
+    let ws_row2 = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                workspace,
+                Some(ws_row.updated_at),
+                BindingChange::Attach(attachment(Activation::Off, 4)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("a change carries its row");
+    assert_eq!(ws_row2.id, ws_row.id, "{CASE}: a change keeps the id");
+    assert_eq!(
+        (ws_row2.position, ws_row2.activation),
+        (4, Activation::Off),
+        "{CASE}: the change landed"
+    );
+    let spent = stale(
+        CASE,
+        store
+            .set_skill_binding(workspace, Some(ws_row.updated_at), BindingChange::Detach)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent.as_ref(),
+        Some(&ws_row2),
+        "{CASE}: a spent token finds the changed row"
+    );
+    let gone = applied(
+        CASE,
+        store
+            .set_skill_binding(workspace, Some(ws_row2.updated_at), BindingChange::Detach)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(gone, None, "{CASE}: a detach carries no row");
+    assert!(
+        store
+            .skill_bindings(BindingHome::Workspace(ids::WORKSPACE_PLATFORM))
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: the workspace row is gone"
+    );
+
+    let kind_row = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                on_kind,
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 3)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    assert_eq!(
+        (
+            kind_row.workspace_id,
+            kind_row.project_id,
+            kind_row.item_kind_id,
+            kind_row.phase_id
+        ),
+        (
+            None,
+            Some(ids::PROJECT_HTUI),
+            Some(ids::KIND_HTUI_FEAT),
+            None
+        ),
+        "{CASE}: an item-kind row carries its project and its kind"
+    );
+    // The fixture's `tests` row sits at the project level, so the same skill now has a project
+    // row, a phase row and an item-kind row; the listing puts NULL item kinds first, then the
+    // phase rows' NULL kind among them (D6).
+    let phase_row = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                key(
+                    ids::SKILL_TESTS,
+                    Some(ids::PROJECT_HTUI),
+                    Some(ids::PHASE_HTUI_IMPLEMENT),
+                ),
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 1)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    assert_eq!(
+        store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE)
+            .into_iter()
+            .filter(|row| row.skill_id == ids::SKILL_TESTS)
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [ids::BINDING_HTUI_TESTS, phase_row.id, kind_row.id],
+        "{CASE}: one skill's rows by item kind then phase, NULLs first (D6)"
+    );
+    assert!(
+        store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_AGY))
+            .await
+            .expect(CASE)
+            .iter()
+            .all(|row| row.item_kind_id != Some(ids::KIND_HTUI_FEAT)),
+        "{CASE}: another project does not list it"
+    );
+    let kind_row2 = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                on_kind,
+                Some(kind_row.updated_at),
+                BindingChange::Attach(attachment(Activation::Off, 7)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("a change carries its row");
+    assert_eq!(kind_row2.id, kind_row.id, "{CASE}: a change keeps the id");
+    let spent = stale(
+        CASE,
+        store
+            .set_skill_binding(on_kind, Some(kind_row.updated_at), BindingChange::Detach)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent.as_ref(),
+        Some(&kind_row2),
+        "{CASE}: a spent token finds the changed item-kind row"
+    );
+    let gone = applied(
+        CASE,
+        store
+            .set_skill_binding(on_kind, Some(kind_row2.updated_at), BindingChange::Detach)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(gone, None, "{CASE}: a detach carries no row");
+    assert!(
+        !store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == kind_row.id),
+        "{CASE}: the item-kind row is gone and the phase row stays"
+    );
+}
+
+/// MOD-127 D3: `toolbox_binding.workspace_id ... ON DELETE CASCADE`: deleting a workspace takes
+/// its attachments and no other level's, and the reach it reports is unchanged (it names no
+/// bindings).
+async fn workspace_delete_takes_its_bindings<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_delete_takes_its_bindings";
+    let workspace = store
+        .create_workspace(new_workspace("doomed"))
+        .await
+        .expect(CASE);
+    let global_before = store.skill_bindings(BindingHome::Global).await.expect(CASE);
+    let project_before = store
+        .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE);
+    for skill in [ids::SKILL_TESTS, ids::SKILL_RUST_STYLE] {
+        applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    key_at(skill, Some(workspace.id), None, None, None),
+                    None,
+                    BindingChange::Attach(attachment(Activation::Always, 0)),
+                )
+                .await
+                .expect(CASE),
+        );
+    }
+    assert_eq!(
+        store
+            .skill_bindings(BindingHome::Workspace(workspace.id))
+            .await
+            .expect(CASE)
+            .len(),
+        2,
+        "{CASE}: the workspace holds two attachments"
+    );
+
+    store.delete_workspace(workspace.id).await.expect(CASE);
+
+    assert!(
+        store
+            .skill_bindings(BindingHome::Workspace(workspace.id))
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: the delete took them"
+    );
+    assert_eq!(
+        store.skill_bindings(BindingHome::Global).await.expect(CASE),
+        global_before,
+        "{CASE}: the global rows stand"
+    );
+    assert_eq!(
+        store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE),
+        project_before,
+        "{CASE}: a project's rows stand"
+    );
+}
+
+/// MOD-127 D3: `toolbox_binding.item_kind_id ... ON DELETE CASCADE`: deleting an item kind takes
+/// its attachments and leaves the project's other rows alone.
+async fn item_kind_delete_takes_its_bindings<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_kind_delete_takes_its_bindings";
+    let fresh = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "SPEC",
+            "specification",
+            ids::GRAPH_HTUI_ANA,
+        ))
+        .await
+        .expect(CASE);
+    let before = store
+        .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE);
+    let row = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                key_at(
+                    ids::SKILL_TESTS,
+                    None,
+                    Some(ids::PROJECT_HTUI),
+                    Some(fresh.id),
+                    None,
+                ),
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 0)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    assert!(
+        store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|other| other.id == row.id),
+        "{CASE}: the kind's row lists under its project"
+    );
+
+    store.delete_item_kind(fresh.id).await.expect(CASE);
+
+    assert_eq!(
+        store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE),
+        before,
+        "{CASE}: the delete took the kind's row and no other"
+    );
+}
+
+/// MOD-127 D3, D6: an item-kind row carries its project, so the project's delete reach counts it
+/// and the delete takes it.
+async fn project_delete_reach_counts_item_kind_bindings<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_delete_reach_counts_item_kind_bindings";
+    let before = store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_AGY))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: a project that exists has a reach"));
+    applied(
+        CASE,
+        store
+            .set_skill_binding(
+                key_at(
+                    ids::SKILL_TESTS,
+                    None,
+                    Some(ids::PROJECT_AGY),
+                    Some(ids::KIND_AGY_FEAT),
+                    None,
+                ),
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 0)),
+            )
+            .await
+            .expect(CASE),
+    );
+    let after = store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_AGY))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: a project that exists has a reach"));
+    assert_eq!(
+        after.skill_bindings,
+        before.skill_bindings + 1,
+        "{CASE}: the reach counts the item-kind row"
+    );
+    let done = store.delete_project(ids::PROJECT_AGY).await.expect(CASE);
+    assert_eq!(
+        done.skill_bindings, after.skill_bindings,
+        "{CASE}: the counts shown before the act are the counts the act took"
     );
 }
 
@@ -30772,7 +31362,7 @@ async fn replace_graph_keeps_bindings_of_kept_phases<S: WriteStore>(store: &S) {
     assert_eq!(
         bound(
             store
-                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
                 .await
                 .expect(CASE)
         ),
@@ -30796,7 +31386,7 @@ async fn replace_graph_keeps_bindings_of_kept_phases<S: WriteStore>(store: &S) {
     assert_eq!(
         bound(
             store
-                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
                 .await
                 .expect(CASE)
         ),
@@ -32024,7 +32614,7 @@ async fn delete_phase_cascades_edges_candidates_parts_and_bindings<S: WriteStore
     );
     assert!(
         store
-            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect(CASE)
             .iter()

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO toolbox_binding (id, kind, ref_id, workspace_id, project_id, item_kind_id, phase_id, pinned_version, position, updated_at) VALUES ($1, 'skill', $2, $3, $4, $5, $6, $7, $8, $9)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "320dee0af0a3f7cd42b38573078b4f2fd41bbfbd3f1662a77f115ca4940eaa23"
+}

@@ -26,12 +26,13 @@ use htui_core::model::{
     PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef, PromptScope,
     PromptTemplate, QueueBatch, QueueEntry, QueueRow, QueueRunFact, Repo, RepoBoxPath, RepoId,
     Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolvedGraph,
-    ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Split, Status, StepGraph, StepGraphId,
-    StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId, VerifyOutcome,
-    WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolveScope,
+    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
+    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Split, Status, StepGraph,
+    StepGraphId, StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId,
+    VerifyOutcome, WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
+    WorkspaceSummary,
 };
 use htui_core::model::{ArtifactLinkKind, LinkedDocument};
 use htui_core::model::{
@@ -43,7 +44,7 @@ use htui_core::model::{RefusedLanding, RunLanding};
 use htui_core::model::{TargetId, TargetSource};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::qdrant::{QDRANT_URL_KEY, StoredQdrantUrl};
-use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
+use htui_core::store::{BindingHome, ReadStore, Result, SettingRung, StoreError, StoredSetting};
 use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgExecutor};
@@ -2109,11 +2110,12 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
-    /// The skill candidates of one step (ANA-22 §6 items 2-3): the global attachments, the
-    /// project's, and — with `phase` — that phase's, resolved most-specific-wins.
+    /// The skill candidates of one step (ANA-22 §6 items 2-3, MOD-127 D5): the global attachments
+    /// and those of the scope's workspace, project, item kind and phase, each only when the scope
+    /// names it, resolved most-specific-wins.
     ///
     /// Two `SELECT`s — every version of every candidate skill, and the candidate attachments
-    /// (global rows, the project's, and the phase's) — then `htui_core::model::skill::resolve` in
+    /// (one `WHERE` arm per level) — then `htui_core::model::skill::resolve` in
     /// Rust, exactly as `MemStore` does. The level rule and the render order therefore have
     /// **one** definition rather than one per backend; expressing `R-SKL-2` a second time in SQL
     /// would be a copy to keep in step. Inactive winners are included — the assembler's `select`
@@ -2123,33 +2125,41 @@ impl PgStore {
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    pub async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> Result<Vec<BoundSkill>> {
-        // `None` binds SQL NULL, so `b.phase_id = $2` is NULL and only the project's
-        // `phase_id IS NULL` rows (and the global ones) apply.
-        let phase = phase.map(PhaseId::as_uuid);
+    pub async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
+        // A `None` in the scope binds SQL NULL, so `b.workspace_id = $1`, `b.item_kind_id = $3`
+        // and `b.phase_id = $4` are NULL and the rows of that level do not apply (MemStore's
+        // `binding_applies` says the same in Rust).
+        let workspace = scope.workspace.map(WorkspaceId::as_uuid);
+        let item_kind = scope.item_kind.map(ItemKindId::as_uuid);
+        let phase = scope.phase.map(PhaseId::as_uuid);
         let rows = sqlx::query_as!(
             SkillBindingRow,
             r#"
-            SELECT b.id         AS "id: htui_core::model::SkillBindingId",
-                   b.skill_id   AS "skill_id: SkillId",
-                   b.project_id AS "project_id?: ProjectId",
-                   b.phase_id   AS "phase_id: PhaseId",
+            SELECT b.id           AS "id: htui_core::model::SkillBindingId",
+                   b.ref_id       AS "skill_id: SkillId",
+                   b.workspace_id AS "workspace_id?: WorkspaceId",
+                   b.project_id   AS "project_id?: ProjectId",
+                   b.item_kind_id AS "item_kind_id?: ItemKindId",
+                   b.phase_id     AS "phase_id?: PhaseId",
                    b.pinned_version,
                    b.position,
-                   b.activation AS "activation: Activation",
+                   b.activation   AS "activation: Activation",
                    b.globs,
                    b.languages,
                    b.updated_at,
                    s.name
-              FROM skill_binding b JOIN skill s ON s.id = b.skill_id
-             WHERE b.project_id IS NULL
-                OR (b.project_id = $1 AND (b.phase_id IS NULL OR b.phase_id = $2))
+              FROM toolbox_binding b JOIN skill s ON s.id = b.ref_id
+             WHERE b.kind = 'skill'
+               AND (   (b.workspace_id IS NULL AND b.project_id IS NULL
+                        AND b.item_kind_id IS NULL AND b.phase_id IS NULL)
+                    OR b.workspace_id = $1
+                    OR (b.project_id = $2 AND b.item_kind_id IS NULL AND b.phase_id IS NULL)
+                    OR (b.project_id = $2 AND b.item_kind_id = $3)
+                    OR (b.project_id = $2 AND b.phase_id = $4))
             "#,
-            project.as_uuid(),
+            workspace,
+            scope.project.as_uuid(),
+            item_kind,
             phase,
         )
         .fetch_all(&self.pool)
@@ -3746,34 +3756,44 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
-    /// `None`: the global attachments; `Some(p)`: `p`'s project and phase attachments. Ordered by
-    /// `(skill_id, phase_id NULLS FIRST)` (D91).
+    /// The skill attachments at one [`BindingHome`]: the global rows, a workspace's, or a
+    /// project's project, item-kind and phase rows. Ordered by `(ref_id, item_kind_id NULLS
+    /// FIRST, phase_id NULLS FIRST)` (D91, MOD-127 D6).
     ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    pub(crate) async fn skill_binding_rows(
-        &self,
-        project: Option<ProjectId>,
-    ) -> Result<Vec<SkillBinding>> {
+    pub(crate) async fn skill_binding_rows(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
+        let (workspace, project) = match home {
+            BindingHome::Global => (None, None),
+            BindingHome::Workspace(id) => (Some(id.as_uuid()), None),
+            BindingHome::Project(id) => (None, Some(id.as_uuid())),
+        };
         sqlx::query_as!(
             SkillBindingColumns,
             r#"
             SELECT id             AS "id: SkillBindingId",
-                   skill_id       AS "skill_id: SkillId",
+                   ref_id         AS "skill_id: SkillId",
+                   workspace_id   AS "workspace_id?: WorkspaceId",
                    project_id     AS "project_id?: ProjectId",
-                   phase_id       AS "phase_id: PhaseId",
+                   item_kind_id   AS "item_kind_id?: ItemKindId",
+                   phase_id       AS "phase_id?: PhaseId",
                    pinned_version,
                    position,
                    activation     AS "activation: Activation",
                    globs,
                    languages,
                    updated_at
-              FROM skill_binding
-             WHERE project_id IS NOT DISTINCT FROM $1
-             ORDER BY skill_id, phase_id NULLS FIRST
+              FROM toolbox_binding
+             WHERE kind = 'skill'
+               AND (   ($1::uuid IS NOT NULL AND workspace_id = $1)
+                    OR ($2::uuid IS NOT NULL AND project_id = $2)
+                    OR ($1::uuid IS NULL AND $2::uuid IS NULL
+                        AND workspace_id IS NULL AND project_id IS NULL))
+             ORDER BY ref_id, item_kind_id NULLS FIRST, phase_id NULLS FIRST
             "#,
-            project.map(ProjectId::as_uuid),
+            workspace,
+            project,
         )
         .fetch_all(&self.pool)
         .await
@@ -3781,8 +3801,8 @@ impl PgStore {
         .map(|rows| rows.into_iter().map(SkillBinding::from).collect())
     }
 
-    /// The row at one natural key (`UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`),
-    /// `None` when there is none.
+    /// The row at one natural key (`UNIQUE NULLS NOT DISTINCT (kind, ref_id, workspace_id,
+    /// project_id, item_kind_id, phase_id)`), `None` when there is none.
     ///
     /// # Errors
     ///
@@ -3795,22 +3815,29 @@ impl PgStore {
             SkillBindingColumns,
             r#"
             SELECT id             AS "id: SkillBindingId",
-                   skill_id       AS "skill_id: SkillId",
+                   ref_id         AS "skill_id: SkillId",
+                   workspace_id   AS "workspace_id?: WorkspaceId",
                    project_id     AS "project_id?: ProjectId",
-                   phase_id       AS "phase_id: PhaseId",
+                   item_kind_id   AS "item_kind_id?: ItemKindId",
+                   phase_id       AS "phase_id?: PhaseId",
                    pinned_version,
                    position,
                    activation     AS "activation: Activation",
                    globs,
                    languages,
                    updated_at
-              FROM skill_binding
-             WHERE skill_id = $1
-               AND project_id IS NOT DISTINCT FROM $2
-               AND phase_id IS NOT DISTINCT FROM $3
+              FROM toolbox_binding
+             WHERE kind = 'skill'
+               AND ref_id = $1
+               AND workspace_id IS NOT DISTINCT FROM $2
+               AND project_id IS NOT DISTINCT FROM $3
+               AND item_kind_id IS NOT DISTINCT FROM $4
+               AND phase_id IS NOT DISTINCT FROM $5
             "#,
             key.skill.as_uuid(),
+            key.workspace.map(WorkspaceId::as_uuid),
             key.project.map(ProjectId::as_uuid),
+            key.item_kind.map(ItemKindId::as_uuid),
             key.phase.map(PhaseId::as_uuid),
         )
         .fetch_optional(&self.pool)

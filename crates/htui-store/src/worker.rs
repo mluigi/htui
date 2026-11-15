@@ -21,11 +21,11 @@ use htui_core::model::{
     NewDocument, NewNote, NewRun, NewRunMemory, NewRunStep, Note, OpenPermission, PendingStop,
     PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
     PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo,
-    RepoBoxPath, RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunMemoryWrite, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    RunSummary, Scope, SessionEvent, SettleOutcome, Status, StepGraphId, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId,
-    WorkspaceStop, WorkspaceSummary,
+    RepoBoxPath, RepoId, Resolution, ResolveScope, ResolvedGraph, ResolvedInput, Run, RunCommand,
+    RunCommandId, RunCommandStatus, RunId, RunMemoryWrite, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Status, StepGraphId,
+    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
+    UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
 use htui_core::model::{Integration, LandOutcome, TargetBinding, TargetId};
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, StoreError, WriteStore};
@@ -1242,12 +1242,8 @@ impl htui_core::store::WorkerHost for PgStore {
     async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
         PgStore::agent_boxes(self, box_id).await
     }
-    async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> Result<Vec<BoundSkill>> {
-        PgStore::bound_skills(self, project, phase).await
+    async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
+        PgStore::bound_skills(self, scope).await
     }
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         PgStore::missing_tags(self, item, box_id).await
@@ -1355,12 +1351,8 @@ impl htui_core::store::WorkerHost for Backend {
     async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
         Backend::agent_boxes(self, box_id).await
     }
-    async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> Result<Vec<BoundSkill>> {
-        Backend::bound_skills(self, project, phase).await
+    async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
+        Backend::bound_skills(self, scope).await
     }
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         Backend::missing_tags(self, item, box_id).await

@@ -2,7 +2,7 @@
 
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoundSkill, BoxId, ItemId, PhaseAgent, PhaseId, ProjectId,
-    PromptTemplate, ResolvedGraph,
+    PromptTemplate, ResolveScope, ResolvedGraph,
 };
 use htui_core::store::Result as StoreResult;
 use htui_orch::GraphSource;
@@ -49,12 +49,8 @@ impl<H: htui_core::store::WorkerHost> GraphSource for HostGraphs<H> {
         self.0.agent_boxes(box_id).await
     }
 
-    async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> StoreResult<Vec<BoundSkill>> {
-        self.0.bound_skills(project, phase).await
+    async fn bound_skills(&self, scope: ResolveScope) -> StoreResult<Vec<BoundSkill>> {
+        self.0.bound_skills(scope).await
     }
 
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> StoreResult<Vec<String>> {

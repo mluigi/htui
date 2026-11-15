@@ -26,10 +26,10 @@ use htui_core::model::{
     MemoryState, MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewFollowUp, NewItem,
     NewMemoryEntry, NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, OpenPermission,
     PermissionId, PermissionStatus, Priority, ProjectId, QueuedFollowUp, RelayOption,
-    RelayOptionKind, RelaySessionId, RepoId, RequirementId, RunCommandId, RunCommandStatus, RunId,
-    RunMode, RunStatus, RunStepCommit, RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph,
-    SnapshotSettings, Status, StepId, StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS,
-    Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    RelayOptionKind, RelaySessionId, RepoId, RequirementId, ResolveScope, RunCommandId,
+    RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit, RunStepTree, SessionEvent,
+    SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome, StepRole,
+    StopMode, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::model::{NewChildBox, NewTarget, TargetId, TargetKind};
 use htui_core::prompt::settings::SettingKey;
@@ -2674,7 +2674,7 @@ async fn inherent_prompt_reads_answer_the_fixture() {
     // the phase binding's pinned version and position.
     let project_level = db
         .store
-        .bound_skills(ids::PROJECT_HTUI, None)
+        .bound_skills(ResolveScope::project(ids::PROJECT_HTUI, None))
         .await
         .expect("bound_skills must not fail");
     assert_eq!(
@@ -2689,7 +2689,10 @@ async fn inherent_prompt_reads_answer_the_fixture() {
 
     let phase_level = db
         .store
-        .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+        .bound_skills(ResolveScope::project(
+            ids::PROJECT_HTUI,
+            Some(ids::PHASE_HTUI_IMPLEMENT),
+        ))
         .await
         .expect("bound_skills must not fail");
     assert_eq!(
@@ -2711,9 +2714,12 @@ async fn inherent_prompt_reads_answer_the_fixture() {
     );
     assert_eq!(
         phase_level,
-        mem.bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
-            .await
-            .expect("MemStore::bound_skills"),
+        mem.bound_skills(ResolveScope::project(
+            ids::PROJECT_HTUI,
+            Some(ids::PHASE_HTUI_IMPLEMENT)
+        ))
+        .await
+        .expect("MemStore::bound_skills"),
         "the collapse is `BoundSkill::collapse` on both backends, bodies included"
     );
 
@@ -3463,7 +3469,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "prompt_template",
         "repo",
         "repo_box_path",
-        "skill_binding",
+        "toolbox_binding",
         "run",
         "run_step",
         "session_event",

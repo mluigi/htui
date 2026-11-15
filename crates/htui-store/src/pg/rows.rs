@@ -30,11 +30,12 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Activation, AgentId, BoxId, GateOutcome, ItemId, LinkNode, MemoryEntry, MemoryEntryId,
-    MemoryEvidence, MemoryKind, MemorySource, MemoryState, MemoryUsage, Persona, PersonaId,
-    PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunLanding, RunMode,
-    RunProvenance, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId,
-    Status, StepId, StepOpening, StepStatus, UpstreamEntry, UserId, VerifyOutcome,
+    Activation, AgentId, BoxId, GateOutcome, ItemId, ItemKindId, LinkNode, MemoryEntry,
+    MemoryEntryId, MemoryEvidence, MemoryKind, MemorySource, MemoryState, MemoryUsage, Persona,
+    PersonaId, PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunLanding,
+    RunMode, RunProvenance, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId,
+    SkillId, Status, StepId, StepOpening, StepStatus, UpstreamEntry, UserId, VerifyOutcome,
+    WorkspaceId,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -271,30 +272,33 @@ impl UpstreamRow {
     }
 }
 
-/// The `skill_binding` columns the table had before MOD-127 M1 (no workspace, no item kind), as
-/// the queries that still select them return them. T2's migration and SQL rewrite replace this
-/// with the full row and delete it.
+/// The `toolbox_binding` columns of one skill attachment (`kind = 'skill'`), as the listing and
+/// natural-key queries return them.
 #[derive(Debug, Clone)]
 pub(crate) struct SkillBindingColumns {
-    /// `skill_binding.id`.
+    /// `toolbox_binding.id`.
     pub(crate) id: SkillBindingId,
-    /// `skill_binding.skill_id`.
+    /// `toolbox_binding.ref_id`: the skill.
     pub(crate) skill_id: SkillId,
-    /// `skill_binding.project_id`.
+    /// `toolbox_binding.workspace_id`.
+    pub(crate) workspace_id: Option<WorkspaceId>,
+    /// `toolbox_binding.project_id`.
     pub(crate) project_id: Option<ProjectId>,
-    /// `skill_binding.phase_id`.
+    /// `toolbox_binding.item_kind_id`.
+    pub(crate) item_kind_id: Option<ItemKindId>,
+    /// `toolbox_binding.phase_id`.
     pub(crate) phase_id: Option<PhaseId>,
-    /// `skill_binding.pinned_version`.
+    /// `toolbox_binding.pinned_version`.
     pub(crate) pinned_version: Option<i32>,
-    /// `skill_binding.position`.
+    /// `toolbox_binding.position`.
     pub(crate) position: i32,
-    /// `skill_binding.activation`.
+    /// `toolbox_binding.activation`.
     pub(crate) activation: Activation,
-    /// `skill_binding.globs`.
+    /// `toolbox_binding.globs`.
     pub(crate) globs: Vec<String>,
-    /// `skill_binding.languages`.
+    /// `toolbox_binding.languages`.
     pub(crate) languages: Vec<String>,
-    /// `skill_binding.updated_at`.
+    /// `toolbox_binding.updated_at`.
     pub(crate) updated_at: DateTime<Utc>,
 }
 
@@ -303,9 +307,9 @@ impl From<SkillBindingColumns> for SkillBinding {
         Self {
             id: row.id,
             skill_id: row.skill_id,
-            workspace_id: None,
+            workspace_id: row.workspace_id,
             project_id: row.project_id,
-            item_kind_id: None,
+            item_kind_id: row.item_kind_id,
             phase_id: row.phase_id,
             pinned_version: row.pinned_version,
             position: row.position,
@@ -317,34 +321,38 @@ impl From<SkillBindingColumns> for SkillBinding {
     }
 }
 
-/// One `skill_binding` row with `skill.name` joined: one attachment
+/// One skill `toolbox_binding` row with `skill.name` joined: one attachment
 /// [`PgStore::bound_skills`](crate::PgStore::bound_skills) hands to
 /// `htui_core::model::skill::resolve`.
 ///
-/// Every `skill_binding` column is carried, so [`into_binding`](SkillBindingRow::into_binding)
+/// Every `toolbox_binding` column is carried, so [`into_binding`](SkillBindingRow::into_binding)
 /// rebuilds the real [`SkillBinding`] and `resolve` applies the level and pin rules to it rather
 /// than a second copy of them living here.
 #[derive(Debug, Clone)]
 pub(crate) struct SkillBindingRow {
-    /// `skill_binding.id`.
+    /// `toolbox_binding.id`.
     pub(crate) id: SkillBindingId,
-    /// `skill_binding.skill_id`.
+    /// `toolbox_binding.ref_id`: the skill.
     pub(crate) skill_id: SkillId,
-    /// `skill_binding.project_id`; `None` is a global attachment.
+    /// `toolbox_binding.workspace_id`.
+    pub(crate) workspace_id: Option<WorkspaceId>,
+    /// `toolbox_binding.project_id`; `None` with no other key is a global attachment.
     pub(crate) project_id: Option<ProjectId>,
-    /// `skill_binding.phase_id`; `None` is the project (or global) level.
+    /// `toolbox_binding.item_kind_id`.
+    pub(crate) item_kind_id: Option<ItemKindId>,
+    /// `toolbox_binding.phase_id`.
     pub(crate) phase_id: Option<PhaseId>,
-    /// `skill_binding.pinned_version`; `None` follows the latest version.
+    /// `toolbox_binding.pinned_version`; `None` follows the latest version.
     pub(crate) pinned_version: Option<i32>,
-    /// `skill_binding.position`.
+    /// `toolbox_binding.position`.
     pub(crate) position: i32,
-    /// `skill_binding.activation`.
+    /// `toolbox_binding.activation`.
     pub(crate) activation: Activation,
-    /// `skill_binding.globs`.
+    /// `toolbox_binding.globs`.
     pub(crate) globs: Vec<String>,
-    /// `skill_binding.languages`.
+    /// `toolbox_binding.languages`.
     pub(crate) languages: Vec<String>,
-    /// `skill_binding.updated_at`.
+    /// `toolbox_binding.updated_at`.
     pub(crate) updated_at: DateTime<Utc>,
     /// `skill.name`, joined: the `<skill name="..">` attribute and the order's tie-break.
     pub(crate) name: String,
@@ -358,9 +366,9 @@ impl SkillBindingRow {
             SkillBinding {
                 id: self.id,
                 skill_id: self.skill_id,
-                workspace_id: None,
+                workspace_id: self.workspace_id,
                 project_id: self.project_id,
-                item_kind_id: None,
+                item_kind_id: self.item_kind_id,
                 phase_id: self.phase_id,
                 pinned_version: self.pinned_version,
                 position: self.position,

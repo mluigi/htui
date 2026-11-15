@@ -37,8 +37,8 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, BatchId, BoundSkill, BoxId, Document, DocumentId, GraphSnapshot,
     Isolation, Item, ItemId, ItemState, LandOutcome, NewDocument, PartMerge, PartPremerge,
     PhaseAgent, PhaseId, PremergeReport, ProjectId, PromptTemplate, RepoId, RepoPremerge,
-    ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId,
-    VerifyOutcome, latest_graph_run,
+    ResolveScope, ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase,
+    StepId, UserId, VerifyOutcome, latest_graph_run,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::secret::SecretSource;
@@ -1668,12 +1668,8 @@ impl GraphSource for MemStore {
         self.agent_boxes(box_id).await
     }
 
-    async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> Result<Vec<BoundSkill>> {
-        self.bound_skills(project, phase).await
+    async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
+        self.bound_skills(scope).await
     }
 
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
@@ -1818,12 +1814,8 @@ impl GraphSource for FakeGraphSource<'_> {
         GraphSource::agent_boxes(self.store, box_id).await
     }
 
-    async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> Result<Vec<BoundSkill>> {
-        GraphSource::bound_skills(self.store, project, phase).await
+    async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
+        GraphSource::bound_skills(self.store, scope).await
     }
 
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
@@ -3603,7 +3595,7 @@ mod tests {
     use htui_agent::fake::FakeDriver;
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
-        Isolation, RepoId, RunMode, RunStep, SnapshotCandidate, SnapshotPhase, StepId,
+        Isolation, RepoId, ResolveScope, RunMode, RunStep, SnapshotCandidate, SnapshotPhase, StepId,
     };
     use htui_core::prompt::DiffBlock;
     use htui_core::store::{MemStore, ReadStore as _};
@@ -4584,14 +4576,19 @@ mod tests {
             "the demo fixture seeds no `agent_box` row, so rung 3 finds nothing on it (plan D62)"
         );
         // MOD-9 D44, D66: the sixth read.
-        let skills =
-            GraphSource::bound_skills(&store, ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
-                .await
-                .expect("MemStore never fails a read");
+        let skills = GraphSource::bound_skills(
+            &store,
+            ResolveScope::project(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT)),
+        )
+        .await
+        .expect("MemStore never fails a read");
         assert_eq!(
             skills,
             store
-                .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+                .bound_skills(ResolveScope::project(
+                    ids::PROJECT_HTUI,
+                    Some(ids::PHASE_HTUI_IMPLEMENT)
+                ))
                 .await
                 .expect("MemStore never fails a read"),
             "the trait answers what the inherent read answers"

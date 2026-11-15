@@ -19,7 +19,7 @@ use htui::app::register_all;
 use htui::testkit::Harness;
 use htui_core::fixtures::ids;
 use htui_core::model::Activation;
-use htui_core::store::WriteStore as _;
+use htui_core::store::{BindingHome, WriteStore as _};
 use htui_store::{Backend, CacheStore, PgStore, secret, testkit};
 
 /// The skill every step writes.
@@ -147,7 +147,7 @@ async fn a_skill_created_edited_and_attached_in_the_tui_lands_on_postgres() {
         .collect();
     assert_eq!(bodies, ["First.", "Second. First."]);
     let rows: Vec<_> = store
-        .skill_bindings(Some(ids::PROJECT_VULKAN))
+        .skill_bindings(BindingHome::Project(ids::PROJECT_VULKAN))
         .await
         .expect("the server's attachments")
         .into_iter()

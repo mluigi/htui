@@ -35,7 +35,9 @@ use htui_core::model::{
     SkillBinding, SkillBindingKey, SkillVersion,
 };
 use htui_core::model::{Agent, AgentBox, AgentId, Billing, EventKind, Scope, Transport};
-use htui_core::store::{BLANK_SKILL_BODY, CasOutcome, MemStore, ReadStore as _, WriteStore};
+use htui_core::store::{
+    BLANK_SKILL_BODY, BindingHome, CasOutcome, MemStore, ReadStore as _, WriteStore,
+};
 use serde_json::json;
 
 /// The shell over `store`, every view registered, on the Skills tab's Skills view (the tab opens
@@ -192,7 +194,7 @@ async fn versions(store: &MemStore, name: &str) -> Vec<SkillVersion> {
 /// `htui`'s row for `skill` at the project level, straight from the store.
 async fn htui_row(store: &MemStore, skill: htui_core::model::SkillId) -> Option<SkillBinding> {
     store
-        .skill_bindings(Some(ids::PROJECT_HTUI))
+        .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
         .await
         .expect("the attachments read")
         .into_iter()
@@ -1521,7 +1523,7 @@ async fn the_prefilled_fields_are_what_the_save_writes() {
     harness.settle().await;
 
     let row = store
-        .skill_bindings(None)
+        .skill_bindings(BindingHome::Global)
         .await
         .expect("the global read")
         .into_iter()

@@ -51,14 +51,14 @@ use crate::model::{
     QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView,
     Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
     RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
-    Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    RequirementState, RequirementUpdate, Resolution, ResolveScope, ResolvedGraph, ResolvedInput,
+    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
     SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    SkillLevel, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
     WorkspaceSummary, canonical_declared_tags, memory_subject_key, missing_tags_failure,
     moved_order, overlaps, prompt_summary, scope_of,
 };
@@ -96,7 +96,7 @@ use crate::store::indexer_lease::IndexerLeaseStore;
 use crate::store::traits::command_log_too_large;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
-    BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
+    BindingFacts, BindingHome, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
     EXECUTOR_MUST_BE_KNOWN, MAX_PARENT_DEPTH, ParkOutcome, QueueStored, QueueTarget, QueueToken,
     ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
     batch_is_closed, branch_refusal, chat_step_status, check_attachment, citation_key,
@@ -762,8 +762,9 @@ impl MemStore {
         }))
     }
 
-    /// The skill candidates of one step (ANA-22 §6 items 2-3): the global attachments, the
-    /// project's, and — with `phase` — that phase's, resolved most-specific-wins by
+    /// The skill candidates of one step (ANA-22 §6 items 2-3, MOD-127 D5): the global attachments,
+    /// the scope's workspace's, the project's, the item kind's and the phase's, each only when the
+    /// scope names it, resolved most-specific-wins by
     /// [`resolve`](crate::model::skill::resolve), exactly as `PgStore`'s two `SELECT`s are, so the
     /// rule has one definition rather than one per backend.
     ///
@@ -774,24 +775,12 @@ impl MemStore {
     /// # Errors
     ///
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
-    pub async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> Result<Vec<BoundSkill>> {
+    pub async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
         Ok(self.read(|state| {
             let rows = state
                 .skill_bindings
                 .iter()
-                .filter(|binding| match binding.project_id {
-                    None => true,
-                    // `phase: None` with a phase row: `phase_id == phase` is false, so the row
-                    // is excluded, as `PgStore`'s `b.phase_id = NULL` is.
-                    Some(owner) => {
-                        owner == project
-                            && (binding.phase_id.is_none() || binding.phase_id == phase)
-                    }
-                })
+                .filter(|binding| binding_applies(binding, scope))
                 .filter_map(|binding| {
                     state
                         .skills
@@ -4123,6 +4112,9 @@ impl State {
             )));
         }
         self.kinds.remove(&id);
+        // MOD-127: `toolbox_binding.item_kind_id ... ON DELETE CASCADE`.
+        self.skill_bindings
+            .retain(|row| row.item_kind_id != Some(id));
         Ok(())
     }
 
@@ -4963,16 +4955,23 @@ impl State {
         rows
     }
 
-    /// D91: `project_id == project`, sorted by `(skill_id, phase_id)` (`None < Some`, as `NULLS
-    /// FIRST`; `Uuid`'s `Ord` is byte order, as Postgres's `uuid` comparison).
-    fn skill_binding_rows(&self, project: Option<ProjectId>) -> Vec<SkillBinding> {
+    /// D91, MOD-127 D6: the rows `home` lists, sorted by `(skill_id, item_kind_id, phase_id)`
+    /// (`None < Some`, as `NULLS FIRST`; `Uuid`'s `Ord` is byte order, as Postgres's `uuid`
+    /// comparison).
+    fn skill_binding_rows(&self, home: BindingHome) -> Vec<SkillBinding> {
         let mut rows: Vec<SkillBinding> = self
             .skill_bindings
             .iter()
-            .filter(|row| row.project_id == project)
+            .filter(|row| home.lists(row))
             .cloned()
             .collect();
-        rows.sort_by_key(|row| (row.skill_id.as_uuid(), row.phase_id.map(PhaseId::as_uuid)));
+        rows.sort_by_key(|row| {
+            (
+                row.skill_id.as_uuid(),
+                row.item_kind_id.map(ItemKindId::as_uuid),
+                row.phase_id.map(PhaseId::as_uuid),
+            )
+        });
         rows
     }
 
@@ -5315,6 +5314,28 @@ impl State {
             None => None,
         };
 
+        // MOD-127 D2: an unknown workspace or item kind is `NotFound`, as an unknown project or
+        // phase is; `check_attachment` then judges the shape and the kind's project.
+        let workspace_exists = match key.workspace {
+            Some(id) if !self.workspaces.contains_key(&id) => {
+                return Err(StoreError::NotFound {
+                    entity: "workspace",
+                    id: id.to_string(),
+                });
+            }
+            _ => true,
+        };
+        let kind_project =
+            match key.item_kind {
+                Some(id) => Some(self.kinds.get(&id).map(|kind| kind.project_id).ok_or_else(
+                    || StoreError::NotFound {
+                        entity: "item_kind",
+                        id: id.to_string(),
+                    },
+                )?),
+                None => None,
+            };
+
         let attachment = match change {
             BindingChange::Detach => {
                 if let Some(row) = current {
@@ -5340,6 +5361,8 @@ impl State {
             &BindingFacts {
                 key,
                 phase_project,
+                workspace_exists,
+                kind_project,
                 skill_name: &skill_name,
                 versions: &versions,
                 repos: &repos,
@@ -6288,6 +6311,9 @@ impl State {
             .retain(|_, edge| !graphs.contains(&edge.graph_id));
         self.skill_bindings
             .retain(|row| row.phase_id.is_none_or(|phase| !phases.contains(&phase)));
+        // MOD-127: `toolbox_binding.workspace_id ... ON DELETE CASCADE`.
+        self.skill_bindings
+            .retain(|row| row.workspace_id != Some(id));
         self.phases.retain(|row| !phases.contains(&row.id));
         self.graphs.retain(|graph, _| !graphs.contains(graph));
         self.workspace_projects.retain(|row| row.workspace_id != id);
@@ -10709,6 +10735,30 @@ impl State {
 
 /// A row count as the `u64` [`DeleteReach`] holds, saturating rather than casting: `usize` is
 /// never wider than `u64` on a target this ships to, and the `try_from` says so without an `as`.
+/// MOD-127 D5: whether `binding` applies in `scope`, the Rust form of `PgStore::bound_skills`'s
+/// `WHERE`. A row applies when its keys match the scope exactly at its level; a `None` in the
+/// scope (a workspace, item kind or phase it does not name) matches no row of that level, as
+/// `b.phase_id = NULL` matches none.
+fn binding_applies(binding: &SkillBinding, scope: ResolveScope) -> bool {
+    match binding.level() {
+        SkillLevel::Global => true,
+        SkillLevel::Workspace => {
+            binding.workspace_id.is_some() && binding.workspace_id == scope.workspace
+        }
+        SkillLevel::Project => binding.project_id == Some(scope.project),
+        SkillLevel::ItemKind => {
+            binding.project_id == Some(scope.project)
+                && binding.item_kind_id.is_some()
+                && binding.item_kind_id == scope.item_kind
+        }
+        SkillLevel::Phase => {
+            binding.project_id == Some(scope.project)
+                && binding.phase_id.is_some()
+                && binding.phase_id == scope.phase
+        }
+    }
+}
+
 fn rows(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
@@ -12450,8 +12500,8 @@ impl WriteStore for MemStore {
         Ok(self.read(|state| state.skill_version_rows(skill)))
     }
 
-    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>> {
-        Ok(self.read(|state| state.skill_binding_rows(project)))
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
+        Ok(self.read(|state| state.skill_binding_rows(home)))
     }
 
     async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
@@ -14237,6 +14287,7 @@ mod tests {
     use super::{FollowUpPayload, MemStore};
     use crate::clock::{Clock as _, TestClock};
     use crate::fixtures::ids;
+    use crate::model::ResolveScope;
     use crate::model::{ACTIVITY_PAGE, ActivityClass, ActivityEvent, ActivityKind};
     use crate::model::{
         AgentBox, AgentId, AnswerOutcome, BatchClose, BoxId, BoxProbe, CancelRequest, ChatRunSpec,
@@ -14830,7 +14881,7 @@ mod tests {
         let store = MemStore::demo();
 
         let project_level = store
-            .bound_skills(ids::PROJECT_HTUI, None)
+            .bound_skills(ResolveScope::project(ids::PROJECT_HTUI, None))
             .await
             .expect("bound_skills must not fail");
         assert_eq!(
@@ -14843,7 +14894,10 @@ mod tests {
         );
 
         let with_phase = store
-            .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+            .bound_skills(ResolveScope::project(
+                ids::PROJECT_HTUI,
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+            ))
             .await
             .expect("bound_skills must not fail");
         assert_eq!(
@@ -14861,7 +14915,7 @@ mod tests {
 
         assert!(
             store
-                .bound_skills(ids::PROJECT_AGY, None)
+                .bound_skills(ResolveScope::project(ids::PROJECT_AGY, None))
                 .await
                 .expect("bound_skills must not fail")
                 .is_empty(),
@@ -14916,7 +14970,7 @@ mod tests {
         let (store, house) = demo_with_a_global_skill();
 
         let agy = store
-            .bound_skills(ids::PROJECT_AGY, None)
+            .bound_skills(ResolveScope::project(ids::PROJECT_AGY, None))
             .await
             .expect("bound_skills must not fail");
         assert_eq!(
@@ -14929,7 +14983,10 @@ mod tests {
         assert_eq!(agy[0].body, "House rules.");
 
         let implement = store
-            .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+            .bound_skills(ResolveScope::project(
+                ids::PROJECT_HTUI,
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+            ))
             .await
             .expect("bound_skills must not fail");
         assert_eq!(
@@ -14962,7 +15019,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .bound_skills(ids::PROJECT_AGY, None)
+                .bound_skills(ResolveScope::project(ids::PROJECT_AGY, None))
                 .await
                 .expect("bound_skills must not fail")
                 .iter()

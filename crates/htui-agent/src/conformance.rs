@@ -55,8 +55,8 @@ use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::{MinimalScrubber, Scrubber as _};
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore, Result as StoreResult,
-    SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore,
+    BindingHome, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore,
+    Result as StoreResult, SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1153,8 +1153,8 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn skill_versions(&self, skill: SkillId) -> StoreResult<Vec<SkillVersion>> {
         self.inner.skill_versions(skill).await
     }
-    async fn skill_bindings(&self, project: Option<ProjectId>) -> StoreResult<Vec<SkillBinding>> {
-        self.inner.skill_bindings(project).await
+    async fn skill_bindings(&self, home: BindingHome) -> StoreResult<Vec<SkillBinding>> {
+        self.inner.skill_bindings(home).await
     }
     async fn create_skill(&self, new: NewSkill) -> StoreResult<(Skill, SkillVersion)> {
         self.inner.create_skill(new).await

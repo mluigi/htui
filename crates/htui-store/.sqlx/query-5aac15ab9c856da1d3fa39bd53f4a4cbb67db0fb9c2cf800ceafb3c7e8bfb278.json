@@ -1,0 +1,161 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id             AS \"id: SkillBindingId\",\n                   ref_id         AS \"skill_id: SkillId\",\n                   workspace_id   AS \"workspace_id?: WorkspaceId\",\n                   project_id     AS \"project_id?: ProjectId\",\n                   item_kind_id   AS \"item_kind_id?: ItemKindId\",\n                   phase_id       AS \"phase_id?: PhaseId\",\n                   pinned_version,\n                   position,\n                   activation     AS \"activation: Activation\",\n                   globs,\n                   languages,\n                   updated_at\n              FROM toolbox_binding\n             WHERE kind = 'skill'\n               AND (   ($1::uuid IS NOT NULL AND workspace_id = $1)\n                    OR ($2::uuid IS NOT NULL AND project_id = $2)\n                    OR ($1::uuid IS NULL AND $2::uuid IS NULL\n                        AND workspace_id IS NULL AND project_id IS NULL))\n             ORDER BY ref_id, item_kind_id NULLS FIRST, phase_id NULLS FIRST\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: SkillBindingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "skill_id: SkillId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "ref_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_id?: WorkspaceId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "project_id?: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "item_kind_id?: ItemKindId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "item_kind_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "phase_id?: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "pinned_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "pinned_version"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "activation: Activation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "activation"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "globs",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "globs"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "languages",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "languages"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5aac15ab9c856da1d3fa39bd53f4a4cbb67db0fb9c2cf800ceafb3c7e8bfb278"
+}

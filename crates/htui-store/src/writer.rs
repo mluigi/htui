@@ -50,9 +50,9 @@ use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::model::{Integration, LandOutcome};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, QueueStored, QueueTarget,
-    QueueToken, ReadStore, Result, SettingRung, StepFence, StoredSetting, UpdateOutcome,
-    WriteStore,
+    BindingHome, CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, QueueStored,
+    QueueTarget, QueueToken, ReadStore, Result, SettingRung, StepFence, StoredSetting,
+    UpdateOutcome, WriteStore,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -988,10 +988,10 @@ impl WriteStore for Writer {
         }
     }
 
-    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>> {
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
         match self {
-            Self::Memory(store) => store.skill_bindings(project).await,
-            Self::Online(pg) => pg.skill_bindings(project).await,
+            Self::Memory(store) => store.skill_bindings(home).await,
+            Self::Online(pg) => pg.skill_bindings(home).await,
         }
     }
 

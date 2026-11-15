@@ -519,7 +519,7 @@ mod tests {
         import, read_text, root_shape, walk,
     };
     use crate::skills::SkillEntry;
-    use htui_core::store::{MemStore, WriteStore as _};
+    use htui_core::store::{BindingHome, MemStore, WriteStore as _};
     use htui_store::Backend;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -845,7 +845,10 @@ mod tests {
     async fn an_import_writes_no_attachment() {
         let backend = demo();
         let writer = backend.writer().expect("writes");
-        let before = writer.skill_bindings(None).await.expect("readable");
+        let before = writer
+            .skill_bindings(BindingHome::Global)
+            .await
+            .expect("readable");
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("rules").join("always.mdc");
         fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
@@ -858,7 +861,10 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(
-            writer.skill_bindings(None).await.expect("readable"),
+            writer
+                .skill_bindings(BindingHome::Global)
+                .await
+                .expect("readable"),
             before,
             "the activation keys are prefill, not state"
         );

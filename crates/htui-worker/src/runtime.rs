@@ -4557,8 +4557,8 @@ mod queue_store_errors {
     use htui_core::model::{
         AgentBox, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
         DocumentHead, Item, ItemId, ItemSummary, PhaseAgent, PhaseId, ProjectId, PromptTemplate,
-        QueueBatch, QueueEntry, RepoBoxPath, ResolvedGraph, Run, RunId, RunStep, RunSummary, Scope,
-        Status, UserId, WorkspaceSummary,
+        QueueBatch, QueueEntry, RepoBoxPath, ResolveScope, ResolvedGraph, Run, RunId, RunStep,
+        RunSummary, Scope, Status, UserId, WorkspaceSummary,
     };
     use htui_core::store::{MemStore, ReadStore as _, Result, StoreError, WorkerHost};
     use htui_store::Backend;
@@ -4692,12 +4692,8 @@ mod queue_store_errors {
         async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
             WorkerHost::agent_boxes(&self.inner, box_id).await
         }
-        async fn bound_skills(
-            &self,
-            project: ProjectId,
-            phase: Option<PhaseId>,
-        ) -> Result<Vec<BoundSkill>> {
-            WorkerHost::bound_skills(&self.inner, project, phase).await
+        async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
+            WorkerHost::bound_skills(&self.inner, scope).await
         }
         async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
             WorkerHost::missing_tags(&self.inner, item, box_id).await

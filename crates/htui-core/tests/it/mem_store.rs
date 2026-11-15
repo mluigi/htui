@@ -62,7 +62,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        358,
+        362,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -131,7 +131,8 @@ async fn demo_store_loads_the_fixture() {
          waiting row and the retry (E1-E5), and MOD-130 M3 T1's driving-box case (D8, P6), and \
          MOD-130 M3 T2's three for the claim keyed on the driver with tags read on the target box \
          (D8, D9, P4), and MOD-133 M3's five for a pushed `pull_request` record: its settle, the \
-         take that skips it, its dependents and the retry (plan D5)"
+         take that skips it, its dependents and the retry (plan D5), and MOD-127 M1's four for the \
+         workspace and item-kind attachment levels (D2, D3, D6)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

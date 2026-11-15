@@ -31,9 +31,9 @@ use htui_core::model::{
     MemoryState, Note, PhaseAgent, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
     PromptTemplate, QueueBatch, QueueEntry, QueueMove, QueueRow, RepoBoxPath, RepoId, Requirement,
     RequirementArea, RequirementFilter, RequirementId, RequirementRevision, RequirementSpec,
-    ResolvedGraph, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    RunSummary, Scope, SessionEvent, StepGraph, StepGraphId, StepId, ToolCallCount, UpstreamEntry,
-    UserId, WaitingCandidate, WorkspaceId, WorkspaceSummary,
+    ResolveScope, ResolvedGraph, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId, StepId, ToolCallCount,
+    UpstreamEntry, UserId, WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::model::{IndexedCollection, IndexerLease, LeaseTake};
 use htui_core::store::{IndexerLeaseStore, MemStore, ReadStore, Result, StoreError, WriteStore};
@@ -372,14 +372,10 @@ impl Backend {
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
     /// [`PROMPT_ON_SERVER_ONLY`].
-    pub async fn bound_skills(
-        &self,
-        project: ProjectId,
-        phase: Option<PhaseId>,
-    ) -> Result<Vec<BoundSkill>> {
+    pub async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
         match self {
-            Self::Memory(store) => store.bound_skills(project, phase).await,
-            Self::Online { pg, .. } => pg.bound_skills(project, phase).await,
+            Self::Memory(store) => store.bound_skills(scope).await,
+            Self::Online { pg, .. } => pg.bound_skills(scope).await,
             Self::Offline { .. } => Err(prompt_offline()),
         }
     }

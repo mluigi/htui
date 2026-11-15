@@ -36,7 +36,8 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// one of `0036_activity_event.sql` (MOD-122 M3 plan D2), then the
 /// one of `0038_indexer_lease.sql` (MOD-159 M1 plan D2), then the one of
 /// `0039_integration.sql` (MOD-133 M1 plan D5), then the one of
-/// `0040_execution_targets.sql` (MOD-130 M1).
+/// `0040_execution_targets.sql` (MOD-130 M1). `0041_toolbox_binding.sql` (MOD-127 M1) renames
+/// `skill_binding` to `toolbox_binding` and adds none.
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -63,7 +64,7 @@ const TABLES: &[&str] = &[
     "document",
     "skill",
     "skill_version",
-    "skill_binding",
+    "toolbox_binding",
     "run",
     "run_step",
     "run_step_commit",
@@ -139,7 +140,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -158,7 +159,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql, \
          MOD-149's 0035_requirement_keys.sql, MOD-122 M3's 0036_activity_event.sql, MOD-125 M4's \
          0037_stopped_run_index.sql, MOD-159 M1's 0038_indexer_lease.sql, MOD-133 M1's \
-         0039_integration.sql and MOD-130 M1's 0040_execution_targets.sql, in ordinal order"
+         0039_integration.sql, MOD-130 M1's 0040_execution_targets.sql and MOD-127 M1's \
+         0041_toolbox_binding.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -466,27 +468,66 @@ const MOD9_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
          builder",
     ),
     (
-        "skill_binding",
-        "project_id",
-        "NULL = global attachment (every project)",
-    ),
-    (
-        "skill_binding",
-        "activation",
-        "always | glob | off; the most specific attachment of a skill wins (ANA-22)",
-    ),
-    (
-        "skill_binding",
-        "globs",
-        "effective globs: typed plus languages expanded at save; <repo>:<glob> only on project or \
-         phase rows",
-    ),
-    (
-        "skill_binding",
+        "toolbox_binding",
         "languages",
         "languages as authored; display only",
     ),
 ];
+
+/// The `COMMENT ON COLUMN` texts of `0041_toolbox_binding.sql` (MOD-127 M1 D3), verbatim, for
+/// [`ANA_COLUMN_COMMENTS`]'s reason. `toolbox_binding.languages` keeps its `0007` text, in
+/// [`MOD9_COLUMN_COMMENTS`], and the rename carried it over.
+const MOD127_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "toolbox_binding",
+        "kind",
+        "the entry kind; skill is the only one so far",
+    ),
+    (
+        "toolbox_binding",
+        "ref_id",
+        "the entry of that kind; no foreign key (the referent table depends on kind), checked on \
+         write",
+    ),
+    (
+        "toolbox_binding",
+        "workspace_id",
+        "set alone = workspace attachment (every project of it)",
+    ),
+    (
+        "toolbox_binding",
+        "project_id",
+        "NULL with every other key NULL = global attachment (every project); alone = project level",
+    ),
+    (
+        "toolbox_binding",
+        "item_kind_id",
+        "with project_id = one item kind of that project",
+    ),
+    (
+        "toolbox_binding",
+        "phase_id",
+        "with project_id = one phase of that project",
+    ),
+    (
+        "toolbox_binding",
+        "activation",
+        "always | glob | off; the most specific attachment of an entry wins (ANA-22)",
+    ),
+    (
+        "toolbox_binding",
+        "globs",
+        "effective globs: typed plus languages expanded at save; <repo>:<glob> only on project, \
+         item kind or phase rows",
+    ),
+];
+
+/// The one `COMMENT ON TABLE` of `0041_toolbox_binding.sql` (MOD-127 M1 D3), verbatim.
+const MOD127_TABLE_COMMENT: (&str, &str) = (
+    "toolbox_binding",
+    "attaches a toolbox entry (kind, ref_id) to a scope; the level is derived from the four scope \
+     keys",
+);
 
 /// The one `COMMENT ON COLUMN` text of `0009_agent_box_user_off.sql` (MOD-23 plan D242), verbatim,
 /// for [`ANA_COLUMN_COMMENTS`]'s reason.
@@ -1390,6 +1431,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD139_COLUMN_COMMENTS)
         .chain(MOD164_COLUMN_COMMENTS)
         .chain(MOD130_COLUMN_COMMENTS)
+        .chain(MOD127_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -1407,8 +1449,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             actual.as_deref(),
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
-             MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163, MOD-163 M2, MOD-139, MOD-164 or \
-             MOD-130) text byte for byte"
+             MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163, MOD-163 M2, MOD-139, MOD-164, \
+             MOD-130 or MOD-127) text byte for byte"
         );
     }
 
@@ -1420,6 +1462,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         MOD146_TABLE_COMMENT,
         MOD139_TABLE_COMMENT,
         MOD130_TABLE_COMMENT,
+        MOD127_TABLE_COMMENT,
     ]
     .into_iter()
     .chain(MOD137_TABLE_COMMENTS.iter().copied())
@@ -1471,6 +1514,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD139_COLUMN_COMMENTS)
             .chain(MOD164_COLUMN_COMMENTS)
             .chain(MOD130_COLUMN_COMMENTS)
+            .chain(MOD127_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -1497,6 +1541,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD139_COLUMN_COMMENTS)
         .chain(MOD164_COLUMN_COMMENTS)
         .chain(MOD130_COLUMN_COMMENTS)
+        .chain(MOD127_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
@@ -4401,8 +4446,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(40),
-        "forty embedded migrations, none applied (through MOD-130 M1's 0040_execution_targets.sql)"
+        MigrationState::Pending(41),
+        "forty-one embedded migrations, none applied (through MOD-127 M1's 0041_toolbox_binding.sql)"
     );
 
     db.drop_db().await;
@@ -4502,8 +4547,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(40),
-        "forty embedded migrations, through MOD-130 M1's 0040_execution_targets.sql"
+        MigrationState::Pending(41),
+        "forty-one embedded migrations, through MOD-127 M1's 0041_toolbox_binding.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4511,8 +4556,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(40),
-        "every one of the forty, through MOD-130 M1's 0040_execution_targets.sql, is pending"
+        HeadlessError::MigrationsPending(41),
+        "every one of the forty-one, through MOD-127 M1's 0041_toolbox_binding.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4534,8 +4579,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(40),
-        "every one of the forty, through MOD-130 M1's 0040_execution_targets.sql, is pending"
+        HeadlessError::MigrationsPending(41),
+        "every one of the forty-one, through MOD-127 M1's 0041_toolbox_binding.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4686,8 +4731,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        40,
-        "the later applies migrate nothing: the forty embedded migrations (through MOD-130 M1's 0040_execution_targets.sql) are applied once"
+        41,
+        "the later applies migrate nothing: the forty-one embedded migrations (through MOD-127 M1's 0041_toolbox_binding.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -9459,6 +9504,332 @@ async fn migration_0040_seeds_the_code_seed() {
             htui_core::model::TargetKind::Local.as_str().to_owned(),
         )],
         "0040's one row is seed::LOCAL_TARGET_ID and LOCAL_TARGET_NAME"
+    );
+
+    db.drop_db().await;
+}
+
+/// Inserts one `toolbox_binding` row of `kind` through the 0041 columns; the result is the
+/// statement's, so a refusal can be asserted.
+async fn try_toolbox_row(
+    pool: &sqlx::PgPool,
+    kind: &str,
+    ref_id: uuid::Uuid,
+    keys: [Option<uuid::Uuid>; 4],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO toolbox_binding \
+         (kind, ref_id, workspace_id, project_id, item_kind_id, phase_id) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(kind)
+    .bind(ref_id)
+    .bind(keys[0])
+    .bind(keys[1])
+    .bind(keys[2])
+    .bind(keys[3])
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// One `toolbox_binding` row as the 0041 test reads it: id, kind, ref_id, the four scope keys,
+/// position, activation, globs.
+type ToolboxRow = (
+    uuid::Uuid,
+    String,
+    uuid::Uuid,
+    Option<uuid::Uuid>,
+    Option<uuid::Uuid>,
+    Option<uuid::Uuid>,
+    Option<uuid::Uuid>,
+    i32,
+    String,
+    Vec<String>,
+);
+
+/// MOD-127 M1 (D2, D3): `0041_toolbox_binding.sql` over a populated v40 schema. The old rows keep
+/// their ids, pins, positions, activations and globs under kind `skill`; the old table and its
+/// column are gone; the scope-shape CHECK admits the five valid shapes and refuses the others
+/// under its own name; the unique key counts every key and treats NULLs as equal; the kind CHECK
+/// admits only `skill`; `ref_id` has no foreign key; the workspace and item kind cascade to their
+/// rows; and an update moves `updated_at`.
+#[tokio::test]
+async fn migration_0041_renames_skill_binding_into_toolbox_binding() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(40, &db.pool)
+        .await
+        .expect("apply 0001 through 0040");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod127").await;
+    let pk = plant_project_kind(pool, user, "toolbox").await;
+    let (project, kind) = pk;
+    let graph = insert_graph(pool, project, "feature").await;
+    let phase = insert_phase(pool, graph, 0, "implement", 1, 0).await;
+    let skill = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO skill (id, name, created_by) VALUES ($1, 'house', $2)")
+        .bind(skill)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert a skill");
+    let (global_row, project_row, phase_row) = (
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+    );
+    for (id, project_id, phase_id, position, activation, globs) in [
+        (global_row, None, None, 5, "always", Vec::<String>::new()),
+        (
+            project_row,
+            Some(project),
+            None,
+            2,
+            "glob",
+            vec!["**/*.rs".to_owned()],
+        ),
+        (phase_row, Some(project), Some(phase), 0, "off", Vec::new()),
+    ] {
+        sqlx::query(
+            "INSERT INTO skill_binding \
+             (id, skill_id, project_id, phase_id, position, activation, globs) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(id)
+        .bind(skill)
+        .bind(project_id)
+        .bind(phase_id)
+        .bind(position)
+        .bind(activation)
+        .bind(globs)
+        .execute(pool)
+        .await
+        .expect("insert an old-shape row");
+    }
+
+    MIGRATOR.run_to(41, pool).await.expect("apply 0041");
+
+    let old: Option<String> = sqlx::query_scalar("SELECT to_regclass('skill_binding')::text")
+        .fetch_one(pool)
+        .await
+        .expect("ask for the old table");
+    assert_eq!(old, None, "the old table is renamed away");
+    let kept: Vec<ToolboxRow> = sqlx::query_as(
+        "SELECT id, kind, ref_id, workspace_id, project_id, item_kind_id, phase_id, position, \
+                activation, globs \
+           FROM toolbox_binding ORDER BY position DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the renamed rows");
+    assert_eq!(
+        kept,
+        vec![
+            (
+                global_row,
+                "skill".to_owned(),
+                skill,
+                None,
+                None,
+                None,
+                None,
+                5,
+                "always".to_owned(),
+                Vec::new()
+            ),
+            (
+                project_row,
+                "skill".to_owned(),
+                skill,
+                None,
+                Some(project),
+                None,
+                None,
+                2,
+                "glob".to_owned(),
+                vec!["**/*.rs".to_owned()]
+            ),
+            (
+                phase_row,
+                "skill".to_owned(),
+                skill,
+                None,
+                Some(project),
+                None,
+                Some(phase),
+                0,
+                "off".to_owned(),
+                Vec::new()
+            ),
+        ],
+        "the old rows keep their ids and columns, gain kind skill and no workspace or item kind"
+    );
+
+    // The five valid shapes beside one skill, each once.
+    let other = uuid::Uuid::now_v7();
+    let workspace = insert_workspace(pool, user, "toolbox-ws").await;
+    for (what, keys) in [
+        ("a workspace row", [Some(workspace), None, None, None]),
+        ("an item-kind row", [None, Some(project), Some(kind), None]),
+    ] {
+        try_toolbox_row(pool, "skill", other, keys)
+            .await
+            .unwrap_or_else(|err| panic!("{what} is admitted: {err}"));
+    }
+    // `ref_id` names no skill: the foreign key went with the rename (D3).
+    assert_eq!(
+        common::count(pool, "toolbox_binding").await,
+        5,
+        "the two new shapes landed, one of them against a ref_id no skill has"
+    );
+
+    for (what, keys) in [
+        (
+            "a workspace with a project",
+            [Some(workspace), Some(project), None, None],
+        ),
+        (
+            "a workspace with an item kind",
+            [Some(workspace), Some(project), Some(kind), None],
+        ),
+        (
+            "an item kind without a project",
+            [None, None, Some(kind), None],
+        ),
+        (
+            "an item kind with a phase",
+            [None, Some(project), Some(kind), Some(phase)],
+        ),
+        (
+            "a workspace with a phase",
+            [Some(workspace), None, None, Some(phase)],
+        ),
+    ] {
+        let refused = try_toolbox_row(pool, "skill", uuid::Uuid::now_v7(), keys)
+            .await
+            .expect_err("a shape the levels do not name is refused");
+        // A phase without a project is the older CHECK's to refuse; the rest are the new one's.
+        let text = refused_by(refused);
+        assert!(
+            text.starts_with("toolbox_binding_scope_shape: ")
+                || text.starts_with("toolbox_binding_phase_needs_project: "),
+            "{what}: refused by a scope check, got {text}"
+        );
+    }
+    assert_refused_by(
+        try_toolbox_row(
+            pool,
+            "skill",
+            uuid::Uuid::now_v7(),
+            [Some(workspace), Some(project), None, None],
+        )
+        .await
+        .expect_err("refused"),
+        "toolbox_binding_scope_shape",
+        "a workspace with a project",
+    );
+    assert_refused_by(
+        try_toolbox_row(
+            pool,
+            "skill",
+            uuid::Uuid::now_v7(),
+            [None, Some(project), Some(kind), Some(phase)],
+        )
+        .await
+        .expect_err("refused"),
+        "toolbox_binding_scope_shape",
+        "an item kind with a phase",
+    );
+    assert_refused_by(
+        try_toolbox_row(
+            pool,
+            "skill",
+            uuid::Uuid::now_v7(),
+            [None, None, Some(kind), None],
+        )
+        .await
+        .expect_err("refused"),
+        "toolbox_binding_scope_shape",
+        "an item kind without a project",
+    );
+    assert_refused_by(
+        try_toolbox_row(pool, "mcp", uuid::Uuid::now_v7(), [None, None, None, None])
+            .await
+            .expect_err("refused"),
+        "toolbox_binding_kind_check",
+        "a kind M1 does not know",
+    );
+    assert_refused_by(
+        try_toolbox_row(pool, "skill", other, [Some(workspace), None, None, None])
+            .await
+            .expect_err("refused"),
+        "toolbox_binding_key",
+        "a second workspace row of one entry",
+    );
+    assert_refused_by(
+        try_toolbox_row(pool, "skill", skill, [None, None, None, None])
+            .await
+            .expect_err("refused"),
+        "toolbox_binding_key",
+        "a second global row of one entry (NULLs are equal in the key)",
+    );
+    assert_eq!(
+        common::count(pool, "toolbox_binding").await,
+        5,
+        "the refusals wrote nothing"
+    );
+
+    let before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM toolbox_binding WHERE id = $1")
+            .bind(project_row)
+            .fetch_one(pool)
+            .await
+            .expect("read updated_at");
+    sqlx::query("UPDATE toolbox_binding SET position = 3 WHERE id = $1")
+        .bind(project_row)
+        .execute(pool)
+        .await
+        .expect("update a row");
+    let after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM toolbox_binding WHERE id = $1")
+            .bind(project_row)
+            .fetch_one(pool)
+            .await
+            .expect("read updated_at");
+    assert!(after > before, "the renamed trigger still moves updated_at");
+
+    sqlx::query("DELETE FROM workspace WHERE id = $1")
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .expect("delete the workspace");
+    assert_eq!(
+        common::count(pool, "toolbox_binding").await,
+        4,
+        "a workspace's row goes with it"
+    );
+    sqlx::query("DELETE FROM item_kind WHERE id = $1")
+        .bind(kind)
+        .execute(pool)
+        .await
+        .expect("delete the item kind");
+    assert_eq!(
+        common::count(pool, "toolbox_binding").await,
+        3,
+        "an item kind's row goes with it"
+    );
+    sqlx::query("DELETE FROM project WHERE id = $1")
+        .bind(project)
+        .execute(pool)
+        .await
+        .expect("delete the project");
+    assert_eq!(
+        common::count(pool, "toolbox_binding").await,
+        1,
+        "a project's rows go with it and the global row stays"
     );
 
     db.drop_db().await;
