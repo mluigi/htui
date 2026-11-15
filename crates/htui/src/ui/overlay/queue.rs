@@ -721,9 +721,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, ItemState,
-        PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectId, ProjectRef, QueueEntry, RunId,
-        RunStatus, Status, StepId, Wait, WorkspaceId,
+        BatchFigures, BatchId, BatchStop, BoxId, CapError, Escalation, Hold, ItemState, LiveFacts,
+        PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectId, ProjectRef, QueueEntry, QueueRunFact,
+        RunId, RunMode, RunStatus, Status, StepId, Wait, WorkspaceId, classify_entry,
     };
     use htui_core::store::StoreError;
     use htui_store::DATABASE_UNREACHABLE;
@@ -1040,6 +1040,57 @@ mod tests {
             );
         }
         insta::assert_snapshot!("states", bench.render(&overlay));
+    }
+
+    /// MOD-130 M4 T4 (P3): the `Elsewhere` sentence names the driving box, `queued for` while the
+    /// run waits and `running on` once it runs; a driver nobody answers for reads `another box`.
+    #[test]
+    fn the_elsewhere_sentence_names_the_driver() {
+        let run = RunId::new();
+        let cases = [
+            (Some("driver"), RunStatus::Queued, "queued for driver"),
+            (Some("driver"), RunStatus::Running, "running on driver"),
+            (None, RunStatus::Queued, "queued for another box"),
+            (None, RunStatus::Running, "running on another box"),
+        ];
+        for (hostname, status, want) in cases {
+            let state = EntryState::Elsewhere {
+                run,
+                hostname: hostname.map(str::to_owned),
+                status,
+            };
+            assert_eq!(sentence(&state), want, "{state:?}");
+        }
+    }
+
+    /// MOD-130 M4 T4 (P3): a run whose work targets one box and is driven by another reads as the
+    /// driver's, through `classify_entry` and then `sentence`, never as the target's.
+    #[test]
+    fn a_run_driven_by_one_box_and_targeted_at_another_reads_as_the_driver() {
+        let here = BoxId::from_uuid(uuid::Uuid::from_u128(1));
+        let target = BoxId::from_uuid(uuid::Uuid::from_u128(2));
+        let driver = BoxId::from_uuid(uuid::Uuid::from_u128(3));
+        for (status, want) in [
+            (RunStatus::Queued, "queued for driver-box"),
+            (RunStatus::Running, "running on driver-box"),
+        ] {
+            let mut queued = row("QX-1", "t");
+            queued.latest_run = Some(QueueRunFact {
+                id: RunId::new(),
+                status,
+                mode: RunMode::Auto,
+                target_box_id: target,
+                target_hostname: Some("target-box".to_owned()),
+                driver_box_id: driver,
+                driver_hostname: Some("driver-box".to_owned()),
+                failure: None,
+                parked_step: None,
+            });
+            let state = classify_entry(&queued, here, &LiveFacts::default());
+            let said = sentence(&state);
+            assert_eq!(said, want, "{status:?}: {state:?}");
+            assert!(!said.contains("target-box"), "{said}");
+        }
     }
 
     /// Finding F1: the cap refusals the fixture leaves out read in words too, and a note or a

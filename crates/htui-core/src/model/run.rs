@@ -462,8 +462,8 @@ pub struct ChatRunSpec {
     pub step_id: StepId,
     /// `run.project_id`.
     pub project_id: ProjectId,
-    /// `run.target_box_id`; version one executes only when it is local, so it is also
-    /// `run.executing_box_id`.
+    /// `run.target_box_id`: this box. A chat run has no target (MOD-130 D17) and always runs and
+    /// is driven here, so it is also `run.executing_box_id`.
     pub target_box_id: BoxId,
     /// `run.started_by`.
     pub started_by: UserId,
