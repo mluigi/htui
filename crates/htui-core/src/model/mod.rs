@@ -232,7 +232,10 @@ pub use skill::{
 };
 pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
-pub use stop::{PendingStop, StopMode, WorkspaceStop, WorkspaceStopState};
+pub use stop::{
+    InBackground, PendingStop, StopMode, WorkspaceLifecycle, WorkspaceRunCounts, WorkspaceStop,
+    WorkspaceStopState,
+};
 pub use target::{
     AttachedBox, DEFAULT_TARGET_KEY, DefaultTarget, NewChildBox, NewTarget, RUNNABLE_KINDS, Target,
     TargetEdit, TargetKind, TargetStatus, locator_refusal, target_name_refusal,
