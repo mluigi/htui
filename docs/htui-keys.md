@@ -219,6 +219,7 @@ open       = ["o"]              # open workspace
 stop       = ["s"]              # stop runs
 resume     = ["r"]              # resume runs
 new        = ["N"]              # new workspace or project
+target     = ["T"]              # default target
 yes        = ["y", "enter"]     # yes
 next_field = ["tab", "down"]    # next field
 prev_field = ["backtab", "up"]  # previous field

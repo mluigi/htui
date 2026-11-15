@@ -620,6 +620,8 @@ pub enum Act {
     /// `workspaces.new`: create a workspace, or a project in the selected row's workspace
     /// (MOD-116 M3 D1).
     WorkspacesNew,
+    /// `workspaces.target`: set the selected row's workspace's default target (MOD-116 M3 D9).
+    WorkspacesTarget,
     /// `waiting.open`: open the selected waiting step.
     WaitingOpen,
     /// `skills.switch_view`: toggle between the Library and Templates views.
@@ -1834,6 +1836,14 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "new",
         &["N"],
         "new workspace or project",
+    ),
+    // MOD-116 M3 D9: ui/tabs/workspaces/mod.rs: on_key, the target picker.
+    row(
+        Act::WorkspacesTarget,
+        Workspaces,
+        "target",
+        &["T"],
+        "default target",
     ),
     // [waiting]
     // waiting_list.rs:284.
@@ -3135,6 +3145,7 @@ mod tests {
         Act::WorkspacesResume,
         Act::LeaveStop,
         Act::WorkspacesNew,
+        Act::WorkspacesTarget,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3397,6 +3408,7 @@ mod tests {
             Act::WorkspacesResume => 253,
             Act::LeaveStop => 254,
             Act::WorkspacesNew => 255,
+            Act::WorkspacesTarget => 256,
         }
     }
 
@@ -3435,8 +3447,8 @@ mod tests {
         // MOD-122 M3 D10: `activity.open` and `activity.filter`, 252.
         // MOD-116 M1 D10: `workspaces.open` took the retired `switcher.switch`'s row, still 252.
         // MOD-116 M2 D10: `workspaces.stop` and `workspaces.resume`, 254; `leave.stop`, 255.
-        // MOD-116 M3 D14: `workspaces.new`, 256.
-        assert_eq!(CATALOGUE.len(), 256);
+        // MOD-116 M3 D14: `workspaces.new`, 256; `workspaces.target`, 257.
+        assert_eq!(CATALOGUE.len(), 257);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {

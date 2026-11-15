@@ -1227,8 +1227,8 @@ pub const LOGS_BROWSE: Stack<'static> = Stack::new(&[
 ]);
 
 /// The Workspaces tab (MOD-116 M1 D10): its own verbs (open, MOD-116 M2 D6's stop and resume,
-/// M3 D1's new), every list act (the moves and the fold), the pane scroll, then the layout and
-/// history layers of a list + detail tab.
+/// M3 D1's new, D9's default target), M3 D14's common edit and delete, every list act (the moves
+/// and the fold), the pane scroll, then the layout and history layers of a list + detail tab.
 pub const WORKSPACES_BROWSE: Stack<'static> = Stack::new(&[
     Layer::view(
         Context::Workspaces,
@@ -1237,8 +1237,10 @@ pub const WORKSPACES_BROWSE: Stack<'static> = Stack::new(&[
             Act::WorkspacesStop,
             Act::WorkspacesResume,
             Act::WorkspacesNew,
+            Act::WorkspacesTarget,
         ],
     ),
+    Layer::only(Context::Common, &[Act::Edit, Act::Delete]),
     LIST_ALL,
     PANE_SCROLL,
     LAYOUT,
@@ -1400,6 +1402,7 @@ mod tests {
         source!("ui/tabs/workspaces/mod.rs"),
         source!("ui/tabs/workspaces/chooser.rs"),
         source!("ui/tabs/workspaces/forms.rs"),
+        source!("ui/tabs/workspaces/delete.rs"),
         source!("ui/shell/activity.rs"),
     ];
 
@@ -2023,6 +2026,10 @@ mod tests {
         // `y`/`enter` and `n`/`esc`; the forms capture text, `tab`/`down` move, `h`/`l` cycle
         // the source and `enter` submits.
         assert_eq!(resolve(WORKSPACES_BROWSE, "N"), [Act::WorkspacesNew]);
+        // MOD-116 M3 D14 (T4): `e` edits, `d` deletes, `T` sets the default target.
+        assert_eq!(resolve(WORKSPACES_BROWSE, "e"), [Act::Edit]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "d"), [Act::Delete]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "T"), [Act::WorkspacesTarget]);
         assert_eq!(resolve(WORKSPACES_PICK, "j"), [Act::ListDown]);
         assert_eq!(resolve(WORKSPACES_PICK, "k"), [Act::ListUp]);
         assert_eq!(resolve(WORKSPACES_PICK, "enter"), [Act::ConfirmYes]);

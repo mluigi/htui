@@ -2,6 +2,10 @@
 //! slug, folder, description) and a new project in a workspace (name, slug, description, where its
 //! repository comes from, and the folder or the URL), each with a preview of what it writes.
 //!
+//! The workspace form also edits one (D5, [`WorkspaceForm::edit`]): prefilled from the held
+//! overview, sent under compare-and-set on the row's `updated_at`; neither the slug nor the folder
+//! follows anything there, and a changed folder points the workspace at it (nothing is moved).
+//!
 //! In both the slug follows the name until the slug field is edited (D2, [`slug_of`]); the
 //! workspace's folder follows the slug until the folder field is edited; a project's
 //! destination (`<workspace folder>/projects/<slug>`) always follows its slug and is not a field.
@@ -18,8 +22,12 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use crossterm::event::KeyEvent;
-use htui_core::model::{WORKSPACES_DIR, WorkspaceId, project_folder, slug_of, workspace_folder};
+use htui_core::model::{
+    WORKSPACES_DIR, Workspace, WorkspaceId, WorkspacePatch, project_folder, slug_of,
+    workspace_folder,
+};
 use htui_orch::infer::redact_remote;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -51,6 +59,13 @@ const STARTS_STOPPED: &str = "A new workspace starts stopped.";
 
 /// The workspace preview with no folder to show.
 const TYPE_A_FOLDER: &str = "type the folder: an absolute path, or one under ~";
+
+/// The folder field's help line on an edit (D5).
+const NOTHING_MOVED: &str = "changing it points the workspace at another folder; nothing is moved";
+
+/// The edit's preview (D5): what a changed folder leaves behind, said with no field focused.
+const OLD_FOLDER_STAYS: &str = "A changed folder is made if missing and used from now on; the old \
+                                folder and what it holds stay where they are.";
 
 /// What a project's destination reads while the workspace has no folder on this box, or the
 /// slug is not one plain name.
@@ -94,7 +109,18 @@ pub(super) enum FormOutcome {
     Pass,
 }
 
-/// The new-workspace form (D4).
+/// The workspace a [`WorkspaceForm`] edits (D5).
+#[derive(Debug, Clone)]
+struct Edit {
+    /// It.
+    id: WorkspaceId,
+    /// The `updated_at` the write is checked against.
+    expected: DateTime<Utc>,
+    /// Its name when the form opened, for the title.
+    name: String,
+}
+
+/// The new-workspace form (D4), or the edit of one (D5).
 #[derive(Debug)]
 pub(super) struct WorkspaceForm {
     /// `workspace.name`.
@@ -117,6 +143,8 @@ pub(super) struct WorkspaceForm {
     busy: Option<u64>,
     /// The last refusal, under the form.
     error: Option<String>,
+    /// The workspace edited; `None` on a new one.
+    edit: Option<Edit>,
 }
 
 /// The workspace form's fields in focus order.
@@ -136,7 +164,48 @@ impl WorkspaceForm {
             home: home.map(Path::to_path_buf),
             busy: None,
             error: None,
+            edit: None,
         }
+    }
+
+    /// D5: the form over `workspace` as it is, its folder on this box `folder` (shown under `~`);
+    /// neither the slug nor the folder follows what is typed before it.
+    pub(super) fn edit(workspace: &Workspace, folder: Option<&Path>, home: Option<&Path>) -> Self {
+        let folder = folder.map_or_else(String::new, |folder| shown(folder, home));
+        Self {
+            name: TextField::with_text(&workspace.name),
+            slug: TextField::with_text(&workspace.slug),
+            folder: TextField::with_text(&folder),
+            description: TextField::with_text(&workspace.description),
+            slug_edited: true,
+            folder_edited: true,
+            edit: Some(Edit {
+                id: workspace.id,
+                expected: workspace.updated_at,
+                name: workspace.name.clone(),
+            }),
+            ..Self::new(home)
+        }
+    }
+
+    /// D5 Stale: the text stays; the next `Enter` is checked against `current`.
+    pub(super) fn retoken(&mut self, current: &Workspace) {
+        if let Some(edit) = &mut self.edit {
+            edit.expected = current.updated_at;
+        }
+    }
+
+    /// The workspace edited, if this is an edit.
+    pub(super) fn editing(&self) -> Option<WorkspaceId> {
+        self.edit.as_ref().map(|edit| edit.id)
+    }
+
+    /// The form's title: `New workspace`, or `Edit <name>`.
+    pub(super) fn title(&self) -> String {
+        self.edit.as_ref().map_or_else(
+            || "New workspace".to_owned(),
+            |edit| format!("Edit {}", edit.name),
+        )
     }
 
     /// The focused text field.
@@ -220,6 +289,18 @@ impl WorkspaceForm {
         };
         self.error = None;
         self.busy = Some(0);
+        if let Some(edit) = &self.edit {
+            return FormOutcome::Submit(Box::new(StoreRequest::EditWorkspace {
+                id: edit.id,
+                expected: edit.expected,
+                patch: WorkspacePatch {
+                    slug: Some(text(&self.slug).trim().to_owned()),
+                    name: Some(text(&self.name).trim().to_owned()),
+                    description: Some(text(&self.description).to_owned()),
+                },
+                folder: folder.display().to_string(),
+            }));
+        }
         FormOutcome::Submit(Box::new(StoreRequest::NewWorkspace {
             slug: text(&self.slug).trim().to_owned(),
             name: text(&self.name).trim().to_owned(),
@@ -258,15 +339,21 @@ impl WorkspaceForm {
             .field(Field::new("name", Value::Text(&self.name)))
             .field(Field::new("slug", Value::Text(&self.slug)))
             .field(
-                Field::new("folder", Value::Text(&self.folder))
-                    .help("an absolute path, or one under ~"),
+                Field::new("folder", Value::Text(&self.folder)).help(if self.edit.is_some() {
+                    NOTHING_MOVED
+                } else {
+                    "an absolute path, or one under ~"
+                }),
             )
             .field(Field::new("description", Value::Text(&self.description)))
             .focus(self.focus)
             .editing(self.busy.is_none());
-        let busy = self
-            .busy
-            .map(|seconds| counted("creating the workspace\u{2026}".to_owned(), seconds));
+        let doing = if self.edit.is_some() {
+            "saving the workspace\u{2026}"
+        } else {
+            "creating the workspace\u{2026}"
+        };
+        let busy = self.busy.map(|seconds| counted(doing.to_owned(), seconds));
         assemble(
             form.lines(width, ctx.accent(), ctx.theme),
             self.error.as_deref(),
@@ -281,6 +368,10 @@ impl WorkspaceForm {
     /// `projects/` each with what it is, the components line, then the state a new workspace
     /// starts in.
     fn preview(&self) -> Vec<String> {
+        // An edit writes nothing new: what a changed folder does is all there is to say.
+        if self.edit.is_some() {
+            return vec![OLD_FOLDER_STAYS.to_owned()];
+        }
         let folder = text(&self.folder).trim().trim_end_matches('/');
         let mut lines = Vec::new();
         if folder.is_empty() {
@@ -976,6 +1067,58 @@ mod tests {
             workspace_key(&mut form, "esc"),
             FormOutcome::Cancel
         ));
+    }
+
+    /// D5: an edit opens prefilled, follows nothing, and sends the row's token; a stale reply's
+    /// row is the next one's.
+    #[test]
+    fn an_edit_is_prefilled_follows_nothing_and_sends_its_token() {
+        let now = chrono::Utc::now();
+        let row = htui_core::model::Workspace {
+            id: ids::WORKSPACE_GRAPHICS,
+            slug: "graphics".to_owned(),
+            name: "Graphics".to_owned(),
+            description: "pixels".to_owned(),
+            created_by: htui_core::model::UserId::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let mut form = WorkspaceForm::edit(
+            &row,
+            Some(Path::new("/home/u/graphics")),
+            Some(Path::new(HOME)),
+        );
+        assert_eq!(form.title(), "Edit Graphics");
+        assert_eq!(form.editing(), Some(ids::WORKSPACE_GRAPHICS));
+        assert_eq!(form.folder(), "~/graphics");
+        type_into_workspace(&mut form, " Lab");
+        assert_eq!(form.slug(), "graphics", "the slug does not follow the name");
+        assert_eq!(form.folder(), "~/graphics");
+        assert_eq!(form.preview(), [super::OLD_FOLDER_STAYS]);
+
+        let later = now + chrono::Duration::seconds(1);
+        form.retoken(&htui_core::model::Workspace {
+            updated_at: later,
+            ..row
+        });
+        let FormOutcome::Submit(request) = workspace_key(&mut form, "enter") else {
+            panic!("the form submits");
+        };
+        let StoreRequest::EditWorkspace {
+            id,
+            expected,
+            patch,
+            folder,
+        } = *request
+        else {
+            panic!("an edit");
+        };
+        assert_eq!(id, ids::WORKSPACE_GRAPHICS);
+        assert_eq!(expected, later);
+        assert_eq!(patch.name.as_deref(), Some("Graphics Lab"));
+        assert_eq!(patch.slug.as_deref(), Some("graphics"));
+        assert_eq!(patch.description.as_deref(), Some("pixels"));
+        assert_eq!(folder, "/home/u/graphics");
     }
 
     #[test]

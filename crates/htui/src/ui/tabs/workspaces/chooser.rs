@@ -1,5 +1,5 @@
 //! A short list in a kit modal over the Workspaces tab (MOD-116 M3 D1): `N`'s "what to create"
-//! and, in T4, the default-target picker. The path picker's shape: a `Modal` sized to its rows, a
+//! and `T`'s default-target picker (D9). The path picker's shape: a `Modal` sized to its rows, a
 //! `kit::list` inside it, the cursor's row banded, the keys on the border.
 //!
 //! The tab resolves a key through [`views::WORKSPACES_PICK`](crate::keys::views::WORKSPACES_PICK)
@@ -70,6 +70,12 @@ impl<T: Clone> Chooser<T> {
             rows,
             cursor,
         }
+    }
+
+    /// The row at `index`: what a [`ChooserOutcome::Disabled`] names (MOD-116 M3 D9: a planned
+    /// target says why it cannot be chosen).
+    pub(super) fn row(&self, index: usize) -> Option<&ChoiceRow<T>> {
+        self.rows.get(index)
     }
 
     /// One act of [`views::WORKSPACES_PICK`](crate::keys::views::WORKSPACES_PICK).
@@ -179,5 +185,7 @@ mod tests {
         let mut chooser = Chooser::new("t", vec![row("a", true, 1), row("b", false, 2)], 0);
         assert_eq!(chooser.on_act(Act::ListDown), ChooserOutcome::Stay);
         assert_eq!(chooser.on_act(Act::ConfirmYes), ChooserOutcome::Disabled(1));
+        assert_eq!(chooser.row(1).map(|row| row.value), Some(2));
+        assert_eq!(chooser.row(2), None);
     }
 }

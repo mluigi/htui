@@ -748,12 +748,14 @@ mod tests {
             ]
         );
         // MOD-116 M1 R1 F7: the Workspaces tab's box, its own verb first, as the switcher's was;
-        // M2 D6 adds stop and resume, M3 D14 new.
+        // M2 D6 adds stop and resume, M3 D14 new, then the default target and the common edit and
+        // delete.
         assert_eq!(
             texts(keys.help_lines(views::WORKSPACES_BROWSE, all)),
             [
                 "Workspaces: o open workspace · s stop runs · r resume runs \
-                 · N new workspace or project",
+                 · N new workspace or project · T default target",
+                "Common: e edit · d delete",
                 "List: j/Down down · k/Up up · g/Home top · G/End bottom · Enter fold",
                 "Pane: J scroll down · K scroll up · PgDn page down · PgUp page up",
                 "Layout: p next layout · P previous layout · > wider list · < narrower list \

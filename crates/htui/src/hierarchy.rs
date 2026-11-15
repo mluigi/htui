@@ -950,6 +950,39 @@ pub fn reach_parts(reach: &DeleteReach) -> Vec<String> {
         .collect()
 }
 
+/// The headline of a workspace delete's warning (MOD-147 A1; MOD-116 M3 D10 moved it here so the
+/// Workspaces tab and Settings › Hierarchy say the same words): its project links and box root
+/// paths, then everything else the delete takes with it, named as a project delete names them.
+#[must_use]
+pub fn workspace_delete_warning(slug: &str, reach: &DeleteReach) -> String {
+    let mut headline = format!(
+        "This deletes workspace `{slug}`: {} and {}. Its projects survive and stay reachable from other workspaces.",
+        plural(
+            usize::try_from(reach.workspace_links).unwrap_or(usize::MAX),
+            "project link",
+            "project links"
+        ),
+        plural(
+            usize::try_from(reach.workspace_box_paths).unwrap_or(usize::MAX),
+            "box root path",
+            "box root paths"
+        ),
+    );
+    // MOD-147 A1: the rest of the reach goes with the workspace, named as a project delete
+    // names them: everything its scope row owns, summed with the workspace's own
+    // workspace-scoped graphs (their step graphs, phases and phase agents). Only the two
+    // counts above are left out here, rather than said twice.
+    let owned = reach_parts(&DeleteReach {
+        workspace_links: 0,
+        workspace_box_paths: 0,
+        ..*reach
+    });
+    if !owned.is_empty() {
+        headline.push_str(&format!(" Gone for good with it: {}.", owned.join(", ")));
+    }
+    headline
+}
+
 /// `(rows, tables)`: the sum of every count and how many of them are non-zero.
 #[must_use]
 pub fn reach_totals(reach: &DeleteReach) -> (u64, usize) {
@@ -974,7 +1007,7 @@ mod tests {
 
     use super::{
         InferOutcome, box_id, infer_one, labelled, reach_parts, reach_totals, snapshot,
-        workspace_root,
+        workspace_delete_warning, workspace_root,
     };
     use crate::store_worker::{StoreRequest, serve};
 
@@ -1232,5 +1265,38 @@ mod tests {
         };
         assert_eq!(reach_totals(&reach), (29, 3));
         assert_eq!(reach_totals(&DeleteReach::default()), (0, 0));
+    }
+
+    /// MOD-116 M3 D10: the headline Settings › Hierarchy drew is the one the Workspaces tab
+    /// draws, word for word (`a_workspace_delete_names_what_its_scope_row_takes` pins it on
+    /// screen).
+    #[test]
+    fn the_workspace_delete_warning_reads_as_before() {
+        let reach = DeleteReach {
+            workspace_links: 1,
+            items: 1,
+            item_kinds: 1,
+            step_graphs: 1,
+            phases: 2,
+            prompt_templates: 10,
+            documents: 1,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            workspace_delete_warning("graphics", &reach),
+            "This deletes workspace `graphics`: 1 project link and 0 box root paths. Its projects \
+             survive and stay reachable from other workspaces. Gone for good with it: 1 item, 1 \
+             kind, 1 graph, 2 phases, 10 templates, 1 document."
+        );
+        let bare = DeleteReach {
+            workspace_links: 2,
+            workspace_box_paths: 1,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            workspace_delete_warning("graphics", &bare),
+            "This deletes workspace `graphics`: 2 project links and 1 box root path. Its projects \
+             survive and stay reachable from other workspaces."
+        );
     }
 }

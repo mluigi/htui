@@ -2245,34 +2245,7 @@ fn delete_pane(
             };
             format!("This deletes project `{slug}` and its entire history. Gone for good: {taken}.")
         }
-        DeleteTarget::Workspace(_) => {
-            let mut headline = format!(
-                "This deletes workspace `{slug}`: {} and {}. Its projects survive and stay reachable from other workspaces.",
-                plural(
-                    usize::try_from(reach.workspace_links).unwrap_or(usize::MAX),
-                    "project link",
-                    "project links"
-                ),
-                plural(
-                    usize::try_from(reach.workspace_box_paths).unwrap_or(usize::MAX),
-                    "box root path",
-                    "box root paths"
-                ),
-            );
-            // MOD-147 A1: the rest of the reach goes with the workspace, named as a project delete
-            // names them: everything its scope row owns, summed with the workspace's own
-            // workspace-scoped graphs (their step graphs, phases and phase agents). Only the two
-            // counts above are left out here, rather than said twice.
-            let owned = reach_parts(&DeleteReach {
-                workspace_links: 0,
-                workspace_box_paths: 0,
-                ..**reach
-            });
-            if !owned.is_empty() {
-                headline.push_str(&format!(" Gone for good with it: {}.", owned.join(", ")));
-            }
-            headline
-        }
+        DeleteTarget::Workspace(_) => crate::hierarchy::workspace_delete_warning(slug, reach),
     };
 
     let room = usize::from(width).max(1);

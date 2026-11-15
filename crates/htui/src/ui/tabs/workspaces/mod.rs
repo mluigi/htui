@@ -42,8 +42,16 @@
 //! (D4); a new project is listed and selected, and the open workspace's scope follows the list
 //! (D11). A clone may take minutes: the form counts the seconds, `Esc` closes it while the
 //! request finishes, and the outcome is told then (D7, D13).
+//!
+//! MOD-116 M3 T4: `e` ([`Act::Edit`]) on a workspace's group or `overview` row opens its form
+//! prefilled from a fresh overview (D5); `d` ([`Act::Delete`]) counts, warns and asks for the
+//! typed slug, as Settings › Hierarchy does, and leaves the folder on disk (D10); `T`
+//! ([`Act::WorkspacesTarget`]) on any row picks the workspace's default target among the live
+//! targets, or the Settings default it inherits (D9). On a project row `e` and `d` say where
+//! projects are edited (D12).
 
 mod chooser;
+mod delete;
 mod forms;
 mod overview;
 mod question;
@@ -52,10 +60,11 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use core::cell::Cell;
 use crossterm::event::KeyEvent;
 use htui_core::model::{
-    ProjectId, ProjectRef, RunStatus, Scope, StopMode, WorkspaceId, WorkspaceLifecycle,
+    ProjectId, ProjectRef, RunStatus, Scope, StopMode, TargetId, WorkspaceId, WorkspaceLifecycle,
     WorkspaceRunCounts, WorkspaceStop, WorkspaceSummary,
 };
 use ratatui::Frame;
@@ -77,9 +86,11 @@ use crate::ui::kit::pane::{Focus, Pane};
 use crate::ui::kit::scroll::{Scroll, Step, window};
 use crate::ui::shell::{PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
-use crate::workspace_setup;
+use crate::ui::tabs::settings::changed_elsewhere;
+use crate::workspace_setup::{self, EditOutcome, TargetChoices, TargetWrite};
 use crate::workspaces::WorkspaceOverview;
 use chooser::{ChoiceRow, Chooser, ChooserOutcome};
+use delete::{DELETE_REACH, DELETE_TITLE, DELETE_WORKSPACE, DeleteOutcome, Deleting};
 use forms::{FormOutcome, ProjectForm, WorkspaceForm, shown};
 
 /// The Workspaces tab's default layout: the shell's list + detail default.
@@ -101,8 +112,14 @@ const RESUME_WORKSPACE: &str = "resume_workspace";
 /// [`StoreRequest::NewWorkspace`]'s name (MOD-116 M3 D15).
 const NEW_WORKSPACE: &str = workspace_setup::REQUEST_NAMES[0];
 
+/// [`StoreRequest::EditWorkspace`]'s name (MOD-116 M3 D15).
+const EDIT_WORKSPACE: &str = workspace_setup::REQUEST_NAMES[1];
+
 /// [`StoreRequest::NewProject`]'s name (MOD-116 M3 D15).
 const NEW_PROJECT: &str = workspace_setup::REQUEST_NAMES[2];
+
+/// [`StoreRequest::TargetChoices`]'s name (MOD-116 M3 D15).
+const TARGET_CHOICES: &str = workspace_setup::REQUEST_NAMES[3];
 
 /// The chooser's title (MOD-116 M3 D1).
 const NEW_TITLE: &str = "New";
@@ -119,6 +136,16 @@ const STILL_CREATING: &str = "a project is still being created";
 /// `Esc` while a project is out (D7).
 const TOLD_WHEN_IT_LANDS: &str = "the project is still being created; you are told when it lands";
 
+/// A told box about an edit (D5).
+const EDIT_TITLE: &str = "Edit workspace";
+
+/// A told box about the default target (D9).
+const TARGET_TITLE: &str = "Default target";
+
+/// `e` or `d` on a project row (D12).
+const PROJECTS_IN_SETTINGS: &str =
+    "projects are edited in Settings \u{203a} Hierarchy until MOD-123";
+
 /// The chooser's keys on its border (D1).
 const CHOOSER_HINT: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
@@ -129,6 +156,13 @@ const CHOOSER_HINT: HintSpec = &[
 /// The workspace form's keys on its pane's border.
 const WORKSPACE_FORM_HINT: HintSpec = &[
     Hint::One(Act::FieldSubmit, "create"),
+    Hint::One(Act::FieldCancel, "cancel"),
+    Hint::One(Act::FormNextField, "field"),
+];
+
+/// The edit form's keys on its pane's border (D5).
+const EDIT_FORM_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "save"),
     Hint::One(Act::FieldCancel, "cancel"),
     Hint::One(Act::FormNextField, "field"),
 ];
@@ -306,6 +340,8 @@ enum Asked {
     Stop,
     /// `workspaces.resume`.
     Resume,
+    /// `common.edit` (MOD-116 M3 D5): the form opens on the fresh overview.
+    Edit,
 }
 
 /// What the tab asks, or tells, in a kit `Ask` over its body (MOD-116 M2 D6).
@@ -353,6 +389,22 @@ enum NewWhat {
     Project(WorkspaceId),
 }
 
+/// What a row of `T`'s picker answers (MOD-116 M3 D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetPick {
+    /// The scope row names no target: the Settings default is inherited.
+    Inherit,
+    /// The scope row names this target.
+    Target(TargetId),
+    /// A kind this build does not run: told, never written.
+    Planned {
+        /// The target's name.
+        name: String,
+        /// The handoff item that makes its kind runnable.
+        owner: String,
+    },
+}
+
 /// What the tab is doing besides browsing (MOD-116 M3).
 #[derive(Debug, Default)]
 enum Mode {
@@ -365,12 +417,25 @@ enum Mode {
     Workspace(Box<WorkspaceForm>),
     /// The new-project form in the detail pane.
     Project(Box<ProjectForm>),
+    /// T4 (D5): a workspace's edit form in the detail pane.
+    Editing(Box<WorkspaceForm>),
+    /// T4 (D10): a workspace being deleted, in a box over the tab.
+    Deleting(Box<Deleting>),
+    /// T4 (D9): `T`'s picker over the tab, for this workspace, with its scope row's token.
+    Targeting(
+        Chooser<TargetPick>,
+        WorkspaceId,
+        Option<(ProjectId, DateTime<Utc>)>,
+    ),
 }
 
 impl Mode {
     /// Whether a form is up.
     const fn has_form(&self) -> bool {
-        matches!(self, Self::Workspace(_) | Self::Project(_))
+        matches!(
+            self,
+            Self::Workspace(_) | Self::Project(_) | Self::Editing(_)
+        )
     }
 }
 
@@ -416,6 +481,10 @@ pub struct WorkspacesTab {
     creating: Option<String>,
     /// MOD-116 M3 D13: the row a create lands the cursor on once the list holds it.
     land_on: Option<Entry>,
+    /// MOD-116 M3 D9: the workspace whose `TargetChoices` is out; one at a time.
+    asking_targets: Option<WorkspaceId>,
+    /// MOD-116 M3 D10: the open workspace just deleted: the next list opens the first one left.
+    reopen: Option<WorkspaceId>,
 }
 
 impl WorkspacesTab {
@@ -658,6 +727,8 @@ impl WorkspacesTab {
                     question::already_stopped(&name, mode),
                 ),
             },
+            // Never raised: `on_reply` opens the edit form on the fresh overview instead.
+            Asked::Edit => told(EDIT_TITLE, format!("{name} is edited in its form")),
             Asked::Resume => match &report.stop {
                 None => told(question::RESUME_TOLD_TITLE, question::not_stopped(&name)),
                 Some(_) => {
@@ -1098,10 +1169,270 @@ impl WorkspacesTab {
                 }
                 return Some(Handled::Consumed);
             }
-            Mode::Workspace(form) => form.on_key(key, pressed, keys),
+            Mode::Targeting(chooser, workspace, scope_row) => {
+                let stack = views::WORKSPACES_PICK;
+                let act = keys.actions(stack, pressed).first().copied();
+                let Some(act @ (Act::ListDown | Act::ListUp | Act::ConfirmYes | Act::ConfirmNo)) =
+                    act
+                else {
+                    return Some(modal_rest(stack, pressed));
+                };
+                let (workspace, scope_row) = (*workspace, *scope_row);
+                match chooser.on_act(act) {
+                    ChooserOutcome::Stay => {}
+                    ChooserOutcome::Disabled(index) => {
+                        if let Some(TargetPick::Planned { name, owner }) =
+                            chooser.row(index).map(|row| row.value.clone())
+                        {
+                            self.tell(TARGET_TITLE, format!("{name} runs once {owner} lands"));
+                        }
+                    }
+                    ChooserOutcome::Chosen(pick) => {
+                        self.mode = Mode::Browse;
+                        self.set_target(workspace, scope_row, pick, ctx);
+                    }
+                    ChooserOutcome::Closed => self.mode = Mode::Browse,
+                }
+                return Some(Handled::Consumed);
+            }
+            Mode::Deleting(deleting) => {
+                let outcome = deleting.on_key(key, pressed, keys);
+                return Some(self.delete_outcome(outcome, ctx));
+            }
+            Mode::Workspace(form) | Mode::Editing(form) => form.on_key(key, pressed, keys),
             Mode::Project(form) => form.on_key(key, pressed, keys),
         };
         Some(self.form_outcome(outcome, ctx))
+    }
+
+    /// MOD-116 M3 D5: `e` on a workspace's group or `overview` row: its form, prefilled from the
+    /// held overview when it is current, else once a fresh one lands; on a project row, where
+    /// projects are edited (D12).
+    fn begin_edit(&mut self, ctx: &Ctx<'_>) {
+        let Some(entry) = self.cursor.filter(|entry| self.holds(*entry)) else {
+            return;
+        };
+        if let Entry::Project(..) = entry {
+            self.tell(EDIT_TITLE, PROJECTS_IN_SETTINGS.to_owned());
+            return;
+        }
+        let workspace = entry.workspace();
+        let current = !self.stale && self.in_flight != Some(workspace);
+        match &self.overview {
+            Some((of, Held::Read(overview))) if *of == workspace && current => {
+                let form = WorkspaceForm::edit(
+                    &overview.tree.workspace,
+                    overview.folder.as_deref(),
+                    self.home.as_deref(),
+                );
+                self.mode = Mode::Editing(Box::new(form));
+            }
+            _ => self.ask(Asked::Edit, ctx),
+        }
+    }
+
+    /// MOD-116 M3 D5: the fresh overview `asked` waited on has landed: the edit form opens on
+    /// it, unless something else is up meanwhile.
+    fn open_edit(&mut self, overview: &WorkspaceOverview) {
+        if matches!(self.mode, Mode::Browse) && self.question.is_none() {
+            let form = WorkspaceForm::edit(
+                &overview.tree.workspace,
+                overview.folder.as_deref(),
+                self.home.as_deref(),
+            );
+            self.mode = Mode::Editing(Box::new(form));
+        }
+    }
+
+    /// MOD-116 M3 D5: the edit was written: the form closes, the list is read again (the shell
+    /// takes a rename of the open workspace from it, D11) and so is the overview.
+    fn edited(&mut self, workspace: WorkspaceId, ctx: &Ctx<'_>) {
+        if matches!(&self.mode, Mode::Editing(form) if form.editing() == Some(workspace)) {
+            self.mode = Mode::Browse;
+        }
+        ctx.request(StoreRequest::Workspaces);
+        self.stale = true;
+        self.read_if_due(ctx);
+    }
+
+    /// MOD-116 M3 D5: the row changed since the form opened: the text stays, the form takes the
+    /// row's new token and says so, and the next `Enter` saves over it.
+    fn edit_stale(
+        &mut self,
+        workspace: WorkspaceId,
+        current: &htui_core::model::Workspace,
+        ctx: &Ctx<'_>,
+    ) {
+        let retry = ctx.keys().label(views::WORKSPACES_FORM, Act::FieldSubmit);
+        match &mut self.mode {
+            Mode::Editing(form) if form.editing() == Some(workspace) && form.is_busy() => {
+                form.retoken(current);
+                form.refused(&changed_elsewhere(retry.as_deref()));
+            }
+            _ => {
+                let text = format!(
+                    "{} changed elsewhere meanwhile; nothing was saved",
+                    current.name
+                );
+                self.tell(EDIT_TITLE, text);
+            }
+        }
+    }
+
+    /// MOD-116 M3 D10: `d` on a workspace's group or `overview` row: the count goes out and the
+    /// box says what it would take; on a project row, where projects are edited (D12).
+    fn begin_delete(&mut self, ctx: &Ctx<'_>) {
+        let Some(entry) = self.cursor.filter(|entry| self.holds(*entry)) else {
+            return;
+        };
+        if let Entry::Project(..) = entry {
+            self.tell(DELETE_TITLE, PROJECTS_IN_SETTINGS.to_owned());
+            return;
+        }
+        let workspace = entry.workspace();
+        let Some(slug) = self.summary(workspace).map(|summary| summary.slug.clone()) else {
+            return;
+        };
+        let folder = match &self.overview {
+            Some((of, Held::Read(overview))) if *of == workspace => overview
+                .folder
+                .as_deref()
+                .map(|folder| shown(folder, self.home.as_deref())),
+            _ => None,
+        };
+        let (deleting, request) = Deleting::begin(workspace, slug, folder);
+        self.mode = Mode::Deleting(Box::new(deleting));
+        ctx.request(request);
+    }
+
+    /// MOD-116 M3 D10: what a delete's key or reply does to the tab.
+    fn delete_outcome(&mut self, outcome: DeleteOutcome, ctx: &Ctx<'_>) -> Handled {
+        match outcome {
+            DeleteOutcome::Stay => {}
+            DeleteOutcome::Pass => return Handled::Pass,
+            DeleteOutcome::Send(request) => ctx.request(request),
+            DeleteOutcome::Closed => self.mode = Mode::Browse,
+            DeleteOutcome::Told(text) => {
+                self.mode = Mode::Browse;
+                self.tell(DELETE_TITLE, text);
+                ctx.request(StoreRequest::Workspaces);
+            }
+            DeleteOutcome::Deleted { workspace } => {
+                self.mode = Mode::Browse;
+                if workspace == ctx.scope.workspace_id {
+                    self.reopen = Some(workspace);
+                }
+                ctx.request(StoreRequest::Workspaces);
+                ctx.request(StoreRequest::WorkspaceRunCounts);
+            }
+        }
+        Handled::Consumed
+    }
+
+    /// MOD-116 M3 D9: `T` on any row of a workspace reads what its default target may be; the
+    /// picker opens on the reply. One read out at a time.
+    fn ask_targets(&mut self, ctx: &Ctx<'_>) {
+        if self.asking_targets.is_some() {
+            return;
+        }
+        let Some(workspace) = self
+            .cursor
+            .filter(|entry| self.holds(*entry))
+            .map(Entry::workspace)
+        else {
+            return;
+        };
+        self.asking_targets = Some(workspace);
+        ctx.request(StoreRequest::TargetChoices(workspace));
+    }
+
+    /// MOD-116 M3 D9: the picker over `choices`: the Settings default first, then every live
+    /// target with its kind; a kind this build does not run is dim and says which item runs it.
+    /// The current choice is selected and marked.
+    fn open_targets(&mut self, workspace: WorkspaceId, choices: &TargetChoices) {
+        const CURRENT: &str = "\u{b7} current";
+        let mut rows = vec![ChoiceRow {
+            label: format!("inherit the Settings default ({})", choices.default_name),
+            note: choices.current.is_none().then(|| CURRENT.to_owned()),
+            enabled: true,
+            value: TargetPick::Inherit,
+        }];
+        let mut selected = 0;
+        for target in &choices.targets {
+            let current = choices.current == Some(target.id);
+            if current {
+                selected = rows.len();
+            }
+            let mut notes = Vec::new();
+            if let Some(owner) = target.planned {
+                notes.push(format!("planned \u{b7} {owner}"));
+            }
+            if current {
+                notes.push(CURRENT.to_owned());
+            }
+            rows.push(ChoiceRow {
+                label: format!("{}  {}", target.name, target.kind.as_str()),
+                note: (!notes.is_empty()).then(|| notes.join(" ")),
+                enabled: target.planned.is_none(),
+                value: target
+                    .planned
+                    .map_or(TargetPick::Target(target.id), |owner| TargetPick::Planned {
+                        name: target.name.clone(),
+                        owner: owner.to_owned(),
+                    }),
+            });
+        }
+        let title = format!("Default target of {}", self.name_of(workspace));
+        self.mode = Mode::Targeting(
+            Chooser::new(title, rows, selected),
+            workspace,
+            choices.scope_row,
+        );
+    }
+
+    /// MOD-116 M3 D9: the picker's choice is written on the scope row it was read with; a
+    /// workspace with no scope row is told.
+    fn set_target(
+        &mut self,
+        workspace: WorkspaceId,
+        scope_row: Option<(ProjectId, DateTime<Utc>)>,
+        pick: TargetPick,
+        ctx: &Ctx<'_>,
+    ) {
+        let target = match pick {
+            TargetPick::Inherit => None,
+            TargetPick::Target(id) => Some(id),
+            TargetPick::Planned { .. } => return,
+        };
+        let Some((_, expected)) = scope_row else {
+            let text = format!(
+                "{} has no scope row, so its default target cannot be set",
+                self.name_of(workspace)
+            );
+            self.tell(TARGET_TITLE, text);
+            return;
+        };
+        ctx.request(StoreRequest::SetWorkspaceTarget {
+            workspace,
+            expected,
+            target,
+        });
+    }
+
+    /// MOD-116 M3 D9: the scope row moved while the picker was up: nothing was written.
+    fn target_stale(&mut self, workspace: WorkspaceId, ctx: &Ctx<'_>) {
+        let again = ctx
+            .keys()
+            .label(views::WORKSPACES_BROWSE, Act::WorkspacesTarget)
+            .map_or_else(
+                || "ask again".to_owned(),
+                |key| format!("press {key} again"),
+            );
+        let text = format!(
+            "the default target of {} changed meanwhile; {again}",
+            self.name_of(workspace)
+        );
+        self.tell(TARGET_TITLE, text);
     }
 
     /// What a form's key does to the tab: a submit is sent (a project's slug held while it is
@@ -1176,34 +1507,55 @@ impl WorkspacesTab {
         ctx.request(StoreRequest::Workspaces);
     }
 
-    /// MOD-116 M3 D13: a create refused (a sentence) or failed (the store's message): under the
-    /// form while it is open and waiting, its text kept, else in the box.
+    /// MOD-116 M3 D13: a create or an edit refused (a sentence) or failed (the store's message):
+    /// under the form while it is open and waiting, its text kept, else in the box. A refused
+    /// target read or write (D9) is told.
     fn setup_refused(&mut self, request: &str, why: &str) {
         let why = &self.under_home_text(why);
-        let project = request == NEW_PROJECT;
-        let slug = if project { self.creating.take() } else { None };
-        match &mut self.mode {
-            Mode::Workspace(form) if !project && form.is_busy() => {
-                form.refused(why);
-                return;
+        match request {
+            NEW_PROJECT => {
+                let slug = self.creating.take();
+                if let Mode::Project(form) = &mut self.mode
+                    && form.is_busy()
+                {
+                    form.refused(why);
+                    return;
+                }
+                let text = match slug {
+                    Some(slug) => format!("Project `{slug}` was not created: {why}"),
+                    None => format!("The project was not created: {why}"),
+                };
+                self.tell(NEW_PROJECT_TITLE, text);
             }
-            Mode::Project(form) if project && form.is_busy() => {
-                form.refused(why);
-                return;
+            NEW_WORKSPACE => {
+                if let Mode::Workspace(form) = &mut self.mode
+                    && form.is_busy()
+                {
+                    form.refused(why);
+                    return;
+                }
+                self.tell(
+                    NEW_WORKSPACE_TITLE,
+                    format!("The workspace was not created: {why}"),
+                );
             }
-            _ => {}
-        }
-        if project {
-            let text = match slug {
-                Some(slug) => format!("Project `{slug}` was not created: {why}"),
-                None => format!("The project was not created: {why}"),
-            };
-            self.tell(NEW_PROJECT_TITLE, text);
-        } else {
-            self.tell(
-                NEW_WORKSPACE_TITLE,
-                format!("The workspace was not created: {why}"),
-            );
+            EDIT_WORKSPACE => {
+                if let Mode::Editing(form) = &mut self.mode
+                    && form.is_busy()
+                {
+                    form.refused(why);
+                    return;
+                }
+                self.tell(EDIT_TITLE, format!("The workspace was not saved: {why}"));
+            }
+            TARGET_CHOICES => {
+                self.asking_targets = None;
+                self.tell(TARGET_TITLE, format!("The targets cannot be read: {why}"));
+            }
+            _ => self.tell(
+                TARGET_TITLE,
+                format!("The default target was not set: {why}"),
+            ),
         }
     }
 
@@ -1226,6 +1578,7 @@ impl WorkspacesTab {
     fn form_hints(&self, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         let spec = match (&self.question, &self.mode) {
             (None, Mode::Workspace(_)) => WORKSPACE_FORM_HINT,
+            (None, Mode::Editing(_)) => EDIT_FORM_HINT,
             (None, Mode::Project(_)) => PROJECT_FORM_HINT,
             _ => return None,
         };
@@ -1243,12 +1596,14 @@ impl WorkspacesTab {
     ) {
         let inner = Pane::inner(area);
         let (title, lines) = match &self.mode {
-            Mode::Workspace(form) => (NEW_WORKSPACE_TITLE.to_owned(), form.lines(inner.width, ctx)),
+            Mode::Workspace(form) | Mode::Editing(form) => {
+                (form.title(), form.lines(inner.width, ctx))
+            }
             Mode::Project(form) => (
                 format!("New project in {}", form.workspace_name()),
                 form.lines(inner.width, ctx),
             ),
-            Mode::Browse | Mode::Choosing(_) => return,
+            Mode::Browse | Mode::Choosing(_) | Mode::Deleting(_) | Mode::Targeting(..) => return,
         };
         frame.render_widget(Paragraph::new(lines), inner);
         let mut pane = Pane::new(&title).focus(focus).accent(ctx.accent());
@@ -1410,6 +1765,9 @@ impl Tab for WorkspacesTab {
                 Act::WorkspacesStop => self.ask(Asked::Stop, ctx),
                 Act::WorkspacesResume => self.ask(Asked::Resume, ctx),
                 Act::WorkspacesNew => self.begin_new(),
+                Act::Edit => self.begin_edit(ctx),
+                Act::Delete => self.begin_delete(ctx),
+                Act::WorkspacesTarget => self.ask_targets(ctx),
                 // A layout, history or global act: the shell's.
                 _ => continue,
             }
@@ -1439,6 +1797,19 @@ impl Tab for WorkspacesTab {
                     self.user_placed = true;
                     self.select(entry);
                 }
+                // MOD-116 M3 D10: the open workspace was deleted here: the first one left is
+                // opened (none leaves the empty state).
+                if let Some(gone) = self.reopen.take()
+                    && ctx.scope.workspace_id == gone
+                    && let Some(first) = self
+                        .workspaces
+                        .iter()
+                        .find(|summary| summary.workspace_id != gone)
+                {
+                    ctx.emit(Action::SetScope {
+                        workspace: first.clone(),
+                    });
+                }
                 self.follow_scope(ctx);
                 self.read_if_due(ctx);
             }
@@ -1454,6 +1825,8 @@ impl Tab for WorkspacesTab {
                 if let Some((_, asked)) = self.pending.take_if(|(pending, _)| pending == workspace)
                 {
                     match overview {
+                        // MOD-116 M3 D5: the edit form opens on it.
+                        Some(read) if asked == Asked::Edit => self.open_edit(read),
                         Some(read) => {
                             self.question = Some(Self::question_of(asked, *workspace, read, ctx));
                         }
@@ -1461,6 +1834,7 @@ impl Tab for WorkspacesTab {
                             let title = match asked {
                                 Asked::Stop => question::STOP_TOLD_TITLE,
                                 Asked::Resume => question::RESUME_TOLD_TITLE,
+                                Asked::Edit => EDIT_TITLE,
                             };
                             let text = format!("{} no longer exists", self.name_of(*workspace));
                             self.tell(title, text);
@@ -1515,13 +1889,19 @@ impl Tab for WorkspacesTab {
                     if let Some((_, asked)) =
                         self.pending.take_if(|(pending, _)| *pending == workspace)
                     {
-                        let stop = asked == Asked::Stop;
-                        let title = if stop {
-                            question::STOP_TOLD_TITLE
-                        } else {
-                            question::RESUME_TOLD_TITLE
-                        };
-                        self.tell(title, question::needs_the_database(stop, message));
+                        match asked {
+                            // MOD-116 M3 D5: the edit's own sentence.
+                            Asked::Edit => self
+                                .tell(EDIT_TITLE, format!("Editing needs the database: {message}")),
+                            Asked::Stop => self.tell(
+                                question::STOP_TOLD_TITLE,
+                                question::needs_the_database(true, message),
+                            ),
+                            Asked::Resume => self.tell(
+                                question::RESUME_TOLD_TITLE,
+                                question::needs_the_database(false, message),
+                            ),
+                        }
                     }
                     self.overview = Some((workspace, Held::Refused(message.clone())));
                     // R1 F3: the refused workspace is asked again on the next refresh, not at
@@ -1541,15 +1921,52 @@ impl Tab for WorkspacesTab {
                 project,
                 repo_path,
             } => self.project_created(*workspace, project, repo_path, ctx),
+            StoreReply::WorkspaceEdited { workspace, outcome } => match outcome {
+                EditOutcome::Applied { .. } => self.edited(*workspace, ctx),
+                EditOutcome::Stale(current) => self.edit_stale(*workspace, current, ctx),
+            },
+            StoreReply::TargetChoices { workspace, choices } => {
+                if self
+                    .asking_targets
+                    .take_if(|asked| asked == workspace)
+                    .is_some()
+                    && matches!(self.mode, Mode::Browse)
+                {
+                    self.open_targets(*workspace, choices);
+                }
+            }
+            StoreReply::WorkspaceTargetSet { workspace, outcome } => match outcome {
+                // The overview's `default target` line follows.
+                TargetWrite::Applied => {
+                    self.stale = true;
+                    self.read_if_due(ctx);
+                }
+                TargetWrite::Stale => self.target_stale(*workspace, ctx),
+            },
             StoreReply::SetupRefused { request, reason }
-                if [NEW_WORKSPACE, NEW_PROJECT].contains(request) =>
+                if workspace_setup::REQUEST_NAMES.contains(request) =>
             {
                 self.setup_refused(request, reason);
             }
             StoreReply::Failed { request, message }
-                if [NEW_WORKSPACE, NEW_PROJECT].contains(request) =>
+                if workspace_setup::REQUEST_NAMES.contains(request) =>
             {
                 self.setup_refused(request, message);
+            }
+            // MOD-116 M3 D10: the delete's count, its write, and their refusals.
+            StoreReply::DeleteReach(_) | StoreReply::Deleted { .. } => {
+                if let Mode::Deleting(deleting) = &mut self.mode {
+                    let outcome = deleting.on_reply(reply);
+                    let _ = self.delete_outcome(outcome, ctx);
+                }
+            }
+            StoreReply::Failed { request, .. }
+                if *request == DELETE_REACH || *request == DELETE_WORKSPACE =>
+            {
+                if let Mode::Deleting(deleting) = &mut self.mode {
+                    let outcome = deleting.on_reply(reply);
+                    let _ = self.delete_outcome(outcome, ctx);
+                }
             }
             _ => {}
         }
@@ -1560,13 +1977,16 @@ impl Tab for WorkspacesTab {
     /// in the tab's box (MOD-116 M2 D6).
     ///
     /// MOD-116 M3 D13: every request of `workspace_setup::REQUEST_NAMES` too: a refused create is
-    /// said under its form, or in the box once the form is closed.
+    /// said under its form, or in the box once the form is closed; D10: a refused count or delete
+    /// is said in the delete's box.
     fn absorbs_failure(&self, request: &str) -> bool {
         [
             WORKSPACE_OVERVIEW,
             WORKSPACE_RUN_COUNTS,
             STOP_WORKSPACES,
             RESUME_WORKSPACE,
+            DELETE_REACH,
+            DELETE_WORKSPACE,
         ]
         .contains(&request)
             || workspace_setup::REQUEST_NAMES.contains(&request)
@@ -1578,9 +1998,11 @@ impl Tab for WorkspacesTab {
             return Handled::Pass;
         }
         match &mut self.mode {
-            Mode::Workspace(form) => form.on_paste(text),
+            Mode::Workspace(form) | Mode::Editing(form) => form.on_paste(text),
             Mode::Project(form) => form.on_paste(text),
-            Mode::Browse | Mode::Choosing(_) => return Handled::Pass,
+            Mode::Browse | Mode::Choosing(_) | Mode::Deleting(_) | Mode::Targeting(..) => {
+                return Handled::Pass;
+            }
         }
         Handled::Consumed
     }
@@ -1619,22 +2041,34 @@ impl Tab for WorkspacesTab {
                 self.render_detail(frame, areas.detail, focus, hints.as_ref(), ctx);
             }
         }
-        if let Mode::Choosing(chooser) = &self.mode {
-            let hint = ctx.keys().hint(views::WORKSPACES_PICK, CHOOSER_HINT);
-            chooser.render(frame, area, &hint, ctx);
+        match &self.mode {
+            Mode::Choosing(chooser) => {
+                let hint = ctx.keys().hint(views::WORKSPACES_PICK, CHOOSER_HINT);
+                chooser.render(frame, area, &hint, ctx);
+            }
+            Mode::Targeting(chooser, ..) => {
+                let hint = ctx.keys().hint(views::WORKSPACES_PICK, CHOOSER_HINT);
+                chooser.render(frame, area, &hint, ctx);
+            }
+            Mode::Deleting(deleting) => deleting.render(frame, area, ctx),
+            Mode::Browse | Mode::Workspace(_) | Mode::Project(_) | Mode::Editing(_) => {}
         }
         self.render_question(frame, area, ctx);
     }
 
     /// [`views::WORKSPACES_CONFIRM`] while a question is up (D6); MOD-116 M3:
-    /// [`views::WORKSPACES_PICK`] while the chooser is, [`views::WORKSPACES_FORM`] while a form
-    /// is; else the browse stack.
+    /// [`views::WORKSPACES_PICK`] while the chooser or the target picker is,
+    /// [`views::WORKSPACES_FORM`] while a form is, the delete's own stage's while one is up;
+    /// else the browse stack.
     fn key_stack(&self) -> Option<Stack<'static>> {
         Some(match (&self.question, &self.mode) {
             (Some(_), _) => views::WORKSPACES_CONFIRM,
             (None, Mode::Browse) => views::WORKSPACES_BROWSE,
-            (None, Mode::Choosing(_)) => views::WORKSPACES_PICK,
-            (None, Mode::Workspace(_) | Mode::Project(_)) => views::WORKSPACES_FORM,
+            (None, Mode::Choosing(_) | Mode::Targeting(..)) => views::WORKSPACES_PICK,
+            (None, Mode::Workspace(_) | Mode::Project(_) | Mode::Editing(_)) => {
+                views::WORKSPACES_FORM
+            }
+            (None, Mode::Deleting(deleting)) => deleting.stack(),
         })
     }
 
@@ -1647,9 +2081,9 @@ impl Tab for WorkspacesTab {
     /// refused one is asked again (R1 F3). MOD-116 M3 D7: a busy form counts one second more.
     fn on_refresh(&mut self, ctx: &mut Ctx<'_>) {
         match &mut self.mode {
-            Mode::Workspace(form) => form.tick(),
+            Mode::Workspace(form) | Mode::Editing(form) => form.tick(),
             Mode::Project(form) => form.tick(),
-            Mode::Browse | Mode::Choosing(_) => {}
+            Mode::Browse | Mode::Choosing(_) | Mode::Deleting(_) | Mode::Targeting(..) => {}
         }
         self.read_if_due(ctx);
     }
