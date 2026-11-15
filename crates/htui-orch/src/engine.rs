@@ -558,7 +558,8 @@ where
     pub app: BTreeMap<String, Value>,
     /// ANA-5 §4.2's box projection for the prompt (blueprint H-11: `box_profile` is inherent too).
     pub box_profile: BoxProfile,
-    /// `run.target_box_id` and `claim_run`'s box.
+    /// This box: the driver of the runs it enqueues and the box `claim_run` admits on (MOD-130
+    /// M3, D8).
     pub box_id: BoxId,
     /// `claim_run`'s liveness token (ANA-2 §4.9).
     pub owner: Uuid,
@@ -617,6 +618,10 @@ where
     parts: EngineParts<'a, S, G, I, V, C, A, K>,
     /// MOD-138 M3 D3 (blueprint A5): the walks [`Engine::run_to_rest`] has open, by run.
     walks: WalkScopes,
+    /// MOD-130 M3 P7: the target kinds `enqueue` lets a run start on,
+    /// [`RUNNABLE_KINDS`](htui_core::model::RUNNABLE_KINDS) in production. Engine tests widen it
+    /// through `with_runnable_kinds` to start a run on a child-box target.
+    runnable: &'static [htui_core::model::TargetKind],
 }
 
 /// MOD-138 M3 D3 (blueprint §3.1, A4, A5): the state of every walk [`Engine::run_to_rest`] has
@@ -1294,7 +1299,19 @@ where
         Self {
             parts,
             walks: WalkScopes::new(),
+            runnable: htui_core::model::RUNNABLE_KINDS,
         }
+    }
+
+    /// MOD-130 M3 P7: this engine with `kinds` as its runnable set, so an engine test can start a
+    /// run on a child-box target, which no production build runs before MOD-44 (D1).
+    #[cfg(test)]
+    pub(crate) const fn with_runnable_kinds(
+        mut self,
+        kinds: &'static [htui_core::model::TargetKind],
+    ) -> Self {
+        self.runnable = kinds;
+        self
     }
 
     /// MOD-138 M3 D3 (blueprint §3.1): the control a session of `run` drives under: its open
@@ -1366,10 +1383,12 @@ where
         }
     }
 
-    /// §6.2's `run`/`queue` up to the claim (MOD-4 plan D186, blueprint F-I): refuse missing tags,
-    /// then resolve the item's graph and refuse rung 4, onto the item, then resolve the target
-    /// cascade and refuse a target that cannot run here (MOD-130 M2 P10, P11), and create the run
-    /// `queued` on it. `create_run` moves the item `open | failed -> queued` in its own
+    /// §6.2's `run`/`queue` up to the claim (MOD-4 plan D186, blueprint F-I): read the item's
+    /// graph once, resolve the target cascade and refuse a target that cannot run here (MOD-130
+    /// M2 P10, P11), then refuse tags missing on the box the work runs on, then resolve the graph
+    /// against that box and refuse rung 4, each refusal onto the item (MOD-130 M3 P2, D9), and
+    /// create the run `queued` on the target, naming this box its driver when the work runs on
+    /// another box (D8, P1). `create_run` moves the item `open | failed -> queued` in its own
     /// transaction, so it admits one run per item and no item lock is needed.
     ///
     /// `pub` so milestone 6's `run_worker` can take the run's lock between this and
@@ -1379,10 +1398,11 @@ where
     /// started from, which a workspace stop gates at the claim.
     ///
     /// # Errors
-    /// [`EngineError::Resolve`] (rung 4, after its note on the item),
-    /// [`EngineError::MissingTags`] (`R-ORCH-10`, after its note on the item, before resolution),
     /// [`EngineError::TargetRefused`] (MOD-130 M2 P10: the cascade's target cannot run here, after
-    /// its note on the item, after resolution; R1 L2: a retired one with no note), the store's
+    /// its note on the item, before the tags and rung 4 (M3 P2); R1 L2: a retired one with no
+    /// note), [`EngineError::MissingTags`] (`R-ORCH-10` on the target box, after its note on the
+    /// item, before resolution), [`EngineError::Resolve`] (rung 4, after its note on the item; or
+    /// `NoGraph`, before the target is resolved), the store's
     /// `Constraint` ([`scope_row_run_workspace`](htui_core::store::scope_row_run_workspace)) for a
     /// scope-row item started from another workspace (R1 L3: before the tags, nothing written),
     /// and the store's refusals, among them `create_run`'s for a target retired since it was read
@@ -1463,24 +1483,45 @@ where
                 ))
             },
         )?;
-        // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
-        // lacks tags *and* has no candidate is refused for the tags, the cheaper box-level fact.
-        let missing = self
-            .parts
-            .graphs
-            .missing_tags(item.id, self.parts.box_id)
+        // MOD-130 M3 P3: the graph is read once. Its `target_id` is the workflow level of the
+        // cascade, and the same read is resolved below, so the two never come from different
+        // graph revisions.
+        let graph = graph::read_graph(self.parts.graphs, &item).await?;
+        // MOD-130 M2 P2, P11: before the tags and resolution (M3 P2), and before `create_run`,
+        // which re-reads the chosen target under its own lock (P8).
+        let chosen = self
+            .cascade_target(&item, &project, workspace, graph.graph.target_id)
             .await?;
+        let binding =
+            htui_core::store::WorkerStore::target_binding(self.parts.store, chosen.target)
+                .await?
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "target",
+                    id: chosen.target.to_string(),
+                })?;
+        if let Some(refusal) =
+            htui_core::model::run_start_refusal(&binding, self.parts.box_id, self.runnable)
+        {
+            return Err(self.refuse_target(&item, refusal, chosen.source).await?);
+        }
+        // MOD-130 M3 D9: the box the work runs on, whose tags and `agent_box` rows decide.
+        let on = htui_core::model::runs_on(&binding, self.parts.box_id);
+        // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
+        // lacks tags *and* has no candidate is refused for the tags, the cheaper fact, read on
+        // the target box (MOD-130 M3 D9).
+        let missing = self.parts.graphs.missing_tags(item.id, on).await?;
         if !missing.is_empty() {
             return Err(self.refuse_missing_tags(&item, missing).await?);
         }
-        let resolved = match graph::resolve(
+        let resolved = match graph::resolve_with(
             self.parts.store,
             self.parts.graphs,
             &item,
+            graph,
             mode,
             &self.parts.app,
             repo_scope.as_deref(),
-            self.parts.box_id,
+            on,
         )
         .await
         {
@@ -1490,25 +1531,6 @@ where
             }
             Err(err) => return Err(err.into()),
         };
-        // MOD-130 M2 P2, P11: after resolution, whose graph is the workflow level, and before
-        // `create_run`, which re-reads the chosen target under its own lock (P8).
-        let chosen = self
-            .cascade_target(&item, &project, workspace, resolved.workflow_target)
-            .await?;
-        let binding =
-            htui_core::store::WorkerStore::target_binding(self.parts.store, chosen.target)
-                .await?
-                .ok_or_else(|| StoreError::NotFound {
-                    entity: "target",
-                    id: chosen.target.to_string(),
-                })?;
-        if let Some(refusal) = htui_core::model::run_start_refusal(
-            &binding,
-            self.parts.box_id,
-            htui_core::model::RUNNABLE_KINDS,
-        ) {
-            return Err(self.refuse_target(&item, refusal, chosen.source).await?);
-        }
 
         let now = self.now();
         let id = RunId::new();
@@ -1522,8 +1544,8 @@ where
                 project_id: item.project_id,
                 item_id: item.id,
                 mode,
-                target_box_id: htui_core::model::runs_on(&binding, self.parts.box_id),
-                executing_box_id: None,
+                target_box_id: on,
+                executing_box_id: htui_core::model::driver_of(&binding, self.parts.box_id),
                 started_by: self.parts.user,
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
@@ -19795,6 +19817,357 @@ mod tests {
             "the run is still queued"
         );
         assert_eq!(recorded_target(&harness, run).await, before);
+    }
+
+    /// MOD-130 M3 T4: a `docker` target bound to a fresh child box of the harness box, probed
+    /// (`set_target_probed`), the child declaring `child_tags`, the harness box declaring `docker`
+    /// beside its `gpu`, and the htui project's level set to the target. Answers the child box and
+    /// the target.
+    async fn child_box_target(
+        harness: &Harness,
+        child_tags: &[&str],
+    ) -> (htui_core::model::BoxId, htui_core::model::TargetId) {
+        let store = &harness.orch.store;
+        let here = harness.orch.box_id();
+        let docker = store
+            .create_target(htui_core::model::NewTarget {
+                id: htui_core::model::TargetId::new(),
+                name: "child docker".to_owned(),
+                kind: htui_core::model::TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("the target is created");
+        let child = htui_core::model::BoxId::new();
+        store
+            .attach_child_box(htui_core::model::NewChildBox {
+                id: child,
+                parent: here,
+                hostname: "child-box".to_owned(),
+                target: docker.id,
+            })
+            .await
+            .expect("the harness box takes a child");
+        assert!(
+            store.set_target_probed(docker.id, harness.orch.clock.now()),
+            "the target exists"
+        );
+        let machine = store
+            .boxes()
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|record| record.row.id == here)
+            .expect("the harness box is the user's")
+            .row;
+        let outcome = store
+            .edit_box(
+                here,
+                machine.edit_version,
+                BoxEdit {
+                    declared_tags: Some(vec!["gpu".to_owned(), "docker".to_owned()]),
+                    quirks: None,
+                    executor: None,
+                },
+            )
+            .await
+            .expect("the harness box accepts the edit");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+        let outcome = store
+            .edit_box(
+                child,
+                0,
+                BoxEdit {
+                    declared_tags: Some(child_tags.iter().map(|tag| (*tag).to_owned()).collect()),
+                    quirks: None,
+                    executor: None,
+                },
+            )
+            .await
+            .expect("the child accepts the edit");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+        set_project_target(harness, ids::PROJECT_HTUI, Some(docker.id)).await;
+        (child, docker.id)
+    }
+
+    /// MOD-130 M3 T4: an enabled `agent_box` row of `agent` on `box_id`, never probed.
+    async fn enable_agent_on(
+        harness: &Harness,
+        agent: htui_core::model::AgentId,
+        box_id: htui_core::model::BoxId,
+    ) {
+        harness
+            .orch
+            .store
+            .upsert_agent_box(&htui_core::model::AgentBox {
+                agent_id: agent,
+                box_id,
+                enabled: true,
+                version: None,
+                path: None,
+                probed_at: None,
+                quota: None,
+                quota_at: None,
+                updated_at: harness.orch.clock.now(),
+                probe: None,
+            })
+            .await
+            .expect("the box takes the row");
+    }
+
+    /// MOD-130 M3 P1 (regression): a local run names no driver, since its target box drives it.
+    #[tokio::test]
+    async fn a_local_run_names_no_driver() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness_engine!(harness.orch, engine);
+
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+            .await
+            .expect("FEAT-3 resolves");
+        let row = harness
+            .orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("enqueue wrote the run");
+        assert_eq!(row.executing_box_id, None);
+        assert_eq!(row.target_box_id, harness.orch.box_id());
+    }
+
+    /// MOD-130 M3 D8, P1, P2: a run on a child-box target runs on the child and is driven by this
+    /// box, so only this box claims it.
+    #[tokio::test]
+    async fn enqueue_on_a_child_box_target_names_this_box_the_driver() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        let (child, docker) = child_box_target(&harness, &["rust"]).await;
+        let here = harness.orch.box_id();
+        harness_engine!(harness.orch, engine);
+        let engine = engine.with_runnable_kinds(htui_core::model::TargetKind::ALL);
+
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+            .await
+            .expect("the child-box target is runnable here");
+        let row = harness
+            .orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("enqueue wrote the run");
+        assert_eq!(row.target_box_id, child, "the work runs on the child");
+        assert_eq!(row.executing_box_id, Some(here), "this box drives it");
+        assert_eq!(
+            recorded_target(&harness, run).await,
+            (
+                Some(docker),
+                Some(htui_core::model::TargetSource::Project),
+                child
+            )
+        );
+
+        let now = harness.orch.clock.now();
+        let ttl = TimeDelta::days(1);
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .claim_run(run, child, harness.orch.owner(), now, ttl)
+                .await
+                .expect("MemStore claims"),
+            htui_core::model::Claim::NotClaimable,
+            "the child is the run's target box, not its driver"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .claim_run(run, here, harness.orch.owner(), now, ttl)
+                .await
+                .expect("MemStore claims"),
+            htui_core::model::Claim::Admitted,
+            "the driver claims it"
+        );
+    }
+
+    /// MOD-130 M3 D9, P2 (`R-ORCH-10`): the enqueue's tag check reads the box the work runs on, the
+    /// child, not this box.
+    #[tokio::test]
+    async fn enqueue_checks_tags_on_the_box_the_work_runs_on() {
+        // A tag only the child declares: the run is written.
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let (child, _) = child_box_target(&harness, &["rust", "cuda"]).await;
+            require_tags(&harness, ids::HTUI_FEAT_3, &["cuda"]).await;
+            harness_engine!(harness.orch, engine);
+            let engine = engine.with_runnable_kinds(htui_core::model::TargetKind::ALL);
+
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+                .await
+                .expect("the child declares `cuda`");
+            assert_eq!(recorded_target(&harness, run).await.2, child);
+        }
+
+        // A tag only this box declares: refused, no run, the item blocked.
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let _ = child_box_target(&harness, &["rust", "cuda"]).await;
+            require_tags(&harness, ids::HTUI_FEAT_3, &["gpu"]).await;
+            let runs_before = harness
+                .orch
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len();
+            harness_engine!(harness.orch, engine);
+            let engine = engine.with_runnable_kinds(htui_core::model::TargetKind::ALL);
+
+            let refused = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+                .await
+                .expect_err("the child has not got `gpu`");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::MissingTags { item, run: None, missing }
+                        if *item == ids::HTUI_FEAT_3 && missing == &["gpu"]
+                ),
+                "{refused:?}"
+            );
+            assert_eq!(
+                harness
+                    .orch
+                    .store
+                    .runs(ids::HTUI_FEAT_3)
+                    .await
+                    .expect("MemStore never fails a read")
+                    .len(),
+                runs_before,
+                "no run row"
+            );
+            assert_eq!(
+                harness.orch.item(ids::HTUI_FEAT_3).await.status,
+                Status::Blocked
+            );
+        }
+    }
+
+    /// MOD-130 M3 D9, P2: rung 3 of the candidate chain reads the `agent_box` rows of the box the
+    /// work runs on, the child, not this box.
+    #[tokio::test]
+    async fn rung_three_reads_the_agents_of_the_box_the_work_runs_on() {
+        // A lone enabled agent on the child: rung 3 answers.
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness.orch.without_candidates("prd");
+            let (child, _) = child_box_target(&harness, &["rust"]).await;
+            enable_agent_on(&harness, ids::AGENT_AGY, child).await;
+            harness_engine!(harness.orch, engine);
+            let engine = engine.with_runnable_kinds(htui_core::model::TargetKind::ALL);
+
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+                .await
+                .expect("rung 3 answers with the child's agent");
+            assert_eq!(recorded_target(&harness, run).await.2, child);
+        }
+
+        // The agent on this box only: rung 4.
+        {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness.orch.without_candidates("prd");
+            let _ = child_box_target(&harness, &["rust"]).await;
+            enable_agent_on(&harness, ids::AGENT_AGY, harness.orch.box_id()).await;
+            harness_engine!(harness.orch, engine);
+            let engine = engine.with_runnable_kinds(htui_core::model::TargetKind::ALL);
+
+            let refused = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+                .await
+                .expect_err("the child has no agent");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::Resolve(crate::graph::ResolveError::NoCandidate { phase })
+                        if phase == "prd"
+                ),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// MOD-130 M3 P2: the target refusal precedes the tag check and rung 4. An item that lacks a
+    /// tag and has no candidate, at a docker target this build cannot run, is refused for the
+    /// target, with the target's sentence as its one note.
+    #[tokio::test]
+    async fn a_target_refusal_comes_before_the_tags_and_rung_four() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness.orch.without_candidates("prd");
+        require_tags(&harness, ids::HTUI_FEAT_3, &["vulkan"]).await;
+        let docker = harness
+            .orch
+            .store
+            .create_target(htui_core::model::NewTarget {
+                id: htui_core::model::TargetId::new(),
+                name: "dev docker".to_owned(),
+                kind: htui_core::model::TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("the target is created");
+        set_project_target(&harness, ids::PROJECT_HTUI, Some(docker.id)).await;
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
+            .await
+            .expect_err("this build runs only local");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::TargetRefused {
+                    item,
+                    refusal: htui_core::model::TargetRefusal::NotRunnable { owner: "MOD-44", .. },
+                    ..
+                } if *item == ids::HTUI_FEAT_3
+            ),
+            "the target, not the tags or rung 4: {refused:?}"
+        );
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        let added: Vec<&str> = notes[notes_before..]
+            .iter()
+            .map(|note| note.body.as_str())
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                "target dev docker is docker, which this build cannot run yet; MOD-44 brings it; \
+                 chosen by its project"
+            ]
+        );
     }
 
     /// MOD-130 M2 D1, P10: a docker target at the project level resolves, but the run cannot
