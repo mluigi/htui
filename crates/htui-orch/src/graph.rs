@@ -461,6 +461,8 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 /// `Active` entries under the cap, copied with their text, so every step, retry and resume of the
 /// run renders the same bytes.
 ///
+/// The graph is read once (`read_graph`) and resolved by [`resolve_with`] (MOD-130 M3, P3).
+///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
 pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
@@ -472,10 +474,63 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     requested_scope: Option<&[RepoId]>,
     box_id: BoxId,
 ) -> std::result::Result<Resolved, ResolveError> {
-    match Box::pin(resolve_or_refused(
+    let graph = read_graph(source, item).await?;
+    Box::pin(resolve_with(
         store,
         source,
         item,
+        graph,
+        mode,
+        app,
+        requested_scope,
+        box_id,
+    ))
+    .await
+}
+
+/// The graph `item` runs (its override, else its kind's default), read once so that the workflow
+/// level of the target cascade and the snapshot come from one revision (MOD-130 M3, P3).
+///
+/// # Errors
+/// [`ResolveError::NoGraph`] when the item resolves to no graph; [`ResolveError::Store`] for the
+/// read itself.
+pub(crate) async fn read_graph<G: GraphSource>(
+    source: &G,
+    item: &Item,
+) -> std::result::Result<ResolvedGraph, ResolveError> {
+    // Boxed: PgStore's read now holds a transaction, and the engine awaits this inside its own
+    // futures (MOD-138 blueprint §4, the 2 MiB debug stack).
+    Box::pin(source.resolve_graph(item.id))
+        .await?
+        .ok_or(ResolveError::NoGraph(item.id))
+}
+
+/// [`resolve`] over a graph already read by `read_graph` (MOD-130 M3, P3): the engine reads the
+/// graph once, takes the workflow level of the target cascade from it, and resolves the same read.
+/// `Resolved::workflow_target` is `graph.graph.target_id`.
+///
+/// # Errors
+/// As [`resolve`], less [`ResolveError::NoGraph`], which only the read raises.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`resolve`'s inputs plus the graph it already read; a struct for them would be named \
+              once and read once"
+)]
+pub async fn resolve_with<S: htui_core::store::WorkerStore, G: GraphSource>(
+    store: &S,
+    source: &G,
+    item: &Item,
+    graph: ResolvedGraph,
+    mode: RunMode,
+    app: &BTreeMap<String, Value>,
+    requested_scope: Option<&[RepoId]>,
+    box_id: BoxId,
+) -> std::result::Result<Resolved, ResolveError> {
+    match Box::pin(resolve_or_refused_with(
+        store,
+        source,
+        item,
+        graph,
         mode,
         app,
         requested_scope,
@@ -660,11 +715,39 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
     requested_scope: Option<&[RepoId]>,
     box_id: BoxId,
 ) -> std::result::Result<Resolution, ResolveError> {
-    // Boxed: PgStore's read now holds a transaction, and the engine awaits this inside its own
-    // futures (MOD-138 blueprint §4, the 2 MiB debug stack).
-    let resolved = Box::pin(source.resolve_graph(item.id))
-        .await?
-        .ok_or(ResolveError::NoGraph(item.id))?;
+    let graph = read_graph(source, item).await?;
+    Box::pin(resolve_or_refused_with(
+        store,
+        source,
+        item,
+        graph,
+        mode,
+        app,
+        requested_scope,
+        box_id,
+    ))
+    .await
+}
+
+/// [`resolve_or_refused`] over a graph already read by [`read_graph`] (MOD-130 M3, P3).
+///
+/// # Errors
+/// As [`resolve_or_refused`], less [`ResolveError::NoGraph`], which only the read raises.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`resolve_or_refused`'s inputs plus the graph it already read; a struct for them \
+              would be named once and read once"
+)]
+pub(crate) async fn resolve_or_refused_with<S: htui_core::store::WorkerStore, G: GraphSource>(
+    store: &S,
+    source: &G,
+    item: &Item,
+    resolved: ResolvedGraph,
+    mode: RunMode,
+    app: &BTreeMap<String, Value>,
+    requested_scope: Option<&[RepoId]>,
+    box_id: BoxId,
+) -> std::result::Result<Resolution, ResolveError> {
     let project = store
         .project(item.project_id)
         .await?
@@ -2132,7 +2215,7 @@ mod tests {
         ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunBounds,
         RunMode, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
         effective_gate, expand_divide, first_decode_failure, override_graph, project_settings,
-        resolve, run_bounds, snapshot_walk_refusal, topology_v2,
+        read_graph, resolve, resolve_with, run_bounds, snapshot_walk_refusal, topology_v2,
     };
 
     /// CLEAN-11: a malformed document is first for its `(project, updated_at)` and not again; an
@@ -4777,6 +4860,67 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect_err("the kind's default graph is gone");
         assert_eq!(error, ResolveError::NoGraph(ids::HTUI_FEAT_1));
+    }
+
+    /// MOD-130 M3 P3: `read_graph` answers [`ResolveError::NoGraph`] for an item that resolves to
+    /// no graph, the same error `resolve` raises (`an_item_with_no_graph_is_refused`).
+    #[tokio::test]
+    async fn read_graph_refuses_an_item_with_no_graph() {
+        let store = store_with(|data| data.graphs.retain(|graph| graph.id != ids::GRAPH_HTUI_FEAT));
+        let item = feat_1(&store).await;
+        let error = read_graph(&TestSource::claude(&store), &item)
+            .await
+            .expect_err("the kind's default graph is gone");
+        assert_eq!(error, ResolveError::NoGraph(ids::HTUI_FEAT_1));
+        assert_eq!(
+            resolve_feat(&store, &TestSource::claude(&store))
+                .await
+                .expect_err("resolve reads the same graph"),
+            error,
+            "`resolve` answers what `read_graph` does"
+        );
+    }
+
+    /// MOD-130 M3 P3: resolving a pre-read graph answers what `resolve` does, field for field, so
+    /// the engine can read the graph once for its workflow level and its snapshot.
+    #[tokio::test]
+    async fn resolve_with_a_pre_read_graph_answers_as_resolve() {
+        let store = MemStore::demo();
+        let source = TestSource::claude(&store);
+        let item = feat_1(&store).await;
+        let graph = read_graph(&source, &item)
+            .await
+            .expect("the seeded feature graph is read");
+        let workflow_target = graph.graph.target_id;
+        let pre_read = resolve_with(
+            &store,
+            &source,
+            &item,
+            graph,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the pre-read graph resolves");
+        let resolved = resolve_feat(&store, &source)
+            .await
+            .expect("the seeded feature graph resolves");
+        assert_eq!(pre_read.snapshot, resolved.snapshot, "the same snapshot");
+        assert_eq!(
+            pre_read.repo_scope, resolved.repo_scope,
+            "the same repo scope"
+        );
+        assert_eq!(
+            pre_read.workflow_target, resolved.workflow_target,
+            "the same workflow target"
+        );
+        assert_eq!(
+            pre_read.workflow_target, workflow_target,
+            "the workflow target is the pre-read graph's"
+        );
+        assert_eq!(pre_read, resolved, "and every other field");
     }
 
     /// MOD-138 D12: a library graph `libflow` holding a copy of `feature`'s `implement` and
