@@ -406,6 +406,7 @@ mod binary {
                  stop       = [\"s\"]              # stop runs\n\
                  resume     = [\"r\"]              # resume runs\n\
                  new        = [\"N\"]              # new workspace or project\n\
+                 target     = [\"T\"]              # default target\n\
                  yes        = [\"y\", \"enter\"]     # yes\n\
                  next_field = [\"tab\", \"down\"]    # next field\n\
                  prev_field = [\"backtab\", \"up\"]  # previous field\n"
