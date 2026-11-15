@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_create.rs
+expression: frame
+---
+Graphics   ¹Workspaces         0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ New project in Graphics ──────────────────────╮
+│▌▾ Graphics  ● open                             ││ name          Plain                            │
+│     overview                                   ││ slug          plain                            │
+│     Vulkan Tutorials                           ││ description                                    │
+│ ▾ Platform  ◐ background · 1 running           ││ source        ‹ existing folder ›              │
+│     overview                                   ││▌folder        ~/plain                          │
+│     htui                                       ││               an absolute path, or one under ~ │
+│     agy                                        ││                                                │
+│                                                ││`~/plain` is not a git repository; plain folders│
+│                                                ││come with MOD-145                               │
+│                                                ││                                                │
+│                                                ││registers ~/plain as it is; htui writes nothing │
+│                                                ││in it; plain folders come with MOD-145          │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰─Enter create · Esc cancel · Tab field …────────╯╰────────────────────────────────────────────────╯

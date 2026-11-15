@@ -1012,6 +1012,17 @@ impl WorkspacesTab {
         }
     }
 
+    /// MOD-116 M3 D3: `text` (a worker's sentence) with every path under the home written `~/…`.
+    fn under_home_text(&self, text: &str) -> String {
+        match self.home.as_deref() {
+            Some(home) => {
+                let home = home.display().to_string();
+                text.replace(&format!("{}/", home.trim_end_matches('/')), "~/")
+            }
+            None => text.to_owned(),
+        }
+    }
+
     /// MOD-116 M3 D1: `N`: the chooser, `workspace` then `project in <name>` for the selected
     /// row's workspace; with no workspace listed, the workspace form at once.
     fn begin_new(&mut self) {
@@ -1125,6 +1136,8 @@ impl WorkspacesTab {
         }
         self.land_on = Some(Entry::Workspace(workspace.workspace_id));
         ctx.request(StoreRequest::Workspaces);
+        // Its state (`○ stopped`, PRD Q4) reads from the counts, which list it from now on.
+        ctx.request(StoreRequest::WorkspaceRunCounts);
         if self.summary(ctx.scope.workspace_id).is_none() {
             ctx.emit(Action::SetScope {
                 workspace: workspace.clone(),
@@ -1166,6 +1179,7 @@ impl WorkspacesTab {
     /// MOD-116 M3 D13: a create refused (a sentence) or failed (the store's message): under the
     /// form while it is open and waiting, its text kept, else in the box.
     fn setup_refused(&mut self, request: &str, why: &str) {
+        let why = &self.under_home_text(why);
         let project = request == NEW_PROJECT;
         let slug = if project { self.creating.take() } else { None };
         match &mut self.mode {
@@ -1207,29 +1221,41 @@ impl WorkspacesTab {
         }
     }
 
-    /// MOD-116 M3: the open form in `area`, titled for what it creates, its keys on the border.
-    fn render_form(&self, frame: &mut Frame<'_>, area: Rect, focus: Focus, ctx: &Ctx<'_>) {
-        let theme = ctx.theme;
+    /// MOD-116 M3: the open form's keys, through [`views::WORKSPACES_FORM`]; none without one or
+    /// while a question is up.
+    fn form_hints(&self, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        let spec = match (&self.question, &self.mode) {
+            (None, Mode::Workspace(_)) => WORKSPACE_FORM_HINT,
+            (None, Mode::Project(_)) => PROJECT_FORM_HINT,
+            _ => return None,
+        };
+        key_line(ctx.keys().hint(views::WORKSPACES_FORM, spec), ctx.theme)
+    }
+
+    /// MOD-116 M3: the open form in `area`, titled for what it creates, `hints` on the border.
+    fn render_form(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        focus: Focus,
+        hints: Option<&Line<'static>>,
+        ctx: &Ctx<'_>,
+    ) {
         let inner = Pane::inner(area);
-        let (title, lines, spec) = match &self.mode {
-            Mode::Workspace(form) => (
-                NEW_WORKSPACE_TITLE.to_owned(),
-                form.lines(inner.width, ctx),
-                WORKSPACE_FORM_HINT,
-            ),
+        let (title, lines) = match &self.mode {
+            Mode::Workspace(form) => (NEW_WORKSPACE_TITLE.to_owned(), form.lines(inner.width, ctx)),
             Mode::Project(form) => (
                 format!("New project in {}", form.workspace_name()),
                 form.lines(inner.width, ctx),
-                PROJECT_FORM_HINT,
             ),
             Mode::Browse | Mode::Choosing(_) => return,
         };
         frame.render_widget(Paragraph::new(lines), inner);
         let mut pane = Pane::new(&title).focus(focus).accent(ctx.accent());
-        if let Some(hints) = key_line(ctx.keys().hint(views::WORKSPACES_FORM, spec), theme) {
-            pane = pane.hints(hints);
+        if let Some(hints) = hints {
+            pane = pane.hints(hints.clone());
         }
-        pane.render(frame, area, theme);
+        pane.render(frame, area, ctx.theme);
     }
 
     /// The detail pane's title: the workspace's name, or the project's.
@@ -1569,13 +1595,18 @@ impl Tab for WorkspacesTab {
     /// detail; the chooser is a box over the tab, under any question.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let areas = ctx.split(area, WORKSPACES_LAYOUT);
-        let hints = self.browse_hints(ctx);
         let form = self.mode.has_form();
+        // A form's keys go on whichever of the tab's panes is focused, as the browse keys do.
+        let hints = if form {
+            self.form_hints(ctx)
+        } else {
+            self.browse_hints(ctx)
+        };
         let detail = !areas.detail.is_empty();
         if let Some(list) = areas.list.filter(|rect| !rect.is_empty()) {
             let focus = ctx.pane_focus(PaneId::List);
             if form && !detail {
-                self.render_form(frame, list, focus, ctx);
+                self.render_form(frame, list, focus, hints.as_ref(), ctx);
             } else {
                 self.render_list(frame, list, focus, hints.as_ref(), ctx);
             }
@@ -1583,7 +1614,7 @@ impl Tab for WorkspacesTab {
         if detail {
             let focus = ctx.pane_focus(PaneId::Detail);
             if form {
-                self.render_form(frame, areas.detail, focus, ctx);
+                self.render_form(frame, areas.detail, focus, hints.as_ref(), ctx);
             } else {
                 self.render_detail(frame, areas.detail, focus, hints.as_ref(), ctx);
             }

@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use crossterm::event::KeyEvent;
-use htui_core::model::{WorkspaceId, project_folder, slug_of, workspace_folder};
+use htui_core::model::{WORKSPACES_DIR, WorkspaceId, project_folder, slug_of, workspace_folder};
 use htui_orch::infer::redact_remote;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -277,19 +277,28 @@ impl WorkspaceForm {
         )
     }
 
-    /// The preview's sentences: the folder and its `projects/`, the components line, then the
-    /// state a new workspace starts in.
+    /// The preview's lines, as a small tree (leading blanks indent): the folder and its
+    /// `projects/` each with what it is, the components line, then the state a new workspace
+    /// starts in.
     fn preview(&self) -> Vec<String> {
         let folder = text(&self.folder).trim().trim_end_matches('/');
         let mut lines = Vec::new();
         if folder.is_empty() {
-            lines.push(TYPE_A_FOLDER.to_owned());
+            // Nothing to follow yet: say where the folder goes once there is a slug.
+            let follows = self
+                .home
+                .as_deref()
+                .filter(|_| !self.folder_edited)
+                .map(|home| shown(&home.join(WORKSPACES_DIR), Some(home)));
+            lines.push(follows.map_or_else(
+                || TYPE_A_FOLDER.to_owned(),
+                |base| format!("the folder follows the slug: {base}/<slug>"),
+            ));
         } else {
-            let top = format!("{folder}/");
-            let projects = "  projects/".to_owned();
-            let column = top.chars().count().max(projects.chars().count()) + 2;
-            lines.push(format!("{top:<column$}{FOLDER_NOTE}"));
-            lines.push(format!("{projects:<column$}{PROJECTS_NOTE}"));
+            lines.push(format!("{folder}/"));
+            lines.push(format!("  {FOLDER_NOTE}"));
+            lines.push(format!("  {}/", htui_core::model::PROJECTS_DIR));
+            lines.push(format!("    {PROJECTS_NOTE}"));
             lines.push(COMPONENTS_NOTE.to_owned());
         }
         lines.push(String::new());
@@ -749,7 +758,7 @@ fn counted(line: String, seconds: u64) -> String {
 }
 
 /// A form's lines: the fields, the error (`theme.error`) or the busy line, a blank, then the
-/// preview in `theme.dim`, each sentence wrapped to `width`.
+/// preview in `theme.dim`, each line wrapped to `width` under its own leading blanks.
 fn assemble(
     mut lines: Vec<Line<'static>>,
     error: Option<&str>,
@@ -760,11 +769,14 @@ fn assemble(
 ) -> Vec<Line<'static>> {
     let width = usize::from(width).max(1);
     let mut push = |text: &str, style: Style| {
-        if text.is_empty() {
+        let body = text.trim_start_matches(' ');
+        if body.is_empty() {
             lines.push(Line::default());
+            return;
         }
-        for row in wrapped(text, width) {
-            lines.push(Line::styled(row, style));
+        let indent = (text.len() - body.len()).min(width / 2);
+        for row in wrapped(body, width - indent) {
+            lines.push(Line::styled(format!("{}{row}", " ".repeat(indent)), style));
         }
     };
     push("", theme.dim);

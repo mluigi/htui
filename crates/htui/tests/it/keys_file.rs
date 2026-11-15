@@ -402,10 +402,13 @@ mod binary {
         assert!(
             stdout.contains(
                 "[workspaces]\n\
-                 open   = [\"o\"]           # open workspace\n\
-                 stop   = [\"s\"]           # stop runs\n\
-                 resume = [\"r\"]           # resume runs\n\
-                 yes    = [\"y\", \"enter\"]  # yes\n"
+                 open       = [\"o\"]              # open workspace\n\
+                 stop       = [\"s\"]              # stop runs\n\
+                 resume     = [\"r\"]              # resume runs\n\
+                 new        = [\"N\"]              # new workspace or project\n\
+                 yes        = [\"y\", \"enter\"]     # yes\n\
+                 next_field = [\"tab\", \"down\"]    # next field\n\
+                 prev_field = [\"backtab\", \"up\"]  # previous field\n"
             ),
             "[workspaces] is at its default: {stdout}"
         );

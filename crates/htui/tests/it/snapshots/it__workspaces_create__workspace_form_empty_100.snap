@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_create.rs
+expression: frame
+---
+no workspace   ¹Workspaces           0 working · 0 waiting · memory · no box ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ New workspace ────────────────────────────────╮
+│                                                ││▌name                                           │
+│                                                ││ slug                                           │
+│                                                ││ folder                                         │
+│                                                ││ description                                    │
+│                                                ││                                                │
+│                                                ││the folder follows the slug: ~/workspaces/<slug>│
+│                                                ││                                                │
+│                                                ││A new workspace starts stopped.                 │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│               No workspaces yet.               ││                                                │
+│                 `N` creates one                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰─Enter create · Esc cancel · Tab field──────────╯╰────────────────────────────────────────────────╯

@@ -71,6 +71,7 @@ mod waiting;
 mod worker_crash_pg;
 mod worker_log_pg;
 mod worker_pg;
+mod workspaces_create;
 mod workspaces_tab;
 #[path = "../../../../tests/rust/write_executable.rs"]
 mod write_executable;

@@ -352,17 +352,15 @@ async fn the_overview_is_read_again_when_its_counts_change() {
     );
 }
 
-/// D8: no workspace says so and names the next step, the key Settings › Hierarchy binds.
+/// D8: no workspace says so and names the next step, the key that creates one here (MOD-116 M3
+/// D1).
 #[tokio::test]
 async fn an_empty_store_says_how_to_create_a_workspace() {
     let mut harness = Harness::empty().with_tab(Box::new(WorkspacesTab::new()));
     harness.settle().await;
     let frame = harness.render();
     assert!(frame.contains("No workspaces yet."), "{frame}");
-    assert!(
-        frame.contains("`N` in Settings \u{203a} Hierarchy creates one"),
-        "{frame}"
-    );
+    assert!(frame.contains("`N` creates one"), "{frame}");
     assert_eq!(harness.app().status, None);
 }
 
