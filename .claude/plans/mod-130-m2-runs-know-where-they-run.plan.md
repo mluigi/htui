@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-130-execution-targets.prd.md`
 **Selected Milestone**: 2 — Runs know where they run
 **Complexity**: Medium-Large
-**Status**: in-progress
+**Status**: complete (`c52e87be`..`8b222d18`, 2026-11-15); review fix round R1 applied; sandbox gate green but for `cache::the_spawned_refresher_passes_and_follows_the_scope`, the known load flake (alone, alternating: base `3e7b7d38` 2/4, HEAD 2/4).
 **Routing**: PRD path, ultracode for implement (C2, C4) (`/handoff-run` in the `hr/MOD-130` sandbox,
 2026-11-15). The plan runs without a confirm gate (handoff-run step 3). No architect: M2 adds no module
 seam beyond what the PRD and M1 fixed (C2 for this milestone is the resolver and the run snapshot, both
@@ -383,6 +383,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | The engine's `app` map is stale relative to a Settings default edit | Low | It is as fresh as every app setting the engine reads (P5); MOD-123's Settings surface owns any refresh |
 | Placing target refusal after rung 4 gives a docker-target item with no candidate the rung-4 note | Low | M2 only; M3 re-orders with D9 (P2) |
 | Blocking the item on a target refusal surprises someone who expected a soft refusal | Low | Mirrors missing tags and rung 4 (invariant 7: a refusal a human can read); `u` unblocks |
+| One shared level (Settings default, workspace, project, workflow) naming a non-runnable target blocks every item the queue runner tries in one tick (review M1, 2026-11-15) | Low now, Medium once setters exist | Maintainer decision 2026-11-15: keep blocking (the missing-tags precedent). The note names the level that chose the target (R1 F1). The setters of MOD-123, MOD-116 and MOD-124 should warn before saving a target that is not runnable; MOD-130's M2 phase note in HANDOFF records this. A `Retired` refusal is soft (R1 L2) |
 
 ## Claims to verify
 

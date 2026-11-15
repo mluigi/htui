@@ -439,6 +439,20 @@ items it follows are done.
   `enqueue` snapshots target and source, run-start refusals). Renumbered behind MOD-125 M4's `0037`, MOD-159 M1's `0038` and
   MOD-133 M1's `0039` (cache behind `0013_integration`) at the merge. Owed on the host: the merged-tree Postgres gate, the live-Qdrant suites
   (`qdrant_worker.rs` gained one literal, compiled only), the Windows build.
+  **Phase M2 landed (`c52e87be`..`8b222d18`, 2026-11-15, on `hr/MOD-130`):** `resolve_target` (item → workflow →
+  project → workspace → Settings → local, naming `TargetSource`). A scope-row item answers as `workspace`; any other
+  item takes the scope row of the run's workspace. `enqueue` records `run.target_id`/`target_source` and sets
+  `target_box_id` to the target's box. Both stores' `create_run` refuse an unknown or retired target (Pg reads it
+  `FOR SHARE`). Mem `delete_target` refuses a target with runs. New `WorkerStore` reads `scope_project` and
+  `target_binding`. Run start refuses a retired target (soft: no note, no block), a kind this build cannot run
+  (names MOD-44/131/47), a target bound to another box, and one that is not `ready`. Every refusal but retired
+  blocks the item with a note naming the level that chose the target (maintainer, 2026-11-15). No migration;
+  conformance `CASES` 346. Plan `.claude/plans/mod-130-m2-runs-know-where-they-run.plan.md`. Deferred to M3:
+  `executing_box_id` at enqueue (D8), tags and candidates against the target box (D9), claim/poll/queue keyed on the
+  driver. The target setters of MOD-123, MOD-116 and MOD-124 should warn before saving a kind that cannot run: one
+  shared level naming one blocks every item the queue tries. Sandbox gate green except the known load flake
+  `cache::the_spawned_refresher_passes_and_follows_the_scope` (base 2/4, HEAD 2/4 alone). Owed on the host: the merged-tree
+  Postgres gate.
 - [ ] **MOD-131 - Driven targets: ssh and docker exec launch, MCP relay tunnel, remote bootstrap**
   (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; §8 accepted 2026-11-14). `R-ORCH-15`, `R-AGT-11`,
   `R-AGT-5`, `R-SEC-2`, `R-BOX-4`. The `TargetTransport` launch decorator under `TransportBuilder` for
