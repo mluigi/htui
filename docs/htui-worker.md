@@ -508,8 +508,10 @@ for now).
   the lease was taken again at every try) do they just say which box indexes it. A `Ctrl+R` on a
   free lease takes it for that one press and lets it go after; one the TUI's own index job holds
   stays the job's. Every press of one TUI uses the same token, so a press stopped half-way by a
-  second press leaves its lease to that press, which takes it back as its own; quitting the TUI
-  lets a press's lease go (it waits at most 1 second for that, beside the index job's stop).
+  second press leaves its lease under that token: the second press waits for the first to stop,
+  then, on the same workspace, takes the lease back as its own. Another workspace's lease lapses
+  within the time-to-live, or is let go when the TUI quits. Quitting the TUI lets a press's lease
+  go (it waits at most 1 second for that, beside the index job's stop).
 - **MCP `search_concepts`** reads every workspace's collection; one that fails (a stale
   collection, or one another embedder wrote) is skipped and logged while the others answer. The
   search fails only when no workspace collection answered.
