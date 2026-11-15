@@ -7,15 +7,20 @@
 //! lease unregisters the session's token, so a call that arrives later answers `session ended`
 //! (I-6).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use htui_agent::driver::{
-    McpServerSpec, PermissionDefault, PermissionMatch, PermissionPolicy, PermissionRule,
+    DriverCaps, McpServerSpec, PermissionDefault, PermissionMatch, PermissionPolicy, PermissionRule,
 };
 use htui_agent::event::PermissionOptionKind;
 use htui_agent::prompt_bridge::PromptPort;
-use htui_core::model::{BoxId, ItemId, ProjectId, RunId, StepId, Transport, UserId};
+use htui_core::model::{
+    BoxId, EnvValue, ItemId, McpPick, McpTransport, ProjectId, RunId, SERVER_NAME,
+    SnapshotMcpServer, SnapshotToolbox, StepId, Transport, UserId,
+};
 use htui_core::prompt::render::HostnameLine;
+use htui_core::prompt::{McpChoice, McpOutcome, SkipReason};
 use htui_core::store::StepFence;
 
 /// Everything a session's tools are scoped to. Built by the engine or the chat runtime; never
@@ -186,6 +191,218 @@ pub fn pre_approve(policy: &mut PermissionPolicy, lease: &ToolLease) {
     );
 }
 
+/// MOD-127 M2 D9: the tool lists of one server a session launches: `allow` pre-approves, `deny`
+/// removes. Bare tool names, as the server advertises them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpTools {
+    /// The server's name: the `<name>` of `mcp__<name>__<tool>`.
+    pub server: String,
+    /// Tools pre-approved for the server.
+    pub allow: Vec<String>,
+    /// Tools removed from the agent.
+    pub deny: Vec<String>,
+}
+
+/// MOD-127 M2 D7, D10: what one step launches of the run's frozen toolbox, and the record of why.
+///
+/// `specs` and `choices` come from one pass ([`plan_mcp`]), so the prompt's `mcp_choices` and the
+/// session's `mcp` cannot disagree. `specs` hold resolved secret **values** and are for the
+/// launch only: their `Debug` redacts them, and nothing here is persisted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpPlan {
+    /// The servers to start after htui's own, by name bytes.
+    pub specs: Vec<McpServerSpec>,
+    /// Every resolved server, rendered or skipped, by name bytes.
+    pub choices: Vec<McpChoice>,
+    /// The lists of the rendered servers, in the order of `specs`.
+    pub tools: Vec<McpTools>,
+}
+
+/// MOD-127 M2 D3, D7, D10: partitions a phase's frozen picks by what the step's agent can carry
+/// and by the secrets the project supplies, and builds a spec for each server that launches.
+///
+/// Pure: no store, no clock, no secret provider. The rules, in order, per pick:
+/// - the winning attachment is `off`: skipped `off`;
+/// - the server's name is htui's own: `reserved_name`;
+/// - the agent carries neither transport: `agent_unsupported`; carries the other one:
+///   `transport_unsupported`;
+/// - a `Secret` the env or a header names is not in `secrets`: `secret_missing` with that **name**
+///   (keys are case-sensitive, as the provider's are). The first one in header, env order.
+///
+/// A pick whose index is outside the toolbox is dropped: a snapshot is written whole, so none is.
+/// `toolbox: None` (a run made before M2) yields no pick and an empty plan.
+#[must_use]
+pub fn plan_mcp(
+    toolbox: Option<&SnapshotToolbox>,
+    picks: &[McpPick],
+    caps: DriverCaps,
+    secrets: &BTreeMap<String, String>,
+) -> McpPlan {
+    let Some(toolbox) = toolbox else {
+        return McpPlan::default();
+    };
+    let mut rows: Vec<(&SnapshotMcpServer, &McpPick)> = picks
+        .iter()
+        .filter_map(|pick| {
+            toolbox
+                .servers
+                .get(pick.server)
+                .map(|server| (server, pick))
+        })
+        .collect();
+    rows.sort_by(|(a, _), (b, _)| a.name.as_bytes().cmp(b.name.as_bytes()));
+    let mut plan = McpPlan::default();
+    for (server, pick) in rows {
+        let (spec, outcome) = match launch_of(server, pick, caps, secrets) {
+            Ok(spec) => (Some(spec), McpOutcome::Rendered),
+            Err(reason) => (None, McpOutcome::Skipped(reason)),
+        };
+        plan.choices.push(McpChoice {
+            server: server.id,
+            name: server.name.clone(),
+            level: pick.level,
+            activation: if pick.active {
+                htui_core::model::Activation::Always
+            } else {
+                htui_core::model::Activation::Off
+            },
+            active: pick.active,
+            outcome,
+        });
+        if let Some(spec) = spec {
+            plan.tools.push(McpTools {
+                server: server.name.clone(),
+                allow: server.allow.clone(),
+                deny: server.deny.clone(),
+            });
+            plan.specs.push(spec);
+        }
+    }
+    plan
+}
+
+/// [`plan_mcp`]'s verdict for one pick: the spec to launch, or why not.
+fn launch_of(
+    server: &SnapshotMcpServer,
+    pick: &McpPick,
+    caps: DriverCaps,
+    secrets: &BTreeMap<String, String>,
+) -> Result<McpServerSpec, SkipReason> {
+    if !pick.active {
+        return Err(SkipReason::Off);
+    }
+    if server.name == SERVER_NAME {
+        return Err(SkipReason::ReservedName);
+    }
+    let (carries, other) = match server.transport {
+        McpTransport::Stdio => (caps.mcp_stdio, caps.mcp_http),
+        McpTransport::Http => (caps.mcp_http, caps.mcp_stdio),
+    };
+    if !carries {
+        return Err(if other {
+            SkipReason::TransportUnsupported
+        } else {
+            SkipReason::AgentUnsupported
+        });
+    }
+    let headers = substitute(&server.headers, secrets)?;
+    let env = substitute(&server.env, secrets)?;
+    Ok(McpServerSpec {
+        name: server.name.clone(),
+        command: match server.transport {
+            McpTransport::Stdio => server.command.clone(),
+            McpTransport::Http => String::new(),
+        },
+        args: match server.transport {
+            McpTransport::Stdio => server.args.clone(),
+            McpTransport::Http => Vec::new(),
+        },
+        env,
+        transport: server.transport,
+        url: match server.transport {
+            McpTransport::Stdio => None,
+            McpTransport::Http => server.url.clone(),
+        },
+        headers,
+    })
+}
+
+/// A key's literal, or the project secret it names; the first name `secrets` lacks is the refusal.
+fn substitute(
+    values: &[(String, EnvValue)],
+    secrets: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, SkipReason> {
+    let mut resolved = BTreeMap::new();
+    for (key, value) in values {
+        let text = match value {
+            EnvValue::Literal(text) => text.clone(),
+            EnvValue::Secret(name) => secrets
+                .get(name)
+                .cloned()
+                .ok_or_else(|| SkipReason::SecretMissing(name.clone()))?,
+        };
+        resolved.insert(key.clone(), text);
+    }
+    Ok(resolved)
+}
+
+/// MOD-127 M2 D9: `server`'s `allow` tools pre-approved, as [`pre_approve`] does for htui's own:
+/// one `allow_once` per tool, matched on `mcp__<server>__<tool>` and appended after every rule
+/// the policy holds, and only under the default `ask`. A tool the server also lists in `deny` is
+/// left unapproved. Empty `allow` appends nothing: the existing policy decides.
+pub fn pre_approve_server(policy: &mut PermissionPolicy, server: &str, tools: &McpTools) {
+    if policy.default != PermissionDefault::Ask {
+        return;
+    }
+    policy.rules.extend(
+        tools
+            .allow
+            .iter()
+            .filter(|tool| !tools.deny.contains(tool))
+            .map(|tool| PermissionRule {
+                matcher: PermissionMatch {
+                    tool_name: Some(qualified_tool_name(server, tool)),
+                    ..PermissionMatch::default()
+                },
+                answer: PermissionOptionKind::AllowOnce,
+                reason: format!("`{server}`'s `{tool}` tool, allowed on the server (MOD-127)"),
+            }),
+    );
+}
+
+/// MOD-127 M2 D9: applies `plan`'s tool lists to a session. Each rendered server's `deny` becomes
+/// a `RejectOnce` rule at the **front** of `policy.rules`, ahead of every allow rule (rules run in
+/// order), and its qualified name joins `deny` (`ToolExposure.deny`, which the CLI turns into
+/// `--disallowedTools`); then its `allow` list is pre-approved ([`pre_approve_server`]).
+/// `ToolExposure.allow` is never touched: it is a real allow-list, and an MCP `allow` must not
+/// restrict.
+pub fn apply_mcp_tools(policy: &mut PermissionPolicy, deny: &mut Vec<String>, plan: &McpPlan) {
+    let mut rejects = Vec::new();
+    for tools in &plan.tools {
+        for tool in &tools.deny {
+            let name = qualified_tool_name(&tools.server, tool);
+            rejects.push(PermissionRule {
+                matcher: PermissionMatch {
+                    tool_name: Some(name.clone()),
+                    ..PermissionMatch::default()
+                },
+                answer: PermissionOptionKind::RejectOnce,
+                reason: format!(
+                    "`{}`'s `{tool}` tool, denied on the server (MOD-127)",
+                    tools.server
+                ),
+            });
+            if !deny.contains(&name) {
+                deny.push(name);
+            }
+        }
+    }
+    policy.rules.splice(0..0, rejects);
+    for tools in &plan.tools {
+        pre_approve_server(policy, &tools.server, tools);
+    }
+}
+
 impl Drop for ToolLease {
     fn drop(&mut self) {
         if let Some(unregister) = self.on_drop.take() {
@@ -235,13 +452,22 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use htui_agent::driver::{McpServerSpec, PermissionMatch, PermissionPolicy, PermissionRule};
+    use htui_agent::driver::{
+        DriverCaps, McpServerSpec, PermissionMatch, PermissionPolicy, PermissionRule,
+    };
     use htui_agent::event::{PermissionOption, PermissionOptionKind, ToolCallEvent, ToolKind};
     use htui_agent::permission::evaluate;
+    use htui_core::model::{
+        EnvValue, McpPick, McpTransport, SERVER_NAME, SnapshotMcpServer, SnapshotToolbox,
+    };
+    use htui_core::prompt::{McpOutcome, SkipReason};
 
     use std::path::{Path, PathBuf};
 
-    use super::{ASKING_TOOLS, ExtraDirRefusal, ToolLease, ToolScope, pre_approve};
+    use super::{
+        ASKING_TOOLS, ExtraDirRefusal, McpPlan, McpTools, ToolLease, ToolScope, apply_mcp_tools,
+        plan_mcp, pre_approve, pre_approve_server,
+    };
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -545,5 +771,322 @@ mod tests {
             debug.contains(&id.to_string()),
             "the prompt id is shown: {debug}"
         );
+    }
+
+    // -- MOD-127 M2 T6: `plan_mcp`, `pre_approve_server`, `apply_mcp_tools` ---------------------
+
+    const DOCS_TOKEN: &str = "sentinel-docs-token-value-0001";
+
+    fn frozen(name: &str, transport: McpTransport) -> SnapshotMcpServer {
+        SnapshotMcpServer {
+            id: htui_core::model::McpServerId::new(),
+            name: name.to_owned(),
+            description: String::new(),
+            transport,
+            command: if transport == McpTransport::Stdio {
+                format!("{name}-server")
+            } else {
+                String::new()
+            },
+            args: if transport == McpTransport::Stdio {
+                vec!["--stdio".to_owned()]
+            } else {
+                Vec::new()
+            },
+            url: (transport == McpTransport::Http).then(|| format!("https://{name}.test/rpc")),
+            headers: Vec::new(),
+            env: Vec::new(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+
+    fn toolbox(servers: Vec<SnapshotMcpServer>) -> (SnapshotToolbox, Vec<McpPick>) {
+        let picks = (0..servers.len())
+            .map(|server| McpPick {
+                server,
+                level: htui_core::model::BindingLevel::Project,
+                active: true,
+            })
+            .collect();
+        (SnapshotToolbox { servers }, picks)
+    }
+
+    fn caps(stdio: bool, http: bool) -> DriverCaps {
+        DriverCaps {
+            mcp_stdio: stdio,
+            mcp_http: http,
+            ..DriverCaps::default()
+        }
+    }
+
+    fn names(plan: &McpPlan) -> Vec<&str> {
+        plan.specs.iter().map(|spec| spec.name.as_str()).collect()
+    }
+
+    fn outcomes(plan: &McpPlan) -> Vec<(&str, McpOutcome)> {
+        plan.choices
+            .iter()
+            .map(|choice| (choice.name.as_str(), choice.outcome.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn renders_servers_by_name_bytes() {
+        let (toolbox, picks) = toolbox(vec![
+            frozen("zulu", McpTransport::Stdio),
+            frozen("alpha", McpTransport::Stdio),
+            frozen("Mid", McpTransport::Stdio),
+        ]);
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), &BTreeMap::new());
+        assert_eq!(names(&plan), ["Mid", "alpha", "zulu"], "byte order");
+        assert!(
+            plan.choices
+                .iter()
+                .all(|choice| choice.outcome == McpOutcome::Rendered)
+        );
+        let alpha = &plan.specs[1];
+        assert_eq!(
+            (alpha.command.as_str(), alpha.args.as_slice()),
+            ("alpha-server", ["--stdio".to_owned()].as_slice())
+        );
+        assert_eq!(alpha.transport, McpTransport::Stdio);
+    }
+
+    #[test]
+    fn an_off_server_is_listed_not_rendered() {
+        let (toolbox, mut picks) = toolbox(vec![
+            frozen("docs", McpTransport::Stdio),
+            frozen("wiki", McpTransport::Stdio),
+        ]);
+        picks[0].active = false;
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), &BTreeMap::new());
+        assert_eq!(names(&plan), ["wiki"]);
+        assert_eq!(
+            outcomes(&plan),
+            [
+                ("docs", McpOutcome::Skipped(SkipReason::Off)),
+                ("wiki", McpOutcome::Rendered)
+            ]
+        );
+        assert!(!plan.choices[0].active);
+        assert_eq!(
+            plan.choices[0].activation,
+            htui_core::model::Activation::Off
+        );
+    }
+
+    #[test]
+    fn a_cli_agent_gets_http() {
+        let (toolbox, picks) = toolbox(vec![frozen("web", McpTransport::Http)]);
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), &BTreeMap::new());
+        let spec = &plan.specs[0];
+        assert_eq!(spec.transport, McpTransport::Http);
+        assert_eq!(spec.url.as_deref(), Some("https://web.test/rpc"));
+        assert_eq!(spec.command, "");
+    }
+
+    #[test]
+    fn an_acp_agent_skips_http_with_a_reason() {
+        let (toolbox, picks) = toolbox(vec![
+            frozen("local", McpTransport::Stdio),
+            frozen("web", McpTransport::Http),
+        ]);
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, false), &BTreeMap::new());
+        assert_eq!(names(&plan), ["local"]);
+        assert_eq!(
+            outcomes(&plan),
+            [
+                ("local", McpOutcome::Rendered),
+                ("web", McpOutcome::Skipped(SkipReason::TransportUnsupported))
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unsupported_agent_skips_every_server_and_the_run_starts() {
+        let (toolbox, picks) = toolbox(vec![
+            frozen("local", McpTransport::Stdio),
+            frozen("web", McpTransport::Http),
+        ]);
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(false, false), &BTreeMap::new());
+        assert!(plan.specs.is_empty() && plan.tools.is_empty());
+        assert_eq!(
+            outcomes(&plan),
+            [
+                ("local", McpOutcome::Skipped(SkipReason::AgentUnsupported)),
+                ("web", McpOutcome::Skipped(SkipReason::AgentUnsupported))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_secret_skips_that_server_only() {
+        let mut docs = frozen("docs", McpTransport::Stdio);
+        docs.env = vec![("API".to_owned(), EnvValue::Secret("DOCS_TOKEN".to_owned()))];
+        let mut web = frozen("web", McpTransport::Http);
+        web.headers = vec![(
+            "X-Api".to_owned(),
+            EnvValue::Secret("docs_token".to_owned()),
+        )];
+        let (toolbox, picks) = toolbox(vec![docs, frozen("plain", McpTransport::Stdio), web]);
+        // The provider supplies `DOCS_TOKEN` only: names are case-sensitive.
+        let secrets = BTreeMap::from([("DOCS_TOKEN".to_owned(), DOCS_TOKEN.to_owned())]);
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), &secrets);
+        assert_eq!(names(&plan), ["docs", "plain"]);
+        assert_eq!(
+            outcomes(&plan)[2],
+            (
+                "web",
+                McpOutcome::Skipped(SkipReason::SecretMissing("docs_token".to_owned()))
+            )
+        );
+        // An empty map (a provider-less project) skips every secret-bearing server.
+        let bare = plan_mcp(Some(&toolbox), &picks, caps(true, true), &BTreeMap::new());
+        assert_eq!(names(&bare), ["plain"]);
+    }
+
+    #[test]
+    fn a_secret_value_reaches_the_spec_and_no_record() {
+        let mut docs = frozen("docs", McpTransport::Stdio);
+        docs.env = vec![
+            ("API".to_owned(), EnvValue::Secret("DOCS_TOKEN".to_owned())),
+            ("MODE".to_owned(), EnvValue::Literal("fast".to_owned())),
+        ];
+        let mut web = frozen("web", McpTransport::Http);
+        web.headers = vec![(
+            "Authorization".to_owned(),
+            EnvValue::Secret("DOCS_TOKEN".to_owned()),
+        )];
+        let (toolbox, picks) = toolbox(vec![docs, web]);
+        let secrets = BTreeMap::from([("DOCS_TOKEN".to_owned(), DOCS_TOKEN.to_owned())]);
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), &secrets);
+
+        assert_eq!(
+            plan.specs[0].env,
+            BTreeMap::from([
+                ("API".to_owned(), DOCS_TOKEN.to_owned()),
+                ("MODE".to_owned(), "fast".to_owned())
+            ])
+        );
+        assert_eq!(
+            plan.specs[1]
+                .headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some(DOCS_TOKEN)
+        );
+        // The record, the tool lists and every Debug leave the value out.
+        let record = serde_json::to_string(&plan.choices).expect("encodes");
+        assert!(!record.contains(DOCS_TOKEN), "{record}");
+        assert!(!format!("{plan:?}").contains(DOCS_TOKEN), "{plan:?}");
+        assert!(
+            !serde_json::to_string(&toolbox.servers)
+                .expect("encodes")
+                .contains(DOCS_TOKEN),
+            "the frozen set holds names only"
+        );
+    }
+
+    #[test]
+    fn a_reserved_name_is_dropped() {
+        let (toolbox, picks) = toolbox(vec![
+            frozen(SERVER_NAME, McpTransport::Stdio),
+            frozen("docs", McpTransport::Stdio),
+        ]);
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), &BTreeMap::new());
+        assert_eq!(names(&plan), ["docs"]);
+        assert_eq!(
+            outcomes(&plan)[1],
+            (SERVER_NAME, McpOutcome::Skipped(SkipReason::ReservedName))
+        );
+    }
+
+    #[test]
+    fn a_snapshot_without_a_toolbox_plans_nothing() {
+        let (_, picks) = toolbox(vec![frozen("docs", McpTransport::Stdio)]);
+        assert_eq!(
+            plan_mcp(None, &picks, caps(true, true), &BTreeMap::new()),
+            McpPlan::default()
+        );
+    }
+
+    #[test]
+    fn allow_pre_approves_only_under_ask_and_skips_denied_tools() {
+        let tools = McpTools {
+            server: "docs".to_owned(),
+            allow: vec!["search".to_owned(), "drop".to_owned()],
+            deny: vec!["drop".to_owned()],
+        };
+        let mut ask = PermissionPolicy::default();
+        pre_approve_server(&mut ask, "docs", &tools);
+        let answer = |policy: &PermissionPolicy, title: &str| {
+            evaluate(policy, Some(&call(title)), &options()).map(|answer| answer.kind)
+        };
+        assert_eq!(
+            answer(&ask, "mcp__docs__search"),
+            Some(PermissionOptionKind::AllowOnce)
+        );
+        assert_eq!(answer(&ask, "mcp__docs__drop"), None);
+        assert_eq!(
+            answer(&ask, "mcp__docs__other"),
+            None,
+            "empty means unlisted asks"
+        );
+
+        let mut allow_all = PermissionPolicy {
+            default: htui_agent::driver::PermissionDefault::Deny,
+            ..PermissionPolicy::default()
+        };
+        pre_approve_server(&mut allow_all, "docs", &tools);
+        assert!(allow_all.rules.is_empty(), "never widens a non-ask default");
+    }
+
+    #[test]
+    fn deny_rules_precede_allow_rules() {
+        let (mut toolbox, picks) = toolbox(vec![frozen("docs", McpTransport::Stdio)]);
+        toolbox.servers[0].allow = vec!["search".to_owned(), "wipe".to_owned()];
+        toolbox.servers[0].deny = vec!["wipe".to_owned()];
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), &BTreeMap::new());
+        let operator = PermissionRule {
+            matcher: PermissionMatch {
+                tool_name: Some("mcp__docs__wipe".to_owned()),
+                ..PermissionMatch::default()
+            },
+            answer: PermissionOptionKind::AllowOnce,
+            reason: "a persona's allow".to_owned(),
+        };
+        let mut policy = PermissionPolicy {
+            rules: vec![operator],
+            ..PermissionPolicy::default()
+        };
+        let mut deny = vec!["Write".to_owned()];
+        apply_mcp_tools(&mut policy, &mut deny, &plan);
+
+        assert_eq!(deny, ["Write", "mcp__docs__wipe"]);
+        assert_eq!(
+            policy.rules[0].answer,
+            PermissionOptionKind::RejectOnce,
+            "the reject is the first rule"
+        );
+        let answer = |title: &str| {
+            evaluate(&policy, Some(&call(title)), &options()).map(|answer| answer.kind)
+        };
+        assert_eq!(
+            answer("mcp__docs__wipe"),
+            Some(PermissionOptionKind::RejectOnce),
+            "ahead of an earlier allow too"
+        );
+        assert_eq!(
+            answer("mcp__docs__search"),
+            Some(PermissionOptionKind::AllowOnce)
+        );
+        // `deny` is never an allow-list.
+        let again = {
+            let mut twice = deny.clone();
+            apply_mcp_tools(&mut PermissionPolicy::default(), &mut twice, &plan);
+            twice
+        };
+        assert_eq!(again, deny, "a name is listed once");
     }
 }

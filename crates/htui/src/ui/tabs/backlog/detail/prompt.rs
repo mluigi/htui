@@ -16,7 +16,7 @@
 //! (blueprint H-28).
 
 use htui_core::model::{ChoiceReason, ItemId, SkillChoice};
-use htui_core::prompt::{Section, TrimRecord};
+use htui_core::prompt::{McpChoice, McpOutcome, Section, TrimRecord};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
@@ -226,6 +226,18 @@ fn render_lines(preview: &PromptPreview) -> Vec<Row> {
     if !record.skill_choices.is_empty() {
         lines.push(Row::default());
     }
+    // MOD-127 M2 D10: one row per MCP server the step resolved, in the same style: a server that
+    // did not launch (off, unsupported, a secret missing) is dim and says why.
+    for (index, choice) in record.mcp_choices.iter().enumerate() {
+        let label = if index == 0 { "mcp" } else { "" };
+        lines.push(Row {
+            text: labelled(label, &mcp_line(choice)),
+            dim: choice.outcome != McpOutcome::Rendered,
+        });
+    }
+    if !record.mcp_choices.is_empty() {
+        lines.push(Row::default());
+    }
     for (index, note) in record.notes.iter().enumerate() {
         let label = if index == 0 { "notes" } else { "" };
         lines.push(Row::plain(labelled(label, note)));
@@ -257,6 +269,23 @@ fn choice_line(choice: &SkillChoice) -> String {
     };
     format!(
         "{} v{version} \u{b7} {} \u{b7} {} \u{2192} {outcome}",
+        choice.name.replace(['\n', '\r'], " "),
+        label::skill_level(choice.level),
+        label::activation(choice.activation),
+    )
+}
+
+/// One MCP choice as the pane lists it: `<name> \u{b7} <level> \u{b7} <activation> \u{2192} <outcome>`,
+/// where the outcome is `rendered`, or `skipped <reason>` in the record's words (`secret_missing`
+/// carries the secret's **name**, never a value). The level and the activation are `kit::label`'s
+/// words, as a skill's.
+fn mcp_line(choice: &McpChoice) -> String {
+    let outcome = match &choice.outcome {
+        McpOutcome::Rendered => "rendered".to_owned(),
+        McpOutcome::Skipped(reason) => format!("skipped {}", reason.describe()),
+    };
+    format!(
+        "{} \u{b7} {} \u{b7} {} \u{2192} {outcome}",
         choice.name.replace(['\n', '\r'], " "),
         label::skill_level(choice.level),
         label::activation(choice.activation),
@@ -776,6 +805,70 @@ mod tests {
             "the reason is spelled out: {row:?}"
         );
         assert!(row.dim, "an inactive choice is dim: {row:?}");
+    }
+
+    #[test]
+    fn mcp_choices_are_rows_and_a_skipped_one_is_dim() {
+        use htui_core::model::McpServerId;
+        use htui_core::prompt::SkipReason;
+
+        let mut assembled = htui_core::prompt::assemble(
+            &htui_core::prompt::fixtures::phase_implement_attempt2(),
+            &htui_core::scrub::MinimalScrubber::new([]),
+        )
+        .expect("the fixture assembles");
+        let choice = |name: &str, level, outcome| McpChoice {
+            server: McpServerId::new(),
+            name: name.to_owned(),
+            level,
+            activation: Activation::Always,
+            active: true,
+            outcome,
+        };
+        assembled.trim.mcp_choices = vec![
+            choice("docs", BindingLevel::Project, McpOutcome::Rendered),
+            choice(
+                "wiki",
+                BindingLevel::Global,
+                McpOutcome::Skipped(SkipReason::SecretMissing("WIKI_TOKEN".to_owned())),
+            ),
+        ];
+        assembled.trim.notes.push("a note".to_owned());
+        let preview = PromptPreview {
+            item: htui_core::fixtures::ids::HTUI_FEAT_1,
+            available: vec!["implement".to_owned()],
+            template: Some(htui_core::prompt::TemplateRef {
+                name: "implement".to_owned(),
+                version: 1,
+            }),
+            outcome: Ok(assembled),
+        };
+
+        let rows = render_lines(&preview);
+        let at = rows
+            .iter()
+            .position(|row| row.text.starts_with("mcp"))
+            .unwrap_or_else(|| panic!("the first choice is a row: {rows:#?}"));
+        assert_eq!(
+            rows[at],
+            Row {
+                text: labelled("mcp", "docs \u{b7} project \u{b7} always \u{2192} rendered"),
+                dim: false
+            }
+        );
+        assert_eq!(
+            rows[at + 1],
+            Row {
+                text: labelled(
+                    "",
+                    "wiki \u{b7} global \u{b7} always \u{2192} skipped secret_missing WIKI_TOKEN"
+                ),
+                dim: true
+            },
+            "a skipped server is dim and names the secret, never a value"
+        );
+        assert_eq!(rows[at + 2], Row::default(), "a blank row closes the block");
+        assert_eq!(rows[at + 3].text, labelled("notes", "a note"));
     }
 
     /// The fixture's assembled prompt for FEAT-1, its budget from the app setting's default, one
