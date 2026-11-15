@@ -5,6 +5,7 @@
 //! Every case opens with [`skip_without_git`] and passes on a box without a usable `git`.
 
 use std::ffi::OsStr;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use htui_orch::isolate::IsolateError;
@@ -278,4 +279,116 @@ async fn repo_facts_says_bare() {
     assert!(facts.bare, "{facts:?}");
     assert_eq!(facts.branch.as_deref(), Some("main"));
     assert_eq!(facts.head, None);
+}
+
+/// `git` behind a wrapper that hands the verb `name=value` as an inherited variable would be: set
+/// only when the verb's own environment does not already set it (an htui `env` wins, as it does
+/// over the parent's).
+fn git_inheriting(git: &Cli, dir: &Path, name: &str, value: &str) -> Cli {
+    let wrapper = dir.join(format!("git-with-{}", name.to_lowercase()));
+    crate::write_executable::write_executable(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ -z \"${{{name}+x}}\" ]; then {name}='{value}'; export {name}; fi\n\
+             exec '{}' \"$@\"\n",
+            git.binary().display()
+        ),
+    );
+    Cli::probe(wrapper).expect("the wrapper answers `--version` as git")
+}
+
+/// A script that records it ran in `<dir>/<name>.ran` and answers `x` to any question.
+fn recording_script(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let script = dir.join(name);
+    let ran = dir.join(format!("{name}.ran"));
+    crate::write_executable::write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\necho x\n",
+            ran.display()
+        ),
+    );
+    (script, ran)
+}
+
+/// A local http server that answers every request `401` with a Basic challenge, on its own
+/// thread for the rest of the process; the URL of a repository on it.
+fn unauthorized_server() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+    let port = listener.local_addr().expect("its address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut head = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => head.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"htui\"\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    format!("http://127.0.0.1:{port}/private.git")
+}
+
+/// MOD-116 M3 R1a A1 (D7: htui never prompts): a private https remote on a desktop whose
+/// `SSH_ASKPASS` or `GIT_ASKPASS` names a dialog fails at once, and the dialog never opens.
+#[tokio::test]
+async fn a_clone_that_needs_credentials_never_asks_an_askpass_program() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let url = unauthorized_server();
+    for variable in ["SSH_ASKPASS", "GIT_ASKPASS"] {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let (askpass, ran) = recording_script(tmp.path(), "askpass");
+        let git = git_inheriting(&git, tmp.path(), variable, &askpass.to_string_lossy());
+        let dest = tmp.path().join("api");
+
+        let started = std::time::Instant::now();
+        let reason = refused(git.clone_repo(&url, &dest).await);
+
+        assert!(reason.starts_with("git clone: "), "{variable}: {reason}");
+        assert!(
+            reason.contains("could not read Username"),
+            "{variable}: the clone says it had no credentials: {reason}"
+        );
+        assert!(
+            !ran.exists(),
+            "{variable} was asked: {:?}",
+            std::fs::read_to_string(&ran)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{variable}: {:?}",
+            started.elapsed()
+        );
+        assert!(!dest.exists(), "nothing is left at {}", dest.display());
+    }
+}
+
+/// MOD-116 M3 R1a A5: an inherited `GIT_ALLOW_PROTOCOL` that allows `ext` does not lift the
+/// clone's own refusal of it; the transport's command never runs.
+#[tokio::test]
+async fn an_inherited_allow_protocol_does_not_let_ext_run_a_command() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let git = git_inheriting(&git, tmp.path(), "GIT_ALLOW_PROTOCOL", "ext");
+    let marker = tmp.path().join("ran");
+    let dest = tmp.path().join("api");
+
+    let url = format!("ext::sh -c touch% {}", marker.display());
+    let reason = refused(git.clone_repo(&url, &dest).await);
+
+    assert!(reason.starts_with("git clone: "), "{reason}");
+    assert!(reason.contains("transport 'ext' not allowed"), "{reason}");
+    assert!(!marker.exists(), "the ext command ran");
+    assert!(!dest.exists(), "nothing is left at {}", dest.display());
 }

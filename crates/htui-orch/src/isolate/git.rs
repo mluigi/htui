@@ -59,10 +59,23 @@ pub const SSH_OPTIONS: &str = "-o BatchMode=yes -o ConnectTimeout=20";
 /// MOD-133 F2 M1: the environment both network verbs run under besides `GIT_SSH_COMMAND`: an
 /// http transfer slower than 1000 bytes a second for 30 s is aborted rather than left to the
 /// verb's budget.
-pub const NETWORK_ENV: [(&str, &str); 2] = [
+///
+/// MOD-116 M3 R1a A1: an empty `GIT_ASKPASS` as well. `GIT_TERMINAL_PROMPT=0` only closes the
+/// tty; before it git asks `GIT_ASKPASS`, then `core.askPass`, then `SSH_ASKPASS`, and a desktop
+/// that sets the last opens a credential dialog the verb then waits on. A set but empty
+/// `GIT_ASKPASS` ends that chain with no program, so a remote that wants credentials fails at once
+/// (D7: htui never prompts).
+pub const NETWORK_ENV: [(&str, &str); 3] = [
     ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
     ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+    ("GIT_ASKPASS", ""),
 ];
+
+/// MOD-116 M3 R1a A5: the transports a clone may use, as `GIT_ALLOW_PROTOCOL`. An inherited
+/// `GIT_ALLOW_PROTOCOL` replaces every `protocol.<name>.allow` setting, the `-c
+/// protocol.ext.allow=never` of [`clone_args`] included, so the clone sets its own: a local path
+/// (`file`), `git`, `http`, `https` and `ssh` (scp-like `host:path` too), never `ext`.
+pub const CLONE_PROTOCOLS: &str = "file:git:http:https:ssh";
 
 /// The bound on `git --version` inside [`Cli::probe`], which runs synchronously inside
 /// `GixIsolator::new`, on a blocking thread when the run runtime builds its isolator (MOD-4 plan
@@ -1396,8 +1409,9 @@ impl Cli {
         }
     }
 
-    /// MOD-116 M3 D8: [`clone_args`] in `dest`'s parent, under [`network_env`] and
-    /// [`CLONE_TIMEOUT`]: `url` cloned into `dest`, which git creates. Nothing is parsed; the
+    /// MOD-116 M3 D8: [`clone_args`] in `dest`'s parent, under [`network_env`],
+    /// [`CLONE_PROTOCOLS`] and [`CLONE_TIMEOUT`]: `url` cloned into `dest`, which git creates (or
+    /// which exists and is empty). Nothing is parsed; the
     /// caller reads the clone back with [`repo_facts`] (an empty remote clones with exit 0 and an
     /// unborn `HEAD`). A relative `dest` is taken against this process's working directory.
     ///
@@ -1425,9 +1439,9 @@ impl Cli {
             budget: self.clone_budget(),
             ..self.clone()
         };
-        let exited = bounded
-            .run("clone", parent, &args, &network_env(ssh.as_deref()))
-            .await?;
+        let mut env = network_env(ssh.as_deref());
+        env.push(("GIT_ALLOW_PROTOCOL", CLONE_PROTOCOLS));
+        let exited = bounded.run("clone", parent, &args, &env).await?;
         if exited.ok() {
             Ok(())
         } else {
@@ -5110,6 +5124,7 @@ mod tests {
             [
                 ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
                 ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+                ("GIT_ASKPASS", ""),
                 ("GIT_SSH_COMMAND", "ssh -o BatchMode=yes"),
             ]
         );
@@ -5118,6 +5133,7 @@ mod tests {
             [
                 ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
                 ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+                ("GIT_ASKPASS", ""),
             ]
         );
     }
