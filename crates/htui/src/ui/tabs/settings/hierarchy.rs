@@ -33,7 +33,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    ProjectId, ProjectPatch, RepoId, RepoPatch, Scope, WorkspaceId, WorkspacePatch,
+    IntegrateMode, ProjectId, ProjectPatch, RepoId, RepoPatch, Scope, WorkspaceId, WorkspacePatch,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -138,6 +138,25 @@ const HINT_EDITING: HintSpec = &[
     Hint::One(Act::FieldSubmit, "save"),
     Hint::One(Act::FieldCancel, "cancel"),
 ];
+
+/// The repo editor's keys on its `integrate` row (MOD-133 M2 E8): [`HINT_EDITING`] with the
+/// choice keys first.
+const HINT_EDITING_CHOICE: HintSpec = &[
+    Hint::Pair(Act::ChoicePrev, Act::ChoiceNext, "mode"),
+    Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
+    Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
+];
+
+/// The repo editor's `integrate` row's label (MOD-133 M2 E8).
+const INTEGRATE_LABEL: &str = "integrate";
+
+/// The `integrate` row's help: what it is, and what `default` means.
+const INTEGRATE_HELP: &str =
+    "how a finished run reaches the remote; default is the project's `integrate` setting";
+
+/// The index of the repo editor's `remote url` field, which `push` needs non-empty.
+const REMOTE_URL_FIELD: usize = 1;
 
 /// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list; the
 /// way out goes through the mode's stack (MOD-67 M6), so it drops while the go-to field is open,
@@ -348,10 +367,29 @@ struct Editor {
     kind: EditorKind,
     /// The inputs, in tab order.
     fields: Vec<Field>,
-    /// Index into `fields`.
+    /// Index into `fields`, or `fields.len()` for the `integrate` row.
     focus: usize,
     /// The `updated_at` of the row this opened on, for the three `Edit*` kinds (M1 D3).
     expected: Option<DateTime<Utc>>,
+    /// MOD-133 M2 E8: the repo's mode, `Some` only for [`EditorKind::EditRepo`] (a new repo is
+    /// created with the project's default). The inner `None` is that default.
+    integrate: Option<Option<IntegrateMode>>,
+    /// The project's default as [`IntegrateMode::project_default`] reads it, `None` when it reads
+    /// no mode (runs then refuse at start): what the row's `default` stands for.
+    inherited: Option<IntegrateMode>,
+    /// The word the row shows for the default, `default (local)`.
+    default_word: String,
+}
+
+/// What one key on an editor's non-field row comes to, decided while the editor is borrowed and
+/// acted on after (MOD-133 M2 E8; `memory.rs`'s `FormStep`).
+enum EditorStep {
+    /// Handled, or not, in place.
+    Done(Handled),
+    /// The field's submit, on the `integrate` row.
+    Submit,
+    /// The field's cancel, on the `integrate` row.
+    Cancel,
 }
 
 /// What the section is doing. `Browse` is not a mode in the modal sense: it captures nothing.
@@ -655,6 +693,7 @@ impl HierarchySection {
                     HINT_BROWSE
                 }
             }
+            Mode::Editing(editor) if editor.on_integrate() => HINT_EDITING_CHOICE,
             Mode::Editing(_) => HINT_EDITING,
             Mode::Picking { .. } => HINT_PICKING,
             // Answered above; the pane names its own keys.
@@ -899,6 +938,9 @@ impl HierarchySection {
             fields,
             focus: 0,
             expected,
+            integrate: None,
+            inherited: None,
+            default_word: String::new(),
         });
     }
 
@@ -985,6 +1027,14 @@ impl HierarchySection {
                     Field::optional("remote url", repo.repo.remote_url.as_deref().unwrap_or("")),
                     Field::required("default branch", &repo.repo.default_branch),
                 ];
+                // MOD-133 M2 E8: the mode row, holding the stored column; `None` is the project's
+                // default, named by what it reads as now.
+                let integrate = repo.repo.integrate;
+                let inherited = IntegrateMode::project_default(&owner.project.settings).ok();
+                let default_word = inherited.map_or_else(
+                    || "default (unreadable)".to_owned(),
+                    |mode| format!("default ({mode})"),
+                );
                 self.open(
                     EditorKind::EditRepo {
                         project: owner.project.id,
@@ -993,6 +1043,11 @@ impl HierarchySection {
                     fields,
                     Some(repo.repo.updated_at),
                 );
+                if let Mode::Editing(editor) = &mut self.mode {
+                    editor.integrate = Some(integrate);
+                    editor.inherited = inherited;
+                    editor.default_word = default_word;
+                }
             }
         }
     }
@@ -1248,6 +1303,10 @@ impl HierarchySection {
     /// `views::HIERARCHY_EDITOR`, `Down`/`Up` included), and everything left over is swallowed
     /// rather than offered to the shell — with the chords the modal global layer admits excepted,
     /// so `ctrl-c` still quits and `F1` opens help (MOD-67 D5).
+    ///
+    /// On the repo editor's `integrate` row (MOD-133 M2 E8) no field sees the key: the choice keys
+    /// cycle the mode, and the field's submit and cancel act on the form, as `memory.rs`'s kind
+    /// row does. Every candidate act of the chord is tried in stack order.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = views::HIERARCHY_EDITOR;
         let outcome = match &mut self.mode {
@@ -1279,18 +1338,40 @@ impl HierarchySection {
                 let Mode::Editing(editor) = &mut self.mode else {
                     return Handled::Pass;
                 };
-                let len = editor.fields.len().max(1);
-                match ctx.keys().actions(stack, chord).first() {
-                    Some(Act::FormNextField) => {
-                        editor.focus = (editor.focus + 1) % len;
+                let len = editor.rows().max(1);
+                let on_choice = editor.on_integrate();
+                let mut step = EditorStep::Done(modal_rest(stack, chord));
+                for act in ctx.keys().actions(stack, chord) {
+                    match act {
+                        Act::FormNextField => editor.focus = (editor.focus + 1) % len,
+                        Act::FormPrevField => editor.focus = (editor.focus + len - 1) % len,
+                        Act::ChoicePrev if on_choice => editor.cycle_integrate(false),
+                        Act::ChoiceNext if on_choice => editor.cycle_integrate(true),
+                        Act::FieldSubmit if on_choice => {
+                            step = EditorStep::Submit;
+                            break;
+                        }
+                        Act::FieldCancel if on_choice => {
+                            step = EditorStep::Cancel;
+                            break;
+                        }
+                        // A global act, or one this row does not take.
+                        _ => continue,
+                    }
+                    step = EditorStep::Done(Handled::Consumed);
+                    break;
+                }
+                match step {
+                    EditorStep::Done(handled) => handled,
+                    EditorStep::Submit => {
+                        self.submit(ctx);
                         Handled::Consumed
                     }
-                    Some(Act::FormPrevField) => {
-                        editor.focus = (editor.focus + len - 1) % len;
+                    EditorStep::Cancel => {
+                        self.mode = Mode::Browse;
+                        self.notice = None;
                         Handled::Consumed
                     }
-                    // A global act, or nothing.
-                    _ => modal_rest(stack, chord),
                 }
             }
         }
@@ -1426,6 +1507,11 @@ impl HierarchySection {
                     self.notice = Some(DELETED_ELSEWHERE.to_owned());
                     return;
                 };
+                // MOD-133 M2 E8: the form is the guard; the stores keep no remote check.
+                if let Some(refusal) = editor.integrate_refusal() {
+                    self.notice = Some(refusal);
+                    return;
+                }
                 StoreRequest::UpdateRepo {
                     project,
                     id,
@@ -1436,8 +1522,8 @@ impl HierarchySection {
                         default_branch: Some(editor.text(2)),
                         // Never the flag: `p` is its only writer (D12).
                         is_primary: None,
-                        // MOD-133: the repo form does not edit the mode yet (M2's).
-                        integrate: None,
+                        // MOD-133 M2 E8: always sent; `Some(None)` is the project's default.
+                        integrate: Some(editor.integrate.flatten()),
                     },
                 }
             }
@@ -2017,16 +2103,81 @@ impl Editor {
             .map_or_else(String::new, |field| field.text().to_owned())
     }
 
+    /// The rows focus cycles over: the fields, then the `integrate` row when there is one.
+    fn rows(&self) -> usize {
+        self.fields.len() + usize::from(self.integrate.is_some())
+    }
+
+    /// Whether the focus is on the `integrate` row (MOD-133 M2 E8).
+    fn on_integrate(&self) -> bool {
+        self.integrate.is_some() && self.focus == self.fields.len()
+    }
+
+    /// One step of the `integrate` choice: `default → local → push → pull_request → default`
+    /// forward, the reverse back.
+    fn cycle_integrate(&mut self, forward: bool) {
+        const ORDER: [Option<IntegrateMode>; 4] = [
+            None,
+            Some(IntegrateMode::Local),
+            Some(IntegrateMode::Push),
+            Some(IntegrateMode::PullRequest),
+        ];
+        let Some(choice) = &mut self.integrate else {
+            return;
+        };
+        let at = ORDER.iter().position(|mode| mode == choice).unwrap_or(0);
+        let next = if forward {
+            (at + 1) % ORDER.len()
+        } else {
+            (at + ORDER.len() - 1) % ORDER.len()
+        };
+        *choice = ORDER[next];
+    }
+
+    /// Whether the `remote url` field holds a URL.
+    fn has_remote(&self) -> bool {
+        !self.text(REMOTE_URL_FIELD).trim().is_empty()
+    }
+
+    /// Why the chosen mode cannot be saved, or `None`; the inherited default never refuses here
+    /// (runs refuse at start, M1 D3).
+    fn integrate_refusal(&self) -> Option<String> {
+        self.integrate
+            .flatten()
+            .and_then(|mode| mode.selectable_refusal(self.has_remote()))
+    }
+
+    /// The `integrate` row (MOD-133 M2 E8): the choice, its refusal as the row's error, and as
+    /// help either the default's refusal (help only) or what the row is.
+    fn integrate_field(&self, choice: Option<IntegrateMode>) -> form::Field<'_> {
+        let word: &str = match choice {
+            Some(mode) => mode.as_str(),
+            None => &self.default_word,
+        };
+        let field = form::Field::new(INTEGRATE_LABEL, Value::Choice(word));
+        if let Some(refusal) = self.integrate_refusal() {
+            return field.error(refusal);
+        }
+        let inherited = choice
+            .is_none()
+            .then_some(self.inherited)
+            .flatten()
+            .and_then(|mode| mode.selectable_refusal(self.has_remote()));
+        field.help(inherited.unwrap_or_else(|| INTEGRATE_HELP.to_owned()))
+    }
+
     /// The fields as a kit form (MOD-115 M3 D3): one row per field in tab order, the focused one
-    /// carrying the marker and the cursor, the labels in one shared column.
+    /// carrying the marker and the cursor, the labels in one shared column; the repo editor's
+    /// `integrate` choice last (MOD-133 M2 E8).
     fn form(&self) -> Form<'_> {
-        self.fields
-            .iter()
-            .fold(Form::new(), |form, field| {
-                form.field(form::Field::new(field.label, Value::Text(&field.input)))
-            })
-            .focus(self.focus)
-            .editing(true)
+        let form = self.fields.iter().fold(Form::new(), |form, field| {
+            form.field(form::Field::new(field.label, Value::Text(&field.input)))
+        });
+        let form = match self.integrate {
+            Some(choice) => form.field(self.integrate_field(choice)),
+            None => form,
+        };
+        form.focus(self.focus).editing(true)
     }
 }
 

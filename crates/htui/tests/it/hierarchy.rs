@@ -22,8 +22,8 @@ use htui::ui::tabs::settings::hierarchy::joined_notice;
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    ItemKindId, NewItemKind, NewProject, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    IntegrateMode, ItemKindId, NewItemKind, NewProject, ProjectId, ProjectPatch, RepoBoxPath,
+    RepoId, RepoPatch, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::root_path::{DirEntry, DirListing};
 use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore, WriteStore};
@@ -3876,6 +3876,224 @@ async fn a_stale_reply_names_the_retry_key_in_force() {
         ],
         "{flagged:?}"
     );
+}
+
+/// A bench section over the demo tree holding one repo `core` with `remote` (and the project's
+/// `integrate` set to `default` when given), the cursor on the repo row and its editor open,
+/// focused on the `integrate` row (MOD-133 M2 E8).
+async fn integrate_row(
+    bench: &SectionBench,
+    remote: Option<&str>,
+    default: Option<IntegrateMode>,
+) -> HierarchySection {
+    let backend = demo();
+    create_repo(&backend, "core", remote).await;
+    let mut opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    if let Some(mode) = default {
+        opened.projects[0]
+            .project
+            .settings
+            .as_object_mut()
+            .expect("the demo project's settings are an object")
+            .insert(
+                IntegrateMode::PROJECT_SETTING.to_owned(),
+                mode.as_str().into(),
+            );
+    }
+    let mut section = homed();
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    for _ in 0..3 {
+        assert_eq!(bench.key(&mut section, "down"), Handled::Consumed);
+    }
+    section
+}
+
+/// The `UpdateRepo` patch one press emitted, or a panic naming what was emitted instead.
+#[track_caller]
+fn repo_patch(emitted: &[Action]) -> RepoPatch {
+    match emitted {
+        [Action::Store(StoreRequest::UpdateRepo { patch, .. })] => patch.clone(),
+        other => panic!("one `UpdateRepo`: {other:?}"),
+    }
+}
+
+/// MOD-133 M2 E8: the repo editor's fourth row is `integrate`, a choice that reads
+/// `default (<project default>)` until one is picked, cycles `default → local → push →
+/// pull_request → default` with the choice keys (either way), and is what `Enter` sends.
+#[tokio::test]
+async fn the_repo_editor_cycles_integrate_and_sends_it() {
+    let bench = SectionBench::new().await;
+    let mut section = integrate_row(&bench, Some(CORE_REMOTE), None).await;
+
+    let frame = bench.render_section(&section, 100);
+    let rows: Vec<usize> = ["name", "remote url", "default branch", "integrate"]
+        .into_iter()
+        .map(|label| field_line(&frame, label).unwrap_or_else(|| panic!("`{label}`: {frame}")))
+        .collect();
+    assert!(
+        rows.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+        "the choice is the fourth row: {rows:?} {frame}"
+    );
+    assert_eq!(
+        field_value(&frame, "integrate").as_deref(),
+        Some("\u{2039} default (local) \u{203a}"),
+        "{frame}"
+    );
+
+    for (key, word) in [
+        ("right", "local"),
+        ("right", "push"),
+        ("right", "pull_request"),
+        ("right", "default (local)"),
+        ("left", "pull_request"),
+        ("left", "push"),
+    ] {
+        assert_eq!(bench.key(&mut section, key), Handled::Consumed);
+        let frame = bench.render_section(&section, 100);
+        assert_eq!(
+            field_value(&frame, "integrate"),
+            Some(format!("\u{2039} {word} \u{203a}")),
+            "after `{key}`: {frame}"
+        );
+    }
+    assert!(bench.drained().is_empty(), "a choice is not a write");
+
+    // Down wraps from the choice row to the first field.
+    bench.key(&mut section, "down");
+    type_at(&bench, &mut section, "x");
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(
+        field_value(&frame, "name").as_deref(),
+        Some("corex"),
+        "{frame}"
+    );
+    bench.key(&mut section, "up");
+
+    bench.key(&mut section, "enter");
+    let patch = repo_patch(&bench.drained());
+    assert_eq!(patch.integrate, Some(Some(IntegrateMode::Push)));
+    assert_eq!(patch.name.as_deref(), Some("corex"));
+}
+
+/// MOD-133 M2 E8: `default` sends `Some(None)`, the column cleared back to the project's default.
+#[tokio::test]
+async fn the_default_choice_sends_a_cleared_mode() {
+    let bench = SectionBench::new().await;
+    let mut section = integrate_row(&bench, Some(CORE_REMOTE), None).await;
+    bench.key(&mut section, "enter");
+    assert_eq!(repo_patch(&bench.drained()).integrate, Some(None));
+}
+
+/// MOD-133 M2 E8: `pull_request` shows its refusal as the row's error and `Enter` refuses with it
+/// in the notice, writing nothing.
+#[tokio::test]
+async fn pull_request_is_refused_on_the_repo_editor() {
+    let bench = SectionBench::new().await;
+    let mut section = integrate_row(&bench, Some(CORE_REMOTE), None).await;
+    bench.key(&mut section, "left");
+    let sentence = IntegrateMode::PullRequest
+        .selectable_refusal(true)
+        .expect("pull_request is refused");
+    let frame = bench.render_section(&section, 100);
+    assert!(flat(&frame).contains(&sentence), "the row's error: {frame}");
+    assert!(
+        error_text(&bench, &section, 100)
+            .iter()
+            .any(|line| line.contains("forge adapter")),
+        "in the error colour"
+    );
+
+    bench.key(&mut section, "enter");
+    assert!(bench.drained().is_empty(), "nothing is written");
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(
+        flat(&frame).matches(sentence.as_str()).count(),
+        2,
+        "the row's error and the notice: {frame}"
+    );
+}
+
+/// MOD-133 M2 E8: `push` with an empty remote URL is refused as `pull_request` is; typing a URL
+/// lifts the refusal and the same `Enter` sends both.
+#[tokio::test]
+async fn push_needs_the_remote_url_field() {
+    let bench = SectionBench::new().await;
+    let mut section = integrate_row(&bench, None, None).await;
+    bench.key(&mut section, "right");
+    bench.key(&mut section, "right");
+    let sentence = IntegrateMode::Push
+        .selectable_refusal(false)
+        .expect("push without a remote is refused");
+    let frame = bench.render_section(&section, 100);
+    assert!(flat(&frame).contains(&sentence), "{frame}");
+    bench.key(&mut section, "enter");
+    assert!(bench.drained().is_empty(), "nothing is written");
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(
+        flat(&frame).matches(sentence.as_str()).count(),
+        2,
+        "the row's error and the notice: {frame}"
+    );
+
+    // Up to the remote URL (the choice row, then the branch, then the URL).
+    bench.key(&mut section, "up");
+    bench.key(&mut section, "up");
+    type_at(&bench, &mut section, CORE_REMOTE);
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(
+        flat(&frame).matches(sentence.as_str()).count(),
+        1,
+        "a URL lifts the row's error; the notice is the last press's: {frame}"
+    );
+    bench.key(&mut section, "enter");
+    let patch = repo_patch(&bench.drained());
+    assert_eq!(patch.integrate, Some(Some(IntegrateMode::Push)));
+    assert_eq!(patch.remote_url, Some(Some(CORE_REMOTE.to_owned())));
+}
+
+/// MOD-133 M2 E8: an inherited default that would refuse is the row's help only — runs refuse
+/// at start (M1 D3) — and never blocks the submit.
+#[tokio::test]
+async fn an_inherited_default_that_would_refuse_is_help_only() {
+    let bench = SectionBench::new().await;
+    let mut section = integrate_row(&bench, None, Some(IntegrateMode::Push)).await;
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(
+        field_value(&frame, "integrate").as_deref(),
+        Some("\u{2039} default (push) \u{203a}"),
+        "{frame}"
+    );
+    let sentence = IntegrateMode::Push
+        .selectable_refusal(false)
+        .expect("push without a remote is refused");
+    assert!(
+        flat(&frame).contains(&sentence),
+        "the help says so: {frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100)
+            .iter()
+            .all(|line| !line.contains("needs a remote URL")),
+        "as help, not as an error"
+    );
+    bench.key(&mut section, "enter");
+    assert_eq!(repo_patch(&bench.drained()).integrate, Some(None));
+}
+
+/// MOD-133 M2 E8: only an existing repo's editor has the row; a new repo is created with the
+/// project's default.
+#[tokio::test]
+async fn the_new_repo_editor_has_no_integrate_row() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "n");
+    let frame = bench.render_section(&section, 100);
+    assert_eq!(field_line(&frame, "integrate"), None, "{frame}");
 }
 
 /// MOD-83: the repo editor's labels read as words, not as column names.
