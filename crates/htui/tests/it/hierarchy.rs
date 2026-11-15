@@ -13,7 +13,7 @@ use chrono::Utc;
 use htui::app::{Action, Handled};
 use htui::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, REQUEST_NAMES, RepoInference,
-    ScopeWrite,
+    ScopeWrite, workspace_delete_warning,
 };
 use htui::store_worker::{LIST_CAP, LIST_DIR, StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
@@ -1732,7 +1732,8 @@ async fn n_on_a_project_opens_the_repo_editor() {
 }
 
 /// A CAS miss keeps the editor and its text, moves the token to the row as it is now, and waits for
-/// a second `Enter` (D7, PRD D8): retyping is the cost the PRD said not to pay.
+/// a second `Enter` (D7, PRD D8): retyping is the cost the PRD said not to pay. On a project row
+/// since MOD-116 M3 D17 (the workspace row's `e` names the Workspaces tab).
 #[tokio::test]
 async fn a_stale_reply_keeps_the_typed_text() {
     let bench = SectionBench::new().await;
@@ -1745,6 +1746,7 @@ async fn a_stale_reply_keeps_the_typed_text() {
     );
     let _ = bench.drained();
 
+    bench.key(&mut section, "j");
     bench.key(&mut section, "e");
     type_at(&bench, &mut section, "-2");
 
@@ -1752,12 +1754,12 @@ async fn a_stale_reply_keeps_the_typed_text() {
     let current = tree(
         serve(
             &backend,
-            &StoreRequest::UpdateWorkspace {
-                id: ids::WORKSPACE_GRAPHICS,
-                expected: opened.workspace.updated_at,
-                patch: WorkspacePatch {
-                    name: Some("Graphics, renamed".to_owned()),
-                    ..WorkspacePatch::default()
+            &StoreRequest::UpdateProject {
+                id: ids::PROJECT_VULKAN,
+                expected: opened.projects[0].project.updated_at,
+                patch: ProjectPatch {
+                    name: Some("Vulkan, renamed".to_owned()),
+                    ..ProjectPatch::default()
                 },
             },
         )
@@ -1782,7 +1784,7 @@ async fn a_stale_reply_keeps_the_typed_text() {
     bench.key(&mut section, "enter");
     let emitted = bench.drained();
     let [
-        Action::Store(StoreRequest::UpdateWorkspace {
+        Action::Store(StoreRequest::UpdateProject {
             expected, patch, ..
         }),
     ] = emitted.as_slice()
@@ -1790,12 +1792,12 @@ async fn a_stale_reply_keeps_the_typed_text() {
         panic!("`Enter` retries by hand, once: {emitted:?}");
     };
     assert_eq!(
-        *expected, current.workspace.updated_at,
+        *expected, current.projects[0].project.updated_at,
         "the retry carries the reloaded row's token, not the one the editor opened on"
     );
     assert_eq!(
         patch.slug.as_deref(),
-        Some("graphics-2"),
+        Some("vulkan-tutorials-2"),
         "and the text that was typed survived the reload"
     );
 }
@@ -1852,82 +1854,14 @@ async fn a_joined_reply_without_shared_prefixes_shows_no_notice() {
     assert!(!frame.contains("shares prefix"), "{frame}");
 }
 
-/// The nil startup scope: a pane that names the key that fixes it rather than an empty box. The
-/// shell after its **last** workspace was deleted is the other half, and it is
-/// [`deleting_the_last_workspace_leaves_the_pane_empty`] — a scope that never had a tree and a
-/// scope whose tree was just taken reach this pane by two different routes.
+/// The nil startup scope: a pane that names the key that fixes it rather than an empty box: the
+/// Workspaces tab's `N` since MOD-116 M3 D17. The shell after its **last** workspace was deleted
+/// reaches the same pane through the Workspaces tab's `SetScope` (its
+/// `deleting_the_open_workspace_opens_the_first_left` case, `workspaces_manage.rs`).
 #[tokio::test]
 async fn no_workspace_says_so() {
     let mut harness = hierarchy_over(MemStore::new()).await;
     insta::assert_snapshot!("no_workspace", harness.render());
-}
-
-/// The last workspace, deleted: the tree it took goes with it, so the pane reads "no workspace"
-/// rather than offering `e`/`n`/`b`/`d` over rows whose ids are gone (blueprint §9.6).
-#[tokio::test]
-async fn deleting_the_last_workspace_leaves_the_pane_empty() {
-    let bench = SectionBench::new().await;
-    let mut section = homed();
-    let backend = demo();
-    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
-    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
-    let _ = bench.drained();
-
-    // `d` on the workspace row, through both confirmations.
-    bench.key(&mut section, "d");
-    let _ = bench.drained();
-    bench.reply(
-        &mut section,
-        &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
-            workspace_links: 1,
-            ..DeleteReach::default()
-        }))),
-    );
-    bench.key(&mut section, "y");
-    type_at(&bench, &mut section, "graphics");
-    bench.key(&mut section, "enter");
-    let _ = bench.drained();
-
-    bench.reply(
-        &mut section,
-        &StoreReply::Deleted {
-            target: DeleteTarget::Workspace(ids::WORKSPACE_GRAPHICS),
-            reach: Box::new(DeleteReach {
-                workspace_links: 1,
-                ..DeleteReach::default()
-            }),
-            mirror: MirrorAfterDelete::Rebuilt,
-        },
-    );
-    let asked = bench.drained();
-    assert!(
-        matches!(asked.as_slice(), [Action::Store(StoreRequest::Workspaces)]),
-        "the workspace the shell was inside is gone, so the list is what decides where it lands: {asked:?}"
-    );
-
-    // Nothing left to enter.
-    bench.reply(&mut section, &StoreReply::Workspaces(Vec::new()));
-    let frame = bench.render_section(&section, 100);
-    assert!(
-        frame.contains("no workspace") && frame.contains("`N` creates one"),
-        "an empty list leaves the pane naming the key that fixes it: {frame}"
-    );
-    assert!(
-        frame.contains("deleted `graphics`"),
-        "and the notice still reports what was taken: {frame}"
-    );
-    assert!(
-        !frame.contains("vulkan-tutorials"),
-        "the deleted tree is not still on screen: {frame}"
-    );
-
-    // And the keys that would write against the deleted ids are refused.
-    bench.key(&mut section, "e");
-    bench.key(&mut section, "d");
-    assert!(
-        bench.drained().is_empty(),
-        "a deleted tree is not a tree to write to"
-    );
 }
 
 /// `Enter` while the first write is still in flight is refused, as the Browse keys are (D6): the
@@ -1942,18 +1876,19 @@ async fn a_second_enter_does_not_resend_the_write() {
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
     let _ = bench.drained();
 
+    bench.key(&mut section, "j");
     bench.key(&mut section, "e");
     type_at(&bench, &mut section, "-2");
     bench.key(&mut section, "enter");
     bench.key(&mut section, "enter");
 
     let emitted = bench.drained();
-    let [Action::Store(StoreRequest::UpdateWorkspace { .. })] = emitted.as_slice() else {
+    let [Action::Store(StoreRequest::UpdateProject { .. })] = emitted.as_slice() else {
         panic!("two `Enter`s are one write: {emitted:?}");
     };
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("still saving the workspace \u{2014} wait for the store's answer"),
+        frame.contains("still saving the project \u{2014} wait for the store's answer"),
         "and the second one says why it did nothing: {frame}"
     );
 }
@@ -1973,12 +1908,15 @@ async fn a_tree_that_lands_mid_delete_keeps_the_confirmation() {
     );
     let _ = bench.drained();
 
+    bench.key(&mut section, "j");
     bench.key(&mut section, "d");
     let asked = bench.drained();
     assert!(
         matches!(
             asked.as_slice(),
-            [Action::Store(StoreRequest::DeleteReach(_))]
+            [Action::Store(StoreRequest::DeleteReach(
+                DeleteTarget::Project(_)
+            ))]
         ),
         "`d` counts first: {asked:?}"
     );
@@ -1994,13 +1932,13 @@ async fn a_tree_that_lands_mid_delete_keeps_the_confirmation() {
     bench.reply(
         &mut section,
         &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
-            workspace_links: 1,
+            items: 1,
             ..DeleteReach::default()
         }))),
     );
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("This deletes workspace `graphics`"),
+        frame.contains("This deletes project `vulkan-tutorials`"),
         "and the counts still reach the warning they were asked for: {frame}"
     );
 }
@@ -2016,7 +1954,9 @@ async fn a_refused_count_leaves_the_confirmation() {
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
     let _ = bench.drained();
 
+    bench.key(&mut section, "j");
     bench.key(&mut section, "d");
+    assert!(section.captures_input(), "the count started");
     let _ = bench.drained();
     bench.reply(
         &mut section,
@@ -2032,13 +1972,14 @@ async fn a_refused_count_leaves_the_confirmation() {
         "a refused count does not go on counting: {frame}"
     );
     assert!(
-        frame.contains("vulkan-tutorials"),
+        frame.contains("vulkan-tutorials") && !section.captures_input(),
         "the tree is back, where `d` can be pressed again: {frame}"
     );
 }
 
 /// An outage that ended: the read that answers clears "hierarchy needs Postgres", and while it is
-/// up the keys it refuses say *that* rather than offering `N` against a store that did not answer.
+/// up the keys it refuses say *that* rather than offering the Workspaces tab's `N` against a store
+/// that did not answer.
 #[tokio::test]
 async fn a_refused_read_is_echoed_and_then_cleared() {
     let bench = SectionBench::new().await;
@@ -2051,10 +1992,10 @@ async fn a_refused_read_is_echoed_and_then_cleared() {
         },
     );
 
-    bench.key(&mut section, "N");
+    bench.key(&mut section, "e");
     assert!(
         bench.drained().is_empty(),
-        "`N` is refused too while the store did not answer"
+        "`e` is refused while the store did not answer"
     );
     let frame = bench.render_section(&section, 100);
     assert!(
@@ -2062,7 +2003,7 @@ async fn a_refused_read_is_echoed_and_then_cleared() {
         "the refusal echoes what the store said, not `N` creates one: {frame}"
     );
     assert!(
-        !frame.contains("`N` creates one"),
+        !frame.contains("creates one"),
         "`N` is not on offer here: {frame}"
     );
 
@@ -2076,7 +2017,10 @@ async fn a_refused_read_is_echoed_and_then_cleared() {
         "a read that answered is not an outage: {frame}"
     );
     assert!(frame.contains("no workspace"), "{frame}");
-    assert!(frame.contains("`N` creates one"), "{frame}");
+    assert!(
+        frame.contains("`N` on the Workspaces tab creates one"),
+        "{frame}"
+    );
 }
 
 /// Offline the tree is one refused read: `Backend::writer()` is `None`, so the section says what is
@@ -2172,44 +2116,8 @@ async fn p_moves_the_primary() {
     );
 }
 
-/// `b` on the workspace row opens the picker on `$HOME` (nothing is stored), and `s` sends the
-/// highlighted directory as navigated, untouched: the guard runs on the worker, so the section
-/// never stats a path and no test path ever reaches a frame (D8, D14; MOD-49 P5, blueprint B-2).
-#[tokio::test]
-async fn b_on_the_workspace_row_picks_the_root() {
-    let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new().with_home(Some("/home/u"));
-    let backend = demo();
-    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
-    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
-    let _ = bench.drained();
-
-    bench.key(&mut section, "b");
-    let emitted = bench.drained();
-    assert!(
-        matches!(
-            emitted.as_slice(),
-            [Action::Store(StoreRequest::ListDir { path, show_hidden: false })] if path == "/home/u"
-        ),
-        "`b` is one listing of the start directory: {emitted:?}"
-    );
-
-    bench.reply(&mut section, &dirs("/home/u", &[("srv", false)], 0));
-    bench.key(&mut section, "s");
-
-    let emitted = bench.drained();
-    let [Action::Store(StoreRequest::SetWorkspaceRoot { id, path })] = emitted.as_slice() else {
-        panic!("`s` is one request: {emitted:?}");
-    };
-    assert_eq!(*id, ids::WORKSPACE_GRAPHICS);
-    assert_eq!(
-        path, "/home/u/srv",
-        "the path is the one navigated, verbatim"
-    );
-}
-
-/// A tree from a workspace the shell is not inside moves the scope (D11): `N` creates a workspace
-/// *and enters it*, and the same arm is what makes a deleted project leave the Backlog.
+/// A tree from a workspace the shell is not inside moves the scope (D11): the same arm is what
+/// makes a deleted project leave the Backlog.
 #[tokio::test]
 async fn a_reply_from_another_workspace_moves_the_scope() {
     let bench = SectionBench::new().await;
@@ -2411,47 +2319,6 @@ async fn i_is_refused_while_a_write_is_in_flight() {
     assert!(
         frame.contains("still saving the repo \u{2014} wait for the store's answer"),
         "and the refusal names the write it is waiting for: {frame}"
-    );
-}
-
-/// A root written through the picker, with a root in the fresh tree, is followed by exactly one
-/// inference (D136; MOD-49 blueprint B-2, D20).
-#[tokio::test]
-async fn a_root_write_that_applied_is_followed_by_one_inference() {
-    let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new().with_home(Some("/home/u"));
-    let backend = demo();
-    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
-    bench.reply(
-        &mut section,
-        &StoreReply::Hierarchy(Some(Box::new(opened.clone()))),
-    );
-    let _ = bench.drained();
-
-    bench.key(&mut section, "b");
-    bench.reply(&mut section, &dirs("/home/u", &[], 0));
-    bench.key(&mut section, "S");
-    let emitted = bench.drained();
-    assert!(
-        matches!(
-            emitted.as_slice(),
-            [.., Action::Store(StoreRequest::SetWorkspaceRoot { path, .. })] if path == "/home/u"
-        ),
-        "`S` writes the listed directory: {emitted:?}"
-    );
-
-    bench.reply(
-        &mut section,
-        &StoreReply::Hierarchy(Some(Box::new(with_root(opened, "/home/u")))),
-    );
-
-    let emitted = bench.drained();
-    assert!(
-        matches!(
-            emitted.as_slice(),
-            [Action::Store(StoreRequest::InferRepoPaths(ws))] if *ws == ids::WORKSPACE_GRAPHICS
-        ),
-        "the applied root write is followed by one inference: {emitted:?}"
     );
 }
 
@@ -2660,31 +2527,31 @@ async fn an_inference_reply_renders_the_tree_and_the_report() {
     insta::assert_snapshot!("inferred", frame);
 }
 
-/// The report is prefixed by the follow-up's cause, the `stored as …` of the root write, and never
-/// by a refusal shown while the walk ran (R-57): once the reply lands nothing is in flight.
+/// The report is never prefixed by a refusal shown while the walk ran (R-57): once the reply lands
+/// nothing is in flight. The follow-up is an edited repo's since MOD-116 M3 D17 (the root's write
+/// left with the workspace row's verbs), and an editor's write leaves no notice to carry.
 #[tokio::test]
-async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_the_walk() {
+async fn an_inference_report_drops_a_refusal_shown_during_the_walk() {
     let bench = SectionBench::new().await;
     let mut section = HierarchySection::new().with_home(None);
     let backend = demo();
-    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
-    let rooted = with_root(opened.clone(), "/srv/htui");
+    let rooted = with_root(tree_with_two_repos(&backend).await, "/srv/htui");
     let report = || InferReport {
         root: Some("/srv/htui".to_owned()),
         truncated: false,
         repos: vec![],
     };
-    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(rooted.clone()))),
+    );
     let _ = bench.drained();
 
-    // The follow-up: typed into the picker's go-to with a trailing slash, so the stored root
-    // reads differently (MOD-49: the picker replaced the typed editor; implementer I-1).
-    bench.key(&mut section, "b");
-    bench.key(&mut section, "/");
-    type_at(&bench, &mut section, "srv/htui/");
+    // The follow-up: `alpha` edited and saved as it is.
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
     bench.key(&mut section, "enter");
-    bench.reply(&mut section, &dirs("/srv/htui/", &[], 0));
-    bench.key(&mut section, "S");
     bench.reply(
         &mut section,
         &StoreReply::Hierarchy(Some(Box::new(rooted.clone()))),
@@ -2709,12 +2576,12 @@ async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_th
     );
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("stored as `/srv/htui` \u{b7} no repo in this workspace to infer"),
-        "the follow-up's cause stays in front of the report: {frame}"
+        frame.contains("no repo in this workspace to infer"),
+        "the report is shown: {frame}"
     );
     assert!(
-        !frame.contains("wait for the store"),
-        "nothing is in flight: {frame}"
+        !frame.contains("wait for the store") && !frame.contains("stored as"),
+        "nothing is in flight, and nothing is in front of it: {frame}"
     );
 
     // `i` carries no cause, and the refusal it provoked is not one.
@@ -2763,7 +2630,7 @@ async fn the_report_notice_names_what_was_not_inferred() {
                 truncated: false,
                 repos: vec![],
             },
-            "no root on this box for this workspace \u{2014} b on the workspace row sets it"
+            "no root on this box for this workspace \u{2014} e on the Workspaces tab sets its folder"
                 .to_owned(),
         ),
         (
@@ -2890,14 +2757,18 @@ fn listings(actions: &[Action]) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// Whether `actions` hold a path write.
+/// Whether `actions` hold a path write: a repo's, the one `b` writes since MOD-116 M3 D17.
 fn writes_a_path(actions: &[Action]) -> bool {
-    actions.iter().any(|action| {
-        matches!(
-            action,
-            Action::Store(StoreRequest::SetWorkspaceRoot { .. } | StoreRequest::SetRepoPath { .. })
-        )
-    })
+    actions
+        .iter()
+        .any(|action| matches!(action, Action::Store(StoreRequest::SetRepoPath { .. })))
+}
+
+/// Moves the cursor onto `alpha`, the first repo of [`tree_with_two_repos`]: workspace, project,
+/// `alpha`. The picker opens on a repo row alone since MOD-116 M3 D17.
+fn onto_alpha(bench: &SectionBench, section: &mut HierarchySection) {
+    bench.key(section, "j");
+    bench.key(section, "j");
 }
 
 /// A bench section over `tree`, `$HOME` fixed at `home`, with what the reply emitted drained.
@@ -2918,9 +2789,10 @@ fn picker_section(
 async fn the_picker_renders_over_the_section() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let rooted = with_root(demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await, "/srv");
+    let rooted = with_root(tree_with_two_repos(&backend).await, "/srv");
     let mut section = picker_section(&bench, rooted, None);
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     assert_eq!(listings(&bench.drained()), [("/srv".to_owned(), false)]);
     bench.reply(
@@ -2978,12 +2850,8 @@ async fn b_with_nothing_stored_starts_at_home() {
     let tree = tree_with_two_repos(&backend).await;
     let mut section = picker_section(&bench, tree, Some("/home/u"));
 
-    // The workspace row, then a repo row: neither has anything stored.
-    bench.key(&mut section, "b");
-    assert_eq!(listings(&bench.drained()), [("/home/u".to_owned(), false)]);
-    bench.key(&mut section, "esc");
-    bench.key(&mut section, "j");
-    bench.key(&mut section, "j");
+    // A repo row with nothing stored, in a workspace with no root row.
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     assert_eq!(listings(&bench.drained()), [("/home/u".to_owned(), false)]);
 }
@@ -2993,9 +2861,10 @@ async fn b_with_nothing_stored_starts_at_home() {
 async fn b_with_no_home_starts_at_the_root() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let tree = tree_with_two_repos(&backend).await;
     let mut section = picker_section(&bench, tree, None);
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     assert_eq!(listings(&bench.drained()), [("/".to_owned(), false)]);
 }
@@ -3013,10 +2882,7 @@ async fn b_on_a_project_row_keeps_its_notice() {
     assert!(bench.drained().is_empty(), "nothing is asked for");
     assert!(!section.captures_input(), "no picker opened");
     let frame = bench.render_section(&section, 100);
-    assert!(
-        frame.contains("`b` wants the workspace or a repo row"),
-        "{frame}"
-    );
+    assert!(frame.contains("`b` wants a repo row"), "{frame}");
 }
 
 /// The whole flow on a repo row: `l` lists the child, `s` writes the highlighted directory with
@@ -3108,9 +2974,10 @@ async fn a_chosen_path_stored_under_another_name_says_so() {
 async fn esc_closes_the_picker_and_writes_nothing() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let tree = tree_with_two_repos(&backend).await;
     let mut section = picker_section(&bench, tree, Some("/home/u"));
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     bench.reply(&mut section, &dirs("/home/u", &[("srv", false)], 0));
     assert!(section.captures_input());
@@ -3127,9 +2994,10 @@ async fn esc_closes_the_picker_and_writes_nothing() {
 async fn a_listing_for_another_path_is_ignored() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let rooted = with_root(demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await, "/srv");
+    let rooted = with_root(tree_with_two_repos(&backend).await, "/srv");
     let mut section = picker_section(&bench, rooted, None);
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     bench.reply(&mut section, &dirs("/elsewhere", &[("stray", false)], 0));
     let frame = bench.render_section(&section, 100);
@@ -3142,12 +3010,10 @@ async fn a_listing_for_another_path_is_ignored() {
 async fn a_refused_listing_shows_in_the_picker_and_h_still_goes_up() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let rooted = with_root(
-        demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await,
-        "/srv/gone",
-    );
+    let rooted = with_root(tree_with_two_repos(&backend).await, "/srv/gone");
     let mut section = picker_section(&bench, rooted, None);
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     let _ = bench.drained();
     bench.reply(
@@ -3173,9 +3039,10 @@ async fn a_refused_listing_shows_in_the_picker_and_h_still_goes_up() {
 async fn a_paste_opens_go_to_with_the_pasted_path() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let tree = tree_with_two_repos(&backend).await;
     let mut section = picker_section(&bench, tree, None);
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     let _ = bench.drained();
     assert_eq!(bench.paste(&mut section, "/srv/htui\n"), Handled::Consumed);
@@ -3191,10 +3058,12 @@ async fn a_paste_opens_go_to_with_the_pasted_path() {
 async fn a_listing_is_not_a_write_in_flight() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let tree = tree_with_two_repos(&backend).await;
     let mut section = picker_section(&bench, tree, None);
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
+    assert!(section.captures_input(), "the picker is open");
     assert!(
         !bench
             .render_section(&section, 100)
@@ -3216,10 +3085,12 @@ async fn a_listing_is_not_a_write_in_flight() {
 async fn ctrl_c_passes_through_the_picker() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let tree = tree_with_two_repos(&backend).await;
     let mut section = picker_section(&bench, tree, None);
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
+    assert!(section.captures_input(), "the picker is open");
     assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
 }
 
@@ -3228,15 +3099,17 @@ async fn ctrl_c_passes_through_the_picker() {
 async fn the_picker_swallows_q() {
     let bench = SectionBench::new().await;
     let backend = demo();
-    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let tree = tree_with_two_repos(&backend).await;
     let mut section = picker_section(&bench, tree, None);
 
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     assert_eq!(bench.key(&mut section, "q"), Handled::Consumed);
     assert!(section.captures_input(), "still picking");
 }
 
-/// A demo store with this box's root of `graphics` at `root`, as a user's earlier `b` left it.
+/// A demo store with this box's root of `graphics` at `root`, and one repo, `alpha`, with no
+/// checkout here: its picker starts at the root (P7).
 async fn rooted_store(root: &str) -> MemStore {
     let store = MemStore::demo();
     store
@@ -3248,11 +3121,13 @@ async fn rooted_store(root: &str) -> MemStore {
         })
         .await
         .expect("the root is seeded");
+    let _ = create_repo(&Backend::memory(store.clone()), "alpha", None).await;
     store
 }
 
-/// The real worker end to end (P1, P8): `b` lists the stored root, `l` opens a directory instead
-/// of cycling to Agents, `h` comes back to it, and `S` stores the canonical path in the tree.
+/// The real worker end to end (P1, P8): `b` on a repo lists the stored root, `l` opens a directory
+/// instead of cycling to Agents, `h` comes back to it, and `S` stores the canonical path in the
+/// tree.
 #[tokio::test]
 async fn picking_in_the_shell_lists_the_root_and_keeps_h_and_l() {
     let dir = tempfile::tempdir().expect("a throwaway directory");
@@ -3264,6 +3139,8 @@ async fn picking_in_the_shell_lists_the_root_and_keeps_h_and_l() {
         .await
         .size(200, 30);
 
+    harness.key("j");
+    harness.key("j");
     harness.key("b");
     harness.settle().await;
     let frame = harness.render();
@@ -3314,6 +3191,8 @@ async fn a_directory_gone_before_the_choice_is_refused_on_the_status_line() {
         .await
         .size(200, 30);
 
+    harness.key("j");
+    harness.key("j");
     harness.key("b");
     harness.settle().await;
     fs::remove_dir(dir.path().join("beta")).expect("the directory is removed");
@@ -3323,47 +3202,13 @@ async fn a_directory_gone_before_the_choice_is_refused_on_the_status_line() {
 
     let frame = harness.render();
     assert!(
-        frame.contains("set_workspace_root: constraint violated"),
+        frame.contains("set_repo_path: constraint violated"),
         "{frame}"
     );
     assert!(frame.contains("does not exist on this box"), "{frame}");
     assert!(
         frame.contains("\u{258c}beta/"),
         "the picker is still open: {frame}"
-    );
-}
-
-/// MOD-125 M2 D9 (M1 review M-3): a workspace whose member run is `stopped` refuses the delete,
-/// and the refusal reads on the status line in the store's own words; nothing is deleted. The
-/// demo's `graphics` holds `RUN_8`, a stopped run of `vulkan-tutorials`.
-#[tokio::test]
-async fn a_workspace_with_a_stopped_run_is_refused_on_the_status_line() {
-    let mut harness = hierarchy_over(MemStore::demo()).await.size(200, 30);
-    harness.key("d");
-    harness.settle().await;
-    harness.key("y");
-    harness.settle().await;
-    type_into(&mut harness, "graphics");
-    harness.key("enter");
-    harness.settle().await;
-
-    let frame = harness.render();
-    assert!(
-        frame.contains("delete_workspace: constraint violated"),
-        "{frame}"
-    );
-    assert!(
-        frame.contains("workspace `graphics` has 1 stopped run"),
-        "{frame}"
-    );
-    assert_eq!(
-        harness.app().top_bar.workspace,
-        "Graphics",
-        "nothing was deleted: the workspace is still in scope"
-    );
-    assert!(
-        frame.contains("vulkan-tutorials"),
-        "and its tree is still drawn: {frame}"
     );
 }
 
@@ -3638,13 +3483,13 @@ async fn a_rebound_picker_key_opens_a_directory() {
     assert!(frame.contains("o open \u{b7} u up"), "{frame}");
 }
 
-/// MOD-67 M6 D4: `[settings.hierarchy] new_workspace = "W"`: with no workspace the rows pane and
-/// the refusal both name `W`, `W` opens the editor and `N` is inert.
+/// MOD-67 M6 D4, MOD-116 M3 D17: `[workspaces] new = "W"`: with no workspace the rows pane and
+/// the refusal both name `W` on the Workspaces tab; neither `W` nor `N` opens anything here.
 #[tokio::test]
-async fn a_rebound_new_workspace_key_is_the_one_the_empty_tree_names() {
+async fn a_rebound_workspaces_new_key_is_the_one_the_empty_tree_names() {
     let bench = SectionBench::new()
         .await
-        .with_keys(keys_from("[settings.hierarchy]\nnew_workspace = \"W\"\n"));
+        .with_keys(keys_from("[workspaces]\nnew = \"W\"\n"));
     let mut section = homed();
     bench.reply(&mut section, &StoreReply::Hierarchy(None));
     let _ = bench.drained();
@@ -3652,20 +3497,23 @@ async fn a_rebound_new_workspace_key_is_the_one_the_empty_tree_names() {
     bench.key(&mut section, "e");
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("no workspace \u{2014} `W` creates one"),
+        frame.contains("no workspace \u{2014} `W` on the Workspaces tab creates one"),
         "the refusal names `W`: {frame}"
     );
     assert_eq!(
-        frame.matches("`W` creates one").count(),
+        frame
+            .matches("`W` on the Workspaces tab creates one")
+            .count(),
         2,
         "the rows pane's next step and the refusal name `W`: {frame}"
     );
     assert!(!frame.contains("`N`"), "{frame}");
 
-    assert_eq!(bench.key(&mut section, "N"), Handled::Pass);
-    assert!(!section.captures_input(), "`N` opens nothing now");
-    bench.key(&mut section, "W");
-    assert!(section.captures_input(), "`W` opens the workspace editor");
+    for key in ["N", "W"] {
+        assert_eq!(bench.key(&mut section, key), Handled::Pass, "{key}");
+        assert!(!section.captures_input(), "`{key}` opens nothing here");
+        assert!(bench.drained().is_empty(), "`{key}` asks nothing");
+    }
 }
 
 /// MOD-67 M6 D4: `[settings.hierarchy] primary = "P"`: a `HierarchyStale` answering `P` says to
@@ -3704,7 +3552,11 @@ async fn a_rebound_primary_key_is_named_after_a_stale_write() {
 /// the picker's keys.
 #[tokio::test]
 async fn f1_over_the_picker_opens_help_and_q_does_not_quit() {
-    let mut harness = hierarchy_over(MemStore::demo()).await;
+    let store = MemStore::demo();
+    let _ = create_repo(&Backend::memory(store.clone()), "alpha", None).await;
+    let mut harness = hierarchy_over(store).await;
+    harness.key("j");
+    harness.key("j");
     harness.key("b");
     harness.settle().await;
     assert!(harness.render().contains("j/k move"), "the picker is open");
@@ -3811,6 +3663,7 @@ fn row_text(buffer: &Buffer, y: u16) -> String {
 async fn the_editor_hint_names_the_field_keys_in_force() {
     let bench = SectionBench::new().await;
     let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "j");
     bench.key(&mut section, "e");
     let hint = bench.key_hint(&section);
     assert!(
@@ -3861,6 +3714,7 @@ async fn a_stale_reply_names_the_retry_key_in_force() {
         &StoreReply::Hierarchy(Some(Box::new(opened.clone()))),
     );
     let _ = bench.drained();
+    bench.key(&mut section, "j");
     bench.key(&mut section, "e");
     bench.key(&mut section, "enter");
     let _ = bench.drained();
@@ -3955,11 +3809,14 @@ async fn the_empty_states_carry_a_next_step() {
     bench.reply(&mut section, &StoreReply::Hierarchy(None));
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains("no workspace"), "{frame}");
-    assert!(frame.contains("`N` creates one"), "{frame}");
+    assert!(
+        frame.contains("`N` on the Workspaces tab creates one"),
+        "{frame}"
+    );
 
     let unbound = SectionBench::new()
         .await
-        .with_keys(keys_from("[settings.hierarchy]\nnew_workspace = []\n"));
+        .with_keys(keys_from("[workspaces]\nnew = []\n"));
     let frame = unbound.render_section(&section, 100);
     assert!(!frame.contains("creates one"), "{frame}");
     assert!(
@@ -3995,32 +3852,33 @@ async fn the_empty_states_carry_a_next_step() {
 async fn a_delete_counts_in_words() {
     let bench = SectionBench::new().await;
     let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "j");
     bench.key(&mut section, "d");
     let _ = bench.drained();
     bench.reply(
         &mut section,
         &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
-            workspace_links: 1,
-            workspace_box_paths: 1,
+            items: 1,
+            phases: 2,
             ..DeleteReach::default()
         }))),
     );
     let frame = flat(&bench.render_section(&section, 100));
     assert!(
-        frame.contains("1 project link and 1 box root path"),
+        frame.contains("Gone for good: 1 item, 2 phases."),
         "{frame}"
     );
 
     bench.key(&mut section, "y");
-    type_at(&bench, &mut section, "graphics");
+    type_at(&bench, &mut section, "vulkan-tutorials");
     bench.key(&mut section, "enter");
     let _ = bench.drained();
     bench.reply(
         &mut section,
         &StoreReply::Deleted {
-            target: DeleteTarget::Workspace(ids::WORKSPACE_GRAPHICS),
+            target: DeleteTarget::Project(ids::PROJECT_VULKAN),
             reach: Box::new(DeleteReach {
-                workspace_links: 1,
+                items: 1,
                 ..DeleteReach::default()
             }),
             mirror: MirrorAfterDelete::Rebuilt,
@@ -4028,23 +3886,20 @@ async fn a_delete_counts_in_words() {
     );
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("deleted `graphics`: 1 row across 1 table; mirror rebuilt"),
+        frame.contains("deleted `vulkan-tutorials`: 1 row across 1 table; mirror rebuilt"),
         "{frame}"
     );
 }
 
-/// MOD-147 A1: a workspace delete takes its scope row and everything the row owns, and the pane
-/// names those counts as a project delete's does, after the links and box paths; with nothing
-/// beyond those two, it adds nothing.
-#[tokio::test]
-async fn a_workspace_delete_names_what_its_scope_row_takes() {
-    let bench = SectionBench::new().await;
-    let mut section = bench_over_demo(&bench).await;
-    bench.key(&mut section, "d");
-    let _ = bench.drained();
-    bench.reply(
-        &mut section,
-        &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
+/// MOD-147 A1: a workspace delete takes its scope row and everything the row owns, and the
+/// warning names those counts as a project delete's does, after the links and box paths; with
+/// nothing beyond those two, it adds nothing. The warning is the Workspaces tab's since MOD-116 M3
+/// D10 (the same headline, [`workspace_delete_warning`]), so it is read here directly.
+#[test]
+fn a_workspace_delete_names_what_its_scope_row_takes() {
+    let warning = workspace_delete_warning(
+        "graphics",
+        &DeleteReach {
             workspace_links: 1,
             items: 1,
             item_kinds: 1,
@@ -4053,36 +3908,28 @@ async fn a_workspace_delete_names_what_its_scope_row_takes() {
             prompt_templates: 10,
             documents: 1,
             ..DeleteReach::default()
-        }))),
+        },
     );
-    let frame = flat(&bench.render_section(&section, 300));
-    assert!(
-        frame.contains(
-            "This deletes workspace `graphics`: 1 project link and 0 box root paths. Its projects \
-             survive and stay reachable from other workspaces. Gone for good with it: 1 item, 1 \
-             kind, 1 graph, 2 phases, 10 templates, 1 document."
-        ),
-        "{frame}"
+    assert_eq!(
+        warning,
+        "This deletes workspace `graphics`: 1 project link and 0 box root paths. Its projects \
+         survive and stay reachable from other workspaces. Gone for good with it: 1 item, 1 kind, \
+         1 graph, 2 phases, 10 templates, 1 document."
     );
 
-    let bench = SectionBench::new().await;
-    let mut section = bench_over_demo(&bench).await;
-    bench.key(&mut section, "d");
-    let _ = bench.drained();
-    bench.reply(
-        &mut section,
-        &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
+    let warning = workspace_delete_warning(
+        "graphics",
+        &DeleteReach {
             workspace_links: 1,
             workspace_box_paths: 1,
             ..DeleteReach::default()
-        }))),
+        },
     );
-    let frame = flat(&bench.render_section(&section, 300));
     assert!(
-        frame.contains("1 project link and 1 box root path"),
-        "{frame}"
+        warning.contains("1 project link and 1 box root path"),
+        "{warning}"
     );
-    assert!(!frame.contains("Gone for good"), "{frame}");
+    assert!(!warning.contains("Gone for good"), "{warning}");
 }
 
 /// MOD-83: a write in flight reads in words, on the Browse hint as in the refusal, and never as a
@@ -4177,8 +4024,9 @@ async fn the_section_reports_its_scroll_for_the_pane() {
 #[tokio::test]
 async fn the_picker_is_a_kit_modal_over_a_kit_list() {
     let bench = SectionBench::new().await;
-    let rooted = with_root(demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await, "/srv");
+    let rooted = with_root(tree_with_two_repos(&demo()).await, "/srv");
     let mut section = picker_section(&bench, rooted, None);
+    onto_alpha(&bench, &mut section);
     bench.key(&mut section, "b");
     bench.reply(
         &mut section,
@@ -4188,7 +4036,7 @@ async fn the_picker_is_a_kit_modal_over_a_kit_list() {
 
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("\u{256d} Root of `graphics` on this box \u{2500}"),
+        frame.contains("\u{256d} Checkout of `alpha` on this box \u{2500}"),
         "{frame}"
     );
     assert!(frame.contains("\u{258c}notes/"), "{frame}");
@@ -4373,37 +4221,80 @@ async fn a_slug_that_is_not_one_name_is_unset() {
     assert!(!line.contains("(default)"), "{line}");
 }
 
-/// The workspace editor shows the same folder line, read only, under its fields, naming the key
-/// that picks another.
+// ---- MOD-116 M3 T5: the workspace row is read only here (D17) ----
+
+/// MOD-116 M3 D17: `e`, `b` and `d` on the workspace row name the Workspaces tab's keys, and ask
+/// and open nothing; `N` is no key of this section any more. The words follow the tab's keys in
+/// force: rebound, the new chord; unbound, where to go.
 #[tokio::test]
-async fn the_workspace_editor_shows_the_folder_line() {
+async fn e_b_and_d_on_the_workspace_row_name_the_workspaces_tab() {
     let bench = SectionBench::new().await;
-    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
-    let mut section = folder_section(&bench, &opened, Some("/home/u"));
-
-    bench.key(&mut section, "e");
-    let frame = bench.render_section(&section, 100);
-    let lines: Vec<&str> = frame.lines().collect();
-    let description = lines
-        .iter()
-        .position(|line| line.contains("description"))
-        .unwrap_or_else(|| panic!("the workspace editor is open: {frame}"));
-    let folder = lines
-        .iter()
-        .rposition(|line| line.contains("~/workspaces/graphics (default)"))
-        .unwrap_or_else(|| panic!("the editor names the folder: {frame}"));
-    assert!(
-        folder > description,
-        "the folder line sits under the fields: {frame}"
+    let mut section = bench_over_demo(&bench).await;
+    for (key, said) in [
+        ("e", "`e` on the Workspaces tab edits the workspace"),
+        ("b", "`e` on the Workspaces tab sets its folder"),
+        ("d", "`d` on the Workspaces tab deletes it"),
+    ] {
+        assert_eq!(bench.key(&mut section, key), Handled::Consumed, "`{key}`");
+        assert!(bench.drained().is_empty(), "`{key}` asks nothing");
+        assert!(!section.captures_input(), "`{key}` opens nothing");
+        let frame = bench.render_section(&section, 100);
+        assert!(frame.contains(said), "`{key}`: {frame}");
+    }
+    assert_eq!(
+        bench.key(&mut section, "N"),
+        Handled::Pass,
+        "`N` is not bound here"
     );
-    assert!(lines[folder].contains("folder on this box"), "{frame}");
+    assert!(!section.captures_input(), "`N` opens nothing");
+    assert!(bench.drained().is_empty(), "`N` asks nothing");
     assert!(
-        lines[folder].contains("`b`"),
-        "the line names the path key: {frame}"
+        !bench.key_hint(&section).contains("workspace"),
+        "the hint offers no workspace verb: {}",
+        bench.key_hint(&section)
     );
 
-    // Typing does not reach it: it is not a field.
-    type_at(&bench, &mut section, "x");
-    let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("~/workspaces/graphics (default)"), "{frame}");
+    let bench = SectionBench::new()
+        .await
+        .with_keys(keys_from("[workspaces]\nedit = \"E\"\ndelete = []\n"));
+    let mut section = bench_over_demo(&bench).await;
+    for (key, said) in [
+        ("e", "`E` on the Workspaces tab edits the workspace"),
+        ("b", "`E` on the Workspaces tab sets its folder"),
+        ("d", "delete the workspace on the Workspaces tab"),
+    ] {
+        bench.key(&mut section, key);
+        let frame = bench.render_section(&section, 100);
+        assert!(frame.contains(said), "`{key}`: {frame}");
+    }
+}
+
+/// MOD-116 M3 D17: `n` on the workspace row still opens the bare project editor, and `Enter` asks
+/// for the project in the scope's workspace.
+#[tokio::test]
+async fn n_on_the_workspace_row_still_creates_a_project() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "n");
+    assert!(section.captures_input(), "the project editor is open");
+    type_at(&bench, &mut section, "shaders");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "Shaders");
+    bench.key(&mut section, "enter");
+
+    let emitted = bench.drained();
+    let [
+        Action::Store(StoreRequest::CreateProject {
+            workspace,
+            slug,
+            name,
+            description,
+        }),
+    ] = emitted.as_slice()
+    else {
+        panic!("`Enter` is one `CreateProject`: {emitted:?}");
+    };
+    assert_eq!(*workspace, ids::WORKSPACE_GRAPHICS);
+    assert_eq!((slug.as_str(), name.as_str()), ("shaders", "Shaders"));
+    assert_eq!(description, "");
 }

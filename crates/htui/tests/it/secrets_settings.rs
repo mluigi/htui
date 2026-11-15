@@ -2703,6 +2703,8 @@ async fn the_hierarchy_section_adopts_a_secrets_tree_without_taking_it_as_its_wr
     bench.reply(&mut hierarchy_section, &tree_reply(&tree));
     let _ = bench.drained();
 
+    // A project's editor: the workspace row's `e` names the Workspaces tab (MOD-116 M3 D17).
+    bench.key(&mut hierarchy_section, "j");
     bench.key(&mut hierarchy_section, "e");
     for c in "-2".chars() {
         bench.key(&mut hierarchy_section, &c.to_string());
@@ -2712,7 +2714,7 @@ async fn the_hierarchy_section_adopts_a_secrets_tree_without_taking_it_as_its_wr
     assert!(
         matches!(
             sent.as_slice(),
-            [Action::Store(StoreRequest::UpdateWorkspace { .. })]
+            [Action::Store(StoreRequest::UpdateProject { .. })]
         ),
         "{sent:?}"
     );

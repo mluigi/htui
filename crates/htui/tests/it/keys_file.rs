@@ -422,6 +422,49 @@ mod binary {
         assert_eq!(notices, [(8, notice.to_owned())]);
     }
 
+    /// MOD-116 M3 D14 (MOD-115 MD4): a file that still names `[settings.hierarchy]
+    /// new_workspace`, retired when workspaces moved to the Workspaces tab, still loads. The binary
+    /// starts, `--print-keys` exits 0 with the `[global]` change applied and `[workspaces] new` at
+    /// its default, stderr names the entry's line, and `load_path` answers that one notice.
+    #[test]
+    fn a_key_file_naming_hierarchy_s_new_workspace_still_loads_with_a_notice() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = fixture("hierarchy_new_workspace");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let notice = "[settings.hierarchy] new_workspace: new workspaces are created on the \
+                      Workspaces tab (its key is [workspaces] new)";
+        assert_eq!(stderr, format!("htui: {}:9: {notice}\n", path.display()));
+        let keys = load_path(&path).expect("the file loads");
+        assert_eq!(stdout, print(&keys));
+        // A version-2 file's list is the whole row: `ctrl-c` is not added back.
+        assert!(
+            stdout.lines().any(|line| line.starts_with("quit ")
+                && line.contains("= [\"ctrl-y\"] ")
+                && line.ends_with("# quit (changed)")),
+            "the [global] change is applied: {stdout}"
+        );
+        assert!(
+            stdout.contains("new        = [\"N\"]              # new workspace or project\n"),
+            "[workspaces] new is at its default: {stdout}"
+        );
+        assert!(!stdout.contains("new_workspace"), "{stdout}");
+        assert!(
+            !stdout.contains("ctrl-n"),
+            "the retired entry binds nothing: {stdout}"
+        );
+        let notices: Vec<(usize, String)> = keys
+            .notices()
+            .into_iter()
+            .map(|notice| (notice.line, notice.message))
+            .collect();
+        assert_eq!(notices, [(9, notice.to_owned())]);
+    }
+
     /// MOD-12 M3 D8 made `ctrl-q` `global.queue`'s default. MOD-12 M3 R1 H1: a file written
     /// before it that binds `ctrl-q` in `[global]` still loads. The user's entry wins, the queue
     /// (which the file leaves at its default) is unbound, stderr says so, and `--print-keys`

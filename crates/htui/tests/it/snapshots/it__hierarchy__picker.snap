@@ -2,9 +2,9 @@
 source: crates/htui/tests/it/hierarchy.rs
 expression: "bench.render_section(&section, 100)"
 ---
-▌Graphics (graphics) — folder on this box: /srv
-  ╭ Root of `graphics` on this box ──────────────────────────────────────────────────────────────╮
-  │/srv                                                                                          │
+ Graphics (graphics) — folder on this box: /srv
+  ╭ Checkout of `alpha` on this box ─────────────────────────────────────────────────────────────╮
+▌ │/srv                                                                                          │
   │ htui/                                                                                        │
   │▌notes/                                                                                       │
   │ shared@                                                                                      │
