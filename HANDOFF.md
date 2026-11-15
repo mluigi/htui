@@ -947,9 +947,17 @@ items it follows are done.
   migration), workspace and project overviews, `o` opens (runs keep walking), `w` jumps to the tab, the switcher
   overlay is gone (a `keys.toml` `[switcher]` table loads with a notice), the header's `+N in background ◐ n`, the
   last open workspace remembered in `ui-state.toml` (not under `--demo`). `WriteStore::workspace_run_counts`
-  (conformance `CASES` 344). Plan `.claude/plans/mod-116-m1-workspaces-tab.plan.md`; review fix round R1. Next: M2
-  (stop, resume, leave dialog). Owed on the host: the merged-tree Postgres gate (the sandbox gate's one red test was
+  (conformance `CASES` 344). Plan `.claude/plans/mod-116-m1-workspaces-tab.plan.md`; review fix round R1. Owed on the host: the merged-tree Postgres gate (the sandbox gate's one red test was
   the `cache::the_spawned_refresher_passes_and_follows_the_scope` load flake, untouched; 5 of 6 alone runs passed).
+  **Phase M2 landed (`266f3896`..`5c8926a3`, 2026-11-15):** `s` stops a workspace's runs gracefully, `s` again forces,
+  `r` resumes, each asked first with a per-run preview (the shared `stop_report` module; `htui stop`/`resume` print
+  as before and no longer read steps); a stop changed while asking is refused and said; the open workspace reads
+  `● open · … · stopping…`/`· stopped · n held`; the overview's Runs section; the leave dialog lists every live
+  workspace and `S` stops them gracefully, waits up to 20 s (wall time), then leaves. Plan
+  `.claude/plans/mod-116-m2-stop-resume-leave.plan.md`; review fix round R1. Deferred: the race rule is
+  check-then-act (a stop replaced between re-read and write is still overwritten, as in `htui stop`; a store-level
+  conditional write would close it). Next: M3 (create and edit). Owed on the host: the merged-tree Postgres gate
+  (sandbox gate: 9200/9201, the one red the same cache load flake), real use of `s`/`r`/`S` beside `htui stop`.
 - [ ] **MOD-117 - Workspace components: catalogue, compose, start and stop** (from the UI redesign
   review, `docs/ui-redesign-findings-2026-10-15.md` §4.1 Components). `R-ENT-17`, `R-SEC-5`, `R-TUI-14`. The catalogue in
   Postgres (types, kinds, images, versions, emulated services or clouds), seeded at first start and

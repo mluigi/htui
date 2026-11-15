@@ -14,7 +14,7 @@ resuming from the tab), `R-TUI-18` (the leave dialog lists every live workspace;
 **Complexity**: Medium (one shared report module moved out of `stop_cmd.rs` with the CLI byte-identical; two
 `StoreRequest`/`StoreReply` pairs served by `workspaces.rs`; a question mode and a Runs section on the tab; a stateful
 leave dialog; three catalogue rows, one view default, one stack; no migration, no store trait change, no `.sqlx`)
-**Status**: DRAFT (fact-checked at `5457063c`)
+**Status**: COMPLETE (2026-11-15; T1-T3 `266f3896`..`1692b8bb`, review fix round R1 `a3305744`..`5c8926a3`). Fact-checked at `5457063c` (see "Verified claims")
 
 ## Summary
 
