@@ -35,14 +35,14 @@ use htui_core::model::{
     DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation,
     ItemFilter, ItemId, ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode,
     MemoryEntry, MemoryEntryId, MemoryRevision, MemoryState, Note, NoteId, OsFamily, Priority,
-    Project, ProjectId, ProjectRef, PromptScope, RepoId, Requirement, RequirementArea,
-    RequirementFilter, RequirementId, RequirementRevision, RequirementSpec, RequirementState,
-    Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId,
-    StepOpening, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome,
-    WaitingCandidate, WorkspaceId, WorkspaceSummary,
+    Project, ProjectId, ProjectRef, PromptScope, RefusedLanding, RepoId, Requirement,
+    RequirementArea, RequirementFilter, RequirementId, RequirementRevision, RequirementSpec,
+    RequirementState, Resolution, ResolvedInput, Run, RunId, RunKind, RunLanding, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Status, StepGraphId, StepId, StepOpening, StepStatus, ToolCallCount, Transport,
+    UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
-use htui_core::model::{ArtifactLinkKind, LinkedDocument};
+use htui_core::model::{ArtifactLinkKind, IntegrateMode, LinkedDocument};
 use htui_core::model::{PlanScope, PlanStatus, RunPlan, RunPlanId};
 use htui_core::model::{Target, TargetId, TargetKind};
 use htui_core::store::{ReadStore, Result, StoreError};
@@ -229,7 +229,7 @@ fn item_summary_of(row: &SqliteRow) -> Result<ItemSummary> {
         updated_at: ts_col("item.updated_at", get(row, "updated_at")?)?,
         touched_paths: strings_col("item.touched_paths", &text(row, "touched_paths")?)?,
         latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
-        latest_run_landing: None,
+        latest_run_landing: get::<Option<RunLanding>>(row, "latest_run_landing")?,
     })
 }
 
@@ -264,6 +264,24 @@ const ITEM_SELECT: &str = "i.id, i.project_id, i.kind_id, i.key_prefix, i.key_nu
 const LATEST_OF_I: &str = "(SELECT r.status FROM run r WHERE r.item_id = i.id AND r.kind = 'graph' \
      AND r.status <> 'cancelled' ORDER BY r.queued_at DESC, r.id DESC LIMIT 1)";
 
+/// MOD-133 M2 E3: the **id** of the latest graph run of the item aliased `i`, in
+/// [`LATEST_OF_I`]'s order (`cancelled` skipped), `NULL` when none.
+const LATEST_ID_OF_I: &str = "(SELECT r.id FROM run r WHERE r.item_id = i.id AND r.kind = 'graph' \
+     AND r.status <> 'cancelled' ORDER BY r.queued_at DESC, r.id DESC LIMIT 1)";
+
+/// MOD-133 M2 E3: the [`RunLanding`] text of the item aliased `i`, over the `integration` records
+/// of **that same run** ([`LATEST_ID_OF_I`]): `refused` when one is refused, else `pending` when
+/// one is outside `landed | pr_merged`, else `NULL` (all landed, or no record). `pg/read.rs`' `ll`
+/// LATERAL as a correlated `CASE`.
+fn landing_case() -> String {
+    format!(
+        "CASE WHEN EXISTS (SELECT 1 FROM integration g WHERE g.run_id = {LATEST_ID_OF_I} \
+         AND g.state = 'refused') THEN 'refused' \
+         WHEN EXISTS (SELECT 1 FROM integration g WHERE g.run_id = {LATEST_ID_OF_I} \
+         AND g.state NOT IN ('landed', 'pr_merged')) THEN 'pending' END"
+    )
+}
+
 /// The **id** of the latest graph run of a `blocked_by` target aliased `t` ([`LATEST_OF_I`]'s
 /// order, `cancelled` skipped), `NULL` when none.
 const LATEST_ID_OF_T: &str = "(SELECT tr.id FROM run tr WHERE tr.item_id = t.id \
@@ -290,11 +308,15 @@ fn ready_case() -> String {
 }
 
 /// MOD-144's [`ItemState`](htui_core::model::ItemState) text of the item aliased `i`: `items`'
-/// `CASE` in `pg/read.rs`, over [`LATEST_OF_I`].
+/// `CASE` in `pg/read.rs`, over [`LATEST_OF_I`]. MOD-133 M2 E3: a `done` latest run reads
+/// `land_refused` or `landing` by [`landing_case`] ahead of `done`.
 fn state_case() -> String {
+    let landing = landing_case();
     format!(
         "CASE WHEN i.status = 'closed' THEN 'closed' WHEN i.status = 'blocked' THEN 'blocked' \
          ELSE COALESCE(CASE {LATEST_OF_I} WHEN 'awaiting_approval' THEN 'needs_you' \
+         WHEN 'done' THEN (CASE ({landing}) WHEN 'refused' THEN 'land_refused' \
+         WHEN 'pending' THEN 'landing' ELSE 'done' END) \
          ELSE {LATEST_OF_I} END, 'open') END"
     )
 }
@@ -477,8 +499,9 @@ impl ReadStore for CacheStore {
         let mut sql = format!(
             "SELECT i.id, i.project_id, i.kind_id, i.key, i.key_prefix, i.key_number, i.title, \
              i.status, i.priority, i.required_tags, i.updated_at, i.touched_paths, \
-             {LATEST_OF_I} AS latest_run_status \
-             FROM item i WHERE i.project_id IN ("
+             {LATEST_OF_I} AS latest_run_status, ({landing}) AS latest_run_landing \
+             FROM item i WHERE i.project_id IN (",
+            landing = landing_case(),
         );
         sql.push_str(&placeholders(scope.project_ids.len()));
         sql.push(')');
@@ -596,11 +619,13 @@ impl ReadStore for CacheStore {
              ), \
              node AS (SELECT item_id, MIN(depth) AS depth FROM walk GROUP BY item_id) \
              SELECT n.item_id, i.project_id, p.slug AS project_slug, i.key, i.title, i.status, \
-                    n.depth, {LATEST_OF_I} AS latest_run_status \
+                    n.depth, {LATEST_OF_I} AS latest_run_status, \
+                    ({landing}) AS latest_run_landing \
                FROM node n \
                JOIN item i    ON i.id = n.item_id \
                JOIN project p ON p.id = i.project_id \
               ORDER BY n.depth, i.key",
+            landing = landing_case(),
         )))
         .bind(id.to_string())
         .bind(i64::from(hops))
@@ -631,7 +656,7 @@ impl ReadStore for CacheStore {
                 status: get::<Status>(row, "status")?,
                 depth: u8::try_from(get::<i64>(row, "depth")?).unwrap_or(u8::MAX),
                 latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
-                latest_run_landing: None,
+                latest_run_landing: get::<Option<RunLanding>>(row, "latest_run_landing")?,
             });
         }
 
@@ -1034,13 +1059,15 @@ impl ReadStore for CacheStore {
                     CASE WHEN s.project_id IS NOT NULL THEN \
                          (SELECT body FROM document d WHERE d.item_id = i.id AND d.kind = 'summary' \
                            ORDER BY d.version DESC LIMIT 1) END AS summary, \
-                    {LATEST_OF_I} AS latest_run_status \
+                    {LATEST_OF_I} AS latest_run_status, \
+                    ({landing}) AS latest_run_landing \
                FROM best \
                JOIN item i    ON i.id = best.item_id \
                JOIN project p ON p.id = i.project_id \
                LEFT JOIN scope s ON s.project_id = i.project_id \
               WHERE best.item_id <> ? \
               ORDER BY best.depth, qualified_key, i.id",
+            landing = landing_case(),
         )))
         .bind(id.to_string())
         .bind(i64::from(hops))
@@ -1064,7 +1091,7 @@ impl ReadStore for CacheStore {
                 in_scope: bool_col(get::<i64>(row, "in_scope")?),
                 summary: opt_text(row, "summary")?,
                 latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
-                latest_run_landing: None,
+                latest_run_landing: get::<Option<RunLanding>>(row, "latest_run_landing")?,
             });
         }
         // The mirror's `ORDER BY` is byte order and Postgres's is collation order, so neither is
@@ -1579,18 +1606,21 @@ impl ReadStore for CacheStore {
     }
 
     async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
-        // `LATEST_OF_I`'s own `run r` shadows the requirement's `r` inside its subquery only.
+        // `LATEST_OF_I`'s (and `landing_case`'s) own `run r` shadows the requirement's `r` inside
+        // its subquery only.
         let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT i.id, i.project_id, i.kind_id, i.key, i.key_prefix, i.key_number, i.title, \
                     i.status, i.priority, i.required_tags, i.updated_at, i.touched_paths, \
                     i.resolution, ir.kind, ir.requirement_version, \
                     (r.version > ir.requirement_version) AS suspect, \
-                    {LATEST_OF_I} AS latest_run_status \
+                    {LATEST_OF_I} AS latest_run_status, \
+                    ({landing}) AS latest_run_landing \
                FROM item_requirement ir \
                JOIN item i        ON i.id = ir.item_id \
                JOIN requirement r ON r.id = ir.requirement_id \
               WHERE ir.requirement_id = ? \
               ORDER BY i.key_prefix, i.key_number, i.id, ir.kind",
+            landing = landing_case(),
         )))
         .bind(requirement.to_string())
         .fetch_all(&self.pool)
@@ -1651,11 +1681,18 @@ impl ReadStore for CacheStore {
         if scope.project_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // MOD-133 M2 E4: the third arm, an `open` item whose latest graph run is `done` and holds a
+        // `refused` record (`pg/read.rs`' `lr` LATERAL as [`LATEST_ID_OF_I`]).
         let sql = format!(
             "SELECT {ITEM_SELECT} FROM item i WHERE i.project_id IN ({}) \
                AND (i.status = 'blocked' \
                     OR EXISTS (SELECT 1 FROM run r \
-                                WHERE r.item_id = i.id AND r.status = 'awaiting_approval'))",
+                                WHERE r.item_id = i.id AND r.status = 'awaiting_approval') \
+                    OR (i.status = 'open' \
+                        AND EXISTS (SELECT 1 FROM run lr \
+                                      JOIN integration g ON g.run_id = lr.id \
+                                     WHERE lr.id = {LATEST_ID_OF_I} AND lr.status = 'done' \
+                                       AND g.state = 'refused')))",
             placeholders(scope.project_ids.len()),
         );
         let mut query = sqlx::query(AssertSqlSafe(sql));
@@ -1707,12 +1744,46 @@ impl ReadStore for CacheStore {
                 .map(run_step_of)
                 .collect::<Result<Vec<_>>>()?
         };
+        // MOD-133 M2 E4: the refused records of each open candidate's latest graph run, when that
+        // run is `done` (the item filter's third arm, record by record); `assemble` orders them.
+        let sql = format!(
+            "SELECT i.id AS item_id, lr.id AS run_id, g.repo_id, rp.name AS repo_name, g.mode, \
+                    g.target_branch, g.refusal, g.updated_at, lr.queued_at \
+               FROM item i \
+               JOIN run lr        ON lr.id = {LATEST_ID_OF_I} \
+               JOIN integration g ON g.run_id = lr.id AND g.state = 'refused' \
+               JOIN repo rp       ON rp.id = g.repo_id \
+              WHERE i.id IN ({}) AND i.status = 'open' AND lr.status = 'done'",
+            placeholders(items.len()),
+        );
+        let mut query = sqlx::query(AssertSqlSafe(sql));
+        for item in &items {
+            query = query.bind(item.id.to_string());
+        }
+        let refused = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .iter()
+            .map(|row| {
+                Ok((
+                    uuid_col::<ItemId>("item.id", &text(row, "item_id")?)?,
+                    RefusedLanding {
+                        run: uuid_col::<RunId>("integration.run_id", &text(row, "run_id")?)?,
+                        repo: uuid_col::<RepoId>("integration.repo_id", &text(row, "repo_id")?)?,
+                        repo_name: text(row, "repo_name")?,
+                        mode: get::<IntegrateMode>(row, "mode")?,
+                        target_branch: text(row, "target_branch")?,
+                        // Non-null on a `refused` record (`chk_integration_refusal` on Postgres).
+                        refusal: opt_text(row, "refusal")?.unwrap_or_default(),
+                        since: ts_col("integration.updated_at", get(row, "updated_at")?)?,
+                        run_queued_at: ts_col("run.queued_at", get(row, "queued_at")?)?,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(WaitingCandidate::assemble(
-            scope,
-            items,
-            runs,
-            steps,
-            Vec::new(),
+            scope, items, runs, steps, refused,
         ))
     }
 }
