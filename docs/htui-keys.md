@@ -114,14 +114,13 @@ next_field     = ["tab", "down"]    # next field
 prev_field     = ["backtab", "up"]  # previous field
 
 [settings.hierarchy]
-new_workspace = ["N"]              # new workspace
-primary       = ["p"]              # make primary
-choose_path   = ["b"]              # choose path
-infer         = ["i"]              # infer paths
-memory        = ["m"]              # memory
-documents     = ["o"]              # documents
-next_field    = ["tab", "down"]    # next field
-prev_field    = ["backtab", "up"]  # previous field
+primary     = ["p"]              # make primary
+choose_path = ["b"]              # choose path
+infer       = ["i"]              # infer paths
+memory      = ["m"]              # memory
+documents   = ["o"]              # documents
+next_field  = ["tab", "down"]    # next field
+prev_field  = ["backtab", "up"]  # previous field
 
 [settings.kinds]
 new_graph  = ["N"]              # new graph
