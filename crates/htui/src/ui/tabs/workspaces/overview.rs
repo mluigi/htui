@@ -1,11 +1,13 @@
 //! The Workspaces tab's detail lines (MOD-116 M1 D8): a workspace's overview, or one of its
 //! projects', built from one [`WorkspaceOverview`] reply. Pure: lines in, no frame, so the tab's
-//! render only scrolls and draws them.
+//! render only scrolls and draws them. A value too long for its row (a path, the inherited
+//! target's sentence) wraps under itself rather than losing its tail at the border.
 
 use htui_core::model::WorkspaceLifecycle;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::hierarchy::ProjectEntry;
+use crate::hierarchy::{ProjectEntry, RepoEntry};
 use crate::ui::Theme;
 use crate::ui::cells;
 use crate::ui::kit::label::{self, plural};
@@ -15,8 +17,14 @@ use crate::workspaces::{ProjectOverview, WorkspaceOverview};
 /// The label column of a `label  value` line: the widest label, `folder on this box`, and two.
 const LABEL: usize = 20;
 
-/// Where a repo or a folder is not checked out on this box.
+/// The indent of a project's counts under its name.
+const INDENT: usize = 2;
+
+/// Where a repo is not checked out on this box.
 const NOT_ON_THIS_BOX: &str = "not on this box";
+
+/// A project with no repo.
+const NO_REPOS: &str = "no repos yet";
 
 /// The mark and its counts: `● open · 2 running`, the counts in the dim role.
 pub fn state_spans(state: WorkspaceLifecycle, theme: &Theme) -> Vec<Span<'static>> {
@@ -29,12 +37,43 @@ pub fn state_spans(state: WorkspaceLifecycle, theme: &Theme) -> Vec<Span<'static
     spans
 }
 
-/// A `label  value` line, the label dim in its column.
-fn labelled(name: &str, value: Span<'static>, theme: &Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(cells::fit(name, LABEL), theme.dim),
+/// `lead` (`lead_width` cells), then `value` wrapped in the `width` left after it, each further
+/// row indented to line up under the first.
+fn hanging(
+    lead: Vec<Span<'static>>,
+    lead_width: usize,
+    value: &str,
+    style: Style,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut rows = wrapped(value, width.saturating_sub(lead_width).max(1)).into_iter();
+    let mut first = lead;
+    first.push(Span::styled(rows.next().unwrap_or_default(), style));
+    let mut lines = vec![Line::from(first)];
+    lines.extend(rows.map(|row| {
+        Line::from(vec![
+            Span::raw(" ".repeat(lead_width)),
+            Span::styled(row, style),
+        ])
+    }));
+    lines
+}
+
+/// A `label  value` line, the label dim in its column, the value wrapped under itself.
+fn labelled(
+    name: &str,
+    value: &str,
+    style: Style,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    hanging(
+        vec![Span::styled(cells::fit(name, LABEL), theme.dim)],
+        LABEL,
         value,
-    ])
+        style,
+        width,
+    )
 }
 
 /// A heading line.
@@ -55,9 +94,21 @@ fn paragraphs(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
+/// Where `repo` is checked out on this box, and the style it reads in; a project with no repo
+/// says so.
+fn repo_path(repo: Option<&RepoEntry>, theme: &Theme) -> (String, Style) {
+    match repo {
+        None => (NO_REPOS.to_owned(), theme.dim),
+        Some(repo) => repo.local_path.as_ref().map_or_else(
+            || (NOT_ON_THIS_BOX.to_owned(), theme.dim),
+            |row| (row.local_path.clone(), theme.base),
+        ),
+    }
+}
+
 /// D8's workspace overview: the state and its counts, the folder, the default target, the held
-/// runs, the description, the goals and one line per project. `width` wraps the description and
-/// the goals.
+/// runs, the description, the goals and each project with its counts and where its primary repo
+/// is. `width` is the pane's inner width.
 pub fn workspace_lines(
     overview: &WorkspaceOverview,
     state: WorkspaceLifecycle,
@@ -65,23 +116,25 @@ pub fn workspace_lines(
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(state_spans(state, theme)), Line::default()];
-    let folder = overview.folder.as_ref().map_or_else(
-        || Span::styled("not set", theme.dim),
-        |path| Span::styled(path.display().to_string(), theme.base),
+    let (folder, style) = overview.folder.as_ref().map_or_else(
+        || ("not set".to_owned(), theme.dim),
+        |path| (path.display().to_string(), theme.base),
     );
-    lines.push(labelled("folder on this box", folder, theme));
-    lines.push(labelled(
+    lines.extend(labelled("folder on this box", &folder, style, width, theme));
+    lines.extend(labelled(
         "default target",
-        Span::styled(overview.default_target.to_string(), theme.base),
+        &overview.default_target.to_string(),
+        theme.base,
+        width,
         theme,
     ));
     let held = overview.counts.held();
-    let held = if held == 0 {
-        Span::styled("none", theme.dim)
+    let (held, style) = if held == 0 {
+        ("none".to_owned(), theme.dim)
     } else {
-        Span::styled(held.to_string(), theme.base)
+        (held.to_string(), theme.base)
     };
-    lines.push(labelled("held runs", held, theme));
+    lines.extend(labelled("held runs", &held, style, width, theme));
 
     let description = &overview.tree.workspace.description;
     if !description.trim().is_empty() {
@@ -113,34 +166,33 @@ pub fn workspace_lines(
         .max()
         .unwrap_or(0);
     for entry in &overview.tree.projects {
-        let counts = project_counts(overview, entry);
-        let items = counts.map_or(0, ProjectOverview::item_total);
-        let running = counts.map_or(0, |line| line.running);
-        let waiting = counts.map_or(0, |line| line.waiting);
         let primary = entry
             .repos
             .iter()
             .find(|repo| repo.repo.is_primary)
             .or_else(|| entry.repos.first());
-        let path = primary
-            .and_then(|repo| repo.local_path.as_ref())
-            .map_or_else(
-                || Span::styled(NOT_ON_THIS_BOX, theme.dim),
-                |row| Span::styled(row.local_path.clone(), theme.base),
-            );
+        let (path, style) = repo_path(primary, theme);
+        let name = format!("{}  ", cells::fit(&entry.project.name, column));
+        lines.extend(hanging(
+            vec![Span::styled(name, theme.base)],
+            column + 2,
+            &path,
+            style,
+            width,
+        ));
+        let counts = project_counts(overview, entry);
+        let items = counts.map_or(0, ProjectOverview::item_total);
+        let running = counts.map_or(0, |line| line.running);
+        let waiting = counts.map_or(0, |line| line.waiting);
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("{}  ", cells::fit(&entry.project.name, column)),
-                theme.base,
-            ),
+            Span::raw(" ".repeat(INDENT)),
             Span::styled(
                 format!(
-                    "{} \u{b7} {running} running \u{b7} {waiting} waiting  ",
+                    "{} \u{b7} {running} running \u{b7} {waiting} waiting",
                     plural(items, "item", "items")
                 ),
                 theme.dim,
             ),
-            path,
         ]));
     }
     lines
@@ -167,7 +219,7 @@ pub fn project_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if entry.repos.is_empty() {
-        lines.push(Line::styled("no repos yet", theme.dim));
+        lines.push(Line::styled(NO_REPOS, theme.dim));
     }
     let column = entry
         .repos
@@ -176,18 +228,20 @@ pub fn project_lines(
         .max()
         .unwrap_or(0);
     for repo in &entry.repos {
-        let path = repo.local_path.as_ref().map_or_else(
-            || Span::styled(NOT_ON_THIS_BOX, theme.dim),
-            |row| Span::styled(row.local_path.clone(), theme.base),
-        );
-        lines.push(Line::from(vec![
-            Span::styled("repo ", theme.dim),
-            Span::styled(
-                format!("{}  ", cells::fit(&repo_name(repo), column)),
-                theme.base,
-            ),
-            path,
-        ]));
+        let (path, style) = repo_path(Some(repo), theme);
+        lines.extend(hanging(
+            vec![
+                Span::styled("repo ", theme.dim),
+                Span::styled(
+                    format!("{}  ", cells::fit(&repo_name(repo), column)),
+                    theme.base,
+                ),
+            ],
+            column + 7,
+            &path,
+            style,
+            width,
+        ));
     }
 
     let description = &entry.project.description;
@@ -220,7 +274,7 @@ pub fn project_lines(
 }
 
 /// `name`, or `name (primary)` for the project's primary repo.
-fn repo_name(repo: &crate::hierarchy::RepoEntry) -> String {
+fn repo_name(repo: &RepoEntry) -> String {
     if repo.repo.is_primary {
         format!("{} (primary)", repo.repo.name)
     } else {
