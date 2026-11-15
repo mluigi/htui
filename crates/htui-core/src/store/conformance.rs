@@ -16351,8 +16351,8 @@ async fn skill_binding_workspace_and_item_kind_levels_attach_change_detach<S: Wr
 }
 
 /// MOD-127 D3: `toolbox_binding.workspace_id ... ON DELETE CASCADE`: deleting a workspace takes
-/// its attachments and no other level's, and the reach it reports is unchanged (it names no
-/// bindings).
+/// its attachments and no other level's, and the reach it reports counts them: the count shown
+/// before the delete is the count the delete takes.
 async fn workspace_delete_takes_its_bindings<S: WriteStore>(store: &S) {
     const CASE: &str = "workspace_delete_takes_its_bindings";
     let workspace = store
@@ -16386,8 +16386,21 @@ async fn workspace_delete_takes_its_bindings<S: WriteStore>(store: &S) {
         2,
         "{CASE}: the workspace holds two attachments"
     );
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace.id))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: a workspace that exists has a reach"));
+    assert_eq!(
+        reach.skill_bindings, 2,
+        "{CASE}: the reach counts the workspace's own two attachments"
+    );
 
-    store.delete_workspace(workspace.id).await.expect(CASE);
+    let report = store.delete_workspace(workspace.id).await.expect(CASE);
+    assert_eq!(
+        report, reach,
+        "{CASE}: the counts shown before the act are the counts the act took (PRD D13)"
+    );
 
     assert!(
         store

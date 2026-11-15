@@ -272,55 +272,6 @@ impl UpstreamRow {
     }
 }
 
-/// The `toolbox_binding` columns of one skill attachment (`kind = 'skill'`), as the listing and
-/// natural-key queries return them.
-#[derive(Debug, Clone)]
-pub(crate) struct SkillBindingColumns {
-    /// `toolbox_binding.id`.
-    pub(crate) id: SkillBindingId,
-    /// `toolbox_binding.ref_id`: the skill.
-    pub(crate) skill_id: SkillId,
-    /// `toolbox_binding.workspace_id`.
-    pub(crate) workspace_id: Option<WorkspaceId>,
-    /// `toolbox_binding.project_id`.
-    pub(crate) project_id: Option<ProjectId>,
-    /// `toolbox_binding.item_kind_id`.
-    pub(crate) item_kind_id: Option<ItemKindId>,
-    /// `toolbox_binding.phase_id`.
-    pub(crate) phase_id: Option<PhaseId>,
-    /// `toolbox_binding.pinned_version`.
-    pub(crate) pinned_version: Option<i32>,
-    /// `toolbox_binding.position`.
-    pub(crate) position: i32,
-    /// `toolbox_binding.activation`.
-    pub(crate) activation: Activation,
-    /// `toolbox_binding.globs`.
-    pub(crate) globs: Vec<String>,
-    /// `toolbox_binding.languages`.
-    pub(crate) languages: Vec<String>,
-    /// `toolbox_binding.updated_at`.
-    pub(crate) updated_at: DateTime<Utc>,
-}
-
-impl From<SkillBindingColumns> for SkillBinding {
-    fn from(row: SkillBindingColumns) -> Self {
-        Self {
-            id: row.id,
-            skill_id: row.skill_id,
-            workspace_id: row.workspace_id,
-            project_id: row.project_id,
-            item_kind_id: row.item_kind_id,
-            phase_id: row.phase_id,
-            pinned_version: row.pinned_version,
-            position: row.position,
-            activation: row.activation,
-            globs: row.globs,
-            languages: row.languages,
-            updated_at: row.updated_at,
-        }
-    }
-}
-
 /// One skill `toolbox_binding` row with `skill.name` joined: one attachment
 /// [`PgStore::bound_skills`](crate::PgStore::bound_skills) hands to
 /// `htui_core::model::skill::resolve`.

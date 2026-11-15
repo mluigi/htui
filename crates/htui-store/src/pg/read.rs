@@ -54,8 +54,7 @@ use crate::backend::ScopeKeys;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
 use crate::pg::rows::{
-    LinkNodeRow, MemoryEntryRow, PersonaRow, RunRow, SkillBindingColumns, SkillBindingRow, StepRow,
-    UpstreamRow,
+    LinkNodeRow, MemoryEntryRow, PersonaRow, RunRow, SkillBindingRow, StepRow, UpstreamRow,
 };
 use crate::{MAX_UPSTREAM_HOPS, order_documents};
 use htui_core::model::{MemoryEvidence, MemorySource};
@@ -3770,7 +3769,7 @@ impl PgStore {
             BindingHome::Project(id) => (None, Some(id.as_uuid())),
         };
         sqlx::query_as!(
-            SkillBindingColumns,
+            SkillBinding,
             r#"
             SELECT id             AS "id: SkillBindingId",
                    ref_id         AS "skill_id: SkillId",
@@ -3798,7 +3797,6 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)
-        .map(|rows| rows.into_iter().map(SkillBinding::from).collect())
     }
 
     /// The row at one natural key (`UNIQUE NULLS NOT DISTINCT (kind, ref_id, workspace_id,
@@ -3812,7 +3810,7 @@ impl PgStore {
         key: SkillBindingKey,
     ) -> Result<Option<SkillBinding>> {
         sqlx::query_as!(
-            SkillBindingColumns,
+            SkillBinding,
             r#"
             SELECT id             AS "id: SkillBindingId",
                    ref_id         AS "skill_id: SkillId",
@@ -3843,7 +3841,6 @@ impl PgStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)
-        .map(|row| row.map(SkillBinding::from))
     }
 
     /// One setting on one rung with the rung row's CAS token, or `None` when that row is absent

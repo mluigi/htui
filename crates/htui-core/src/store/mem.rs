@@ -327,7 +327,7 @@ struct State {
     /// [`WriteStore::skill_versions`] and appended to by [`WriteStore::create_skill`] and
     /// [`WriteStore::add_skill_version`].
     skill_versions: Vec<SkillVersion>,
-    /// `skill_binding`, resolved through `model::skill::resolve`, read by
+    /// `toolbox_binding`, resolved through `model::skill::resolve`, read by
     /// [`WriteStore::skill_bindings`] and written by [`WriteStore::set_skill_binding`].
     skill_bindings: Vec<SkillBinding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
@@ -5939,7 +5939,7 @@ impl State {
 
     /// What a workspace delete reaches: its links and its box paths, and no project (D4); since
     /// MOD-137 D3 also its graphs, their phases and their candidates (no new `DeleteReach` field:
-    /// blueprint §4 item 9).
+    /// blueprint §4 item 9), and since MOD-127 its own toolbox attachments.
     fn workspace_reach(&self, id: WorkspaceId) -> Option<DeleteReach> {
         if !self.workspaces.contains_key(&id) {
             return None;
@@ -5984,6 +5984,14 @@ impl State {
                 self.workspace_box_paths
                     .iter()
                     .filter(|row| row.workspace_id == id)
+                    .count(),
+            ),
+            // MOD-127: the workspace's own attachments (`toolbox_binding.workspace_id ... ON
+            // DELETE CASCADE`); the scope row's are counted by its project reach.
+            skill_bindings: rows(
+                self.skill_bindings
+                    .iter()
+                    .filter(|row| row.workspace_id == Some(id))
                     .count(),
             ),
             ..DeleteReach::default()
@@ -10733,8 +10741,6 @@ impl State {
     }
 }
 
-/// A row count as the `u64` [`DeleteReach`] holds, saturating rather than casting: `usize` is
-/// never wider than `u64` on a target this ships to, and the `try_from` says so without an `as`.
 /// MOD-127 D5: whether `binding` applies in `scope`, the Rust form of `PgStore::bound_skills`'s
 /// `WHERE`. A row applies when its keys match the scope exactly at its level; a `None` in the
 /// scope (a workspace, item kind or phase it does not name) matches no row of that level, as
@@ -10759,6 +10765,8 @@ fn binding_applies(binding: &SkillBinding, scope: ResolveScope) -> bool {
     }
 }
 
+/// A row count as the `u64` [`DeleteReach`] holds, saturating rather than casting: `usize` is
+/// never wider than `u64` on a target this ships to, and the `try_from` says so without an `as`.
 fn rows(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
@@ -17045,7 +17053,7 @@ mod tests {
     ///
     /// `project_delete_takes_everything_and_says_so` asserts the counts, which is all §6.1 can
     /// see: no trait reader returns a `prompt_template`, an `item_key_counter` or a
-    /// `skill_binding`, and none returns a row that *should* have gone. This walks every map
+    /// `toolbox_binding` row, and none returns a row that *should* have gone. This walks every map
     /// instead, and asserts the second thing a count cannot — that nothing surviving points at
     /// something that did not.
     #[tokio::test]

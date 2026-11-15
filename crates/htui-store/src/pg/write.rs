@@ -125,7 +125,7 @@ use uuid::Uuid;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
 use crate::pg::read::{StepGraphRow, graph_body_on, graph_edges_on, phase_parts_on, phase_rows_on};
-use crate::pg::rows::{MemoryEntryRow, PersonaRow, SkillBindingColumns};
+use crate::pg::rows::{MemoryEntryRow, PersonaRow};
 use htui_core::model::{
     CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemoryEvidence, MemorySource, NewRunMemory, RunMemoryWrite,
 };
@@ -1116,8 +1116,8 @@ async fn lock_activity_sources(
 
 /// What a workspace delete reaches: its links and its box paths, and no project
 /// (`0001_init.sql:162,174`); since MOD-137 D3 also its graphs, their phases and their candidates
-/// (`fk_step_graph_workspace ... ON DELETE CASCADE`), `MemStore`'s counts. `None` when no row has
-/// that id.
+/// (`fk_step_graph_workspace ... ON DELETE CASCADE`), `MemStore`'s counts; since MOD-127 also its own
+/// `toolbox_binding` rows. `None` when no row has that id.
 ///
 /// Takes a connection rather than the pool so [`WriteStore::delete_reach`] can count on a borrowed
 /// one and [`WriteStore::delete_workspace`] can count **inside its own transaction** — which,
@@ -1133,7 +1133,8 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
                (SELECT count(*) FROM g)                                         AS "graphs!",
                (SELECT count(*) FROM ph)                                        AS "phases!",
                (SELECT count(*) FROM phase_agent
-                 WHERE phase_id IN (SELECT id FROM ph))                         AS "agents!"
+                 WHERE phase_id IN (SELECT id FROM ph))                         AS "agents!",
+               (SELECT count(*) FROM toolbox_binding WHERE workspace_id = $1)   AS "bindings!"
           FROM workspace WHERE id = $1
         "#,
         id.as_uuid(),
@@ -1150,6 +1151,9 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
         step_graphs: rows(row.graphs),
         phases: rows(row.phases),
         phase_agents: rows(row.agents),
+        // MOD-127: the workspace's own attachments cascade with it; the scope row's are counted
+        // by its project reach below.
+        skill_bindings: rows(row.bindings),
         ..DeleteReach::default()
     };
 
@@ -6784,12 +6788,13 @@ impl WriteStore for PgStore {
     }
 
     /// D90, D92: the row at `key` and the facts [`check_attachment`] needs are read first, then
-    /// one statement writes: an attach under `None` is `INSERT … ON CONFLICT (kind,
-    /// ref_id, workspace_id, project_id, item_kind_id, phase_id) DO NOTHING` (it infers the `NULLS NOT DISTINCT` key, probed), a change
-    /// is `UPDATE … WHERE id AND updated_at`, a detach `DELETE … WHERE id AND updated_at`. The
-    /// reads are advisory: the write's own `WHERE` or `ON CONFLICT` decides, and zero rows re-read
-    /// the key for `Stale`, as `update_workspace`. A project or phase deleted between the reads
-    /// and the write is the FK's `23503`, a `Constraint`.
+    /// one statement writes: an attach under `None` is `INSERT … ON CONFLICT (kind, ref_id,
+    /// workspace_id, project_id, item_kind_id, phase_id) DO NOTHING` (it infers the `NULLS NOT
+    /// DISTINCT` key, probed), a change is `UPDATE … WHERE id AND updated_at`, a detach
+    /// `DELETE … WHERE id AND updated_at`. The reads are advisory: the write's own `WHERE` or
+    /// `ON CONFLICT` decides, and zero rows re-read the key for `Stale`, as `update_workspace`. A
+    /// workspace, project, item kind or phase deleted between the reads and the write is the FK's
+    /// `23503`, a `Constraint`.
     async fn set_skill_binding(
         &self,
         key: SkillBindingKey,
@@ -6917,7 +6922,7 @@ impl WriteStore for PgStore {
 
         let written = match &current {
             None => sqlx::query_as!(
-                SkillBindingColumns,
+                SkillBinding,
                 r#"
                 INSERT INTO toolbox_binding
                        (id, kind, ref_id, workspace_id, project_id, item_kind_id, phase_id,
@@ -6952,10 +6957,9 @@ impl WriteStore for PgStore {
             )
             .fetch_optional(&self.pool)
             .await
-            .map_err(map_sqlx)?
-            .map(SkillBinding::from),
+            .map_err(map_sqlx)?,
             Some(row) => sqlx::query_as!(
-                SkillBindingColumns,
+                SkillBinding,
                 r#"
                 UPDATE toolbox_binding SET
                     pinned_version = $3,
@@ -6987,8 +6991,7 @@ impl WriteStore for PgStore {
             )
             .fetch_optional(&self.pool)
             .await
-            .map_err(map_sqlx)?
-            .map(SkillBinding::from),
+            .map_err(map_sqlx)?,
         };
         match written {
             Some(row) => Ok(CasOutcome::Applied(Some(row))),

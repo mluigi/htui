@@ -17,7 +17,7 @@ use crate::model::ids::{
 use crate::model::skill_glob::SkillGlobs;
 
 str_enum!(
-    /// `skill_binding.activation` (ANA-22 §6 item 4): whether the winning attachment puts its
+    /// `toolbox_binding.activation` (ANA-22 §6 item 4): whether the winning attachment puts its
     /// skill into a step's prompt.
     Activation {
         /// Always rendered. The column default, so every binding written before `0007` is
@@ -105,40 +105,40 @@ pub struct SkillVersion {
     pub created_at: DateTime<Utc>,
 }
 
-/// A row of `skill_binding` (§5.6 as amended by ANA-22 §7.1): one attachment of a skill,
-/// globally, to a project, or to one phase of it. `UNIQUE NULLS NOT DISTINCT (skill_id,
-/// project_id, phase_id)` allows one attachment per skill per level, which is why [`resolve`] has
-/// to pick one.
+/// A `kind = 'skill'` row of `toolbox_binding` (§5.6 as amended by ANA-22 §7.1 and MOD-127): one
+/// attachment of a skill, globally, to a workspace, a project, an item kind or one phase of it.
+/// `UNIQUE NULLS NOT DISTINCT (kind, ref_id, workspace_id, project_id, item_kind_id, phase_id)`
+/// allows one attachment per skill per level, which is why [`resolve`] has to pick one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillBinding {
-    /// `skill_binding.id`.
+    /// `toolbox_binding.id`.
     pub id: SkillBindingId,
-    /// `skill_binding.skill_id`.
+    /// `toolbox_binding.ref_id`.
     pub skill_id: SkillId,
-    /// `skill_binding.workspace_id`; `Some` is a workspace attachment and excludes every other
+    /// `toolbox_binding.workspace_id`; `Some` is a workspace attachment and excludes every other
     /// key.
     pub workspace_id: Option<WorkspaceId>,
-    /// `skill_binding.project_id`; `None` with no workspace is a global attachment (every
+    /// `toolbox_binding.project_id`; `None` with no workspace is a global attachment (every
     /// project).
     pub project_id: Option<ProjectId>,
-    /// `skill_binding.item_kind_id`; `Some` requires `project_id` and no `phase_id`.
+    /// `toolbox_binding.item_kind_id`; `Some` requires `project_id` and no `phase_id`.
     pub item_kind_id: Option<ItemKindId>,
-    /// `skill_binding.phase_id`; `None` is the project (or global) level. `Some` requires
-    /// `project_id` (`skill_binding_phase_needs_project`).
+    /// `toolbox_binding.phase_id`; `None` is the project (or global) level. `Some` requires
+    /// `project_id` (`toolbox_binding_phase_needs_project`).
     pub phase_id: Option<PhaseId>,
-    /// `skill_binding.pinned_version`; `None` follows the latest version.
+    /// `toolbox_binding.pinned_version`; `None` follows the latest version.
     pub pinned_version: Option<i32>,
-    /// `skill_binding.position`: ascending render order, `skill.name` bytes breaking the tie.
+    /// `toolbox_binding.position`: ascending render order, `skill.name` bytes breaking the tie.
     pub position: i32,
-    /// `skill_binding.activation`.
+    /// `toolbox_binding.activation`.
     pub activation: Activation,
-    /// `skill_binding.globs`: the effective globs, non-empty when `activation` is `Glob`
-    /// (`skill_binding_glob_needs_globs`); `select` matches them against the step's files (MOD-9
+    /// `toolbox_binding.globs`: the effective globs, non-empty when `activation` is `Glob`
+    /// (`toolbox_binding_glob_needs_globs`); `select` matches them against the step's files (MOD-9
     /// D111).
     pub globs: Vec<String>,
-    /// `skill_binding.languages`: as authored, display only; the matcher reads `globs`.
+    /// `toolbox_binding.languages`: as authored, display only; the matcher reads `globs`.
     pub languages: Vec<String>,
-    /// `skill_binding.updated_at`.
+    /// `toolbox_binding.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -161,7 +161,7 @@ impl SkillBinding {
     }
 
     /// The level this attachment sits at, from its four nullable keys. A phase row with no
-    /// project is refused by `skill_binding_phase_needs_project`; were one ever read, it is
+    /// project is refused by `toolbox_binding_phase_needs_project`; were one ever read, it is
     /// `Global`, the same answer `PgStore`'s `WHERE b.project_id IS NULL` gives it.
     #[must_use]
     pub fn level(&self) -> SkillLevel {
@@ -229,15 +229,15 @@ pub struct NewSkillVersion {
 /// build exactly those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SkillBindingKey {
-    /// `skill_binding.skill_id`.
+    /// `toolbox_binding.ref_id`.
     pub skill: SkillId,
-    /// `skill_binding.workspace_id`.
+    /// `toolbox_binding.workspace_id`.
     pub workspace: Option<WorkspaceId>,
-    /// `skill_binding.project_id`.
+    /// `toolbox_binding.project_id`.
     pub project: Option<ProjectId>,
-    /// `skill_binding.item_kind_id`.
+    /// `toolbox_binding.item_kind_id`.
     pub item_kind: Option<ItemKindId>,
-    /// `skill_binding.phase_id`.
+    /// `toolbox_binding.phase_id`.
     pub phase: Option<PhaseId>,
 }
 
@@ -322,11 +322,11 @@ impl SkillBindingKey {
 /// stores `canonical_globs(globs, languages)` and the normalised languages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
-    /// `skill_binding.pinned_version`; `None` follows the latest.
+    /// `toolbox_binding.pinned_version`; `None` follows the latest.
     pub pinned_version: Option<i32>,
-    /// `skill_binding.position`, `>= 0`.
+    /// `toolbox_binding.position`, `>= 0`.
     pub position: i32,
-    /// `skill_binding.activation`.
+    /// `toolbox_binding.activation`.
     pub activation: Activation,
     /// Typed globs: `<glob>` or `<repo>:<glob>` (D74).
     pub globs: Vec<String>,
@@ -404,7 +404,7 @@ pub struct BoundSkill {
     /// attachment's pin names no version, or the skill has none: the skill then renders nothing
     /// and records `missing_version`, with no fallback to a broader attachment (plan D39, OQ-9).
     pub version: Option<i32>,
-    /// `skill_binding.position` of the attachment that won.
+    /// `toolbox_binding.position` of the attachment that won.
     pub position: i32,
     /// `skill_version.body`, inlined verbatim; empty when `version` is `None`.
     pub body: String,
@@ -836,7 +836,7 @@ mod tests {
         );
     }
 
-    /// Ties on `skill_binding.position` break on `skill.name` **byte** order, not locale order:
+    /// Ties on `toolbox_binding.position` break on `skill.name` **byte** order, not locale order:
     /// an ICU collation would read these as `apple`, `Ångström`, `Zebra`.
     #[test]
     fn equal_positions_break_on_name_bytes() {
@@ -1076,7 +1076,7 @@ mod tests {
         assert_eq!(
             level(None, phase),
             SkillLevel::Global,
-            "a phase row with no project is refused by skill_binding_phase_needs_project; were \
+            "a phase row with no project is refused by toolbox_binding_phase_needs_project; were \
              one read, it is global"
         );
     }
@@ -1338,6 +1338,9 @@ mod tests {
                 level
             );
         }
+        assert!(
+            SkillLevel::Global < SkillLevel::Project && SkillLevel::Project < SkillLevel::Phase
+        );
 
         // MOD-9 D109: a matched choice adds `path`, last; a v 2 choice reads back with none.
         let matched = SkillChoice {

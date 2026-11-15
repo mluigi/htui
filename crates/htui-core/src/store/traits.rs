@@ -23,7 +23,7 @@
 //! that is what lets `CacheStore` answer them and `store::conformance`'s `READ_CASES` run over the
 //! mirror (plan D96). [`WriteStore`] gains one: [`WriteStore::set_step_prompt`], the pre-flight
 //! audit row. The prompt inputs that are **not** mirrored — `prompt_template`, `skill`,
-//! `skill_version`, `skill_binding`, `box_tool` — stay inherent on `MemStore` / `PgStore` for the
+//! `skill_version`, `toolbox_binding`, `box_tool` — stay inherent on `MemStore` / `PgStore` for the
 //! same reason `agents()` does.
 //!
 //! **MOD-9 milestone 3** adds the skill readers to `WriteStore` beside their writers (plan D75),
@@ -1143,7 +1143,7 @@ pub trait WriteStore: ReadStore {
     /// `is_override`, `revision` and the timestamps are ignored. `target_id` is never written;
     /// [`set_graph_target`](Self::set_graph_target) is its writer (MOD-130 M1, blueprint B9).
     /// Nodes are diffed **by phase
-    /// id**: a kept id is updated in place and keeps its `skill_binding` rows; a new id is
+    /// id**: a kept id is updated in place and keeps its `toolbox_binding` rows; a new id is
     /// inserted; a stored id missing from `body` is deleted with its candidates, parts, edges and
     /// phase bindings. Every node's candidates and parts, and the graph's edges, are replaced
     /// wholesale. `revision` + 1.
@@ -3766,13 +3766,13 @@ pub fn phase_not_in_project(phase: PhaseId, project: ProjectId) -> String {
 /// D78: a pin to a version the skill does not have.
 #[must_use]
 pub fn pin_names_no_version(skill: &str, version: i32) -> String {
-    format!("skill_binding.pinned_version `{version}` names no version of skill `{skill}`")
+    format!("toolbox_binding.pinned_version `{version}` names no version of skill `{skill}`")
 }
 
 /// D78: `position < 0`.
 #[must_use]
 pub fn negative_position(position: i32) -> String {
-    format!("skill_binding.position `{position}` must be 0 or more")
+    format!("toolbox_binding.position `{position}` must be 0 or more")
 }
 
 /// D78: a qualified glob on a global row.
@@ -3805,7 +3805,9 @@ pub struct BindingFacts<'a> {
     pub key: SkillBindingKey,
     /// The project owning `key.phase`'s graph (`None` when `key.phase` is `None`).
     pub phase_project: Option<ProjectId>,
-    /// Whether `key.workspace` names a workspace (`true` when `key.workspace` is `None`).
+    /// Whether `key.workspace` names a workspace (`true` when `key.workspace` is `None`). Defence
+    /// in depth: both stores answer `NotFound` for an unknown workspace before they build the
+    /// facts, so a store never passes `false`; the refusal here keeps the rule total on its own.
     pub workspace_exists: bool,
     /// The project owning `key.item_kind` (`None` when `key.item_kind` is `None` or names no kind).
     pub kind_project: Option<ProjectId>,
@@ -3826,6 +3828,34 @@ pub struct StoredAttachment {
     pub globs: Vec<String>,
     /// `skill_language::normalise(attachment.languages)`.
     pub languages: Vec<String>,
+}
+
+/// [`check_attachment`]'s first refusals, in its order: a workspace beside another key, then a
+/// workspace that does not exist, then an item kind without a project, then an item kind with a
+/// phase. Pure over `facts`, so it can stand ahead of the facts' project checks.
+fn check_key_shape(facts: &BindingFacts<'_>) -> core::result::Result<(), String> {
+    let key = facts.key;
+    if let Some(workspace) = key.workspace {
+        if key.project.is_some() || key.item_kind.is_some() || key.phase.is_some() {
+            return Err(workspace_attachment_is_alone(workspace));
+        }
+        if !facts.workspace_exists {
+            return Err(references_no_row(
+                "toolbox_binding.workspace_id",
+                workspace,
+                "workspace",
+            ));
+        }
+    }
+    if let Some(item_kind) = key.item_kind {
+        if key.project.is_none() {
+            return Err(item_kind_attachment_needs_a_project(item_kind));
+        }
+        if let Some(phase) = key.phase {
+            return Err(item_kind_and_phase_exclude_each_other(item_kind, phase));
+        }
+    }
+    Ok(())
 }
 
 /// D78's `Constraint` chain, in order, first refusal wins (MOD-127 D2 and D7 added 0 to 2 and the
@@ -3852,28 +3882,12 @@ pub fn check_attachment(
     attachment: &Attachment,
 ) -> core::result::Result<StoredAttachment, String> {
     let key = facts.key;
-    if let Some(workspace) = key.workspace {
-        if key.project.is_some() || key.item_kind.is_some() || key.phase.is_some() {
-            return Err(workspace_attachment_is_alone(workspace));
-        }
-        if !facts.workspace_exists {
-            return Err(references_no_row(
-                "toolbox_binding.workspace_id",
-                workspace,
-                "workspace",
-            ));
-        }
-    }
-    if let Some(item_kind) = key.item_kind {
-        let Some(project) = key.project else {
-            return Err(item_kind_attachment_needs_a_project(item_kind));
-        };
-        if let Some(phase) = key.phase {
-            return Err(item_kind_and_phase_exclude_each_other(item_kind, phase));
-        }
-        if facts.kind_project != Some(project) {
-            return Err(item_kind_not_in_project(item_kind, project));
-        }
+    check_key_shape(facts)?;
+    // `check_key_shape` has refused an item kind without a project, so both are `Some` or neither.
+    if let (Some(item_kind), Some(project)) = (key.item_kind, key.project)
+        && facts.kind_project != Some(project)
+    {
+        return Err(item_kind_not_in_project(item_kind, project));
     }
     if let Some(phase) = key.phase {
         let Some(project) = key.project else {
@@ -5091,7 +5105,7 @@ pub struct DeleteReach {
     pub repos: u64,
     /// `repo_box_path` rows.
     pub repo_box_paths: u64,
-    /// `skill_binding` rows.
+    /// `toolbox_binding` rows.
     pub skill_bindings: u64,
     /// `run` rows.
     pub runs: u64,
