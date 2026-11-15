@@ -2095,6 +2095,15 @@ pub fn is_dirty(path: &Path) -> Result<bool, IsolateError> {
     })
 }
 
+/// MOD-133 M3 D3 step 4: whether the tree at `path` is mid-merge, its git directory holding
+/// `MERGE_HEAD` (a `git merge` killed before it committed or aborted).
+///
+/// # Errors
+/// [`IsolateError::Git`] when the repository cannot be opened.
+pub fn merge_in_progress(path: &Path) -> Result<bool, IsolateError> {
+    Ok(open(path)?.git_dir().join("MERGE_HEAD").exists())
+}
+
 /// Whether the working tree holds any untracked, not-ignored file — the half of `git status` that
 /// [`is_dirty`] leaves out on purpose.
 ///

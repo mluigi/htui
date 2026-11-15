@@ -5448,10 +5448,12 @@ async fn reconcile_onto_recovers_a_merge_whose_ref_move_never_happened() {
     assert_primary_untouched(&git, &fix).await;
 }
 
-/// MOD-133 M3 D3: a landing tree with uncommitted work is refused naming the landing tree, never
-/// the person's checkout; the run branch does not move.
+/// MOD-133 M3 D3 steps 4-5: a landing tree with uncommitted work is a scratch tree, reset to the
+/// tip and landed on; one that cannot be reset (its `index.lock` held past every retry) is
+/// refused naming the landing tree, never the person's checkout, and the run branch does not
+/// move.
 #[tokio::test]
-async fn reconcile_onto_refuses_a_dirty_landing_tree_naming_it() {
+async fn reconcile_onto_resets_a_dirty_landing_tree_and_refuses_one_it_cannot_reset() {
     let Some(git) = skip_without_git!() else {
         return;
     };
@@ -5459,15 +5461,34 @@ async fn reconcile_onto_refuses_a_dirty_landing_tree_naming_it() {
     let tip = fix.ensure_run_branch().await;
     let run = RunId::new();
     let (a, _, a_rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
-    let (b, _, b_rows) = run_branch_step(&fix, run, &tip, "b.txt", "b\n").await;
+    let (b, b_after, b_rows) = run_branch_step(&fix, run, &tip, "b.txt", "b\n").await;
+    let (c, _, c_rows) = run_branch_step(&fix, run, &tip, "c.txt", "c\n").await;
     let first = fix.merged_onto(run, a, &a_rows).await;
     let landing = fix.landing_tree(run);
     std::fs::write(landing.join("f"), "edited\n").expect("the landing tree is written to");
 
+    let second = fix.merged_onto(run, b, &b_rows).await;
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &second).await,
+        [second.clone(), first, b_after]
+    );
+    assert_eq!(
+        porcelain_status(&git, &landing).await,
+        "",
+        "the edit was reset"
+    );
+
+    std::fs::write(landing.join("f"), "edited again\n").expect("the landing tree is written to");
+    let admin = PathBuf::from(
+        git_ok(&git, &landing, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .trim(),
+    );
+    std::fs::write(admin.join("index.lock"), "").expect("the landing tree's index is locked");
     let refused = fix
-        .reconcile_onto(run, b, &b_rows)
+        .reconcile_onto(run, c, &c_rows)
         .await
-        .expect_err("a dirty landing tree is refused");
+        .expect_err("a landing tree that cannot be reset is refused");
     assert!(
         matches!(&refused, IsolateError::Refused(reason)
             if *reason == dirty_landing_tree(&landing)),
@@ -5475,8 +5496,156 @@ async fn reconcile_onto_refuses_a_dirty_landing_tree_naming_it() {
     );
     assert_eq!(
         branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
-        Some(first.as_str())
+        Some(second.as_str())
     );
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3 (probe C12): a run branch checked out in the primary after the step was
+/// prepared is refused at the landing, naming the primary; the branch does not move and the
+/// primary stays clean.
+#[tokio::test]
+async fn reconcile_onto_refuses_a_run_branch_checked_out_since_the_step_began() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    git_out(&git, &fix.core.path, &["checkout", "--quiet", RUN_BRANCH]).await;
+
+    let refused = fix
+        .reconcile_onto(run, step, &rows)
+        .await
+        .expect_err("a checked-out run branch is refused");
+    assert!(
+        matches!(&refused, IsolateError::Refused(reason)
+            if *reason == run_branch_checked_out(RUN_BRANCH, &fix.core.path)),
+        "{refused}"
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(tip.as_str()),
+        "the run branch did not move"
+    );
+    assert_eq!(head_of(&git, &fix.core.path).await, tip);
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+    assert!(!fix.core.path.join("a.txt").exists());
+}
+
+/// MOD-133 M3 D3 steps 4-5: a merge killed mid-way in the landing tree (`MERGE_HEAD` and a
+/// conflicted index, `HEAD` still at the tip) is aborted and reset, not refused for good: the
+/// next step lands.
+#[tokio::test]
+async fn reconcile_onto_resets_a_landing_tree_left_mid_merge() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (a, _, a_rows) = run_branch_step(&fix, run, &tip, "same.txt", "a\n").await;
+    let (_, b_after, _) = run_branch_step(&fix, run, &tip, "same.txt", "b\n").await;
+    let (c, c_after, c_rows) = run_branch_step(&fix, run, &tip, "c.txt", "c\n").await;
+    let first = fix.merged_onto(run, a, &a_rows).await;
+    let landing = fix.landing_tree(run);
+    let (merged, _) = git_as(&git, &landing, &["merge", "--no-ff", "--no-edit", &b_after]).await;
+    assert!(!merged, "the left-over merge conflicts");
+    assert!(
+        git_as(
+            &git,
+            &landing,
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+        )
+        .await
+        .0,
+        "the landing tree is mid-merge"
+    );
+    assert_eq!(
+        head_of(&git, &landing).await,
+        first,
+        "HEAD is still the tip"
+    );
+
+    let second = fix.merged_onto(run, c, &c_rows).await;
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &second).await,
+        [second.clone(), first, c_after]
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(second.as_str())
+    );
+    assert_eq!(head_of(&git, &landing).await, second);
+    assert_eq!(porcelain_status(&git, &landing).await, "");
+    assert!(
+        !git_as(
+            &git,
+            &landing,
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+        )
+        .await
+        .0,
+        "the merge was aborted"
+    );
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3 step 9: a run branch moved by someone else between two landings (a commit on
+/// its tip, the base still an ancestor) leaves the landing tree behind it; the next landing
+/// resyncs the tree, merges onto the moved tip and moves the ref from there.
+#[tokio::test]
+async fn reconcile_onto_follows_a_run_branch_moved_between_landings() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (a, _, a_rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let (b, b_after, b_rows) = run_branch_step(&fix, run, &tip, "b.txt", "b\n").await;
+    let first = fix.merged_onto(run, a, &a_rows).await;
+    let tree = format!("{first}^{{tree}}");
+    let foreign = git_ok(
+        &git,
+        &fix.core.path,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &first,
+            "-m",
+            "a commit of someone else",
+        ],
+    )
+    .await
+    .trim()
+    .to_owned();
+    let reference = format!("refs/heads/{RUN_BRANCH}");
+    git_ok(
+        &git,
+        &fix.core.path,
+        &["update-ref", &reference, &foreign, &first],
+    )
+    .await;
+    let landing = fix.landing_tree(run);
+    assert_eq!(
+        head_of(&git, &landing).await,
+        first,
+        "the landing tree is behind"
+    );
+
+    let second = fix.merged_onto(run, b, &b_rows).await;
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &second).await,
+        [second.clone(), foreign, b_after]
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(second.as_str())
+    );
+    assert_eq!(head_of(&git, &landing).await, second);
     assert_primary_untouched(&git, &fix).await;
 }
 
@@ -5534,6 +5703,34 @@ async fn cleanup_removes_the_landing_tree_and_keeps_the_branch() {
         branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
         Some(merged.as_str()),
         "the run branch survives cleanup"
+    );
+}
+
+/// MOD-133 M3 D3: a landing tree whose directory is already gone still has its `git` entry
+/// removed at cleanup, so nothing is left under the scratch root.
+#[tokio::test]
+async fn cleanup_removes_the_entry_of_a_landing_tree_whose_directory_is_gone() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    fix.merged_onto(run, step, &rows).await;
+    let landing = fix.landing_tree(run);
+    std::fs::remove_dir_all(&landing).expect("the landing directory is deleted behind git's back");
+
+    fix.isolator
+        .cleanup(run, &rows)
+        .await
+        .expect("cleanup removes every tree");
+    assert!(
+        worktree_list(&git, &fix.core.path)
+            .await
+            .iter()
+            .all(|entry| entry.path != landing),
+        "the landing tree's entry is gone"
     );
 }
 
