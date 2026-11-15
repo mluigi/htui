@@ -1245,9 +1245,8 @@ impl htui_core::store::WorkerHost for PgStore {
     async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
         PgStore::bound_skills(self, scope).await
     }
-    // MOD-127 M2 T2 stub: T3 resolves the table's rows.
-    async fn bound_mcp_servers(&self, _scope: ResolveScope) -> Result<Vec<BoundMcp>> {
-        Ok(Vec::new())
+    async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        PgStore::bound_mcp_servers(self, scope).await
     }
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         PgStore::missing_tags(self, item, box_id).await
@@ -1358,9 +1357,8 @@ impl htui_core::store::WorkerHost for Backend {
     async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
         Backend::bound_skills(self, scope).await
     }
-    // MOD-127 M2 T2 stub: T3 resolves the table's rows.
-    async fn bound_mcp_servers(&self, _scope: ResolveScope) -> Result<Vec<BoundMcp>> {
-        Ok(Vec::new())
+    async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        Backend::bound_mcp_servers(self, scope).await
     }
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         Backend::missing_tags(self, item, box_id).await

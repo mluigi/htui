@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id             AS \"id: SkillBindingId\",\n                   ref_id         AS \"skill_id: SkillId\",\n                   workspace_id   AS \"workspace_id?: WorkspaceId\",\n                   project_id     AS \"project_id?: ProjectId\",\n                   item_kind_id   AS \"item_kind_id?: ItemKindId\",\n                   phase_id       AS \"phase_id?: PhaseId\",\n                   pinned_version,\n                   position,\n                   activation     AS \"activation: Activation\",\n                   globs,\n                   languages,\n                   updated_at\n              FROM toolbox_binding\n             WHERE kind = 'skill'\n               AND ref_id = $1\n               AND workspace_id IS NOT DISTINCT FROM $2\n               AND project_id IS NOT DISTINCT FROM $3\n               AND item_kind_id IS NOT DISTINCT FROM $4\n               AND phase_id IS NOT DISTINCT FROM $5\n            ",
+  "query": "\n            SELECT id             AS \"id: SkillBindingId\",\n                   ref_id         AS \"skill_id: SkillId\",\n                   workspace_id   AS \"workspace_id?: WorkspaceId\",\n                   project_id     AS \"project_id?: ProjectId\",\n                   item_kind_id   AS \"item_kind_id?: ItemKindId\",\n                   phase_id       AS \"phase_id?: PhaseId\",\n                   pinned_version,\n                   position,\n                   activation     AS \"activation: Activation\",\n                   globs,\n                   languages,\n                   updated_at\n              FROM toolbox_binding\n             WHERE kind = $1\n               AND ref_id = $2\n               AND workspace_id IS NOT DISTINCT FROM $3\n               AND project_id IS NOT DISTINCT FROM $4\n               AND item_kind_id IS NOT DISTINCT FROM $5\n               AND phase_id IS NOT DISTINCT FROM $6\n            ",
   "describe": {
     "columns": [
       {
@@ -138,6 +138,7 @@
     ],
     "parameters": {
       "Left": [
+        "Text",
         "Uuid",
         "Uuid",
         "Uuid",
@@ -160,5 +161,5 @@
       false
     ]
   },
-  "hash": "09d7df5656f0ca423920b337bd0f883539264a524832a4feef5a0ff6671c975e"
+  "hash": "b17e089c3790d354309f2906b49b0ed6a044c622f0b77879c1f53533120e82a0"
 }

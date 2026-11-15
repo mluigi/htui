@@ -1672,9 +1672,8 @@ impl GraphSource for MemStore {
         self.bound_skills(scope).await
     }
 
-    // MOD-127 M2 T2 stub: T3 resolves the table's rows.
-    async fn bound_mcp_servers(&self, _scope: ResolveScope) -> Result<Vec<BoundMcp>> {
-        Ok(Vec::new())
+    async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        self.bound_mcp_servers(scope).await
     }
 
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
@@ -4537,6 +4536,70 @@ mod tests {
             .expect("the second run prepares");
         assert_eq!(admitted, 2);
         assert_eq!(isolator.releases(), 2, "every call is counted");
+    }
+
+    /// MOD-127 M2 D5: the eighth read delegates the same way, so a server attached at the
+    /// project level reaches the source's answer, and an `off` attachment at a narrower level is
+    /// returned inactive instead of recursing or vanishing.
+    #[tokio::test]
+    async fn the_store_answers_bound_mcp_servers_without_recursing() {
+        use htui_core::model::{
+            Activation, Attachment, BindingChange, BindingKey, McpServerId, McpTransport,
+            NewMcpServer,
+        };
+        use htui_core::store::WriteStore as _;
+
+        let store = MemStore::demo();
+        let scope = ResolveScope::project(ids::PROJECT_HTUI, None);
+        assert!(
+            GraphSource::bound_mcp_servers(&store, scope)
+                .await
+                .expect("MemStore never fails a read")
+                .is_empty(),
+            "the demo fixture binds no server"
+        );
+        let server = store
+            .create_mcp_server(NewMcpServer {
+                id: McpServerId::new(),
+                name: "docs".to_owned(),
+                description: String::new(),
+                transport: McpTransport::Stdio,
+                command: "mcp-docs".to_owned(),
+                args: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                env: Vec::new(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("create a server");
+        store
+            .set_skill_binding(
+                BindingKey::project(server.id, ids::PROJECT_HTUI),
+                None,
+                BindingChange::Attach(Attachment {
+                    pinned_version: None,
+                    position: 0,
+                    activation: Activation::Always,
+                    globs: Vec::new(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("attach it to the project");
+        let bound = GraphSource::bound_mcp_servers(&store, scope)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            bound
+                .iter()
+                .map(|row| (row.server.id, row.active))
+                .collect::<Vec<_>>(),
+            [(server.id, true)],
+            "the project's attachment resolves through the source"
+        );
     }
 
     /// `impl GraphSource for MemStore` delegates to the seven inherent reads of the same names.

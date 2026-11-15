@@ -11,7 +11,7 @@
 //! (blueprint A.8). Result columns come back through the type-override syntax, which only needs
 //! `Decode`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use htui_core::model::IntegrateMode;
@@ -36,6 +36,9 @@ use htui_core::model::{
 };
 use htui_core::model::{ArtifactLinkKind, LinkedDocument};
 use htui_core::model::{
+    BoundMcp, EnvValue, McpCandidate, McpServer, McpServerId, McpTransport, resolve_mcp,
+};
+use htui_core::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     StepGraphEdge,
 };
@@ -54,7 +57,8 @@ use crate::backend::ScopeKeys;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
 use crate::pg::rows::{
-    LinkNodeRow, MemoryEntryRow, PersonaRow, RunRow, SkillBindingRow, StepRow, UpstreamRow,
+    LinkNodeRow, McpBindingRow, McpServerRow, MemoryEntryRow, PersonaRow, RunRow, SkillBindingRow,
+    StepRow, UpstreamRow,
 };
 use crate::{MAX_UPSTREAM_HOPS, order_documents};
 use htui_core::model::{MemoryEvidence, MemorySource};
@@ -2197,6 +2201,69 @@ impl PgStore {
         ))
     }
 
+    /// A step's MCP servers (MOD-127 M2 D5): the `kind = 'mcp_server'` attachments that apply in
+    /// `scope` (the `WHERE` of [`bound_skills`](Self::bound_skills), over the same five levels),
+    /// then the records they name, resolved by [`resolve_mcp`](htui_core::model::resolve_mcp),
+    /// the one rule `MemStore` calls too. An `off` winner is included, inactive. An attachment
+    /// whose server is gone (`ref_id` has no foreign key; a delete takes its attachments, but a
+    /// read can land between the two statements) is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`]; a blob that does not decode included.
+    pub async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        let workspace = scope.workspace.map(WorkspaceId::as_uuid);
+        let item_kind = scope.item_kind.map(ItemKindId::as_uuid);
+        let phase = scope.phase.map(PhaseId::as_uuid);
+        let bindings = sqlx::query_as!(
+            McpBindingRow,
+            r#"
+            SELECT b.ref_id       AS "server_id: McpServerId",
+                   b.workspace_id AS "workspace_id?: WorkspaceId",
+                   b.project_id   AS "project_id?: ProjectId",
+                   b.item_kind_id AS "item_kind_id?: ItemKindId",
+                   b.phase_id     AS "phase_id?: PhaseId",
+                   b.activation   AS "activation: Activation"
+              FROM toolbox_binding b
+             WHERE b.kind = 'mcp_server'
+               AND (   (b.workspace_id IS NULL AND b.project_id IS NULL
+                        AND b.item_kind_id IS NULL AND b.phase_id IS NULL)
+                    OR b.workspace_id = $1
+                    OR (b.project_id = $2 AND b.item_kind_id IS NULL AND b.phase_id IS NULL)
+                    OR (b.project_id = $2 AND b.item_kind_id = $3)
+                    OR (b.project_id = $2 AND b.phase_id = $4))
+            "#,
+            workspace,
+            scope.project.as_uuid(),
+            item_kind,
+            phase,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if bindings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<Uuid> = bindings.iter().map(|row| row.server_id.as_uuid()).collect();
+        let servers: HashMap<McpServerId, McpServer> = self
+            .mcp_server_rows_of(&wanted)
+            .await?
+            .into_iter()
+            .map(|server| (server.id, server))
+            .collect();
+        let candidates: Vec<McpCandidate> = bindings
+            .iter()
+            .filter_map(|row| {
+                servers.get(&row.server_id).map(|server| McpCandidate {
+                    server: server.clone(),
+                    level: row.level(),
+                    activation: row.activation,
+                })
+            })
+            .collect();
+        Ok(resolve_mcp(&candidates))
+    }
+
     /// One box projected for the prompt's `box` section, or `None` when no row has that id.
     ///
     /// The `box_tool` join is [`BoxProfile::project`]'s: name byte order, capped at
@@ -3755,9 +3822,111 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
-    /// The skill attachments at one [`BindingHome`]: the global rows, a workspace's, or a
+    /// Every MCP server, ordered by `name` bytes (MOD-127 M2 D2).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn mcp_server_rows(&self) -> Result<Vec<McpServer>> {
+        let rows = sqlx::query_as!(
+            McpServerRow,
+            r#"
+            SELECT id          AS "id: McpServerId",
+                   name,
+                   description,
+                   transport   AS "transport: McpTransport",
+                   command,
+                   args,
+                   url,
+                   headers     AS "headers: Json<Vec<(String, EnvValue)>>",
+                   env         AS "env: Json<Vec<(String, EnvValue)>>",
+                   allow,
+                   deny,
+                   created_by  AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM mcp_server
+             ORDER BY name COLLATE "C"
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(McpServer::from).collect())
+    }
+
+    /// The servers whose ids are in `ids`, in no particular order.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn mcp_server_rows_of(&self, ids: &[Uuid]) -> Result<Vec<McpServer>> {
+        let rows = sqlx::query_as!(
+            McpServerRow,
+            r#"
+            SELECT id          AS "id: McpServerId",
+                   name,
+                   description,
+                   transport   AS "transport: McpTransport",
+                   command,
+                   args,
+                   url,
+                   headers     AS "headers: Json<Vec<(String, EnvValue)>>",
+                   env         AS "env: Json<Vec<(String, EnvValue)>>",
+                   allow,
+                   deny,
+                   created_by  AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM mcp_server
+             WHERE id = ANY($1)
+            "#,
+            ids,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(McpServer::from).collect())
+    }
+
+    /// One MCP server by id, `None` when there is no such row.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn mcp_server_row(&self, id: McpServerId) -> Result<Option<McpServer>> {
+        let row = sqlx::query_as!(
+            McpServerRow,
+            r#"
+            SELECT id          AS "id: McpServerId",
+                   name,
+                   description,
+                   transport   AS "transport: McpTransport",
+                   command,
+                   args,
+                   url,
+                   headers     AS "headers: Json<Vec<(String, EnvValue)>>",
+                   env         AS "env: Json<Vec<(String, EnvValue)>>",
+                   allow,
+                   deny,
+                   created_by  AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM mcp_server
+             WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(McpServer::from))
+    }
+
+    /// The attachments at one [`BindingHome`], of both kinds: the global rows, a workspace's, or a
     /// project's project, item-kind and phase rows. Ordered by `(ref_id, item_kind_id NULLS
-    /// FIRST, phase_id NULLS FIRST)` (D91, MOD-127 D6).
+    /// FIRST, phase_id NULLS FIRST)` (D91, MOD-127 D6). A row's `skill_id` holds its `ref_id`
+    /// whatever its `kind` (the model's `Binding` has no kind); a server's id is never a skill's.
     ///
     /// # Errors
     ///
@@ -3784,8 +3953,7 @@ impl PgStore {
                    languages,
                    updated_at
               FROM toolbox_binding
-             WHERE kind = 'skill'
-               AND (   ($1::uuid IS NOT NULL AND workspace_id = $1)
+             WHERE (   ($1::uuid IS NOT NULL AND workspace_id = $1)
                     OR ($2::uuid IS NOT NULL AND project_id = $2)
                     OR ($1::uuid IS NULL AND $2::uuid IS NULL
                         AND workspace_id IS NULL AND project_id IS NULL))
@@ -3806,9 +3974,9 @@ impl PgStore {
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub(crate) async fn skill_binding_row(&self, key: BindingKey) -> Result<Option<Binding>> {
-        // MOD-127 M2 T2 stub: no `mcp_server` row is read here until T3.
-        let BindingRef::Skill(skill) = key.target else {
-            return Ok(None);
+        let ref_id = match key.target {
+            BindingRef::Skill(skill) => skill.as_uuid(),
+            BindingRef::McpServer(server) => server.as_uuid(),
         };
         sqlx::query_as!(
             Binding,
@@ -3826,14 +3994,15 @@ impl PgStore {
                    languages,
                    updated_at
               FROM toolbox_binding
-             WHERE kind = 'skill'
-               AND ref_id = $1
-               AND workspace_id IS NOT DISTINCT FROM $2
-               AND project_id IS NOT DISTINCT FROM $3
-               AND item_kind_id IS NOT DISTINCT FROM $4
-               AND phase_id IS NOT DISTINCT FROM $5
+             WHERE kind = $1
+               AND ref_id = $2
+               AND workspace_id IS NOT DISTINCT FROM $3
+               AND project_id IS NOT DISTINCT FROM $4
+               AND item_kind_id IS NOT DISTINCT FROM $5
+               AND phase_id IS NOT DISTINCT FROM $6
             "#,
-            skill.as_uuid(),
+            key.target.kind().as_str(),
+            ref_id,
             key.workspace.map(WorkspaceId::as_uuid),
             key.project.map(ProjectId::as_uuid),
             key.item_kind.map(ItemKindId::as_uuid),

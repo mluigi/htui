@@ -1,0 +1,195 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE mcp_server SET\n                name        = $3,\n                description = $4,\n                transport   = $5,\n                command     = $6,\n                args        = $7,\n                url         = $8,\n                headers     = $9,\n                env         = $10,\n                allow       = $11,\n                deny        = $12\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id          AS \"id: McpServerId\",\n                      name,\n                      description,\n                      transport   AS \"transport: McpTransport\",\n                      command,\n                      args,\n                      url,\n                      headers     AS \"headers: Json<Vec<(String, EnvValue)>>\",\n                      env         AS \"env: Json<Vec<(String, EnvValue)>>\",\n                      allow,\n                      deny,\n                      created_by  AS \"created_by: UserId\",\n                      created_at,\n                      updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: McpServerId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "transport: McpTransport",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "transport"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "command",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "command"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "args",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "args"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "headers: Json<Vec<(String, EnvValue)>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "headers"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "env: Json<Vec<(String, EnvValue)>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "env"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "allow",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "allow"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "deny",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "deny"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "created_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "mcp_server",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "TextArray",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fb44a2dea1c8bbaca51b1073774bb621bd35d1366663cde384c08460b1317dfe"
+}

@@ -67,6 +67,10 @@ use crate::model::{
     locator_refusal, target_name_refusal,
 };
 use crate::model::{
+    BoundMcp, McpCandidate, McpServer, McpServerId, McpServerPatch, NewMcpServer,
+    mcp_server_patch_refusal, new_mcp_server_refusal, resolve_mcp,
+};
+use crate::model::{
     CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemorySource, MemoryUsage, NewRunMemory, RunMemoryWrite,
     RunProvenance,
 };
@@ -330,6 +334,11 @@ struct State {
     /// `toolbox_binding`, resolved through `model::skill::resolve`, read by
     /// [`WriteStore::skill_bindings`] and written by [`WriteStore::set_skill_binding`].
     skill_bindings: Vec<Binding>,
+    /// `mcp_server` (MOD-127 M2 D2): a global registry like `skills`, no versions, no fixture. Its
+    /// attachments are rows of `skill_bindings` whose `skill_id` holds the server's id (`kind =
+    /// 'mcp_server'` in Postgres): the two id spaces are disjoint UUIDv7s, so a row is a server's
+    /// exactly when its `skill_id` is a key here ([`State::binding_key`]).
+    mcp_servers: HashMap<McpServerId, McpServer>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
     /// `box.probe_spec_digest`, which `BoxRow` does not carry (D14). Written by
@@ -570,6 +579,7 @@ impl MemStore {
             personas: data.personas.into_iter().map(|row| (row.id, row)).collect(),
             skill_versions: data.skill_versions,
             skill_bindings: data.skill_bindings,
+            mcp_servers: HashMap::new(),
             box_tools: data.box_tools,
             box_probe_digests: HashMap::new(),
             app_settings: BTreeMap::new(),
@@ -789,6 +799,34 @@ impl MemStore {
                 })
                 .collect();
             crate::model::skill::resolve(rows, &state.skill_versions)
+        }))
+    }
+
+    /// A step's MCP servers (MOD-127 M2 D5): the `mcp_server` attachments that apply in `scope`
+    /// (`binding_applies`, the filter `PgStore`'s `WHERE` says in SQL), resolved most-specific-wins
+    /// by [`resolve_mcp`] and ordered by server name bytes. An `off` winner is included, inactive.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        Ok(self.read(|state| {
+            let candidates: Vec<McpCandidate> = state
+                .skill_bindings
+                .iter()
+                .filter(|binding| binding_applies(binding, scope))
+                .filter_map(|binding| {
+                    state
+                        .mcp_servers
+                        .get(&McpServerId::from_uuid(binding.skill_id.as_uuid()))
+                        .map(|server| McpCandidate {
+                            server: server.clone(),
+                            level: binding.level(),
+                            activation: binding.activation,
+                        })
+                })
+                .collect();
+            resolve_mcp(&candidates)
         }))
     }
 
@@ -4979,7 +5017,121 @@ impl State {
     fn skill_binding_at(&self, key: BindingKey) -> Option<&Binding> {
         self.skill_bindings
             .iter()
-            .find(|row| BindingKey::of(row) == key)
+            .find(|row| self.binding_key(row) == key)
+    }
+
+    /// The key a stored row sits under, kind included: a row whose `skill_id` is a registered
+    /// server's id is that server's attachment (MOD-127 M2 D1; [`State::mcp_servers`]).
+    fn binding_key(&self, row: &Binding) -> BindingKey {
+        let server = McpServerId::from_uuid(row.skill_id.as_uuid());
+        BindingKey {
+            target: if self.mcp_servers.contains_key(&server) {
+                BindingRef::McpServer(server)
+            } else {
+                BindingRef::Skill(row.skill_id)
+            },
+            ..BindingKey::of(row)
+        }
+    }
+
+    /// Every server, by `name` bytes (`COLLATE "C"`).
+    fn mcp_server_rows(&self) -> Vec<McpServer> {
+        let mut rows: Vec<McpServer> = self.mcp_servers.values().cloned().collect();
+        rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        rows
+    }
+
+    /// Order: [`new_mcp_server_refusal`]; `require_user(created_by, "mcp_server.created_by")`; a
+    /// taken id → `already_exists("mcp_server", id)`; a taken name → `already_exists("mcp_server",
+    /// name)`. Both stamps are `now`.
+    fn create_mcp_server(&mut self, new: NewMcpServer, now: DateTime<Utc>) -> Result<McpServer> {
+        if let Some(refusal) = new_mcp_server_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "mcp_server.created_by")?;
+        if self.mcp_servers.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("mcp_server", new.id)));
+        }
+        if self.mcp_servers.values().any(|row| row.name == new.name) {
+            return Err(StoreError::Constraint(already_exists(
+                "mcp_server",
+                &new.name,
+            )));
+        }
+        let server = McpServer {
+            id: new.id,
+            name: new.name,
+            description: new.description,
+            transport: new.transport,
+            command: new.command,
+            args: new.args,
+            url: new.url,
+            headers: new.headers,
+            env: new.env,
+            allow: new.allow,
+            deny: new.deny,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        self.mcp_servers.insert(server.id, server.clone());
+        Ok(server)
+    }
+
+    /// `update_skill`'s shape: `NotFound("mcp_server")` → `Stale(current)` →
+    /// [`mcp_server_patch_refusal`] → a name another row holds → apply and stamp `now` (an
+    /// all-`None` patch still stamps, as the Postgres trigger does).
+    fn update_mcp_server(
+        &mut self,
+        id: McpServerId,
+        expected: DateTime<Utc>,
+        patch: McpServerPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<McpServer>> {
+        let current = self
+            .mcp_servers
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "mcp_server",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(refusal) = mcp_server_patch_refusal(&current, &patch) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(name) = &patch.name
+            && self
+                .mcp_servers
+                .values()
+                .any(|row| row.id != id && row.name == *name)
+        {
+            return Err(StoreError::Constraint(already_exists("mcp_server", name)));
+        }
+        let row = self
+            .mcp_servers
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        patch.apply(row);
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// Removes the server and every attachment that names it (`toolbox_binding.ref_id` has no
+    /// foreign key, M1 D3), returning how many attachments went.
+    fn delete_mcp_server(&mut self, id: McpServerId) -> Result<u64> {
+        if self.mcp_servers.remove(&id).is_none() {
+            return Err(StoreError::NotFound {
+                entity: "mcp_server",
+                id: id.to_string(),
+            });
+        }
+        let before = self.skill_bindings.len();
+        self.skill_bindings
+            .retain(|row| row.skill_id.as_uuid() != id.as_uuid());
+        Ok(u64::try_from(before - self.skill_bindings.len()).unwrap_or(u64::MAX))
     }
 
     /// Order: `new_skill_refusal`; `require_user(created_by, "skill.created_by")`; a taken id →
@@ -5276,24 +5428,33 @@ impl State {
         change: BindingChange,
         now: DateTime<Utc>,
     ) -> Result<CasOutcome<Option<Binding>>> {
-        // MOD-127 M2 T2 stub: the stores keep `mcp_server` attachments from T3 on.
-        let BindingRef::Skill(skill) = key.target else {
-            return Err(StoreError::Constraint(
-                "mcp_server attachments are not stored yet".to_owned(),
-            ));
-        };
         let current = self.skill_binding_at(key).cloned();
         if current.as_ref().map(|row| row.updated_at) != expected {
             return Ok(CasOutcome::Stale(current));
         }
-        let skill_name = self
-            .skills
-            .get(&skill)
-            .map(|row| row.name.clone())
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "skill",
-                id: skill.to_string(),
-            })?;
+        // The target's own facts; an `mcp_server` attachment has no name to quote and no versions
+        // (MOD-127 M2 D4), and its row keeps the server's id in `skill_id`.
+        let (skill, skill_name) = match key.target {
+            BindingRef::Skill(skill) => (
+                skill,
+                self.skills
+                    .get(&skill)
+                    .map(|row| row.name.clone())
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "skill",
+                        id: skill.to_string(),
+                    })?,
+            ),
+            BindingRef::McpServer(server) => {
+                if !self.mcp_servers.contains_key(&server) {
+                    return Err(StoreError::NotFound {
+                        entity: "mcp_server",
+                        id: server.to_string(),
+                    });
+                }
+                (SkillId::from_uuid(server.as_uuid()), String::new())
+            }
+        };
         let project_slug = match key.project {
             Some(id) => self
                 .projects
@@ -5351,11 +5512,14 @@ impl State {
             }
             BindingChange::Attach(attachment) => attachment,
         };
-        let versions: Vec<i32> = self
-            .skill_version_rows(skill)
-            .iter()
-            .map(|row| row.version)
-            .collect();
+        let versions: Vec<i32> = match key.target {
+            BindingRef::Skill(_) => self
+                .skill_version_rows(skill)
+                .iter()
+                .map(|row| row.version)
+                .collect(),
+            BindingRef::McpServer(_) => Vec::new(),
+        };
         let repos: Vec<String> = key
             .project
             .map(|id| self.repo_rows(id))
@@ -12554,37 +12718,27 @@ impl WriteStore for MemStore {
         self.write(|state| state.set_skill_binding(key, expected, change, now))
     }
 
-    // MOD-127 M2 T2 stubs: T3 replaces them with the table's real reads and writes.
-    async fn mcp_servers(&self) -> Result<Vec<crate::model::McpServer>> {
-        Ok(Vec::new())
+    async fn mcp_servers(&self) -> Result<Vec<McpServer>> {
+        Ok(self.read(State::mcp_server_rows))
     }
 
-    async fn create_mcp_server(
-        &self,
-        _new: crate::model::NewMcpServer,
-    ) -> Result<crate::model::McpServer> {
-        Err(StoreError::Constraint(
-            "mcp servers are not stored yet".to_owned(),
-        ))
+    async fn create_mcp_server(&self, new: NewMcpServer) -> Result<McpServer> {
+        let now = self.now();
+        self.write(|state| state.create_mcp_server(new, now))
     }
 
     async fn update_mcp_server(
         &self,
-        id: crate::model::McpServerId,
-        _expected: DateTime<Utc>,
-        _patch: crate::model::McpServerPatch,
-    ) -> Result<CasOutcome<crate::model::McpServer>> {
-        Err(StoreError::NotFound {
-            entity: "mcp_server",
-            id: id.to_string(),
-        })
+        id: McpServerId,
+        expected: DateTime<Utc>,
+        patch: McpServerPatch,
+    ) -> Result<CasOutcome<McpServer>> {
+        let now = self.now();
+        self.write(|state| state.update_mcp_server(id, expected, patch, now))
     }
 
-    async fn delete_mcp_server(&self, id: crate::model::McpServerId) -> Result<u64> {
-        Err(StoreError::NotFound {
-            entity: "mcp_server",
-            id: id.to_string(),
-        })
+    async fn delete_mcp_server(&self, id: McpServerId) -> Result<u64> {
+        self.write(|state| state.delete_mcp_server(id))
     }
 
     async fn personas(&self) -> Result<Vec<Persona>> {

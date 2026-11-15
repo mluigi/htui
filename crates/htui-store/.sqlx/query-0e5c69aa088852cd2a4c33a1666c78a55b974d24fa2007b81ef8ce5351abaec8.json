@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id             AS \"id: SkillBindingId\",\n                   ref_id         AS \"skill_id: SkillId\",\n                   workspace_id   AS \"workspace_id?: WorkspaceId\",\n                   project_id     AS \"project_id?: ProjectId\",\n                   item_kind_id   AS \"item_kind_id?: ItemKindId\",\n                   phase_id       AS \"phase_id?: PhaseId\",\n                   pinned_version,\n                   position,\n                   activation     AS \"activation: Activation\",\n                   globs,\n                   languages,\n                   updated_at\n              FROM toolbox_binding\n             WHERE kind = 'skill'\n               AND (   ($1::uuid IS NOT NULL AND workspace_id = $1)\n                    OR ($2::uuid IS NOT NULL AND project_id = $2)\n                    OR ($1::uuid IS NULL AND $2::uuid IS NULL\n                        AND workspace_id IS NULL AND project_id IS NULL))\n             ORDER BY ref_id, item_kind_id NULLS FIRST, phase_id NULLS FIRST\n            ",
+  "query": "\n                INSERT INTO toolbox_binding\n                       (id, kind, ref_id, workspace_id, project_id, item_kind_id, phase_id,\n                        pinned_version, position, activation, globs, languages)\n                VALUES ($1, $12, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)\n                ON CONFLICT (kind, ref_id, workspace_id, project_id, item_kind_id, phase_id)\n                DO NOTHING\n                RETURNING id             AS \"id: SkillBindingId\",\n                          ref_id         AS \"skill_id: SkillId\",\n                          workspace_id   AS \"workspace_id?: WorkspaceId\",\n                          project_id     AS \"project_id?: ProjectId\",\n                          item_kind_id   AS \"item_kind_id?: ItemKindId\",\n                          phase_id       AS \"phase_id?: PhaseId\",\n                          pinned_version,\n                          position,\n                          activation     AS \"activation: Activation\",\n                          globs,\n                          languages,\n                          updated_at\n                ",
   "describe": {
     "columns": [
       {
@@ -139,7 +139,17 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid"
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Text",
+        "TextArray",
+        "TextArray",
+        "Text"
       ]
     },
     "nullable": [
@@ -157,5 +167,5 @@
       false
     ]
   },
-  "hash": "5aac15ab9c856da1d3fa39bd53f4a4cbb67db0fb9c2cf800ceafb3c7e8bfb278"
+  "hash": "0e5c69aa088852cd2a4c33a1666c78a55b974d24fa2007b81ef8ce5351abaec8"
 }
