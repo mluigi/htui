@@ -3,6 +3,7 @@
 **Source PRD**: `.claude/prds/mod-130-execution-targets.prd.md`
 **Selected Milestone**: 1 — Targets and child boxes exist
 **Complexity**: Large
+**Status**: complete (`9ea41c6b`..`f8c3d2b3`, 2026-11-15); review fix round R1 applied; sandbox gate green.
 **Routing**: PRD path, ultracode for implement (C2, C4) (`/handoff-run`, 2026-11-14). The plan runs
 without a confirm gate (handoff-run step 3).
 

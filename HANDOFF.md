@@ -432,6 +432,16 @@ items it follows are done.
   `docs/decisions/ana/ana-37.md`): the Qdrant URL became one database-wide setting on 2026-10-20, so
   MOD-158 no longer touches `workspace` and needs no coordination here. `R-NF-2` was replaced on ANA-37; this item's
   `dockerd`/`sshd` sentence was not in it, so merge that sentence into the new text rather than replace it.
+  PRD `.claude/prds/mod-130-execution-targets.prd.md` (D1-D18 accepted 2026-11-14; 4 milestones).
+  **Phase M1 landed (`9ea41c6b`..`f8c3d2b3`, 2026-11-15, on `hr/MOD-130`, to collect):** migration
+  `0037_execution_targets` (`target` with the seeded local row `LOCAL_TARGET_ID`, `box.kind`/`parent_box_id`, `os_family`
+  NULL only for a container, `target_id` on project/step_graph/item/run, `run.target_source`), cache `0013` (24 mirrored
+  tables); target create/edit/attach-child-box, the level setters and the Settings default (`default_target`), retire and
+  delete refused while in use (Pg item writers and setters read the target `FOR SHARE`); the item target is a spec field;
+  `R-NF-2` amended (`6ed37436`). Plan `.claude/plans/mod-130-m1-targets-and-child-boxes.plan.md`. Next: M2 (resolver,
+  `enqueue` snapshots target and source, run-start refusals). At collect: `0037`/cache `0013` renumber behind any newer
+  migration on main (count pins move). Owed on the host: the merged-tree Postgres gate (PG 16), the live-Qdrant suites
+  (`qdrant_worker.rs` gained one literal, compiled only), the Windows build.
 - [ ] **MOD-131 - Driven targets: ssh and docker exec launch, MCP relay tunnel, remote bootstrap**
   (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; §8 accepted 2026-11-14). `R-ORCH-15`, `R-AGT-11`,
   `R-AGT-5`, `R-SEC-2`, `R-BOX-4`. The `TargetTransport` launch decorator under `TransportBuilder` for
