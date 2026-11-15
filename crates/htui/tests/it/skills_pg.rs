@@ -121,6 +121,7 @@ async fn a_skill_created_edited_and_attached_in_the_tui_lands_on_postgres() {
     // Attach to `vulkan-tutorials` with the form's defaults.
     harness.key("a");
     harness.key("j");
+    harness.key("j"); // the workspace row sits first (MOD-127 M1 T4)
     harness.key("enter");
     harness.key("ctrl-s");
     harness.settle().await;
