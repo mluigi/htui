@@ -5,6 +5,7 @@ expression: frame
 Graphics   ¹Settings       0 working · 0 waiting · memory ·  F9  about   ?  keys
 ╭─ Boxes ─────────────────────────────────────────────────────────────── Boxes ╮
 │▌DESKTOP-HTUI (this box)      host            DESKTOP-HTUI (this box)         │
+│                              kind            machine                         │
 │                              os              Windows 10.0.26200 · x86_64     │
 │                              cpu             AMD Ryzen 9 7950X               │
 │                              ram             65536 MB                        │
@@ -24,5 +25,4 @@ Graphics   ¹Settings       0 working · 0 waiting · memory ·  F9  about   ?  
 │                                              rustc 1.98.0                    │
 │                                                                              │
 │                              probe spec: seed · <digest>                 │
-│                                                                              │
 ╰─j/k move · t tags · e quirks · w executor · p probe · s spec · r reload …────╯

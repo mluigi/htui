@@ -813,10 +813,12 @@ impl ReadStore for CacheStore {
     async fn runs(&self, id: ItemId) -> Result<Vec<RunSummary>> {
         let run_rows = sqlx::query(
             "SELECT r.id, r.item_id, r.project_id, r.kind, r.mode, r.status, r.target_box_id, \
+                    r.target_id, r.target_source, t.name AS target_name, \
                     r.executing_box_id, COALESCE(b.hostname, '') AS box_hostname, \
                     r.queued_at, r.started_at, r.finished_at, r.failure \
                FROM run r \
                LEFT JOIN box b ON b.id = COALESCE(r.executing_box_id, r.target_box_id) \
+               LEFT JOIN target t ON t.id = r.target_id \
               WHERE r.item_id = ? \
               ORDER BY r.queued_at DESC",
         )
@@ -922,6 +924,12 @@ impl ReadStore for CacheStore {
                     mode: get::<RunMode>(row, "mode")?,
                     status: get::<RunStatus>(row, "status")?,
                     target_box_id: uuid_col("run.target_box_id", &text(row, "target_box_id")?)?,
+                    target_id: opt_uuid_col::<TargetId>(
+                        "run.target_id",
+                        opt_text(row, "target_id")?.as_deref(),
+                    )?,
+                    target_name: opt_text(row, "target_name")?,
+                    target_source: get::<Option<TargetSource>>(row, "target_source")?,
                     executing_box_id: opt_uuid_col(
                         "run.executing_box_id",
                         opt_text(row, "executing_box_id")?.as_deref(),

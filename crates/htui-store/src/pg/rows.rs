@@ -34,8 +34,8 @@ use htui_core::model::{
     MemoryEntryId, MemoryEvidence, MemoryKind, MemorySource, MemoryState, MemoryUsage, Persona,
     PersonaId, PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunLanding,
     RunMode, RunProvenance, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId,
-    SkillId, Status, StepId, StepOpening, StepStatus, UpstreamEntry, UserId, VerifyOutcome,
-    WorkspaceId,
+    SkillId, Status, StepId, StepOpening, StepStatus, TargetId, TargetSource, UpstreamEntry,
+    UserId, VerifyOutcome, WorkspaceId,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -57,6 +57,12 @@ pub(crate) struct RunRow {
     pub(crate) status: RunStatus,
     /// `run.target_box_id`.
     pub(crate) target_box_id: BoxId,
+    /// `run.target_id`.
+    pub(crate) target_id: Option<TargetId>,
+    /// `target.name` through the join; `None` with no target.
+    pub(crate) target_name: Option<String>,
+    /// `run.target_source`.
+    pub(crate) target_source: Option<TargetSource>,
     /// `run.executing_box_id`.
     pub(crate) executing_box_id: Option<BoxId>,
     /// `box.hostname` of the executing box, else of the target box; `''` when neither has a row.
@@ -82,6 +88,9 @@ impl RunRow {
             mode: self.mode,
             status: self.status,
             target_box_id: self.target_box_id,
+            target_id: self.target_id,
+            target_name: self.target_name,
+            target_source: self.target_source,
             executing_box_id: self.executing_box_id,
             box_hostname: self.box_hostname,
             queued_at: self.queued_at,

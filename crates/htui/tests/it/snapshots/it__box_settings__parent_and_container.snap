@@ -1,0 +1,23 @@
+---
+source: crates/htui/tests/it/box_settings.rs
+expression: frame
+---
+ DESKTOP-HTUI (this box)      host            docker-here
+▌└ docker-here                kind            container
+                              parent          DESKTOP-HTUI
+                              os              not probed
+                              cpu             AMD Ryzen 9 7950X
+                              ram             65536 MB
+                              gpu             nvidia
+                              htui            0.1.0
+                              last probe      2026-09-01 00:00 UTC
+                              spec            probed under the current spec: no
+                              probed tags     rust, msvc, cmake
+                              declared tags   gpu
+                              quirks          (none)
+                              executor        tui
+                              worker level    warn
+                                              applies to `htui worker` on this box · v cycles
+                              tools           (none)
+
+                              probe spec: seed · <digest>

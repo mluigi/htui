@@ -349,7 +349,8 @@ pub enum EntryState {
         /// `Queued` (admitted, not claimed yet) or `Running`.
         status: RunStatus,
     },
-    /// A `queued` or `running` run driven by another box (MOD-43 owns choosing; MOD-130 M3, D8).
+    /// A `queued` or `running` run driven by another box (MOD-130 M3, D8). The sentence names that
+    /// driver, never the box the work targets (MOD-130 M4, P3).
     Elsewhere {
         /// The run.
         run: RunId,

@@ -21,7 +21,7 @@ use htui::ui::tabs::settings::{BoxesSection, PromptSection, SettingsSection, Set
 use htui_agent::box_probe::spec;
 use htui_core::fixtures::{demo_data, ids};
 use htui_core::model::{
-    BoxEdit, BoxId, BoxRecord, Executor, LogShipLevel, Scope, canonical_declared_tags,
+    BoxEdit, BoxId, BoxKind, BoxRecord, Executor, LogShipLevel, Scope, canonical_declared_tags,
 };
 use htui_core::store::traits::BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN;
 use htui_core::store::{MemStore, StoreError};
@@ -2416,6 +2416,89 @@ async fn two_boxes_with_one_hostname_carry_their_id_suffix() {
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("two_boxes", frame);
     });
+}
+
+/// The demo world plus a container box `docker-here` on the fixture box. The container's id
+/// (`from_u128(1)`) sorts before the machine's, so the store lists the container first and only
+/// `tree_order` puts it under its parent.
+fn parent_and_container() -> MemStore {
+    let mut data = demo_data();
+    let fixture = data
+        .boxes
+        .iter()
+        .find(|row| row.id == ids::BOX)
+        .expect("the fixture box")
+        .clone();
+    let mut container = fixture.clone();
+    container.id = BoxId::from_uuid(Uuid::from_u128(1));
+    container.hostname = "docker-here".to_owned();
+    container.kind = BoxKind::Container;
+    container.parent_box_id = Some(ids::BOX);
+    container.os_family = None;
+    data.boxes.push(container);
+    MemStore::from_demo(data)
+}
+
+/// MOD-130 M4 P4: a container is listed under its machine, indented, and its detail names
+/// `kind` and `parent`; a machine names `kind` alone.
+#[tokio::test]
+async fn a_container_box_is_listed_under_its_parent() {
+    let snapshot = snap_of(parent_and_container()).await;
+    assert_eq!(
+        snapshot
+            .boxes
+            .iter()
+            .map(|record| record.row.hostname.as_str())
+            .collect::<Vec<_>>(),
+        ["DESKTOP-HTUI", "docker-here"]
+    );
+    let (bench, mut section) = bench_with(&snapshot).await;
+
+    let machine = bench.render_section(&section, 100);
+    assert!(machine.contains("kind"), "{machine}");
+    assert!(machine.contains("machine"), "{machine}");
+    assert!(
+        !machine.contains("parent "),
+        "a machine has no parent row: {machine}"
+    );
+
+    bench.key(&mut section, "down");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("\u{2514} docker-here"), "{frame}");
+    assert!(frame.contains("container"), "{frame}");
+    assert!(
+        frame.contains("parent") && frame.contains("DESKTOP-HTUI"),
+        "{frame}"
+    );
+
+    insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
+        insta::assert_snapshot!("parent_and_container", frame);
+    });
+}
+
+/// A container whose parent is not in the list is still indented, last, and says so.
+#[tokio::test]
+async fn a_container_of_an_unlisted_parent_says_not_listed() {
+    let mut data = demo_data();
+    let mut orphan = data
+        .boxes
+        .iter()
+        .find(|row| row.id == ids::BOX)
+        .expect("the fixture box")
+        .clone();
+    orphan.id = BoxId::from_uuid(Uuid::from_u128(1));
+    orphan.hostname = "lost-box".to_owned();
+    orphan.kind = BoxKind::Container;
+    orphan.parent_box_id = Some(BoxId::from_uuid(Uuid::from_u128(99)));
+    data.boxes.push(orphan);
+    let snapshot = snap_of(MemStore::from_demo(data)).await;
+    let (bench, mut section) = bench_with(&snapshot).await;
+
+    bench.key(&mut section, "down");
+    let frame = bench.render_section(&section, 100);
+
+    assert!(frame.contains("\u{2514} lost-box"), "{frame}");
+    assert!(frame.contains("(not listed)"), "{frame}");
 }
 
 /// F-G: offline, the read is refused with the worker's sentence, and the section says so.

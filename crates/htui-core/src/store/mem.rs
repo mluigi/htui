@@ -2404,6 +2404,12 @@ impl State {
                 mode: run.mode,
                 status: run.status,
                 target_box_id: run.target_box_id,
+                target_id: run.target_id,
+                target_name: run
+                    .target_id
+                    .and_then(|id| self.target_row(id).ok())
+                    .map(|target| target.name),
+                target_source: run.target_source,
                 executing_box_id: run.executing_box_id,
                 box_hostname: self.run_hostname(run),
                 queued_at: run.queued_at,

@@ -570,6 +570,133 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-130 M4 T1 (D7, P2): the offline `runs` names each run's target and the level that chose it
+/// off the mirror, as Postgres does: a run on a docker target chosen by its project, a run on the
+/// seeded `local` target by default, and a run with no target (`None` for all three). The target
+/// rows ride the pass (`target` is mirrored since cache `0014`).
+#[tokio::test]
+async fn the_mirror_runs_name_their_target_like_postgres() {
+    use htui_core::model::{
+        GraphSnapshot, Isolation, NewRun, ResolvedTarget, RunMode, RunStatus, SnapshotGraph,
+        SnapshotSettings, TargetSource,
+    };
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let at = Utc::now().trunc_subsecs(6);
+    let docker = db
+        .store
+        .create_target(docker_target("mirror docker"))
+        .await
+        .expect("create the docker target");
+    let new_run = |target: Option<ResolvedTarget>| NewRun {
+        workspace_id: None,
+        id: RunId::new(),
+        project_id: ids::PROJECT_HTUI,
+        item_id: ids::HTUI_ANA_2,
+        mode: RunMode::Manual,
+        target_box_id: ids::BOX,
+        executing_box_id: None,
+        started_by: ids::USER,
+        graph_snapshot: GraphSnapshot {
+            v: GraphSnapshot::V,
+            graph: SnapshotGraph {
+                id: ids::GRAPH_HTUI_FEAT,
+                name: "feature".to_owned(),
+                is_override: false,
+                scope: None,
+                revision: None,
+            },
+            topology: "sha256:cache".to_owned(),
+            mode: RunMode::Manual,
+            phases: Vec::new(),
+            settings: SnapshotSettings {
+                default_isolation: Isolation::Worktree,
+                per_token_cap_run: None,
+                per_token_cap_batch: None,
+                max_fan_out: 4,
+                max_agents_per_run: 8,
+                max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+                max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+                max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+                runtime_changes: htui_core::model::RuntimeChanges::Ask,
+            },
+            scope: None,
+            personas: Vec::new(),
+            memory: None,
+            capture: None,
+            source: None,
+            edges: Vec::new(),
+            integrate: std::collections::BTreeMap::new(),
+        },
+        repo_scope: Vec::new(),
+        queued_at: at,
+        batch_id: None,
+        target,
+    };
+    // A live run holds its item, so each run is cancelled before the next is queued.
+    let queue = |request: NewRun| async {
+        let run = db.store.create_run(request).await.expect("create_run");
+        assert!(
+            db.store
+                .transition_run(run.id, RunStatus::Queued, RunStatus::Cancelled, at)
+                .await
+                .expect("transition_run"),
+            "queued -> cancelled"
+        );
+        run.id
+    };
+    let on_docker = queue(new_run(Some(ResolvedTarget {
+        target: docker.id,
+        source: TargetSource::Project,
+    })))
+    .await;
+    let on_local = queue(new_run(Some(ResolvedTarget {
+        target: htui_core::seed::LOCAL_TARGET_ID,
+        source: TargetSource::Default,
+    })))
+    .await;
+    let chat = queue(new_run(None)).await;
+
+    let cache = open_cache(&db).await;
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the pass");
+
+    let mirrored = cache.runs(ids::HTUI_ANA_2).await.expect("cache runs");
+    assert_eq!(
+        mirrored,
+        db.store.runs(ids::HTUI_ANA_2).await.expect("pg runs"),
+        "the mirror answers the item's runs as Postgres does"
+    );
+    let triple = |run: RunId| {
+        mirrored
+            .iter()
+            .find(|r| r.id == run)
+            .map(|r| (r.target_id, r.target_name.clone(), r.target_source))
+    };
+    assert_eq!(
+        triple(on_docker),
+        Some((
+            Some(docker.id),
+            Some("mirror docker".to_owned()),
+            Some(TargetSource::Project)
+        ))
+    );
+    assert_eq!(
+        triple(on_local),
+        Some((
+            Some(htui_core::seed::LOCAL_TARGET_ID),
+            Some(htui_core::seed::LOCAL_TARGET_NAME.to_owned()),
+            Some(TargetSource::Default)
+        ))
+    );
+    assert_eq!(triple(chat), Some((None, None, None)));
+
+    teardown(db, &[&cache]).await;
+}
+
 /// MOD-72 review M2: the mirror's `json_type` guard (blueprint E3) against the `tool_kind` shapes
 /// the fixture lacks. `store::conformance::tool_call_counts_group_by_step_and_kind` runs on Mem and
 /// Postgres only, and the mirror's read case sees the fixture's one `read`; so this writes the

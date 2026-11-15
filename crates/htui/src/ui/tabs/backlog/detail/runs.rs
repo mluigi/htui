@@ -70,8 +70,9 @@ use htui_core::model::{
     FOLLOW_UP_QUEUED, FOLLOW_UP_REFUSED, FOLLOW_UP_SENT, FollowUpText, FollowUpView, ItemId,
     PermissionId, RelayOption, RelayOptionKind, RelayView, Resolution, RunCommandStatus, RunId,
     RunKind, RunMode, RunStatus, RunStepSummary, RunSummary, StepId, StepOpening, StepPermission,
-    StepStatus, ToolCallCount, UsageTotals,
+    StepStatus, TargetSource, ToolCallCount, UsageTotals,
 };
+use htui_core::seed::LOCAL_TARGET_ID;
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
 use ratatui::Frame;
@@ -1504,9 +1505,30 @@ fn stamp(at: Option<chrono::DateTime<chrono::Utc>>) -> String {
     at.map_or_else(|| PENDING.to_owned(), |at| at.format(STAMP).to_string())
 }
 
-/// One run's lines: `kind status box started`, `mode … finished`, `cancel requested` while a
-/// cancel of it is pending (MOD-42 plan D14), and the failure when there is one, fitted to the
-/// pane.
+/// A run's target line, `runs on {name} · from {source}` (MOD-130 M4 P1): where the cascade put
+/// the run and which level chose it, dimmed and fitted to the pane. `None` when there is nothing
+/// to explain: a chat run (no target, D17), and the built-in local target chosen by the default,
+/// which is every run as it ran before targets. A target whose row no longer answers reads
+/// `a removed target`.
+fn target_line(run: &RunSummary, theme: &Theme) -> Option<Line<'static>> {
+    let id = run.target_id?;
+    let source = run.target_source.unwrap_or(TargetSource::Default);
+    if id == LOCAL_TARGET_ID && source == TargetSource::Default {
+        return None;
+    }
+    let name = run.target_name.as_deref().unwrap_or("a removed target");
+    Some(Line::from(Span::styled(
+        cells::fit(
+            &format!("runs on {name} \u{b7} from {}", source.as_str()),
+            PANE,
+        ),
+        theme.dim,
+    )))
+}
+
+/// One run's lines: `kind status box started`, `mode … finished`, the target line (when the run
+/// has one worth saying), `cancel requested` while a cancel of it is pending (MOD-42 plan D14),
+/// and the failure when there is one, fitted to the pane.
 fn run_lines(run: &RunSummary, cancel_requested: bool, theme: &Theme) -> Vec<Line<'static>> {
     let started = stamp(run.started_at);
     let finished = stamp(run.finished_at);
@@ -1520,6 +1542,7 @@ fn run_lines(run: &RunSummary, cancel_requested: bool, theme: &Theme) -> Vec<Lin
         ]),
         mode_line(label::run_mode(run.mode), &finished, theme.dim),
     ];
+    lines.extend(target_line(run, theme));
     if cancel_requested {
         lines.push(Line::from(Span::styled(
             cells::fit(CANCEL_REQUESTED_LINE, PANE),
@@ -2544,12 +2567,13 @@ mod tests {
     use chrono::TimeDelta;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use htui_core::fixtures::{demo_at, ids};
-    use htui_core::model::Status;
     use htui_core::model::{
         FOLLOW_UP_EMPTY, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_CANCELLED,
         FOLLOW_UP_SESSION_ENDED, GateOutcome, PermissionStatus, ProjectRef, RelaySessionId,
         RunCommandId, Scope, executor_scrub_refusal,
     };
+    use htui_core::model::{Status, TargetId};
+    use htui_core::seed::LOCAL_TARGET_NAME;
     use htui_core::store::{MemStore, ReadStore};
     use htui_orch::Rest;
     use serde_json::json;
@@ -3470,6 +3494,180 @@ mod tests {
         assert_eq!(
             text(&lines[1]).trim_end(),
             format!("manual{}\u{2014}", " ".repeat(26))
+        );
+    }
+
+    /// `run` placed on `name` (MOD-130 M4 T2), chosen at the `source` level.
+    fn placed(run: RunSummary, id: TargetId, name: &str, source: TargetSource) -> RunSummary {
+        RunSummary {
+            target_id: Some(id),
+            target_name: Some(name.to_owned()),
+            target_source: Some(source),
+            ..run
+        }
+    }
+
+    /// MOD-130 M4 P1: a plain local run (the default target, the default source), a chat run and
+    /// a run queued before M2 read exactly as they did: no target line.
+    #[tokio::test]
+    async fn a_local_default_run_adds_no_target_line() {
+        let theme = Theme::default();
+        let run = feat_1_runs().await.remove(0);
+        assert_eq!(run_lines(&run, false, &theme).len(), 2, "no target: chat");
+        let local = placed(
+            run,
+            LOCAL_TARGET_ID,
+            LOCAL_TARGET_NAME,
+            TargetSource::Default,
+        );
+        assert!(target_line(&local, &theme).is_none());
+        assert_eq!(run_lines(&local, false, &theme).len(), 2);
+    }
+
+    /// P1: a local run a level pinned names its target and the level.
+    #[tokio::test]
+    async fn a_pinned_local_run_names_its_target_and_level() {
+        let theme = Theme::default();
+        let run = placed(
+            feat_1_runs().await.remove(0),
+            LOCAL_TARGET_ID,
+            LOCAL_TARGET_NAME,
+            TargetSource::Project,
+        );
+        let lines = run_lines(&run, false, &theme);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            text(&lines[2]).trim_end(),
+            "runs on this box \u{b7} from project"
+        );
+    }
+
+    /// P1: a child-box run reads its target and the level, dimmed, under the mode line.
+    #[tokio::test]
+    async fn a_child_box_run_names_its_target() {
+        let theme = Theme::default();
+        let run = placed(
+            feat_1_runs().await.remove(0),
+            TargetId::new(),
+            "docker-here",
+            TargetSource::Item,
+        );
+        let lines = run_lines(&run, false, &theme);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            text(&lines[2]).trim_end(),
+            "runs on docker-here \u{b7} from item"
+        );
+        assert_eq!(lines[2].spans[0].style, theme.dim);
+    }
+
+    /// P1: a long target name is clipped to the pane like the lines around it.
+    #[tokio::test]
+    async fn a_long_target_name_is_clipped_to_the_pane() {
+        let theme = Theme::default();
+        let run = placed(
+            feat_1_runs().await.remove(0),
+            TargetId::new(),
+            &"a-target-with-a-very-long-name ".repeat(3),
+            TargetSource::Workspace,
+        );
+        let line = target_line(&run, &theme).expect("a child target names itself");
+        assert_eq!(line.width(), PANE, "{:?}", text(&line));
+        assert!(text(&line).ends_with('\u{2026}'), "{:?}", text(&line));
+        assert!(text(&line).starts_with("runs on a-target-with"));
+    }
+
+    /// P1: a target whose row no longer answers still shows the line.
+    #[tokio::test]
+    async fn a_missing_target_row_reads_a_removed_target() {
+        let theme = Theme::default();
+        let run = RunSummary {
+            target_id: Some(TargetId::new()),
+            target_name: None,
+            target_source: Some(TargetSource::Settings),
+            ..feat_1_runs().await.remove(0)
+        };
+        let line = target_line(&run, &theme).expect("the line stays");
+        assert_eq!(
+            text(&line).trim_end(),
+            "runs on a removed target \u{b7} from settings"
+        );
+    }
+
+    /// D17: a chat run has no target, so nothing is shown for it.
+    #[tokio::test]
+    async fn a_chat_run_adds_no_target_line() {
+        let theme = Theme::default();
+        let run = RunSummary {
+            target_id: None,
+            target_name: None,
+            target_source: None,
+            ..feat_1_runs().await.remove(0)
+        };
+        assert!(target_line(&run, &theme).is_none());
+    }
+
+    /// A failed run reads header, mode, target, failure.
+    #[tokio::test]
+    async fn a_failed_run_reads_the_target_before_the_failure() {
+        let theme = Theme::default();
+        let run = RunSummary {
+            status: RunStatus::Failed,
+            failure: Some("stage 3 refused the prompt".to_owned()),
+            ..placed(
+                feat_1_runs().await.remove(0),
+                TargetId::new(),
+                "docker-here",
+                TargetSource::Item,
+            )
+        };
+        let lines = run_lines(&run, true, &theme);
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|line| text(line).trim_end().to_owned())
+            .collect();
+        assert_eq!(lines.len(), 5, "{rows:#?}");
+        assert!(rows[2].starts_with("runs on docker-here"), "{rows:#?}");
+        assert_eq!(rows[3], "cancel requested", "{rows:#?}");
+        assert_eq!(rows[4], "stage 3 refused the prompt", "{rows:#?}");
+    }
+
+    /// A Runs pane over `FEAT-1`'s run, placed on a child box's target.
+    async fn child_box_pane(shell: &Shell) -> RunsTab {
+        let run = placed(
+            feat_1_runs().await.remove(0),
+            TargetId::new(),
+            "docker-here",
+            TargetSource::Item,
+        );
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(vec![run]), &mut shell.ctx());
+        let _ = shell.emit.take();
+        pane
+    }
+
+    /// The list with a child-box run, snapshot.
+    #[tokio::test]
+    async fn the_list_names_a_child_box_target() {
+        let shell = Shell::new();
+        let pane = child_box_pane(&shell).await;
+        insta::assert_snapshot!(
+            "the_list_names_a_child_box_target",
+            drawn_at(&pane, &shell, PANE_WIDTH, 16).join("\n")
+        );
+    }
+
+    /// The flow head with a child-box run, snapshot.
+    #[tokio::test]
+    async fn the_flow_head_names_a_child_box_target() {
+        let shell = Shell::new();
+        let mut pane = child_box_pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert_eq!(pane.view, View::Flow);
+        insta::assert_snapshot!(
+            "the_flow_head_names_a_child_box_target",
+            drawn_at(&pane, &shell, PANE_WIDTH, 16).join("\n")
         );
     }
 

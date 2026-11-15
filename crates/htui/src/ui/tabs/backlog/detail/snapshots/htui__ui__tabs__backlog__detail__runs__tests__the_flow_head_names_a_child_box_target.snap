@@ -1,0 +1,20 @@
+---
+source: crates/htui/src/ui/tabs/backlog/detail/runs.rs
+expression: "drawn_at(&pane, &shell, PANE_WIDTH, 16).join(\"\\n\")"
+---
+graph  ● done      DESKTOP-HTUI 09-02 08:00
+manual                          09-02 12:00
+runs on docker-here · from item
+
+           ╭──────────────────╮
+           │prd               │
+           │● done            │
+           │                  │
+           ╰──────────────────╯
+                     │
+                     │
+                     ▼
+           ╭──────────────────╮
+           │plan              │
+           │● done            │
+           │                  │
