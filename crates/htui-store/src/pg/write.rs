@@ -10745,6 +10745,9 @@ impl WriteStore for PgStore {
     /// has just committed re-checks the `WHERE` against that committed row, so a record freshly
     /// leased to another owner is not leased again: no record goes to two owners.
     ///
+    /// MOD-133 M3 D5: a `pull_request` record with a `landed_hash` (its run branch pushed) is never
+    /// taken, whatever its lease: it waits for MOD-134 to open the pull request.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] for a TTL out of range, before anything is read.
@@ -10765,6 +10768,7 @@ impl WriteStore for PgStore {
                   JOIN run r ON r.id = g.run_id
                  WHERE r.executing_box_id = $1
                    AND g.state = 'pending'
+                   AND NOT (g.mode = 'pull_request' AND g.landed_hash IS NOT NULL)
                    AND ($4::uuid IS NULL OR g.run_id = $4)
                    AND (g.lease_owner = $2 OR g.lease_owner IS NULL
                         OR g.lease_expires_at IS NULL OR g.lease_expires_at <= clock_timestamp())
@@ -10810,6 +10814,10 @@ impl WriteStore for PgStore {
     /// MOD-133 D6: one `UPDATE` guarded by `state = 'pending' AND lease_owner = $3`; a row it
     /// does not match (lost lease, settled, unknown) is `Ok(false)` with nothing written.
     ///
+    /// MOD-133 M3 D5: [`LandOutcome::Pushed`] keeps the record `pending` with `landed_hash` set,
+    /// and its `UPDATE` also requires `mode = 'pull_request'` (`$7`), so a pushed outcome on any
+    /// other mode's record is `Ok(false)` too.
+    ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
@@ -10820,8 +10828,10 @@ impl WriteStore for PgStore {
         owner: Uuid,
         outcome: &LandOutcome,
     ) -> Result<bool> {
+        let pushed = matches!(outcome, LandOutcome::Pushed { .. });
         let (state, landed_hash, refusal) = match outcome {
             LandOutcome::Landed { hash } => (IntegrationState::Landed, Some(hash.as_str()), None),
+            LandOutcome::Pushed { hash } => (IntegrationState::Pending, Some(hash.as_str()), None),
             LandOutcome::Refused { reason } => {
                 (IntegrationState::Refused, None, Some(reason.as_str()))
             }
@@ -10835,13 +10845,15 @@ impl WriteStore for PgStore {
                     lease_owner      = NULL, \
                     lease_expires_at = NULL \
               WHERE run_id = $1 AND repo_id = $2 \
-                AND state = 'pending' AND lease_owner = $3",
+                AND state = 'pending' AND lease_owner = $3 \
+                AND (NOT $7::boolean OR mode = 'pull_request')",
             run.as_uuid(),
             repo.as_uuid(),
             owner,
             state as IntegrationState,
             landed_hash,
             refusal,
+            pushed,
         )
         .execute(&self.pool)
         .await
