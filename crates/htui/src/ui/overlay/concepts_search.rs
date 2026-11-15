@@ -496,6 +496,10 @@ impl Overlay for ConceptsSearch {
             ConceptsReply::Indexed(Ok(IndexOutcome::HeldBy(lease))) => {
                 self.index = IndexLine::Done(held_line(lease));
             }
+            // MOD-159 M3 D6: that box was asked for a pass; said dim, as the held line is.
+            ConceptsReply::Indexed(Ok(IndexOutcome::Requested(lease))) => {
+                self.index = IndexLine::Done(requested_line(lease));
+            }
             ConceptsReply::Indexed(Err(message)) => {
                 self.index = IndexLine::Failed(message.clone());
             }
@@ -694,6 +698,14 @@ pub fn held_line(lease: &IndexerLease) -> String {
         ),
         None => format!("indexing runs on {holder}"),
     }
+}
+
+/// MOD-159 M3 D6: a `Ctrl+R` that asked the box holding the workspace's indexer lease for a pass:
+/// [`held_line`] and `; asked it to reindex`, e.g.
+/// `indexing runs on hal (lease until 09:41); asked it to reindex`.
+#[must_use]
+pub fn requested_line(lease: &IndexerLease) -> String {
+    format!("{}; asked it to reindex", held_line(lease))
 }
 
 /// `error` with where it is fixed (MOD-115 M4 E6, MOD-83), `place`'s, unless it already names a
@@ -1822,6 +1834,62 @@ mod tests {
             bench.theme.dim.fg.expect("dim has a colour")
         );
         insta::assert_snapshot!("held_by_another_box", frame);
+    }
+
+    /// MOD-159 M3 D6: a `Ctrl+R` that asked the box holding the lease for a pass says so after
+    /// the held line, dim like it: the holder's name, or its id's tail when its row is gone.
+    #[test]
+    fn a_ctrl_r_another_box_indexes_asks_it_to_reindex() {
+        let bench = Bench::platform().in_platform();
+        let mut search = ConceptsSearch::new();
+        bench.ctrl(&mut search, 'r');
+        let _ = bench.emit.take();
+        let expires_at = chrono::DateTime::parse_from_rfc3339("2026-11-14T09:41:00Z")
+            .expect("a timestamp")
+            .with_timezone(&chrono::Utc);
+        let lease = IndexerLease {
+            collection: IndexedCollection::Workspace(bench.scope.workspace_id).name(),
+            box_id: Some(BoxId::from_uuid(uuid::Uuid::from_u128(
+                0x0123_4567_89ab_cdef,
+            ))),
+            box_name: Some("hal".to_owned()),
+            expires_at: Some(expires_at),
+            live: true,
+        };
+        let line = "indexing runs on hal (lease until 09:41); asked it to reindex";
+        assert_eq!(requested_line(&lease), line);
+        let unnamed = IndexerLease {
+            box_name: None,
+            ..lease.clone()
+        };
+        assert_eq!(
+            requested_line(&unnamed),
+            "indexing runs on 89abcdef (lease until 09:41); asked it to reindex"
+        );
+
+        bench.reply(
+            &mut search,
+            ConceptsReply::Indexed(Ok(IndexOutcome::Requested(lease))),
+        );
+        let frame = bench.render(&search);
+        assert!(!frame.contains(INDEXING), "{frame}");
+        let buffer = bench.buffer(&search, 100, 30);
+        let y = (0..buffer.area.height)
+            .find(|&y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains(line)
+            })
+            .unwrap_or_else(|| panic!("the requested line is drawn:\n{frame}"));
+        let x = (0..buffer.area.width)
+            .find(|&x| buffer[(x, y)].symbol() == "i")
+            .expect("its first cell");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            bench.theme.dim.fg.expect("dim has a colour")
+        );
+        insta::assert_snapshot!("requested_from_another_box", frame);
     }
 
     /// MOD-159 M1 D9: a search names the workspace whose collection it reads.
