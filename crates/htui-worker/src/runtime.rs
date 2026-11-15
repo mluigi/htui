@@ -3738,21 +3738,22 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
                 Err(err) => ctx.refuse(err.to_string()),
             };
         }
-        UnblockCase::RetryLanding(run) => {
+        UnblockCase::RetryLanding(_) => {
             let outcome = match engine.dispatch(Command::Unblock { item }).await {
                 Ok(outcome) => outcome,
                 Err(err) => return ctx.refuse(err.to_string()),
             };
-            let retried = matches!(
-                outcome,
+            // The case the dispatch itself decided, which a concurrent write may have moved.
+            let retried = match outcome {
                 CommandOutcome::Unblocked {
-                    case: UnblockCase::RetryLanding(_),
+                    case: UnblockCase::RetryLanding(run),
                     ..
-                }
-            );
+                } => Some(run),
+                _ => None,
+            };
             ctx.done(outcome);
             // The answer is sent; the engine borrows `kit`, so the landing stays in this task.
-            if retried
+            if let Some(run) = retried
                 && executes_this_box(&ctx).await
                 && let Err(err) = Box::pin(engine.land(Some(run))).await
             {
