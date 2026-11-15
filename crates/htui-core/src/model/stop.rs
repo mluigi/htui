@@ -539,7 +539,7 @@ mod tests {
             "background and stopping count; the open one and those without running runs do not"
         );
         assert_eq!(
-            InBackground::of(open.workspace_id, &[open.clone()]),
+            InBackground::of(open.workspace_id, core::slice::from_ref(&open)),
             InBackground::default(),
             "the open workspace never counts"
         );
