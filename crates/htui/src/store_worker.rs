@@ -82,6 +82,7 @@ use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 use crate::worker_log::ship::{PER_BOX_CAP, retention_cut};
+use crate::workspaces::{self, WorkspaceOverview};
 
 /// Monotonic request counter, minted by `App::dispatch` (blueprint C.2).
 pub type Seq = u64;
@@ -478,6 +479,11 @@ pub enum StoreRequest {
     /// (`workspace_stop` is not mirrored). Asked by the shell once a second and on a scope change
     /// (D5). Answered with [`StoreReply::WorkspaceRunCounts`].
     WorkspaceRunCounts,
+    /// MOD-116 M1 D7: one workspace's overview for the Workspaces tab (its tree, folder, goals,
+    /// counts, default target and per-project counts), served by [`crate::workspaces::serve`]
+    /// through the writer; offline `Unreachable`. Answered with
+    /// [`StoreReply::WorkspaceOverview`].
+    WorkspaceOverview(WorkspaceId),
     /// This user's headless workers' log lines (MOD-122 M2 D10): `id > after`, oldest first, at
     /// most 2 000; `after: None` is the newest 2 000. Served in `try_serve` through
     /// `Backend::worker_logs`, so offline it is answered empty rather than refused, and an
@@ -1456,6 +1462,7 @@ impl StoreRequest {
             Self::ImportPersonas { .. } => "import_personas",
             Self::ProjectTypes => "project_types",
             Self::WorkspaceRunCounts => "workspace_run_counts",
+            Self::WorkspaceOverview(..) => "workspace_overview",
             Self::WorkerLogs { .. } => "worker_logs",
             Self::Activity { .. } => "activity",
             Self::SweepRetention => "sweep_retention",
@@ -1930,6 +1937,14 @@ pub enum StoreReply {
     /// The answer to [`StoreRequest::WorkspaceRunCounts`] (MOD-116 M1 D6): one row per
     /// workspace, zeros included, in workspace-id order.
     WorkspaceRunCounts(Vec<WorkspaceRunCounts>),
+    /// The answer to [`StoreRequest::WorkspaceOverview`] (MOD-116 M1 D7): the asked workspace
+    /// and its overview, `None` when the workspace does not exist.
+    WorkspaceOverview {
+        /// The workspace asked about.
+        workspace: WorkspaceId,
+        /// Its overview; `None` for an unknown workspace.
+        overview: Option<Box<WorkspaceOverview>>,
+    },
     /// The answer to [`StoreRequest::WorkerLogs`] (MOD-122 M2 D10): rows oldest first, empty
     /// offline.
     WorkerLogs(Vec<WorkerLogLine>),
@@ -2443,7 +2458,7 @@ pub(crate) fn permissions_or_unknown(
 /// `read_permissions` is the writer's permission read. [`try_serve`] passes
 /// [`WriteStore::open_permissions`]; it is a parameter only so a test can make it fail with
 /// something other than `Unreachable`, which no [`Backend`] can be made to do (review R2).
-async fn serve_waiting(
+pub(crate) async fn serve_waiting(
     backend: &Backend,
     scope: &Scope,
     read_permissions: impl AsyncFnOnce(&Writer, &Scope) -> StoreResult<Vec<WaitingPermission>>,
@@ -2732,6 +2747,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
             StoreReply::WorkspaceRunCounts(WriteStore::workspace_run_counts(&writer).await?)
         }
+        // MOD-116 M1 D7: the Workspaces tab's overview, assembled in its own module as the
+        // hierarchy snapshot is; the `?` keeps `go_offline` working for an `Unreachable`.
+        StoreRequest::WorkspaceOverview(..) => workspaces::serve(backend, request).await?,
         // MOD-122 M2 D10, blueprint F5/F11: one read, inline. Offline answers empty (the tab
         // merges it, adding nothing); the `?` keeps `go_offline` working for an `Unreachable`.
         StoreRequest::WorkerLogs { after } => {
@@ -6849,6 +6867,10 @@ mod tests {
         assert_eq!(
             StoreRequest::WorkspaceRunCounts.name(),
             "workspace_run_counts"
+        );
+        assert_eq!(
+            StoreRequest::WorkspaceOverview(ids::WORKSPACE_PLATFORM).name(),
+            "workspace_overview"
         );
         assert_eq!(
             StoreRequest::WorkerLogs { after: None }.name(),
