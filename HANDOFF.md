@@ -15,7 +15,16 @@
   Also refresh "Parallel runs" below: drop the closed ID and promote what it unblocked.
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-15):** **MOD-133 is done** (`docs/decisions/mod/mod-133.md`; M1 and M2 merged on main, M3 on
+**Current status (2026-11-15):** **MOD-130 is done** (`docs/decisions/mod/mod-130.md`; M1 and M2 merged on main, M3 and M4 on
+`hr/MOD-130`, to collect): an item runs where its target says. A `target` record names the kind and the box; the item,
+its workflow, its project, its workspace and the Settings default each may set one, the first wins, and the run
+records it with the level that chose it. Only `local` runs in this build; any other kind is refused at run start with a
+sentence naming the level. The queue, claim and worker poll key on the box that drives a run, so a driven target starts
+on this box. The Runs tab says `runs on <target> · from <level>` (hidden for a plain local run), the queue overlay names
+the driving box, and Settings › Boxes lists a container under its machine. M3 and M4 add no migration. Owed on the host:
+`scripts/hr collect MOD-130`, the merged-tree Postgres gate (`CASES` 359) and the Windows build. MOD-132 no longer
+waits; MOD-131 waits on MOD-44 only.
+**MOD-133 is done** (`docs/decisions/mod/mod-133.md`; M1 and M2 merged on main, M3 on
 `hr/MOD-133`, to collect): each repo integrates `local` (default, unchanged), `push` (fast-forward of the remote's
 target branch by the executing box, never forced) or `pull_request` (steps land on a run branch `htui/item/<key>` in a
 detached landing worktree, which is pushed after `done`; the record waits for MOD-134 to open the PR; Settings keeps
@@ -32,9 +41,6 @@ lets the leases go. M3 adds no migration. MOD-112 (4), MOD-161 and MOD-167 plug 
 on it. Owed on the host: `scripts/hr collect MOD-159`, the merged-tree Postgres gate, the live-Qdrant suites, and
 `cache::the_spawned_refresher_passes_and_follows_the_scope` (fails in the sandbox and on main alike; M3 touches no
 `cache/` code).
-**ANA-42 is concluded** (`docs/decisions/ana/ana-42.md`): the maintainer accepted
-all six §8 decisions; MOD-130, MOD-131 and MOD-132 are no longer pending it, and MOD-43's queued-until-claimed rule
-now covers the enrolled kind only.
 Gate notes (TOOL-17, `docs/decisions/tool/tool-17.md`): `cargo-nextest` 0.9.151 is required (host:
 `~/.cargo/bin`; sandboxes: `scripts/hr build`, owed); a sandbox run on the old test layout that adds a
 `tests/<name>.rs` moves it under `tests/it/` at collect (TOOL-15); many Postgres cases failing `57P03` means the dev
@@ -67,7 +73,7 @@ MOD-152's, MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`,
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), MOD-133 M1, MOD-130 M1, MOD-130 M2 and MOD-133 M2 (merged on main 2026-11-15), and MOD-159 (done 2026-11-15, `docs/decisions/mod/mod-159.md`; M1 and M2 on main, M3 on `hr/MOD-159`): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 354 after MOD-130 M2 and MOD-133 M2 and M3 (354 on `hr/MOD-133`, 349 on main until it is collected), none with a migration), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection,
+Live coordinates after MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), MOD-133 M1, MOD-130 M1, MOD-130 M2 and MOD-133 M2 (merged on main 2026-11-15), MOD-130 done (2026-11-15, `docs/decisions/mod/mod-130.md`; M3 and M4 on `hr/MOD-130`, no migration; `RunSummary` carries `target_id`, `target_name`, `target_source`; store conformance `CASES` 359 on the branch), and MOD-159 (done 2026-11-15, `docs/decisions/mod/mod-159.md`; M1 and M2 on main, M3 on `hr/MOD-159`): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 354 after MOD-130 M2 and MOD-133 M2 and M3 (354 on `hr/MOD-133`, 349 on main until it is collected), none with a migration), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection,
 `pass_requested_at` written since M3; not mirrored; `0036` on its branch; collections `htui_ws_<uuid>` per workspace and
 `htui_global`; the API MOD-112 (4), MOD-161 and MOD-167 plug into is `IndexerLeaseStore` (take, renew, release,
 `request_indexer_pass`, `claim_indexer_pass`), `take_or_request_pass` → `LeaseTurn::{Ours, Requested, Held}`,
@@ -117,7 +123,7 @@ items it follows are done.
 
 **Wave 1 (together)**
 
-- MOD-130: opus
+- MOD-132: opus
 - MOD-116: sonnet
 - MOD-127: sonnet
 - ANA-39: none (analysis)
@@ -130,7 +136,7 @@ items it follows are done.
 
 **Wave 2**
 
-- MOD-132: opus
+- MOD-131: opus
 - MOD-136: opus
 - MOD-154: sonnet
 - MOD-117: sonnet
@@ -355,7 +361,7 @@ items it follows are done.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it (ANA-42 §8 Q2, accepted 2026-11-14: the enrolled kind only; a driven target
-  starts on this box, MOD-130); the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
+  starts on this box, MOD-130, done: `docs/decisions/mod/mod-130.md`); the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
   hints and a poll backstop, and shows worker liveness. Its auto-mode half builds on MOD-12, now done
   (`docs/decisions/mod/mod-12.md`: the queue runs on the local box only and reports a run live elsewhere)
   (MOD-42 is done: `docs/decisions/mod/mod-42.md`; its relay answers within a 1 s poll, which a
@@ -375,7 +381,7 @@ items it follows are done.
   `TransportBuilder` (`docker exec -i`), adapters unchanged; kill-tree is container removal; agent
   credentials on a named volume; the container never holds the DSN. Linux and macOS first (Windows
   via MOD-16). The `R-NF-2` amendment (`dockerd` opt-in per target) was accepted on ANA-42 §8 Q4
-  (2026-11-14) and is written by MOD-130. The MOD-7 dependency is met (done, `docs/decisions/mod/mod-7.md`: id-keyed
+  (2026-11-14) and was written by MOD-130 (done, `docs/decisions/mod/mod-130.md`). The MOD-7 dependency is met (done, `docs/decisions/mod/mod-7.md`: id-keyed
   registration, the box probe, capability tags); survives TUI exit through `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`).
   A child box's hostname never moves a digest, and the project's hostname switch covers it by
   construction (MOD-33 D275, `docs/decisions/mod/mod-33.md`).
@@ -422,61 +428,13 @@ items it follows are done.
   not the worker, resolves project secrets. Blocked on MOD-47. MOD-10 is done (`docs/decisions/mod/mod-10.md`):
   the executing box resolves a project's secrets with the machine identity in its own keyring; a headless worker
   without one refuses, and delivering it is this item's.
-- [ ] **MOD-130 - Execution targets: target record, child boxes, target cascade** (from ANA-42,
-  `docs/ANA-42.md` §7.1, §7.2, §7.8; §8 accepted 2026-11-14, `docs/decisions/ana/ana-42.md`).
-  `R-ORCH-15`, `R-ORCH-12`, `R-BOX-1..4`, `R-NF-2`. Migration for a `target` record (`kind`, `locator`,
-  `box_id`, `status`) and `box.kind`/`parent_box_id` (relax the `os_family` CHECK for child boxes);
-  `target_id` at workspace, project, workflow and item with the Settings default and an inherited-from
-  resolver; the queue keys on `executing_box_id`, not `target_box_id == here`, so a driven target starts
-  on this box; the `R-NF-2` amendment (`dockerd` and `sshd` opt-in per target). Wires MOD-44's container
-  box to the record. Not blocked; read beside MOD-43 and MOD-44. ANA-37 (concluded 2026-10-19,
-  `docs/decisions/ana/ana-37.md`): the Qdrant URL became one database-wide setting on 2026-10-20, so
-  MOD-158 no longer touches `workspace` and needs no coordination here. `R-NF-2` was replaced on ANA-37; this item's
-  `dockerd`/`sshd` sentence was not in it, so merge that sentence into the new text rather than replace it.
-  PRD `.claude/prds/mod-130-execution-targets.prd.md` (D1-D18 accepted 2026-11-14; 4 milestones).
-  **Phase M1 landed (`9ea41c6b`..`f8c3d2b3`, 2026-11-15, merged on main 2026-11-15):** migration
-  `0040_execution_targets` (`0037` on the branch) (`target` with the seeded local row `LOCAL_TARGET_ID`, `box.kind`/`parent_box_id`, `os_family`
-  NULL only for a container, `target_id` on project/step_graph/item/run, `run.target_source`), cache `0014` (`0013` on the branch; 25 mirrored
-  tables); target create/edit/attach-child-box, the level setters and the Settings default (`default_target`), retire and
-  delete refused while in use (Pg item writers and setters read the target `FOR SHARE`); the item target is a spec field;
-  `R-NF-2` amended (`6ed37436`). Plan `.claude/plans/mod-130-m1-targets-and-child-boxes.plan.md`. Next: M2 (resolver,
-  `enqueue` snapshots target and source, run-start refusals). Renumbered behind MOD-125 M4's `0037`, MOD-159 M1's `0038` and
-  MOD-133 M1's `0039` (cache behind `0013_integration`) at the merge. Owed on the host: the merged-tree Postgres gate, the live-Qdrant suites
-  (`qdrant_worker.rs` gained one literal, compiled only), the Windows build.
-  **Phase M2 landed (`c52e87be`..`8b222d18`, 2026-11-15, on `hr/MOD-130`):** `resolve_target` (item → workflow →
-  project → workspace → Settings → local, naming `TargetSource`). A scope-row item answers as `workspace`; any other
-  item takes the scope row of the run's workspace. `enqueue` records `run.target_id`/`target_source` and sets
-  `target_box_id` to the target's box. Both stores' `create_run` refuse an unknown or retired target (Pg reads it
-  `FOR SHARE`). Mem `delete_target` refuses a target with runs. New `WorkerStore` reads `scope_project` and
-  `target_binding`. Run start refuses a retired target (soft: no note, no block), a kind this build cannot run
-  (names MOD-44/131/47), a target bound to another box, and one that is not `ready`. Every refusal but retired
-  blocks the item with a note naming the level that chose the target (maintainer, 2026-11-15). No migration;
-  conformance `CASES` 346. Plan `.claude/plans/mod-130-m2-runs-know-where-they-run.plan.md`. Deferred to M3:
-  `executing_box_id` at enqueue (D8), tags and candidates against the target box (D9), claim/poll/queue keyed on the
-  driver. The target setters of MOD-123, MOD-116 and MOD-124 should warn before saving a kind that cannot run: one
-  shared level naming one blocks every item the queue tries. Sandbox gate green except the known load flake
-  `cache::the_spawned_refresher_passes_and_follows_the_scope` (base 2/4, HEAD 2/4 alone). Owed on the host: the merged-tree
-  Postgres gate.
-  **Phase M3 landed (`cf55f77f`..`d5030c43`, 2026-11-15, on `hr/MOD-130`):** the queue keys on the driver,
-  `COALESCE(executing_box_id, target_box_id)`, in both stores' `claim_run`, `queued_runs_on_box` and `queue_rows`, and in
-  `classify_entry` (`Elsewhere` names the driving box; `QueueRunFact` gains `driver_box_id`/`driver_hostname`).
-  `NewRun.executing_box_id` and `driver_of`: `enqueue` writes the driver only when the work runs on another box; a local
-  run keeps `NULL` and an enrolled one waits for its own worker (maintainer Q1, 2026-11-15). Enqueue and claim check tags,
-  and enqueue resolves rung 3, on the target box (D9); slots and overlap stay on the driver. Pg `claim_run` reads the
-  target box `FOR SHARE` after the claiming box when the two differ (maintainer, 2026-11-15; no writer locks a child
-  before its parent). `enqueue_with` reads the graph once and refuses the target before tags. No migration; conformance
-  `CASES` 350. Plan `.claude/plans/mod-130-m3-queue-keys-on-the-driver.plan.md`. Handed to MOD-44 (maintainer Q2): the
-  pre-enqueue tag filters (`ready_items`, `missing_tags`, `missing_tags_of`, the Backlog) and the walk-time box reads
-  stay on this box until a container run can start. Next: M4 (where a run runs is visible). Sandbox gate green but for
-  the known load flake above (alone 2/4, as at M2's base); `worker_crash_pg::a_cancel_picked_but_not_applied_survives_the_kill`
-  failed once under the gate's load and passed alone 5/5. Owed on the host: the merged-tree Postgres gate.
 - [ ] **MOD-131 - Driven targets: ssh and docker exec launch, MCP relay tunnel, remote bootstrap**
   (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; §8 accepted 2026-11-14). `R-ORCH-15`, `R-AGT-11`,
   `R-AGT-5`, `R-SEC-2`, `R-BOX-4`. The `TargetTransport` launch decorator under `TransportBuilder` for
   `ssh -T`, a docker context and `docker exec -i`; relay socket forwarding with the token as a stdin
   preamble (spike stream-local forwarding and `sun_path` length first, §9); a per-target `htui` helper
   path shipped from this box; remote probe, install and login through the channel; secrets injected into
-  the exec's environment. Blocked on MOD-130 and MOD-44.
+  the exec's environment. Blocked on MOD-44; MOD-130 is done (`docs/decisions/mod/mod-130.md`).
 - [ ] **MOD-132 - Target preparation and branch collection by bundle** (from ANA-42,
   `docs/ANA-42.md` §7.5, §7.6; §8 accepted 2026-11-14). `R-ORCH-15`, `R-SEC-5`, `R-ENT-17`.
   The `prepare · <target>` stage (clone with `pushurl` disabled, compose project on free ports) and the
@@ -485,7 +443,8 @@ items it follows are done.
   (2026-10-18, `docs/ANA-33.md` §7.11):** `prepare · <target>` and `collect branch` are `role = 'stage'` rows at
   positions -2 and -1 (`node_key` `prepare`, `collect`). MOD-139 is done (`docs/decisions/mod/mod-139.md`): the
   `stage` role and positions -3..-1 with these keys are reserved in `0029`; writing the rows is this item's.
-  Blocked on MOD-130.
+  MOD-130 is done (`docs/decisions/mod/mod-130.md`: `target`, child boxes, the cascade and the driver-keyed queue);
+  nothing blocks this item.
 - [ ] **MOD-134 - Forge adapter and push/forge credentials** (from ANA-34, `docs/ANA-34.md` §7.4,
   §7.5). `R-ORCH-14`, `R-BOX-4`, `R-STO-1`, `R-SEC-2`, `R-SEC-3`, `R-SEC-4`. A forge adapter with four
   verbs (push a branch, open or update a PR, set auto-merge, read PR state); OneDev REST first
@@ -981,7 +940,7 @@ items it follows are done.
   second status line ("runs on … · workflow …") and `t` "how it runs": target (inherit or one) and
   workflow (auto or pinned). The status grouping, `h` and the state filter key on MOD-144's
   `htui_core::model::ItemState` (`ALL` is the attention order; `ItemFilter.states`); MOD-144 rekeyed the
-  facet, list, detail and graph marks, not grouping or `h`. MOD-115 is done (`docs/decisions/mod/mod-115.md`); targets beyond this box need MOD-130 (ANA-42 concluded, `docs/decisions/ana/ana-42.md`), workflows need MOD-124 and
+  facet, list, detail and graph marks, not grouping or `h`. MOD-115 is done (`docs/decisions/mod/mod-115.md`); targets beyond this box need MOD-130, done (`docs/decisions/mod/mod-130.md`; ANA-42 concluded, `docs/decisions/ana/ana-42.md`), workflows need MOD-124 and
   MOD-126.
   **Carried from MOD-115 (MOD-81):** cap the list width at about 160 columns so the detail takes the rest
   (the shell's `ListSize` has no maximum yet), wrap or scroll the Prompt pane (its rows end in `…` today),
@@ -1225,6 +1184,6 @@ items it follows are done.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 5 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows) |
-| MOD-N   | 73 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-176 worktree resume without reflogs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 72 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-176 worktree resume without reflogs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-18 dev Postgres crash) |

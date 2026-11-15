@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-130-execution-targets.prd.md`
 **Selected Milestone**: 4 — Where a run runs is visible
 **Complexity**: Medium
-**Status**: planned and fact-checked (2026-11-15); implementation not started.
+**Status**: complete (`8261f21a`..`b86e1981`, 2026-11-15); review fix round R1 applied (`b86e1981`); sandbox gate green but for the known load flake `cache::the_spawned_refresher_passes_and_follows_the_scope`.
 **Routing**: plan path (PRD exists; M4 is its last milestone), no ultracode, lane shape (4 serial tasks, more than
 five files) (`/handoff-run` in the `hr/MOD-130` sandbox, 2026-11-15). The plan runs without a confirm gate. No
 architect: M4 adds no module seam; it widens one read model (`RunSummary`) and edits three render sites.
