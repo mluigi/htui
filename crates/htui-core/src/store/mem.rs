@@ -2340,9 +2340,8 @@ impl State {
 
     /// `box.hostname` of the box a run is on: the executing one, else the target (blueprint B.4).
     fn run_hostname(&self, run: &Run) -> String {
-        let id = run.executing_box_id.unwrap_or(run.target_box_id);
         self.boxes
-            .get(&id)
+            .get(&run.driver())
             .map_or_else(String::new, |row| row.hostname.clone())
     }
 
@@ -7030,8 +7029,8 @@ impl State {
         // `status = 'running'` alone — "an `awaiting_approval` run consumes no compute and must
         // not hold a slot" — while the overlap predicate "ranges over non-terminal runs, including
         // `awaiting_approval` ones, because a parked run still owns its trees and its unmerged
-        // branch" (invariant 6). A `queued` run is in neither: it has no `executing_box_id` and no
-        // tree.
+        // branch" (invariant 6). A `queued` run is in neither, excluded by its status: it may
+        // already name its driver in `executing_box_id` (MOD-130 M3 D8), but it has no tree.
         // A `stopped` run is in the overlap set and not the slot (MOD-125 D2).
         let mut live: Vec<&Run> = self
             .runs

@@ -165,7 +165,7 @@ pub struct Args {
 /// `htui`'s subcommands (MOD-41 plan D14).
 #[derive(Debug, Clone, PartialEq, Eq, clap::Subcommand)]
 pub enum Command {
-    /// Run this box's runs with no terminal: claim queued runs targeted at this box, walk them,
+    /// Run this box's runs with no terminal: claim queued runs this box drives, walk them,
     /// heartbeat, recover, and stop on SIGINT/SIGTERM. The DSN comes from the OS keyring, the
     /// systemd credential `htui-dsn`, or `--dsn-stdin`; never argv or the environment.
     /// A step whose agent asks for a permission waits for an answer from a TUI's Runs pane.

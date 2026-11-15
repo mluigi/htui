@@ -7850,9 +7850,9 @@ impl WriteStore for PgStore {
     /// would be that index's `23505`, a [`StoreError::Constraint`] through [`map_sqlx`]
     /// (unreachable under the lock).
     ///
-    /// Every other rule is the schema's: `project_id`, `target_box_id`, `started_by` and each
-    /// `repo_scope` entry are foreign keys, a repeated `id` is the primary key, and a `graph` run
-    /// without a snapshot is `ck_run_graph_snapshot` — all `23xxx`, all
+    /// Every other rule is the schema's: `project_id`, `target_box_id`, `executing_box_id`,
+    /// `started_by` and each `repo_scope` entry are foreign keys, a repeated `id` is the primary
+    /// key, and a `graph` run without a snapshot is `ck_run_graph_snapshot` — all `23xxx`, all
     /// [`StoreError::Constraint`] through [`map_sqlx`], which is the same answer `MemStore` spells
     /// out by hand.
     ///
@@ -8063,8 +8063,8 @@ impl WriteStore for PgStore {
     /// `status = 'running'` alone — "an `awaiting_approval` run consumes no compute and must not
     /// hold a slot" (`docs/ANA-2.md:1110`) — while the overlap predicate ranges over the
     /// non-terminal set, `awaiting_approval` included, because a parked run still owns its trees
-    /// and its unmerged branch (invariant 6). A `queued` run is in neither: it has no
-    /// `executing_box_id`.
+    /// and its unmerged branch (invariant 6). A `queued` run is in neither, excluded by its
+    /// status: it may already name its driver in `executing_box_id` (MOD-130 M3 D8).
     ///
     /// The overlap check reads the live rows that share a repo (`repo_scope && $2`) in
     /// `(queued_at, id)` order and decides §4.7's rules L, I, P in Rust with the predicate
@@ -8154,15 +8154,20 @@ impl WriteStore for PgStore {
             )
             .fetch_optional(&mut *tx)
             .await
-            .map_err(map_sqlx)?;
+            .map_err(map_sqlx)?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "box",
+                id: claimed.target_box_id.to_string(),
+            })?;
         }
 
-        // MOD-125 D5: run, then box (and the target box, above), then the stop row. resume_workspace locks only workspace_stop;
-        // stop_workspace also takes FOR KEY SHARE on workspace and app_user through its foreign
-        // keys, neither of which a claim locks; delete_workspace locks run rows before the stop
-        // row, the claim's own order. So no cycle. FOR SHARE makes a racing resume (DELETE) or
-        // escalation wait for this decision; a stop inserted after this read is ordered after the claim, and
-        // M2's executor stops the run it admitted. The early return drops `tx`, which rolls back.
+        // MOD-125 D5: run, then box (and the target box, above), then the stop row.
+        // resume_workspace locks only workspace_stop; stop_workspace also takes FOR KEY SHARE on
+        // workspace and app_user through its foreign keys, neither of which a claim locks;
+        // delete_workspace locks run rows before the stop row, the claim's own order. So no cycle.
+        // FOR SHARE makes a racing resume (DELETE) or escalation wait for this decision; a stop
+        // inserted after this read is ordered after the claim, and M2's executor stops the run it
+        // admitted. The early return drops `tx`, which rolls back.
         if let Some(workspace) = claimed.workspace_id {
             let stopped = sqlx::query_scalar!(
                 r#"SELECT 1 AS "one!" FROM workspace_stop WHERE workspace_id = $1 FOR SHARE"#,

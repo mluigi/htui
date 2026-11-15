@@ -1578,15 +1578,14 @@ where
     /// a Tokio runtime with the time driver enabled (blueprint H-3).
     ///
     /// # Errors
-    /// [`EngineError::ClaimRefused`] naming the rule when the box is full or the scope overlaps,
-    /// or the run's workspace is stopped (MOD-125 D5), the run then left `queued` with nothing
-    /// written; [`EngineError::MissingTags`] when the
-    /// run's item needs tags this box lacks, after `claim_run` failed the run and blocked its item
-    /// in its transaction and this engine wrote the note afterwards in a separate call, outside
-    /// that transaction (`R-ORCH-10`, MOD-7 milestone 3 D85, as rung 4 does). If the walk is
-    /// preempted or a store call fails in between, the run stays `failed` and the item `blocked`
-    /// without the note, and `run.failure` (`missing_tags_failure`'s sentence) is the lasting
-    /// record;
+    /// [`EngineError::ClaimRefused`] naming the rule when the box is full or the scope overlaps, or
+    /// the run's workspace is stopped (MOD-125 D5), the run then left `queued` with nothing
+    /// written; [`EngineError::MissingTags`] when the run's item needs tags the run's target box
+    /// lacks (MOD-130 M3 D9), after `claim_run` failed the run and blocked its item in its
+    /// transaction and this engine wrote the note afterwards in a separate call, outside that
+    /// transaction (`R-ORCH-10`, MOD-7 milestone 3 D85, as rung 4 does). If the walk is preempted
+    /// or a store call fails in between, the run stays `failed` and the item `blocked` without the
+    /// note, and `run.failure` (`missing_tags_failure`'s sentence) is the lasting record;
     /// [`EngineError::LeaseLost`] when another orchestrator takes the lease mid-walk; every other
     /// [`EngineError`] the walk raises.
     pub async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
@@ -20027,6 +20026,13 @@ mod tests {
                 .await
                 .expect("MemStore never fails a read")
                 .len();
+            let notes_before = harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len();
             harness_engine!(harness.orch, engine);
             let engine = engine.with_runnable_kinds(htui_core::model::TargetKind::ALL);
 
@@ -20057,6 +20063,17 @@ mod tests {
                 harness.orch.item(ids::HTUI_FEAT_3).await.status,
                 Status::Blocked
             );
+            let notes = harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read");
+            let added: Vec<&str> = notes[notes_before..]
+                .iter()
+                .map(|note| note.body.as_str())
+                .collect();
+            assert_eq!(added, vec!["missing tags: gpu"], "the one tag note");
         }
     }
 
@@ -20102,6 +20119,11 @@ mod tests {
                         if phase == "prd"
                 ),
                 "{refused:?}"
+            );
+            assert_eq!(
+                harness.orch.item(ids::HTUI_FEAT_3).await.status,
+                Status::Blocked,
+                "rung 4 blocks the item"
             );
         }
     }
