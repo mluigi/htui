@@ -114,6 +114,23 @@ str_enum!(
     }
 );
 
+impl TargetSource {
+    /// MOD-130 M2 R1 F1: the phrase a target refusal names this level with
+    /// (`…; chosen by its project`). [`TargetSource::Default`] is the local target and cannot
+    /// refuse in practice; should it, it is `the built-in default`.
+    #[must_use]
+    pub const fn chosen_by(self) -> &'static str {
+        match self {
+            Self::Item => "the item",
+            Self::Workflow => "its workflow",
+            Self::Project => "its project",
+            Self::Workspace => "its workspace",
+            Self::Settings => "the Settings default",
+            Self::Default => "the built-in default",
+        }
+    }
+}
+
 /// The cascade's levels, each `None` = inherit (MOD-130 M2, D3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TargetLevels {
@@ -815,6 +832,26 @@ mod tests {
                 source
             );
         }
+    }
+
+    /// MOD-130 M2 R1 F1: the phrase a target refusal names its level with, one per source.
+    #[test]
+    fn chosen_by_names_every_level() {
+        let phrases: Vec<_> = TargetSource::ALL
+            .iter()
+            .map(|source| (source.as_str(), source.chosen_by()))
+            .collect();
+        assert_eq!(
+            phrases,
+            [
+                ("item", "the item"),
+                ("workflow", "its workflow"),
+                ("project", "its project"),
+                ("workspace", "its workspace"),
+                ("settings", "the Settings default"),
+                ("default", "the built-in default"),
+            ]
+        );
     }
 
     /// D3: all 32 combinations; the first level set wins, none is the local target (D2).
