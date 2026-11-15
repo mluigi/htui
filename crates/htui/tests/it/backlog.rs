@@ -1982,9 +1982,9 @@ async fn keys(harness: &mut Harness, keys: &[&str]) {
     harness.drive_to_end().await;
 }
 
-/// `f`, then `l` seven times to `done` on the Status row (`ItemState::ALL`'s attention order,
-/// MOD-144), ticked with `space`.
-const TICK_DONE: [&str; 9] = ["f", "l", "l", "l", "l", "l", "l", "l", "space"];
+/// `f`, then `l` nine times to `done` on the Status row (`ItemState::ALL`'s attention order,
+/// MOD-144; MOD-133 M2 E2 put `landing refused` and `landing` ahead of it), ticked with `space`.
+const TICK_DONE: [&str; 11] = ["f", "l", "l", "l", "l", "l", "l", "l", "l", "l", "space"];
 
 /// From the Status row, down to Tags and type `rust`.
 const TYPE_RUST: [&str; 6] = ["down", "down", "r", "u", "s", "t"];

@@ -42,7 +42,12 @@ async fn applying_the_form_sends_one_filtered_items_read() {
     let bench = Bench::new().await;
     let mut tab = bench.tab();
     press(&mut tab, &bench, KeyCode::Char('f'));
-    for _ in 0..7 {
+    // `l` from `needs you` to `done`, ninth in `ItemState::ALL` (MOD-133 M2 E2).
+    let done = ItemState::ALL
+        .iter()
+        .position(|state| *state == ItemState::Done)
+        .expect("`Done` is a state");
+    for _ in 0..done {
         press(&mut tab, &bench, KeyCode::Char('l'));
     }
     press(&mut tab, &bench, KeyCode::Char(' '));
