@@ -467,9 +467,10 @@ impl PromptSection {
 
     /// The edit act on a [`SettingKind::Integrate`] row (MOD-133 M2 E7): one write, never an
     /// editor. `not set → local → push → not set`; `pull_request` is never offered, and a stored
-    /// one (or a value no reader takes) moves on as `push` does, to `not set` — a stored value the
-    /// reader cannot read is replaced by `local`. Stepping to `push` on a project no repo of which
-    /// carries a remote URL is refused in the notice, and nothing is written.
+    /// one moves on as `push` does, to `not set`. A stored value the reader cannot read counts as
+    /// `not set`, so it is replaced by `local`. Stepping to `push` on a project no repo of which
+    /// carries a remote URL is refused in the notice, and the cycle steps past it to `not set`
+    /// instead (MOD-133 M2 R1), so a stored `local` can still be cleared.
     fn cycle_integrate(&mut self, row: Row, ctx: &Ctx<'_>) {
         let Row::Project { p, .. } = row else {
             return;
@@ -494,10 +495,10 @@ impl PromptSection {
             Some(IntegrateMode::Local) => Some(IntegrateMode::Push),
             Some(IntegrateMode::Push | IntegrateMode::PullRequest) => None,
         };
-        if let Some(refusal) = next.and_then(|mode| mode.selectable_refusal(has_remote)) {
-            self.refuse(refusal);
-            return;
-        }
+        let (next, refusal) = match next.and_then(|mode| mode.selectable_refusal(has_remote)) {
+            Some(refusal) => (None, Some(refusal)),
+            None => (next, None),
+        };
         self.notice = None;
         match (next, expected) {
             (Some(next), _) => self.send(
@@ -521,6 +522,10 @@ impl PromptSection {
                 ctx,
             ),
             (None, _) => self.say(NOTHING_SET),
+        }
+        // Said after the write is sent, so the notice is the refusal, not `NOTHING_SET`.
+        if let Some(refusal) = refusal {
+            self.refuse(refusal);
         }
     }
 

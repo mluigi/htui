@@ -2004,20 +2004,36 @@ async fn the_edit_act_cycles_integrate_local_push_then_not_set() {
     assert_eq!(*expected, token);
 }
 
-/// MOD-133 M2 E7: stepping to `push` on a project no repo of which carries a remote URL is
-/// refused in the notice with `IntegrateMode::Push`'s own sentence, and nothing is written.
+/// MOD-133 M2 E7, R1 (F5): stepping to `push` on a project no repo of which carries a remote URL
+/// is refused in the notice with `IntegrateMode::Push`'s own sentence, and the cycle steps past it
+/// to `not set` instead: a stored `local` is cleared, so it never sticks.
 #[tokio::test]
-async fn push_is_refused_for_a_project_without_a_remote() {
+async fn push_without_a_remote_is_refused_and_local_steps_to_not_set() {
     let snapshot = with_integrate(
         &demo_settings(&demo()).await,
         Some(IntegrateMode::Local),
         false,
     );
+    let token = project_token(&snapshot);
     let (bench, mut section) = bench_from(&snapshot).await;
     move_to(&bench, &mut section, project_row(SettingKey::Integrate));
 
     bench.key(&mut section, "e");
-    assert!(bench.drained().is_empty(), "nothing is written");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::ClearSetting {
+            rung,
+            key,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`push` is refused, so `local` steps to `not set`, a clear: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, SettingKey::Integrate);
+    assert_eq!(*expected, token);
     let sentence = IntegrateMode::Push
         .selectable_refusal(false)
         .expect("push without a remote is refused");
