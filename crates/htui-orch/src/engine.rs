@@ -1491,6 +1491,7 @@ where
                 repo_scope: resolved.repo_scope,
                 queued_at: now,
                 batch_id: batch,
+                target: None,
             })
             .await?;
         Ok(id)
@@ -13803,6 +13804,7 @@ mod tests {
                 repo_scope: Vec::new(),
                 queued_at: now,
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -17517,6 +17519,7 @@ mod tests {
                 repo_scope: resolved.repo_scope,
                 queued_at: harness.orch.clock.now(),
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -17623,6 +17626,7 @@ mod tests {
                 repo_scope: resolved.repo_scope,
                 queued_at: harness.orch.clock.now(),
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -28122,6 +28126,7 @@ mod settle_walk_writes {
                 repo_scope: Vec::new(),
                 queued_at: orch.clock.now(),
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("MemStore creates the run");

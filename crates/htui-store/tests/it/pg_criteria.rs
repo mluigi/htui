@@ -1292,6 +1292,7 @@ fn race_run(item: ItemId) -> NewRun {
         repo_scope: Vec::new(),
         queued_at: Utc::now(),
         batch_id: None,
+        target: None,
     }
 }
 
@@ -11844,6 +11845,8 @@ fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
         lease_box_id: None,
         lease_expires_at: None,
         updated_at: chat_at,
+        target_id: None,
+        target_source: None,
     });
     htui_core::store::MemStore::from_demo(data)
 }

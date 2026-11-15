@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id               AS \"id: RunId\",\n                   project_id       AS \"project_id: ProjectId\",\n                   item_id          AS \"item_id: ItemId\",\n                   workspace_id     AS \"workspace_id: WorkspaceId\",\n                   kind             AS \"kind: RunKind\",\n                   mode             AS \"mode: RunMode\",\n                   status           AS \"status: RunStatus\",\n                   target_box_id    AS \"target_box_id: BoxId\",\n                   executing_box_id AS \"executing_box_id: BoxId\",\n                   graph_snapshot,\n                   started_by       AS \"started_by: UserId\",\n                   queued_at,\n                   started_at,\n                   finished_at,\n                   failure,\n                   repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                   lease_box_id     AS \"lease_box_id: BoxId\",\n                   lease_expires_at,\n                   updated_at\n              FROM run\n             WHERE status IN ('queued','running','awaiting_approval','stopped')\n               AND repo_scope && $1::uuid[]\n             ORDER BY queued_at, id\n            ",
+  "query": "\n            SELECT id               AS \"id: RunId\",\n                   project_id       AS \"project_id: ProjectId\",\n                   item_id          AS \"item_id: ItemId\",\n                   workspace_id     AS \"workspace_id: WorkspaceId\",\n                   kind             AS \"kind: RunKind\",\n                   mode             AS \"mode: RunMode\",\n                   status           AS \"status: RunStatus\",\n                   target_box_id    AS \"target_box_id: BoxId\",\n                   target_id        AS \"target_id: TargetId\",\n                   target_source    AS \"target_source: TargetSource\",\n                   executing_box_id AS \"executing_box_id: BoxId\",\n                   graph_snapshot,\n                   started_by       AS \"started_by: UserId\",\n                   queued_at,\n                   started_at,\n                   finished_at,\n                   failure,\n                   repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                   lease_box_id     AS \"lease_box_id: BoxId\",\n                   lease_expires_at,\n                   updated_at\n              FROM run\n             WHERE item_id = ANY($1)\n               AND status IN ('queued','running','awaiting_approval','stopped')\n            ",
   "describe": {
     "columns": [
       {
@@ -93,6 +93,28 @@
       },
       {
         "ordinal": 8,
+        "name": "target_id: TargetId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "target_id"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "target_source: TargetSource",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "target_source"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
         "name": "executing_box_id: BoxId",
         "type_info": "Uuid",
         "origin": {
@@ -103,7 +125,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "graph_snapshot",
         "type_info": "Jsonb",
         "origin": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "started_by: UserId",
         "type_info": "Uuid",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "queued_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -136,7 +158,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
         "name": "started_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -147,7 +169,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "finished_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -158,7 +180,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 16,
         "name": "failure",
         "type_info": "Text",
         "origin": {
@@ -169,7 +191,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 17,
         "name": "repo_scope: Vec<RepoId>",
         "type_info": "UuidArray",
         "origin": {
@@ -180,7 +202,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 18,
         "name": "lease_box_id: BoxId",
         "type_info": "Uuid",
         "origin": {
@@ -191,7 +213,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 19,
         "name": "lease_expires_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -202,7 +224,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 20,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -229,6 +251,8 @@
       false,
       true,
       true,
+      true,
+      true,
       false,
       false,
       true,
@@ -240,5 +264,5 @@
       false
     ]
   },
-  "hash": "8d5c28af8ff480efa9853e5ecaa7861592431be99f3d23b7db9cec8fc5b95d83"
+  "hash": "2e19bb2f7144822c7d2dabe93cd9183757f01b94e235182a394c02b40c3e92b6"
 }

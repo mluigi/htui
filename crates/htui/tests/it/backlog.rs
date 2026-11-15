@@ -1249,6 +1249,7 @@ async fn a_run_with_no_steps_says_so_in_the_flow() {
             repo_scope: Vec::new(),
             queued_at: demo_at(2, 8),
             batch_id: None,
+            target: None,
         })
         .await
         .expect("the run is queued");
@@ -3657,6 +3658,7 @@ async fn pausing_names_the_runs_still_running() {
                 repo_scope: Vec::new(),
                 queued_at: demo_at(2, 8),
                 batch_id: Some(batch.id),
+                target: None,
             })
             .await
             .expect("the run is admitted under the batch");

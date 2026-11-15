@@ -8,12 +8,13 @@ use serde_json::Value;
 
 use crate::model::ids::{
     AgentId, BatchId, BoxId, CommandRunId, ItemId, PersonaId, ProjectId, RepoId, RunId, RunPlanId,
-    StepGraphId, StepId, UserId, WorkspaceId,
+    StepGraphId, StepId, TargetId, UserId, WorkspaceId,
 };
 use crate::model::integration::IntegrateMode;
 use crate::model::kind::{
     CommandQueue, EdgeKind, EdgePredicate, Gate, GraphScope, Isolation, PlanScope, Split,
 };
+use crate::model::target::{ResolvedTarget, TargetSource};
 
 str_enum!(
     /// `run.kind` (§5.8).
@@ -295,8 +296,17 @@ pub struct Run {
     pub mode: RunMode,
     /// `run.status`.
     pub status: RunStatus,
-    /// `run.target_box_id`: the box the run is for; version one executes only when it is local.
+    /// `run.target_box_id`: the box the work runs on: the resolved target's box, this box for
+    /// `local` (MOD-130 M2).
     pub target_box_id: BoxId,
+    /// `run.target_id` (MOD-130 M2, D7): the target the cascade chose, written at enqueue and
+    /// never updated. `None` on a chat run and on every run queued before M2.
+    #[serde(default)]
+    pub target_id: Option<TargetId>,
+    /// `run.target_source` (MOD-130 M2, D7): the cascade level that chose
+    /// [`Run::target_id`]. `None` on a chat run and on every run queued before M2.
+    #[serde(default)]
+    pub target_source: Option<TargetSource>,
     /// `run.executing_box_id`.
     pub executing_box_id: Option<BoxId>,
     /// `run.graph_snapshot` (`JSONB`): the graph, phases and agents as they were at start
@@ -529,6 +539,11 @@ pub struct NewRun {
     /// `run.workspace_id` (MOD-125 D3); `None` is never gated by a workspace stop.
     #[serde(default)]
     pub workspace_id: Option<WorkspaceId>,
+    /// `run.target_id` and `run.target_source` (MOD-130 M2, D7, P7). The engine always writes
+    /// `Some`; `None` (tests only) is stored as `NULL`/`NULL`. The store refuses a target that
+    /// names no row or is retired.
+    #[serde(default)]
+    pub target: Option<ResolvedTarget>,
 }
 
 /// Arguments of [`crate::store::WriteStore::create_step`]: a `run_step` inserted at `pending`
@@ -2073,6 +2088,8 @@ mod tests {
             lease_box_id: None,
             lease_expires_at: None,
             updated_at: at(minute),
+            target_id: None,
+            target_source: None,
         };
         let runs = vec![
             run(1, 1, RunKind::Graph, RunStatus::Done),
@@ -2138,6 +2155,8 @@ mod tests {
             lease_box_id: None,
             lease_expires_at: None,
             updated_at: at(minute),
+            target_id: None,
+            target_source: None,
         };
         for live in RunStatus::ALL.iter().copied().filter(|s| s.is_active()) {
             let runs = vec![

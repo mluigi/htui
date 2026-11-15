@@ -103,6 +103,7 @@ impl Leased {
                 repo_scope: Vec::new(),
                 queued_at: Utc::now(),
                 batch_id: None,
+                target: None,
             })
             .await
             .expect("the run is created");

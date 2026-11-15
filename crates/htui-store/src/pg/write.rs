@@ -56,7 +56,7 @@ use htui_core::model::{
 use htui_core::model::{ArtifactLinkId, DocumentId};
 use htui_core::model::{
     AttachedBox, BoxKind, DEFAULT_TARGET_KEY, DefaultTarget, NewChildBox, NewTarget, Target,
-    TargetEdit, TargetId, TargetKind, locator_refusal, target_name_refusal,
+    TargetEdit, TargetId, TargetKind, TargetSource, locator_refusal, target_name_refusal,
 };
 use htui_core::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
@@ -7962,6 +7962,11 @@ impl WriteStore for PgStore {
             )));
         }
 
+        // MOD-130 M2 P8: the target is read `FOR SHARE`, so a `retire_target` or `delete_target`
+        // racing the enqueue serialises with it; no row and a retired row are the readable
+        // refusals, never a raw SQLSTATE.
+        share_level_target(&mut tx, "run.target_id", new.target.map(|t| t.target)).await?;
+
         // MOD-12 D7, H-6: a run joins only an open batch. `FOR SHARE` conflicts with
         // `close_batch`'s UPDATE, so a pause and an admission serialise on the batch row and a run
         // never joins a batch that has already closed. The lock order here is item, then batch;
@@ -7989,8 +7994,9 @@ impl WriteStore for PgStore {
             r#"
             INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,
                              executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,
-                             batch_id, workspace_id)
-            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10, $11)
+                             batch_id, workspace_id, target_id, target_source)
+            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10, $11,
+                    $12, $13)
             RETURNING id               AS "id: RunId",
                       project_id       AS "project_id: ProjectId",
                       item_id          AS "item_id: ItemId",
@@ -7999,6 +8005,8 @@ impl WriteStore for PgStore {
                       mode             AS "mode: RunMode",
                       status           AS "status: RunStatus",
                       target_box_id    AS "target_box_id: BoxId",
+                      target_id        AS "target_id: TargetId",
+                      target_source    AS "target_source: TargetSource",
                       executing_box_id AS "executing_box_id: BoxId",
                       graph_snapshot,
                       started_by       AS "started_by: UserId",
@@ -8022,6 +8030,8 @@ impl WriteStore for PgStore {
             &scope,
             new.batch_id.map(BatchId::as_uuid),
             workspace_id.map(WorkspaceId::as_uuid),
+            new.target.map(|t| t.target.as_uuid()),
+            new.target.map(|t| t.source.as_str()),
         )
         .fetch_one(&mut *tx)
         .await
@@ -8529,6 +8539,8 @@ impl WriteStore for PgStore {
                        mode             AS "mode: RunMode",
                        status           AS "status: RunStatus",
                        target_box_id    AS "target_box_id: BoxId",
+                       target_id        AS "target_id: TargetId",
+                       target_source    AS "target_source: TargetSource",
                        executing_box_id AS "executing_box_id: BoxId",
                        graph_snapshot,
                        started_by       AS "started_by: UserId",
@@ -8797,6 +8809,8 @@ impl WriteStore for PgStore {
                    mode             AS "mode: RunMode",
                    status           AS "status: RunStatus",
                    target_box_id    AS "target_box_id: BoxId",
+                   target_id        AS "target_id: TargetId",
+                   target_source    AS "target_source: TargetSource",
                    executing_box_id AS "executing_box_id: BoxId",
                    graph_snapshot,
                    started_by       AS "started_by: UserId",

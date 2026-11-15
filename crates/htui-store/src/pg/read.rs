@@ -17,7 +17,6 @@ use chrono::{DateTime, Utc};
 use htui_core::model::IntegrateMode;
 use htui_core::model::OwnerDocument;
 use htui_core::model::StepRole;
-use htui_core::model::TargetId;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
@@ -40,6 +39,7 @@ use htui_core::model::{
     StepGraphEdge,
 };
 use htui_core::model::{PlanStatus, RunPlan, RunPlanId};
+use htui_core::model::{TargetId, TargetSource};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::qdrant::{QDRANT_URL_KEY, StoredQdrantUrl};
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -777,6 +777,8 @@ impl ReadStore for PgStore {
                    mode             AS "mode: RunMode",
                    status           AS "status: RunStatus",
                    target_box_id    AS "target_box_id: BoxId",
+                   target_id        AS "target_id: TargetId",
+                   target_source    AS "target_source: TargetSource",
                    executing_box_id AS "executing_box_id: BoxId",
                    graph_snapshot,
                    started_by       AS "started_by: UserId",
@@ -1620,6 +1622,8 @@ impl ReadStore for PgStore {
                    mode             AS "mode: RunMode",
                    status           AS "status: RunStatus",
                    target_box_id    AS "target_box_id: BoxId",
+                   target_id        AS "target_id: TargetId",
+                   target_source    AS "target_source: TargetSource",
                    executing_box_id AS "executing_box_id: BoxId",
                    graph_snapshot,
                    started_by       AS "started_by: UserId",
@@ -3038,6 +3042,8 @@ impl PgStore {
                    mode             AS "mode: RunMode",
                    status           AS "status: RunStatus",
                    target_box_id    AS "target_box_id: BoxId",
+                   target_id        AS "target_id: TargetId",
+                   target_source    AS "target_source: TargetSource",
                    executing_box_id AS "executing_box_id: BoxId",
                    graph_snapshot,
                    started_by       AS "started_by: UserId",

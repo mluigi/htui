@@ -3142,8 +3142,7 @@ pub trait WriteStore: ReadStore {
     /// 1. an unknown id is `NotFound { entity: "target" }`;
     /// 2. the local target is [`target_built_in`] (D2);
     /// 3. a target a level or the Settings default names is [`target_in_use`];
-    /// 4. a target a run references is [`target_has_runs`] (Postgres only until M2 gives the
-    ///    in-memory run a target, P8).
+    /// 4. a target a run references is [`target_has_runs`].
     ///
     /// Postgres locks the target row `FOR UPDATE` before step 3 (blueprint B7).
     ///

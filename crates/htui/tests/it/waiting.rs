@@ -124,6 +124,7 @@ async fn park_ana_2_leased(store: &MemStore, ttl: TimeDelta) -> (RunId, StepId, 
             repo_scope: Vec::new(),
             queued_at: at,
             batch_id: None,
+            target: None,
         })
         .await
         .expect("create_run")
@@ -223,6 +224,7 @@ async fn park_ws_1(store: &MemStore) {
             repo_scope: Vec::new(),
             queued_at: at,
             batch_id: None,
+            target: None,
         })
         .await
         .expect("create_run")
