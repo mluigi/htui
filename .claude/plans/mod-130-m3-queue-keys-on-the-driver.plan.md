@@ -133,14 +133,16 @@ Every task's brief carries this section.
     `WriteStore::claim_run` docs (`crates/htui-core/src/store/traits.rs:1571-1613`) to "not driven by
     `box`"; the `MissingTags` clause there (`:1574`, "the box's `probed_tags` … `declared_tags`") to
     the run's target box.
-  - **Pg doc, lock sentence (fact-check C24):** `PgStore::claim_run`'s doc (`pg/write.rs:8082-8085`)
-    says the run row and the box row are locked `FOR UPDATE` before the tag read, "so a concurrent
-    `record_box_probe` or `edit_box` waits for the decision and the check cannot race a re-probe".
-    Under P4 the tags are read from `target_box_id`. For a child-box run that is not the locked
-    (claiming) box, so the sentence becomes false. T2 must at least rewrite it. Whether the claim
-    should also lock the target box (e.g. `FOR SHARE` after the driver's `FOR UPDATE`) is a design
-    choice the fact-check left to the maintainer; until answered, T2 changes no lock and states the
-    race in the doc (benign while no child-box run can be enqueued, D1). The same doc's last paragraph
+  - **Pg target-box lock (fact-check C24; maintainer, 2026-11-15: lock it in M3).** When
+    `target_box_id <> box_id`, `PgStore::claim_run` reads the target box row `FOR SHARE` right after the
+    claiming box's `FOR UPDATE` and before the tag read (order: run → claiming box → target box, i.e.
+    parent → child for a container run). A local run (`target_box_id = box_id`) takes no extra lock. A
+    concurrent `record_box_probe`/`edit_box` of the target box then waits for the decision, so the
+    doc's "the check cannot race a re-probe" stays true; rewrite the doc (`pg/write.rs:8082-8085`) to
+    name both rows. Before committing, check every box writer that locks two box rows (child-box
+    attach, `edit_box`, `record_box_probe`, retire/delete paths) and confirm none locks a child before
+    its parent; name the result in the commit message. Mem has no locks; its claim reads under the
+    state mutex as today. The same doc's last paragraph
     (`:8086-8090`, "`create_run` locks the item and then the box (through `run.target_box_id`'s
     foreign key)") gains `executing_box_id`'s key as well (P6).
 - **P5 — The queue facts are additive.** `QueueRunFact` (`crates/htui-core/src/model/queue.rs:210`)
@@ -431,6 +433,14 @@ Tests first. Conformance cases (+3, 347 → 350):
   - **Overlap:** after admitting the child-box run, a local run sharing its repo scope gets
     `Overlaps { with: <child-box run> }`.
 
+Pg-only race test (in `crates/htui-store/tests/it/pg_conformance.rs` or beside M2's `create_run` race
+tests, whichever file holds those): `claim_run_holds_the_target_box_against_a_re_probe` — open a
+transaction that claims a child-box run up to the target-box lock (or hold a `FOR SHARE` the same way the
+M2 race tests stage a lock), and show a concurrent `edit_box` of the child waits until it ends. If the
+claim cannot be paused mid-way, assert instead that after the claim commits, a tag edit that would have
+refused it changes nothing about the admitted run, and say in the commit why the stronger test was not
+possible.
+
 Move the three count pins to 350. Existing claim cases and the Mem unit tests
 (`claim_run_refuses_an_overlapping_scope_and_a_full_box`, `a_run_with_no_item_is_never_refused_for_tags`)
 stay unedited and green.
@@ -590,7 +600,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 ## Verified claims
 
 Fact-check 2026-11-15 (handoff-run step 3.5): 23 verified, 8 amended (plan text corrected where used),
-1 falsified with a maintainer question (C24). File-set intersection: pass (C23).
+1 falsified, answered by the maintainer (C24: lock the target box in M3). File-set intersection: pass (C23).
 
 | Claim | Verdict | Evidence |
 |---|---|---|
@@ -617,7 +627,7 @@ Fact-check 2026-11-15 (handoff-run step 3.5): 23 verified, 8 amended (plan text 
 | C21 | amended | Lock order holds, but "claim_run … no item" is wrong: its `MissingTags` branch runs `UPDATE item SET status = 'blocked'` (`pg/write.rs:8194`) after the run (`:8109`) and box (`:8122`) locks. No cycle: that item is the claimed queued run's, and `create_run` refuses an item with a live (`queued` included) run under its item lock before the INSERT's FK key shares (`:7890`, `:7903-7915`). P6's lock-order bullet amended. |
 | C22 | verified | Mem `edit_box` filters only on `user_id == this_user` and `edit_version` (`mem.rs:3115-3122`), no kind check; Pg `UPDATE box … WHERE id = $1 AND user_id = $5 AND edit_version = $2` (`pg/write.rs:3902-3910`), no kind check; no CHECK on `box.declared_tags` for containers (`0040_execution_targets.sql:48-57`). A child box inherits its parent's `user_id` (`mem.rs:11466`, `pg/write.rs:4450-4456`). No seam needed. |
 | C23 | verified | T0 {`graph.rs`} (no `NewRun` literal there) meets no other set. T3 {`queue.rs`, `mem.rs`, `store/worker.rs`, `pg/read.rs`, `.sqlx`, `pg_criteria.rs`} ∩ T4 {`engine.rs`} = ∅. T1 ∩ T4 = {`engine.rs`} (T1's literals) and T1 ∩ T3 ⊇ {`mem.rs`, `.sqlx`, `pg_criteria.rs`}: both pairs are ordered by "Depends on", so no claimed-independent pair intersects. Note: T0 beside T1 is file-disjoint but not build-disjoint (T1 breaks every crate's build mid-task), so the lanes need their own worktrees. |
-| C24 | falsified (question) | After P4 the tag query reads `target_box_id`; for a child-box run that box is not the one locked `FOR UPDATE` (`pg/write.rs:8122`), so the doc's guarantee (`:8082-8085`) no longer holds. P4 amended: T2 rewrites the doc and changes no lock. Open for the maintainer: also lock the target box (`FOR SHARE`) in `claim_run`? |
+| C24 | falsified (question) | After P4 the tag query reads `target_box_id`; for a child-box run that box is not the one locked `FOR UPDATE` (`pg/write.rs:8122`), so the doc's guarantee (`:8082-8085`) no longer holds. Maintainer, 2026-11-15: lock it in M3. P4 amended: T2 reads the target box `FOR SHARE` after the claiming box when they differ, rewrites the doc, adds a Pg race test. |
 | C25 | verified | `str_enum!` gives `pub const ALL: &'static [Self]` (`model/mod.rs:47`; used `target.rs:589`); `pub const RUNNABLE_KINDS: &[TargetKind]` (`target.rs:50`) is a `const`, so a `const fn` may store it. |
 | C26 | amended | `classify_entry`'s doc (`queue.rs:446-449`) says "targeted here" / "targeted elsewhere"; P5 listed only the `EntryState` docs. P5 amended. |
 | C27 | amended | `EngineParts.box_id` doc: "`run.target_box_id` and `claim_run`'s box" (`engine.rs:561`), stale under D8. T4 amended to update it. |
