@@ -2268,8 +2268,9 @@ pub fn move_branch(path: &Path, name: &str, from: &str, to: &str) -> Result<(), 
 
 /// MOD-133 M3 D1: where `full_ref` (`refs/heads/<name>`) is checked out: `main` itself when its
 /// `HEAD` names it, else the base of the first linked worktree whose `HEAD` file names it, else
-/// `None`. A run branch checked out anywhere must not be moved by `update-ref` (probe C12): that
-/// tree's index and files would be left behind its `HEAD`.
+/// `None`. A tree mid-rebase or mid-bisect of the branch holds it too, its `HEAD` detached
+/// (`busy_with`). A run branch checked out anywhere must not be moved by `update-ref` (probe
+/// C12): that tree's index and files would be left behind its `HEAD`.
 ///
 /// # Errors
 /// [`IsolateError::Git`] when the repository cannot be opened, its `HEAD` read, or its
@@ -2279,7 +2280,7 @@ pub fn checked_out_at(main: &Path, full_ref: &str) -> Result<Option<PathBuf>, Is
     let head = repo.head_name().map_err(|err| {
         IsolateError::Git(format!("cannot read HEAD of {}: {err}", main.display()))
     })?;
-    if head.is_some_and(|name| name.as_bstr() == full_ref) {
+    if head.is_some_and(|name| name.as_bstr() == full_ref) || busy_with(repo.git_dir(), full_ref) {
         return Ok(Some(main.to_path_buf()));
     }
     let proxies = repo.worktrees().map_err(|err| {
@@ -2291,10 +2292,9 @@ pub fn checked_out_at(main: &Path, full_ref: &str) -> Result<Option<PathBuf>, Is
     for proxy in proxies {
         // A worktree's `HEAD` is a file in its administrative entry: `ref: <name>` when it is on
         // a branch, a hash when detached. An entry whose file cannot be read checks nothing out.
-        let Ok(text) = std::fs::read_to_string(proxy.git_dir().join("HEAD")) else {
-            continue;
-        };
-        if text.trim().strip_prefix("ref:").map(str::trim) == Some(full_ref) {
+        let on_branch = std::fs::read_to_string(proxy.git_dir().join("HEAD"))
+            .is_ok_and(|text| text.trim().strip_prefix("ref:").map(str::trim) == Some(full_ref));
+        if on_branch || busy_with(proxy.git_dir(), full_ref) {
             let base = proxy
                 .base()
                 .unwrap_or_else(|_| proxy.git_dir().to_path_buf());
@@ -2302,6 +2302,25 @@ pub fn checked_out_at(main: &Path, full_ref: &str) -> Result<Option<PathBuf>, Is
         }
     }
     Ok(None)
+}
+
+/// Whether the worktree whose administrative directory is `admin` holds `full_ref` while its
+/// `HEAD` is detached, as git's own `is_worktree_being_rebased` and `is_worktree_being_bisected`
+/// (`worktree.c`) read it: `rebase-merge/head-name` or `rebase-apply/head-name` names the full
+/// ref being rebased, `BISECT_START` the short name of the branch being bisected. A file that
+/// cannot be read names nothing.
+fn busy_with(admin: &Path, full_ref: &str) -> bool {
+    let read = |path: PathBuf| std::fs::read_to_string(path).ok();
+    let rebased = ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .filter_map(|state| read(admin.join(state).join("head-name")))
+        .any(|text| text.trim() == full_ref);
+    rebased
+        || read(admin.join("BISECT_START")).is_some_and(|text| {
+            full_ref
+                .strip_prefix("refs/heads/")
+                .is_some_and(|name| text.trim() == name)
+        })
 }
 
 /// What `refs/heads/<name>` points at, or `None` when it does not exist
@@ -4145,6 +4164,185 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!("git: git worktree add: fatal: a branch named 'htui/{step}' already exists")
+        );
+    }
+
+    /// MOD-133 M3 D3: the landing tree is added detached at `at` and locked; no branch is made
+    /// and none is checked out there.
+    #[tokio::test]
+    async fn add_detached_worktree_holds_its_post_condition() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let first = repo_with_one_commit(&repo);
+        let second = commit_file(&repo, "g", "second\n", "two");
+        let run = htui_core::model::RunId::new();
+        let tree = dir.path().join("landing").join("core");
+
+        git.add_detached_worktree(&repo, &tree, run, &first)
+            .await
+            .expect("the landing tree is added");
+        assert_eq!(super::head(&tree).expect("the tree has a HEAD"), first);
+        assert_eq!(
+            super::head(&repo).expect("HEAD reads"),
+            second,
+            "the primary stays"
+        );
+        let entry = super::worktree_by_path(&repo, &tree)
+            .expect("the read succeeds")
+            .expect("gix lists the entry");
+        assert!(entry.locked);
+        assert_eq!(
+            entry.lock_reason.as_deref(),
+            Some(&*format!("htui run {run}"))
+        );
+        let listed = super::testkit::worktree_list(&git, &repo).await;
+        let ours = listed
+            .iter()
+            .find(|entry| entry.path == super::canonical(&tree))
+            .expect("git worktree list names the tree it made");
+        assert_eq!(ours.head.as_deref(), Some(&*first));
+        assert_eq!(ours.branch, None, "detached");
+    }
+
+    /// MOD-133 M3 D1: `checked_out_at` names the primary when its `HEAD` is on the branch, the
+    /// linked worktree whose `HEAD` is, and nothing for a branch no tree holds.
+    #[tokio::test]
+    async fn checked_out_at_names_the_primary_a_linked_worktree_or_none() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let first = repo_with_one_commit(&repo);
+        let primary = super::open(&repo)
+            .expect("the repository opens")
+            .head_name()
+            .expect("HEAD reads")
+            .expect("the primary is on a branch")
+            .as_bstr()
+            .to_string();
+        assert_eq!(
+            super::checked_out_at(&repo, &primary).expect("the read succeeds"),
+            Some(repo.clone())
+        );
+
+        let step = htui_core::model::StepId::new();
+        let tree = dir.path().join("linked");
+        git.add_worktree(&repo, &tree, step, htui_core::model::RunId::new(), &first)
+            .await
+            .expect("the worktree is added");
+        assert_eq!(
+            super::checked_out_at(&repo, &format!("refs/heads/htui/{step}"))
+                .expect("the read succeeds"),
+            Some(super::canonical(&tree))
+        );
+
+        super::create_branch(&repo, "free", &first).expect("the branch is written");
+        assert_eq!(
+            super::checked_out_at(&repo, "refs/heads/free").expect("the read succeeds"),
+            None
+        );
+    }
+
+    /// MOD-133 M3 D1, D3: a branch being rebased is checked out even though `HEAD` is detached,
+    /// as git's own `is_worktree_being_rebased` reads it: `rebase-merge/head-name` in the primary,
+    /// `rebase-apply/head-name` in a linked worktree; `BISECT_START` names a branch being
+    /// bisected.
+    #[tokio::test]
+    async fn checked_out_at_reads_a_rebase_or_bisect_in_progress() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let first = repo_with_one_commit(&repo);
+        for name in ["merged", "applied", "bisected"] {
+            super::create_branch(&repo, name, &first).expect("the branch is written");
+        }
+        let admin = super::open(&repo)
+            .expect("the repository opens")
+            .git_dir()
+            .to_path_buf();
+        std::fs::create_dir(admin.join("rebase-merge")).expect("the rebase state is made");
+        std::fs::write(
+            admin.join("rebase-merge").join("head-name"),
+            "refs/heads/merged\n",
+        )
+        .expect("the rebased branch is named");
+        assert_eq!(
+            super::checked_out_at(&repo, "refs/heads/merged").expect("the read succeeds"),
+            Some(repo.clone())
+        );
+
+        let tree = dir.path().join("linked");
+        git.add_detached_worktree(&repo, &tree, htui_core::model::RunId::new(), &first)
+            .await
+            .expect("the worktree is added");
+        let linked = super::open(&tree)
+            .expect("the linked tree opens")
+            .git_dir()
+            .to_path_buf();
+        std::fs::create_dir(linked.join("rebase-apply")).expect("the rebase state is made");
+        std::fs::write(
+            linked.join("rebase-apply").join("head-name"),
+            "refs/heads/applied\n",
+        )
+        .expect("the rebased branch is named");
+        assert_eq!(
+            super::checked_out_at(&repo, "refs/heads/applied").expect("the read succeeds"),
+            Some(super::canonical(&tree))
+        );
+
+        std::fs::write(linked.join("BISECT_START"), "bisected\n").expect("the bisect is started");
+        assert_eq!(
+            super::checked_out_at(&repo, "refs/heads/bisected").expect("the read succeeds"),
+            Some(super::canonical(&tree))
+        );
+        assert_eq!(
+            super::checked_out_at(&repo, "refs/heads/elsewhere").expect("the read succeeds"),
+            None
+        );
+    }
+
+    /// MOD-133 M3 D3 step 9: the compare-and-swap moves a branch only from where it is; a stale
+    /// `from` is a `Git` error that leaves the branch alone, and an absent branch is refused, not
+    /// created.
+    #[test]
+    fn move_branch_is_a_compare_and_swap() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let first = repo_with_one_commit(dir.path());
+        let second = commit_file(dir.path(), "g", "second\n", "two");
+        let third = commit_file(dir.path(), "h", "third\n", "three");
+        super::create_branch(dir.path(), "run", &first).expect("the branch is written");
+
+        let err = super::move_branch(dir.path(), "run", &second, &third)
+            .expect_err("a stale `from` is refused");
+        assert!(matches!(&err, IsolateError::Git(_)), "{err}");
+        assert_eq!(
+            super::branch_target(dir.path(), "run").expect("the read succeeds"),
+            Some(first.clone()),
+            "the branch did not move"
+        );
+
+        let err = super::move_branch(dir.path(), "absent", &first, &third)
+            .expect_err("an absent branch is refused");
+        assert!(matches!(&err, IsolateError::Git(_)), "{err}");
+        assert_eq!(
+            super::branch_target(dir.path(), "absent").expect("the read succeeds"),
+            None,
+            "and not created"
+        );
+
+        super::move_branch(dir.path(), "run", &first, &third).expect("a current `from` moves it");
+        assert_eq!(
+            super::branch_target(dir.path(), "run").expect("the read succeeds"),
+            Some(third)
         );
     }
 
