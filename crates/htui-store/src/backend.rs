@@ -1023,8 +1023,8 @@ fn orchestration_offline() -> StoreError {
 }
 
 /// MOD-159 M1 plan D12: the indexer lease goes to the arm's store, `MemStore` for `--demo` and
-/// the overlay tests, Postgres online. Offline every verb is refused with
-/// [`DATABASE_UNREACHABLE`]: the lease is live coordination state the mirror does not hold
+/// the overlay tests, Postgres online, and so do MOD-159 M3's pass request and claim. Offline
+/// every verb is refused with [`DATABASE_UNREACHABLE`]: the lease is live coordination state the mirror does not hold
 /// (`0038_indexer_lease.sql`), so there is nothing to take, renew, release or read.
 impl IndexerLeaseStore for Backend {
     async fn take_indexer_lease(
@@ -1082,6 +1082,29 @@ impl IndexerLeaseStore for Backend {
         match self {
             Self::Memory(store) => store.indexer_lease(collection).await,
             Self::Online { pg, .. } => pg.indexer_lease(collection).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    async fn request_indexer_pass(
+        &self,
+        collection: &IndexedCollection,
+    ) -> Result<Option<IndexerLease>> {
+        match self {
+            Self::Memory(store) => store.request_indexer_pass(collection).await,
+            Self::Online { pg, .. } => pg.request_indexer_pass(collection).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    async fn claim_indexer_pass(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.claim_indexer_pass(collection, owner).await,
+            Self::Online { pg, .. } => pg.claim_indexer_pass(collection, owner).await,
             Self::Offline { .. } => Err(orchestration_offline()),
         }
     }
@@ -1592,6 +1615,27 @@ mod tests {
         );
         assert_eq!(
             memory
+                .request_indexer_pass(&global)
+                .await
+                .expect("request in memory")
+                .expect("the lease is held live")
+                .box_id,
+            Some(box_id)
+        );
+        assert!(
+            memory
+                .claim_indexer_pass(&global, owner)
+                .await
+                .expect("claim in memory")
+        );
+        assert!(
+            !memory
+                .claim_indexer_pass(&global, owner)
+                .await
+                .expect("claim again in memory")
+        );
+        assert_eq!(
+            memory
                 .release_indexer_leases(owner)
                 .await
                 .expect("release in memory"),
@@ -1624,6 +1668,14 @@ mod tests {
         ));
         assert!(matches!(
             offline.indexer_lease(&global).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.request_indexer_pass(&global).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.claim_indexer_pass(&global, owner).await,
             Err(StoreError::Unreachable(_))
         ));
         cache.close().await;

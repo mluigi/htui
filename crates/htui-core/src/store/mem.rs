@@ -482,6 +482,9 @@ struct MemIndexerLease {
     box_id: Option<BoxId>,
     /// `indexer_lease.lease_expires_at`.
     expires_at: Option<DateTime<Utc>>,
+    /// `indexer_lease.pass_requested_at` (MOD-159 M3 plan D1): kept by a take and a release,
+    /// cleared only by the holder's claim.
+    pass_requested_at: Option<DateTime<Utc>>,
 }
 
 impl MemIndexerLease {
@@ -13241,7 +13244,8 @@ impl WriteStore for MemStore {
 
 /// MOD-159 M1 plan D3: `indexer_lease` in memory, `PgStore`'s rules. Expiry is judged, and
 /// stamped, by this handle's clock plus the TTL (MOD-40 plan D10), and a TTL out of range is
-/// refused before the lock is taken.
+/// refused before the lock is taken. A pass request (MOD-159 M3 plan D2) is stamped by the same
+/// clock.
 impl IndexerLeaseStore for MemStore {
     async fn take_indexer_lease(
         &self,
@@ -13310,6 +13314,35 @@ impl IndexerLeaseStore for MemStore {
     async fn indexer_lease(&self, collection: &IndexedCollection) -> Result<Option<IndexerLease>> {
         let now = self.now();
         Ok(self.read(|state| state.indexer_lease_view(&collection.name(), now)))
+    }
+
+    async fn request_indexer_pass(
+        &self,
+        collection: &IndexedCollection,
+    ) -> Result<Option<IndexerLease>> {
+        let now = self.now();
+        let name = collection.name();
+        Ok(self.write(|state| {
+            let row = state
+                .indexer_leases
+                .get_mut(&name)
+                .filter(|row| row.live(now))?;
+            row.pass_requested_at = Some(now);
+            state.indexer_lease_view(&name, now)
+        }))
+    }
+
+    async fn claim_indexer_pass(
+        &self,
+        collection: &IndexedCollection,
+        owner: Uuid,
+    ) -> Result<bool> {
+        Ok(self.write(
+            |state| match state.indexer_leases.get_mut(&collection.name()) {
+                Some(row) if row.owner == Some(owner) => row.pass_requested_at.take().is_some(),
+                _ => false,
+            },
+        ))
     }
 }
 
@@ -13400,12 +13433,19 @@ impl State {
             }
             _ => LeaseTake::Taken,
         };
+        // A pending pass request outlives the take (MOD-159 M3 plan D2), as `PgStore`'s upsert
+        // leaves `pass_requested_at` alone.
+        let pass_requested_at = self
+            .indexer_leases
+            .get(&name)
+            .and_then(|row| row.pass_requested_at);
         self.indexer_leases.insert(
             name,
             MemIndexerLease {
                 owner: Some(owner),
                 box_id: Some(box_id),
                 expires_at: Some(expires_at),
+                pass_requested_at,
             },
         );
         answer

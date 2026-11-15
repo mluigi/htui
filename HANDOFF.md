@@ -15,7 +15,16 @@
   Also refresh "Parallel runs" below: drop the closed ID and promote what it unblocked.
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-14):** **ANA-42 is concluded** (`docs/decisions/ana/ana-42.md`): the maintainer accepted
+**Current status (2026-11-15):** **MOD-159 is done** (`docs/decisions/mod/mod-159.md`; M1 and M2 merged on main, M3
+on `hr/MOD-159`, to collect): each Qdrant collection has one indexer, the holder of its `indexer_lease` row (worker or
+TUI); one collection per workspace (`htui_ws_<uuid>`) plus `htui_global` replace `htui_concepts_v2`; a 60 s
+incremental cycle runs between full reconciles; `Ctrl+R` and `--index-items` take a free lease, or ask the live holder
+for a pass (`...; asked it to reindex`), which its index job serves as a full reconcile at its next beat; quitting
+lets the leases go. M3 adds no migration. MOD-112 (4), MOD-161 and MOD-167 plug into this indexer and no longer wait
+on it. Owed on the host: `scripts/hr collect MOD-159`, the merged-tree Postgres gate, the live-Qdrant suites, and
+`cache::the_spawned_refresher_passes_and_follows_the_scope` (fails in the sandbox and on main alike; M3 touches no
+`cache/` code).
+**ANA-42 is concluded** (`docs/decisions/ana/ana-42.md`): the maintainer accepted
 all six §8 decisions; MOD-130, MOD-131 and MOD-132 are no longer pending it, and MOD-43's queued-until-claimed rule
 now covers the enrolled kind only. **MOD-125 is done** (`docs/decisions/mod/mod-125.md`; merged on
 main): `htui stop [--force] <workspace>` and `htui resume <workspace>` stop every run of a workspace (graceful at
@@ -23,36 +32,18 @@ the turn boundary, forced mid-turn) and resume each on its box through its saved
 (`--yes`), with a report of how each run resumes. Migration `0037_stopped_run_index` (`0036` on the branch, renumbered behind MOD-122 M3's at the merge). Owed on the host: after the
 merge reinstall the MCP relay and `htui claude emit --force` on each box; the Postgres gate, the
 live-Qdrant suites and M3's live probes (`cli_live` 12-13, `isolation_live` `reopen`).
-**MOD-122 is done** (`docs/decisions/mod/mod-122.md`; merged on main): the Logs tab shows htui's own log (always in memory) and every worker's shipped log,
-and the activity panel fills the Backlog's activity slot (default preset `ide_activity`) with every wait and failure
-across all workspaces: `activity_event` rows written by deferred triggers on `run`/`run_step`/`item`/`step_permission`
-(MemStore: a status diff in `write`), needs-you pinned and counted, `f` filters, Enter jumps with history and switches
-workspace. Events share `log_retention_days` (14 days, now in Settings › Prompt) plus 100 000 per user. Migration
-`0036_activity_event` (`0034` on the branch, renumbered behind MOD-150 M3's and MOD-149's at the merge). Owed on the
-host: the merged-tree Postgres gate, the live-Qdrant suites, the Windows build and the real-keyring smoke.
-**MOD-149 is done** (`docs/decisions/mod/mod-149.md`; on `hr/MOD-149`, merged on main with `hr/MOD-150`): requirement
-keys are stored, `W-<AREA>-<N>` in a workspace scope row, a same-owner refinement nests as `R-TUI-2.1` from a
-per-parent counter, a project requirement refining a workspace one keeps its own key, and
-`requirement_coverage_state` derives coverage from splits. Migration `0035_requirement_keys`, cache `0012` (both were
-`0034`/`0011` on the branch and renumbered behind MOD-150 M3's at the merge); owed on the host: its merged-tree
-Postgres gate and live-Qdrant suites.
-**TOOL-17 is done** (`docs/decisions/tool/tool-17.md`; merged, `48db70dc`): the
-gate's `test` step runs `cargo nextest run --workspace --all-features --no-fail-fast --profile gate`, then
-`cargo test --doc` (291 s against `cargo test`'s 381 s); `cargo-nextest` 0.9.151 is required (host: `~/.cargo/bin`;
-sandboxes: `scripts/hr build`, owed). Live Qdrant tests live in `qdrant_live`/`qdrant_worker` or start with
-`live_qdrant_` (the `live-qdrant` group in `.config/nextest.toml`); `qdrant_turn`/`mock_keyring` stay for
-`cargo test` item runs. Each crate's integration tests are modules of one `tests/it/main.rs` binary (TOOL-15;
-exempt `htui-agent/tests/extensibility.rs` and `htui/tests/panic_hook.rs`), so a sandbox run on the old layout
-that adds a `tests/<name>.rs` moves it under `tests/it/` at collect. Gate red only on `claude_plugin`; many
-Postgres cases failing `57P03` means the dev Postgres crashed (TOOL-18, cause unknown, 2 of 7 nextest runs today): re-run.
+Gate notes (TOOL-17, `docs/decisions/tool/tool-17.md`): `cargo-nextest` 0.9.151 is required (host:
+`~/.cargo/bin`; sandboxes: `scripts/hr build`, owed); a sandbox run on the old test layout that adds a
+`tests/<name>.rs` moves it under `tests/it/` at collect (TOOL-15); many Postgres cases failing `57P03` means the dev
+Postgres crashed (TOOL-18): re-run.
 Phases landed on main with the item still open:
-MOD-162 M1, MOD-159 M1; each item's note says what is next.
+MOD-162 M1; its note says what is next.
 MOD-152 (`docs/decisions/mod/mod-152.md`) is on `hr/MOD-152`, to collect.
 MOD-141 (`docs/decisions/mod/mod-141.md`): M3 is on `hr/MOD-141`, to collect. MOD-139
 (`docs/decisions/mod/mod-139.md`) still owes the host Qdrant suites and Postgres gate; its migration is
 `0029_divided_fanout` (MOD-97 took `0028`).
 MOD-143 waits on MOD-133.
-Earlier completions, MOD-164, MOD-152, TOOL-16, TOOL-15, MOD-141, MOD-170, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
+Earlier completions, MOD-149, MOD-122, TOOL-17, MOD-164, MOD-152, TOOL-16, TOOL-15, MOD-141, MOD-170, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
@@ -63,7 +54,8 @@ Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-17
 -SelfTest`, TOOL-8's `claude -p "/gate fmt"` and `.ps1` commands, TOOL-9's `.ps1` gate files);
 TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-dev.md`); MOD-93's live
 install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; MOD-97's live `cli_live` case 11 (an inherited key, `apiKeySource` stays `none`) and Windows build of its
-`remove_case_variants`; MOD-141's, MOD-147's, MOD-152's, MOD-162's and MOD-164's merged-tree Postgres gate and live-Qdrant suites, with
+`remove_case_variants`; MOD-122's, MOD-141's, MOD-147's, MOD-149's, MOD-152's, MOD-162's and MOD-164's merged-tree Postgres gate and live-Qdrant suites (MOD-122's also
+its Windows build and real-keyring smoke), with
 MOD-162's bench live wiring test and its two reference runs (`docs/benchmarks/mod-162-m1-2026-11-11.md`);
 MOD-152's, MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`, `qdrant_worker`,
 `state_cli_pg`'s index case, MOD-160's
@@ -72,8 +64,12 @@ MOD-152's, MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`,
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-159 M1, MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), and MOD-159 M2, MOD-133 M1 and MOD-130 M1 (merged on main 2026-11-15): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 343), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection;
-not mirrored; `0036` on its branch), before it the index-only
+Live coordinates after MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), MOD-133 M1 and MOD-130 M1 (merged on main 2026-11-15), and MOD-159 (done 2026-11-15, `docs/decisions/mod/mod-159.md`; M1 and M2 on main, M3 on `hr/MOD-159`): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 343), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection,
+`pass_requested_at` written since M3; not mirrored; `0036` on its branch; collections `htui_ws_<uuid>` per workspace and
+`htui_global`; the API MOD-112 (4), MOD-161 and MOD-167 plug into is `IndexerLeaseStore` (take, renew, release,
+`request_indexer_pass`, `claim_indexer_pass`), `take_or_request_pass` → `LeaseTurn::{Ours, Requested, Held}`,
+`IndexChangesStore` and `Indexer::sync`/`sync_changes`, run by the index job in `htui/src/concepts.rs`; see
+`docs/decisions/mod/mod-159.md`), before it the index-only
 `0037_stopped_run_index` (MOD-125 M4: `idx_run_stopped_box`, serves `pending_resumes`; not mirrored; `0036` on its branch), before it `0036_activity_event` (MOD-122 M3:
 `activity_event`, deferred constraint triggers on `run`/`run_step`/`item`/`step_permission`, one event per transition per
 transaction, unique `(txid, kind, subject)`; not mirrored; `0034` on its branch), before it `0035_requirement_keys` (MOD-149: stored `requirement.key`, `refines_id`, `child_number`,
@@ -102,13 +98,13 @@ MOD-70's were before), so a branch adding a migration renumbers at merge time an
 `htui-store/tests/migrations.rs`. MOD-163's `0026_trim_record_v5` became `0027` behind MOD-147's `0026_workspace_scope` at this merge. `0027`'s column
 comment keeps its own bytes ("written before 0026") and `MOD163_M2_COLUMN_COMMENTS` pins them (`8d69db61`); an applied
 migration's SQL is never edited to follow a rename. Items that still owe one include MOD-143
-and MOD-171. Pins: store conformance `CASES` 325 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
-`ACTIVITY_CASES` 12 (`htui-core/src/store/conformance.rs`, MOD-122 M3), `INDEXER_LEASE_CASES` 10 (MOD-159), `INDEX_CHANGES_CASES` 7 (MOD-159 M2), `htui-orch` `CASES` 265
-(`htui-orch/tests/fake_conformance.rs`); Postgres tables 58
+and MOD-171. Pins: store conformance `CASES` 343 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
+`ACTIVITY_CASES` 12 (`htui-core/src/store/conformance.rs`, MOD-122 M3), `INDEXER_LEASE_CASES` 15 (MOD-159; 10 on main until M3 is collected), `INDEX_CHANGES_CASES` 7 (MOD-159 M2), `htui-orch` `CASES` 265
+(`htui-orch/tests/fake_conformance.rs`); Postgres tables 60
 (`htui-store/tests/migrations.rs` `TABLES`).
 ---
 
-## Parallel runs (2026-11-14)
+## Parallel runs (2026-11-15)
 
 The next ten items by `next-item.sh` ranking, then what each wave unlocks, by dependencies only (file and
 migration overlap is not checked; trigger-gated and "wanted later" items are left out). One item per line:
@@ -118,7 +114,6 @@ items it follows are done.
 
 **Wave 1 (together)**
 
-- MOD-159: opus
 - MOD-130: opus
 - MOD-133: opus
 - MOD-116: sonnet
@@ -126,6 +121,7 @@ items it follows are done.
 - ANA-39: none (analysis)
 - MOD-43: opus
 - MOD-166: opus
+- MOD-112: opus
 
 **Wave 2**
 
@@ -598,7 +594,7 @@ items it follows are done.
   visibility list and MOD-169. Nothing is superseded from a score (`R-ENT-13`, `R-STO-8`,
   `docs/ANA-37.md` §5.4) unless MOD-169 measures a usable threshold and the maintainer amends both; no run
   waits on Qdrant (`R-NF-2`), and there is no full-text fallback. Blocked on
-  MOD-159 (MOD-163 and MOD-164 done); MOD-112 (4) for the tool's workspace scope. "Must" (`R-ENT-13`, 2026-10-20).
+  MOD-112 (4) for the tool's workspace scope (MOD-159 done, `docs/decisions/mod/mod-159.md`; MOD-163 and MOD-164 done). "Must" (`R-ENT-13`, 2026-10-20).
 - [ ] **MOD-168 - Global memory scope and automatic promotion** (from ANA-38, `docs/ANA-38.md` §7.2 P6).
   `R-ENT-13`, `R-PRM-1`, `R-ID-7`, `R-SEC-3`. A third hidden scope row (global), on the pattern of
   ANA-35's workspace scope row; an automatic promotion pipeline (a generalization check by the light model,
@@ -851,8 +847,8 @@ items it follows are done.
   **`item_create`**: an agent proposes an item, held as a draft until a person accepts it. (4) The index
   also covers **notes** and **scrubbed run transcripts**, and searches can be scoped to a workspace
   (member projects plus the workspace's scope row, `docs/ANA-35.md` §7.5). The question tool is MOD-75's;
-  the planner's tools are MOD-140's (from ANA-33, `docs/decisions/ana/ana-33.md`). Not blocked except part (4), which waits on MOD-159 and, for its
-  workspace scope, which is `htui_store::vector_sync::workspace_search_scope` (MOD-147, done,
+  the planner's tools are MOD-140's (from ANA-33, `docs/decisions/ana/ana-33.md`). Not blocked: part (4) waited on MOD-159 (done, `docs/decisions/mod/mod-159.md`) and, for its
+  workspace scope, on `htui_store::vector_sync::workspace_search_scope` (MOD-147, done,
   `docs/decisions/mod/mod-147.md`) (from ANA-35).
   ANA-36 §7.2 adds design input: `item_read` with links both ways and authors marked, outline-first
   `document_read`, out-of-workspace stubs and stable draft ids; part (1) also gains a scrubbed transcript
@@ -861,52 +857,16 @@ items it follows are done.
   part (2) exists as `search_concepts` (MOD-11), project-only today. Part (4) keeps notes, scrubbed
   transcripts (prompt, follow-up, assistant-text and plan events; no tool calls, tool results or edit
   proposals), workspace-owned items once ANA-35 lands, and agents' workspace scope (`R-MCP-1` now covers
-  notes and transcript snippets); it plugs into MOD-159's indexer and is blocked on MOD-159. Part (1)'s
+  notes and transcript snippets); it plugs into MOD-159's indexer (done, `docs/decisions/mod/mod-159.md`; the lease, change read and index job). Part (1)'s
   read tools carry a text filter over keys, titles and bodies that works without Qdrant, agents' fallback
   while knowledge search is unavailable (`R-MCP-2`).
-- [ ] **MOD-159 - One knowledge indexer per collection: lease, freshness, coverage** (from ANA-37,
-  `docs/ANA-37.md` §7.2, §7.3, §8 Q3-Q5; amended 2026-10-20, one Qdrant and a global collection).
-  `R-STO-8`, `R-ENT-12`, `R-ENT-13`, `R-ENT-16`. In the one Qdrant (MOD-158, done: `docs/decisions/mod/mod-158.md`;
-  settings resolve through `concepts_worker::resolve_settings`/`QdrantSource`): one collection per
-  workspace, replacing `htui_concepts_v2`, and one global collection for global memory (MOD-168), never
-  copied into a workspace's; collection names carry no version while htui is in development, so a
-  payload change (MOD-167; MOD-147 made the stamp 3) drops and reindexes instead of renaming (MOD-144's payload-schema
-  stamp in `vector.rs` already does it for the current collection) (by maintainer
-  decision, 2026-10-20); an indexer lease row in Postgres per collection (holder, box, expiry; taken
-  when free or expired, renewed each beat on the run lease's TTLs; renewed before each delete batch,
-  orphans confirmed absent in the same pass; worker or TUI, one lease per collection a process serves);
-  the run records the workspace it was queued from; a 60 s incremental cycle (timestamps with the cache
-  refresh's overlap window, transcripts by step and `seq`) plus the full reconcile; `Ctrl+R` and
-  `--index-items` take the lease only when free, otherwise request a pass and show the holder's box;
-  `--search-items` over several workspaces names those unavailable; a workspace search also queries the
-  global collection. Coverage beyond MOD-112 (4), which keeps notes, transcripts, workspace-owned items
-  and agents' scope: documents owned by a project or the workspace and workspace requirements. Memory is
-  MOD-167's point type and near-duplicate check, plugged into this indexer as MOD-112 (4) is. MOD-158 is
-  done, MOD-147 is (`docs/decisions/mod/mod-147.md`: owner documents index through `sync_owner_documents`),
-  and MOD-149 is (`docs/decisions/mod/mod-149.md`: stored `W-` keys, `requirement_refinements`), so nothing blocks it.
-  **Phase 1 landed (`cd65d461..a61f879b` on `hr/MOD-159`, merged on main 2026-11-14):** M1 lease and collections. Migration `0038_indexer_lease` (`0036` on the branch, renumbered behind MOD-122 M3's and MOD-125 M4's at the merge)
-  (not mirrored) and `IndexerLeaseStore`. Collections `htui_ws_<uuid>` and `htui_global` replace `htui_concepts_v2`, which the global holder
-  drops. The worker and TUI index job reconciles under each collection's lease and renews before each delete batch,
-  confirming orphans by re-listing. Searches read the workspace collections plus global. `Ctrl+R`/`--index-items` defer to
-  a live holder. PRD `.claude/prds/mod-159-knowledge-indexer.prd.md`, plan
-  `.claude/plans/mod-159-m1-lease-and-collections.plan.md`. Owed on the host: the live-Qdrant suites.
-  **Phase 2 landed (`b4509a9f..d9020fcf` on `hr/MOD-159`, 2026-11-14, merged on main 2026-11-15):** M2 freshness. `IndexChangesStore` (MemStore,
-  PgStore; no migration, two `.sqlx` entries) lists items, item documents, requirements and owner documents written
-  after a store-clock instant; `Indexer::sync_changes` rebuilds only those rows, deleting only their stale points under
-  the lease guard (deleted rows stay with the full reconcile). The index job runs it every 60 s (`INCREMENTAL_CYCLE`)
-  per held collection from an in-process cursor pulled back by `cache_overlap_seconds`, with no keyring read; a full
-  reconcile still runs every `concepts_sync_minutes`. Plan `.claude/plans/mod-159-m2-freshness.plan.md`. Accepted, for
-  the write-up: document `created_at` is the writer's clock (a writer lagging the database by more than the overlap
-  waits for the reconcile); a pass with changes reads the changed project's points from Qdrant each cycle while a write
-  stays in the overlap; `document` has no `created_at` index. M3 (pass requests, holder visibility, release on exit)
-  remains.
 - [ ] **MOD-161 - Related items at draft time** (from ANA-37, `docs/ANA-37.md` §7.4, §8 Q7).
   `R-STO-8`, `R-ID-6`, `R-ENT-9`, `R-MCP-2`. The top 5 nearest items across the workspace (open and
   closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's
   follow-up drafts and the MOD-8 importer, for a person to judge; display-only, nothing written from a
   score (no score separated duplicates, `docs/ANA-37.md` §5.4); "knowledge search unavailable" during an
-  outage, filing unaffected. Blocked on MOD-159; the `item_create`, follow-up and importer parts on
-  MOD-112 (3), MOD-135 and MOD-8.
+  outage, filing unaffected. MOD-159 is done (`docs/decisions/mod/mod-159.md`), so the TUI part is not blocked; the
+  `item_create`, follow-up and importer parts wait on MOD-112 (3), MOD-135 and MOD-8.
 - [ ] **MOD-162 - Retrieval benchmark in the repo; rerun at workspace scale** (from ANA-37,
   `docs/ANA-37.md` §5, §11). `R-STO-8`. Move the ANA-37 harness (corpus builder, frozen queries with
   their hash, metrics, McNemar) from `/tmp` into the repo as a dev tool against a scratch Qdrant; build
@@ -1254,6 +1214,6 @@ items it follows are done.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 5 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows) |
-| MOD-N   | 75 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-176 worktree resume without reflogs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 74 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-176 worktree resume without reflogs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-18 dev Postgres crash) |

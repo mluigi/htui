@@ -34,10 +34,12 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
-    BoxId, IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, ProjectId,
-    RequirementState, Resolution, Scope,
+    BoxId, IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, LeaseTurn,
+    ProjectId, RequirementState, Resolution, Scope,
 };
-use htui_core::store::{IndexChangesStore, IndexerLeaseStore, MemStore, ReadStore, StoreError};
+use htui_core::store::{
+    IndexChangesStore, IndexerLeaseStore, MemStore, ReadStore, StoreError, take_or_request_pass,
+};
 use htui_orch::recover::LeaseTimes;
 use htui_store::embed::DenseEmbedder;
 use htui_store::embed::RtenEmbedder;
@@ -301,8 +303,9 @@ pub(crate) async fn scopes_named(
 
 /// `--index-items`: brings each workspace's collection in step with its projects (or one
 /// project's), under that collection's lease, then reports (MOD-159 M1 plan D12). A workspace
-/// whose lease another box holds is one line on stderr and is skipped; the run still exits 0.
-/// Every lease the run took is let go at the end.
+/// whose lease another box holds is skipped: the run asks the holder for a pass (MOD-159 M3 D4)
+/// and says so in one line on stderr naming its box; the run still exits 0. Every lease the run
+/// took is let go at the end.
 ///
 /// # Errors
 ///
@@ -347,10 +350,20 @@ pub struct Holder {
     pub ttl: TimeDelta,
 }
 
-/// The sentence for a workspace whose collection another box indexes (plan D12).
+/// The sentence for a workspace whose collection another box indexes (plan D12), when no pass
+/// request could be recorded ([`LeaseTurn::Held`]).
 fn held_note(slug: &str, lease: &IndexerLease) -> String {
     format!(
         "workspace {slug}: indexing runs on {}; not indexed here",
+        holder_name(lease)
+    )
+}
+
+/// The sentence for a workspace whose collection another box indexes and was asked to reindex
+/// (MOD-159 M3 D6): [`held_note`]'s box, through [`holder_name`].
+fn requested_note(slug: &str, lease: &IndexerLease) -> String {
+    format!(
+        "workspace {slug}: indexing runs on {}; asked it to reindex",
         holder_name(lease)
     )
 }
@@ -372,10 +385,13 @@ pub(crate) fn holder_name(lease: &IndexerLease) -> String {
 }
 
 /// `--index-items`' body over `store` and `index` (plan D12, D10), the test seam. Per workspace in
-/// `scopes`, its collection's lease: held by another owner, `note` says so and the workspace is
-/// skipped; otherwise the collection is opened and synced, the lease renewed before each delete
-/// batch. Then the global collection's lease: when taken, the collection is opened (created) and
-/// the legacy collection dropped. Leases are not let go here: the caller does.
+/// `scopes`, its collection's lease, through [`take_or_request_pass`] (MOD-159 M3 D4): held live
+/// by another owner, the run asks the holder for a pass, `note` says so (or, when nothing could
+/// be recorded, that the holder indexes it) and the workspace is skipped; otherwise the
+/// collection is opened and synced, the lease renewed before each delete batch. Then the global
+/// collection's lease (taken, never requested: it has nothing to sync): when taken, the
+/// collection is opened (created) and the legacy collection dropped. Leases are not let go here:
+/// the caller does.
 ///
 /// # Errors
 ///
@@ -395,12 +411,19 @@ where
     let mut report = SyncReport::default();
     for (slug, scope) in scopes {
         let collection = IndexedCollection::Workspace(scope.workspace_id);
-        let take = store
-            .take_indexer_lease(&collection, holder.box_id, holder.owner, holder.ttl)
-            .await?;
-        if let LeaseTake::Held(lease) = take {
-            note(held_note(slug, &lease));
-            continue;
+        let turn =
+            take_or_request_pass(store, &collection, holder.box_id, holder.owner, holder.ttl)
+                .await?;
+        match turn {
+            LeaseTurn::Ours => {}
+            LeaseTurn::Requested(lease) => {
+                note(requested_note(slug, &lease));
+                continue;
+            }
+            LeaseTurn::Held(lease) => {
+                note(held_note(slug, &lease));
+                continue;
+            }
         }
         let vectors = index
             .open(settings.clone(), &collection)
@@ -679,9 +702,13 @@ impl JobState {
 /// The URL first: none resolves, and nothing is taken, opened or loaded (no URL is one `info`
 /// line until a URL is set). Then, for every workspace of [`IndexSource::index_scopes`] and the
 /// global collection, in that order: its lease is taken (or renewed) for `owner`; one another
-/// owner holds is forgotten. A held collection whose last reconcile is older than
-/// [`sync_interval`], or that this job never reconciled, is opened and synced over its workspace's
-/// scope, the lease renewed before each delete batch; an abandoned sync forgets the collection.
+/// owner holds is forgotten. A held workspace collection's pass request is claimed right after
+/// its take (MOD-159 M3 D5), before the pass reads anything, so a request made during the pass
+/// stays for the next beat; a claimed request reconciles the collection in full this beat. A held
+/// collection whose last reconcile is older than [`sync_interval`], that this job never
+/// reconciled, or that was requested, is opened and synced over its workspace's scope, the lease
+/// renewed before each delete batch; an abandoned sync forgets the collection. A requested
+/// reconcile that fails has consumed its request.
 /// The key is read at the first due collection only (MOD-159 M1 R2), and while one collection
 /// reconciles every lease the job holds is renewed each refresh. A key that cannot be read lets
 /// every lease the job holds go, so a box with a key takes the indexing over, and the job takes
@@ -803,9 +830,12 @@ where
                 continue;
             }
         }
+        // MOD-159 M3 D5: the claim comes before the pass reads anything, so a request made
+        // during it re-stamps the cleared column and is claimed at the next beat.
+        let requested = scope.is_some() && claim_pass(source, &collection, owner).await;
         let now = tokio::time::Instant::now();
         let last = state.held.get(&collection).copied();
-        if let Some(held) = last.filter(|held| held.reconciled.elapsed() < every) {
+        if let Some(held) = last.filter(|held| !requested && held.reconciled.elapsed() < every) {
             // MOD-159 M2 D9: between reconciles, the rows written since the last pass.
             let (Some(cursor), Some(scope)) = (held.cursor, scope.as_ref()) else {
                 continue;
@@ -901,6 +931,26 @@ where
         .map_or(times.refresh, |due| {
             times.refresh.min(due.max(Duration::from_secs(1)))
         })
+}
+
+/// Claims `collection`'s pass request for `owner` (MOD-159 M3 D5): `true` is one `info` line and
+/// a full reconcile this beat. A claim that fails is a `warn` line and no request.
+async fn claim_pass<L: IndexerLeaseStore>(
+    leases: &L,
+    collection: &IndexedCollection,
+    owner: Uuid,
+) -> bool {
+    match leases.claim_indexer_pass(collection, owner).await {
+        Ok(true) => {
+            tracing::info!(%collection, "concepts index pass requested; reconciling this beat");
+            true
+        }
+        Ok(false) => false,
+        Err(err) => {
+            tracing::warn!(%err, %collection, "concepts index pass request unread; next beat");
+            false
+        }
+    }
 }
 
 /// `url` with the key [`concepts_worker::QdrantSource::api_key`] reads now (MOD-159 M1 R2: only
@@ -3651,9 +3701,9 @@ mod tests {
             assert_eq!(pause, BEAT);
         }
 
-        /// D12: `--index-items` syncs each workspace whose lease it takes, says which box indexes
-        /// one it cannot take and skips it, then creates the global collection and drops the
-        /// legacy one.
+        /// D12: `--index-items` syncs each workspace whose lease it takes, asks the box that
+        /// indexes one it cannot take for a pass (MOD-159 M3 D4), says so and skips it, then
+        /// creates the global collection and drops the legacy one.
         #[tokio::test(start_paused = true)]
         async fn index_items_skips_a_workspace_another_box_indexes_and_says_so() {
             let read = demo();
@@ -3695,7 +3745,7 @@ mod tests {
                 notes,
                 [
                     format!(
-                        "workspace {graphics}: indexing runs on DESKTOP-HTUI; not indexed here"
+                        "workspace {graphics}: indexing runs on DESKTOP-HTUI; asked it to reindex"
                     ),
                     format!("dropped the old shared collection `{LEGACY_COLLECTION}`"),
                 ]
@@ -3706,6 +3756,12 @@ mod tests {
                     .expect("the memory store never fails"),
                 2,
                 "the run held Platform and the global collection"
+            );
+            assert!(
+                read.claim_indexer_pass(&GRAPHICS, other)
+                    .await
+                    .expect("the memory store never fails"),
+                "the run asked Graphics' holder for a pass"
             );
         }
 
@@ -3732,6 +3788,155 @@ mod tests {
             assert_eq!(
                 held_note("platform", &named),
                 "workspace platform: indexing runs on hal; not indexed here"
+            );
+        }
+
+        /// MOD-159 M3 D6: `requested_note` names the holder as `held_note` does, and says the
+        /// holder was asked to reindex.
+        #[test]
+        fn a_requested_note_names_the_box_by_hostname_or_short_id() {
+            let lease = IndexerLease {
+                collection: PLATFORM.name(),
+                box_id: Some(BoxId::from_uuid(
+                    Uuid::parse_str("0192f3a4-5b6c-7d8e-9f01-23456789abcd").expect("uuid"),
+                )),
+                box_name: None,
+                expires_at: None,
+                live: true,
+            };
+            assert_eq!(
+                requested_note("platform", &lease),
+                "workspace platform: indexing runs on 6789abcd; asked it to reindex"
+            );
+            let named = IndexerLease {
+                box_name: Some("hal\u{1b}".into()),
+                ..lease
+            };
+            assert_eq!(
+                requested_note("platform", &named),
+                "workspace platform: indexing runs on hal; asked it to reindex"
+            );
+        }
+
+        /// MOD-159 M3 D5: a pass request on a collection the job holds is claimed at the next
+        /// beat, which reconciles it in full though the interval has not passed; the request is
+        /// gone after, and a beat with none reconciles nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_pass_request_reconciles_a_held_collection_at_the_next_beat() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            let platform = index.store(PLATFORM);
+            tokio::time::advance(BEAT).await;
+            let holder = read
+                .request_indexer_pass(&PLATFORM)
+                .await
+                .expect("the memory store never fails");
+            assert!(holder.is_some(), "the job holds Platform live");
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(platform.full_syncs(), 2, "the requested reconcile");
+            assert!(
+                !read
+                    .claim_indexer_pass(&PLATFORM, owner)
+                    .await
+                    .expect("the memory store never fails"),
+                "the beat claimed the request"
+            );
+            tokio::time::advance(BEAT).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(platform.full_syncs(), 2, "no request, no reconcile");
+        }
+
+        /// MOD-159 M3 D3: the claim comes before the pass, so a request made while a requested
+        /// reconcile runs stays for the next beat, which reconciles again.
+        #[tokio::test(start_paused = true)]
+        async fn a_request_made_during_a_requested_reconcile_is_served_by_the_next_beat() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            let platform = index.store(PLATFORM);
+            tokio::time::advance(BEAT).await;
+            read.request_indexer_pass(&PLATFORM)
+                .await
+                .expect("the memory store never fails")
+                .expect("the job holds Platform live");
+            *platform.pause.lock().expect("not poisoned") = Some(MINUTE);
+            let again = tokio::spawn({
+                let read = read.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    read.request_indexer_pass(&PLATFORM)
+                        .await
+                        .expect("the memory store never fails")
+                }
+            });
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert!(
+                again.await.expect("the request ran").is_some(),
+                "made while the reconcile ran"
+            );
+            assert_eq!(platform.full_syncs(), 2, "the first requested reconcile");
+            tokio::time::advance(BEAT).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(platform.full_syncs(), 3, "the request made during it");
+        }
+
+        /// MOD-159 M3 D3: a requested reconcile that fails has consumed its request: the next
+        /// beat runs no full sync (the interval and the next request are the retries).
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_requested_reconcile_consumes_its_request() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            let platform = index.store(PLATFORM);
+            tokio::time::advance(BEAT).await;
+            let item = mint_item(&read, "Filed before a failed reconcile").await;
+            platform.fail.store(1, Ordering::SeqCst);
+            // `syncs` counts reads of htui's points: a full sync reads them before it upserts
+            // (and fails), and an incremental pass is not due within a beat.
+            let htui_reads = platform.syncs();
+            read.request_indexer_pass(&PLATFORM)
+                .await
+                .expect("the memory store never fails")
+                .expect("the job holds Platform live");
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(
+                platform.syncs(),
+                htui_reads + 1,
+                "the requested reconcile ran"
+            );
+            assert!(!has_item(&platform, item), "and failed");
+            assert!(
+                !read
+                    .claim_indexer_pass(&PLATFORM, owner)
+                    .await
+                    .expect("the memory store never fails"),
+                "the request was consumed"
+            );
+            tokio::time::advance(BEAT).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(platform.syncs(), htui_reads + 1, "not retried");
+            assert_eq!(
+                platform.full_syncs(),
+                1,
+                "no full sync reached agy since the first"
+            );
+        }
+
+        /// MOD-159 M3 D5: the global collection has no scope to reconcile, so a beat never claims
+        /// its pass request, even one the job holds: the request stays pending.
+        #[tokio::test(start_paused = true)]
+        async fn a_beat_never_claims_the_global_collections_request() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            tokio::time::advance(BEAT).await;
+            read.request_indexer_pass(&IndexedCollection::Global)
+                .await
+                .expect("the memory store never fails")
+                .expect("the job holds the global collection live");
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert!(
+                read.claim_indexer_pass(&IndexedCollection::Global, owner)
+                    .await
+                    .expect("the memory store never fails"),
+                "the request is still pending"
             );
         }
 

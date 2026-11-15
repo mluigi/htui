@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE indexer_lease SET pass_requested_at = NULL WHERE collection = $1 AND lease_owner = $2 AND pass_requested_at IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ae4d4eac7d82119da29d50329fed1e73d48340ec914163671414e5c978aa4bc3"
+}

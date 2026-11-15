@@ -17,9 +17,9 @@ use std::time::Duration;
 use chrono::TimeDelta;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
-use htui_core::model::{BoxId, IndexedCollection, IndexerLease, LeaseTake, Scope, WorkspaceId};
+use htui_core::model::{BoxId, IndexedCollection, IndexerLease, LeaseTurn, Scope, WorkspaceId};
 use htui_core::qdrant::{QdrantUrl, QdrantUrlError, StoredQdrantUrl};
-use htui_core::store::{IndexerLeaseStore as _, MemStore, StoreError};
+use htui_core::store::{IndexerLeaseStore as _, MemStore, StoreError, take_or_request_pass};
 use htui_orch::recover::LeaseTimes;
 use htui_store::embed::{DENSE_DIM, RtenEmbedder};
 use htui_store::model;
@@ -70,8 +70,14 @@ pub enum ConceptsReply {
 pub enum IndexOutcome {
     /// The lease was free or this runtime's: the run synced.
     Synced(SyncReport),
-    /// Another process holds the lease and indexes this collection; nothing was synced here.
+    /// Another process holds the lease and indexes this collection; nothing was synced here and
+    /// no pass request could be recorded (it let go and was taken again at every attempt).
     HeldBy(IndexerLease),
+    /// Another process holds the lease live and was asked for a pass (MOD-159 M3 plan D4, D6):
+    /// the holder's index job, or the next job to take the lease (a `Ctrl+R` press or
+    /// `--index-items` never claims it), reconciles the collection in full at its next beat;
+    /// nothing was synced here.
+    Requested(IndexerLease),
 }
 
 /// `Ctrl+R`'s answer on a box with no `box` row of its own (MOD-159 M1 plan D12): a lease names
@@ -1412,16 +1418,20 @@ async fn this_box(backend: &Backend) -> Option<BoxId> {
 
 /// `Ctrl+R` under `scope`'s workspace collection lease (MOD-159 M1 plan D12, R2). A lease the
 /// runtime's token (`job_owner`) holds, its index job's, renews: the sync runs under it and it is
-/// kept. Otherwise the press takes the lease under a token of its own, so the job, beating
-/// meanwhile, finds it held instead of sharing it, and lets go of that one lease after the sync; a
-/// press aborted half-way (superseded, or the TUI quit) leaves it to lapse within the TTL. A lease
-/// another owner holds live is [`IndexOutcome::HeldBy`] and nothing is synced. The sync renews
-/// the lease before each delete batch ([`LeaseRenewal`]).
+/// kept. Otherwise the press goes through [`take_or_request_pass`] under the runtime's press token
+/// (`press_owner`, never the job's, MOD-159 M3 plan D7), so the job, beating meanwhile, finds the
+/// lease held instead of sharing it: a lease free or already the presses' is synced under and let
+/// go of after the sync (a press aborted half-way, superseded or quit, leaves it to the next press,
+/// which takes it back as its own, or to the TUI's exit, which lets it go); a live holder is asked
+/// for a pass ([`IndexOutcome::Requested`]); one that could not be asked is
+/// [`IndexOutcome::HeldBy`]. Neither syncs anything. The sync renews the lease before each delete
+/// batch ([`LeaseRenewal`]).
 async fn index_under_lease(
     index: &dyn ConceptIndex,
     backend: Backend,
     scope: Scope,
     job_owner: Uuid,
+    press_owner: Uuid,
 ) -> Result<IndexOutcome, String> {
     let collection = IndexedCollection::Workspace(scope.workspace_id);
     let Some(box_id) = this_box(&backend).await else {
@@ -1435,15 +1445,14 @@ async fn index_under_lease(
     let owner = if the_jobs {
         job_owner
     } else {
-        let press = Uuid::now_v7();
-        match backend
-            .take_indexer_lease(&collection, box_id, press, ttl)
+        match take_or_request_pass(&backend, &collection, box_id, press_owner, ttl)
             .await
             .map_err(|e| e.to_string())?
         {
-            LeaseTake::Held(lease) => return Ok(IndexOutcome::HeldBy(lease)),
-            // A fresh token is never `Ours`; both mean the press holds it now.
-            LeaseTake::Taken | LeaseTake::Ours => press,
+            LeaseTurn::Requested(lease) => return Ok(IndexOutcome::Requested(lease)),
+            LeaseTurn::Held(lease) => return Ok(IndexOutcome::HeldBy(lease)),
+            // Free, or a superseded press's left under the same token: the press holds it now.
+            LeaseTurn::Ours => press_owner,
         }
     };
     let guard = LeaseRenewal {
@@ -1486,8 +1495,15 @@ pub struct ConceptsRuntime {
     /// What [`Self::publish`] last handed the index (MOD-158 R1, B-L2).
     published: Published,
     /// This process's indexer-lease token (MOD-159 M1 plan D5), its index job's: `Ctrl+R` renews
-    /// a lease the job holds under it, and takes a free one under a token of its own (R2).
+    /// a lease the job holds under it, and takes a free one under [`Self::press_owner`] (R2).
     owner: Uuid,
+    /// Every `Ctrl+R` press's indexer-lease token (MOD-159 M3 plan D7), one per runtime and never
+    /// [`Self::owner`]: a press superseded half-way leaves its lease under it, so the next press
+    /// takes it back as its own, and [`Self::stop_index_job`] lets go of what it still holds.
+    press_owner: Uuid,
+    /// The tasks [`Self::shutdown`] aborted, awaited by [`Self::stop_index_job`] before it lets go
+    /// of the presses' leases, so none is taken again after the release.
+    aborted: Vec<JoinHandle<()>>,
     /// The TUI's index job ([`Self::with_index_job`]), `None` when this runtime runs none.
     job: Option<JobSlot>,
 }
@@ -1568,6 +1584,8 @@ impl ConceptsRuntime {
             tasks: HashMap::new(),
             published: Published::Never,
             owner: Uuid::now_v7(),
+            press_owner: Uuid::now_v7(),
+            aborted: Vec::new(),
             job: None,
         }
     }
@@ -1601,6 +1619,13 @@ impl ConceptsRuntime {
     #[must_use]
     pub const fn owner(&self) -> Uuid {
         self.owner
+    }
+
+    /// The indexer-lease token every `Ctrl+R` press takes a lease with when the index job does not
+    /// hold it (MOD-159 M3 plan D7).
+    #[must_use]
+    pub const fn press_owner(&self) -> Uuid {
+        self.press_owner
     }
 
     /// Over [`shared_index`]: what `store_worker::spawn_with_runtimes` builds (D231).
@@ -1660,19 +1685,51 @@ impl ConceptsRuntime {
         }
     }
 
-    /// MOD-159 M1 plan D8: stops the TUI's index job, if one runs, and lets go of its leases
-    /// (waited for at most [`TUI_RELEASE_WAIT`]), then waits as long again at most for an earlier
-    /// job's stop still in flight. The store loop calls it once, when the UI is gone.
-    pub async fn stop_index_job(&mut self) {
-        let Some(job) = self.job.as_mut() else {
-            return;
+    /// MOD-159 M1 plan D8, M3 plan D7: at the TUI's exit, side by side, lets go of the `Ctrl+R`
+    /// presses' leases over `backend` (after the tasks [`Self::shutdown`] aborted are gone or half
+    /// of [`TUI_RELEASE_WAIT`] has passed, all within it; a failure, a timeout or an offline
+    /// backend leaves them to lapse) and stops the TUI's index job, if one runs, letting go of its
+    /// leases (waited for at most [`TUI_RELEASE_WAIT`]), then waits as long again at most for an earlier job's stop
+    /// still in flight. The two tokens differ, so the two legs touch different rows. The store
+    /// loop calls it once, when the UI is gone, after [`Self::shutdown`].
+    pub async fn stop_index_job(&mut self, backend: &Backend) {
+        let (aborted, press_owner) = (std::mem::take(&mut self.aborted), self.press_owner);
+        let presses = async move {
+            // MOD-159 M3 R1: the aborted tasks have half the wait, so one that does not end still
+            // leaves the release the rest; the leg as a whole stays within the wait.
+            let deadline = tokio::time::Instant::now() + TUI_RELEASE_WAIT;
+            let gone = async {
+                for task in aborted {
+                    let _ = task.await;
+                }
+            };
+            if tokio::time::timeout(TUI_RELEASE_WAIT / 2, gone)
+                .await
+                .is_err()
+            {
+                tracing::debug!("an aborted concepts task did not end in time");
+            }
+            let release = backend.release_indexer_leases(press_owner);
+            match tokio::time::timeout_at(deadline, release).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::debug!(%err, "the Ctrl+R leases were not let go; they lapse");
+                }
+                Err(_) => tracing::debug!("the Ctrl+R leases were not let go in time; they lapse"),
+            }
         };
-        if let Some(running) = job.running.take() {
-            running.stop(TUI_RELEASE_WAIT).await;
-        }
-        if let Some(stopping) = job.stopping.take() {
-            let _ = tokio::time::timeout(TUI_RELEASE_WAIT, stopping).await;
-        }
+        let job = async {
+            let Some(job) = self.job.as_mut() else {
+                return;
+            };
+            if let Some(running) = job.running.take() {
+                running.stop(TUI_RELEASE_WAIT).await;
+            }
+            if let Some(stopping) = job.stopping.take() {
+                let _ = tokio::time::timeout(TUI_RELEASE_WAIT, stopping).await;
+            }
+        };
+        tokio::join!(presses, job);
     }
 
     /// MOD-160 D5: the loop wrote or cleared the `qdrant_url` row (or tried): the index reads its
@@ -1768,9 +1825,24 @@ impl ConceptsRuntime {
                         ConceptsReply::Indexed(Ok(IndexOutcome::Synced(SyncReport::default()))),
                     )));
                 }
-                let (backend, scope, scope_row_of, owner) =
-                    (backend.clone(), scope.clone(), *scope_row_of, self.owner);
+                let (backend, scope, scope_row_of, owner, press_owner) = (
+                    backend.clone(),
+                    scope.clone(),
+                    *scope_row_of,
+                    self.owner,
+                    self.press_owner,
+                );
+                // MOD-159 M3 R1: every press shares one token, so the press this one supersedes
+                // must be gone before this one takes: its release, still in flight, would let go
+                // of the lease this press has just taken. Aborted before the spawn, awaited first.
+                let superseded = self.tasks.remove(&key);
+                if let Some(superseded) = &superseded {
+                    superseded.abort();
+                }
                 tokio::spawn(async move {
+                    if let Some(superseded) = superseded {
+                        let _ = superseded.await;
+                    }
                     // MOD-147 M4 D8: the scope row joins off the loop, as a search's does.
                     let scope = match scope_row_of {
                         Some(workspace_id) => {
@@ -1782,7 +1854,8 @@ impl ConceptsRuntime {
                         }
                         None => scope,
                     };
-                    let outcome = index_under_lease(&*index, backend, scope, owner).await;
+                    let outcome =
+                        index_under_lease(&*index, backend, scope, owner, press_owner).await;
                     let _ = replies.send(ReplyEnvelope {
                         seq,
                         origin,
@@ -1832,10 +1905,12 @@ impl ConceptsRuntime {
     }
 
     /// The UI is gone: every task is aborted. An index run stopped half-way is safe: the next run
-    /// rebuilds what it did not reach.
+    /// rebuilds what it did not reach. The aborted tasks are kept for [`Self::stop_index_job`],
+    /// which awaits them before it lets go of the presses' leases (MOD-159 M3 plan D7).
     pub fn shutdown(&mut self) {
         for task in std::mem::take(&mut self.tasks).into_values() {
             task.abort();
+            self.aborted.push(task);
         }
     }
 }
@@ -1847,6 +1922,7 @@ mod tests {
     use crate::store_worker;
     use crate::ui::overlay::OverlayId;
     use htui_core::fixtures::ids;
+    use htui_core::model::LeaseTake;
     use htui_core::model::document::GOALS_KIND;
     use htui_core::model::{DocumentId, NewOwnerDocument, OwnerDocument};
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
@@ -1946,6 +2022,7 @@ mod tests {
         match outcome(reply) {
             Ok(IndexOutcome::Synced(report)) => Ok(*report),
             Ok(IndexOutcome::HeldBy(lease)) => panic!("expected a sync, held by {lease:?}"),
+            Ok(IndexOutcome::Requested(lease)) => panic!("expected a sync, asked {lease:?}"),
             Err(message) => Err(message.clone()),
         }
     }
@@ -3955,19 +4032,16 @@ mod tests {
         assert_eq!(hits(&reply).1, &Ok(Vec::new()));
     }
 
-    /// D12: another owner holds the workspace's lease: the reply names it and nothing is synced.
+    /// D12, MOD-159 M3 D4: another owner holds the workspace's lease live: the press asks it for
+    /// a pass (its next claim finds the request), the reply names it, and nothing is synced.
     #[tokio::test]
-    async fn a_ctrl_r_while_another_owner_holds_the_lease_says_who_and_syncs_nothing() {
+    async fn a_ctrl_r_while_another_owner_holds_the_lease_asks_the_holder_and_syncs_nothing() {
         let (backend, scope) = platform().await;
         let collection = IndexedCollection::Workspace(scope.workspace_id);
         let other_box = BoxId::new();
+        let other_owner = Uuid::now_v7();
         let taken = backend
-            .take_indexer_lease(
-                &collection,
-                other_box,
-                Uuid::now_v7(),
-                TimeDelta::seconds(120),
-            )
+            .take_indexer_lease(&collection, other_box, other_owner, TimeDelta::seconds(120))
             .await
             .expect("the memory store takes it");
         assert_eq!(taken, LeaseTake::Taken);
@@ -3986,11 +4060,18 @@ mod tests {
             ),
         )
         .await;
-        let Ok(IndexOutcome::HeldBy(lease)) = outcome(&replies[0].reply) else {
-            panic!("held by the other owner: {:?}", replies[0].reply)
+        let Ok(IndexOutcome::Requested(lease)) = outcome(&replies[0].reply) else {
+            panic!("the other owner was asked: {:?}", replies[0].reply)
         };
         assert_eq!(lease.box_id, Some(other_box));
         assert!(lease.live);
+        assert!(
+            backend
+                .claim_indexer_pass(&collection, other_owner)
+                .await
+                .expect("the memory store claims it"),
+            "the holder finds the request"
+        );
         assert!(
             index.store(&collection).points().is_empty(),
             "nothing was synced"
@@ -4152,6 +4233,149 @@ mod tests {
         assert!(!lease.live, "the press let it go: {lease:?}");
     }
 
+    /// MOD-159 M3 D7: a press the TUI's exit stopped half-way lets its lease go at
+    /// `stop_index_job` (no index job runs here), so another owner takes it at once rather than
+    /// after the TTL.
+    #[tokio::test(start_paused = true)]
+    async fn a_ctrl_r_quit_mid_sync_lets_its_lease_go() {
+        let (backend, scope) = platform().await;
+        let collection = IndexedCollection::Workspace(scope.workspace_id);
+        let index = Arc::new(MemIndex::new().delayed(Duration::from_secs(3600)));
+        let mut runtime = ConceptsRuntime::new(index);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime.serve(
+            &backend,
+            &tx,
+            &envelope(
+                1,
+                StoreRequest::IndexConcepts {
+                    scope,
+                    scope_row_of: None,
+                },
+            ),
+        );
+        assert!(matches!(served, ConceptsServed::Deferred), "{served:?}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let lease = backend
+            .indexer_lease(&collection)
+            .await
+            .expect("the memory store reads it")
+            .expect("the press took it");
+        assert!(lease.live, "held mid-sync: {lease:?}");
+        assert!(
+            backend
+                .renew_indexer_lease(&collection, runtime.press_owner(), TimeDelta::seconds(120))
+                .await
+                .expect("the memory store answers"),
+            "the press token holds it"
+        );
+
+        runtime.shutdown();
+        runtime.stop_index_job(&backend).await;
+        let lease = backend
+            .indexer_lease(&collection)
+            .await
+            .expect("the memory store reads it")
+            .expect("taken once");
+        assert!(!lease.live, "let go at exit: {lease:?}");
+        let other = backend
+            .take_indexer_lease(
+                &collection,
+                BoxId::new(),
+                Uuid::now_v7(),
+                TimeDelta::seconds(120),
+            )
+            .await
+            .expect("the memory store takes it");
+        assert_eq!(other, LeaseTake::Taken);
+    }
+
+    /// MOD-159 M3 R1: an aborted task that never ends costs the presses' release only its share
+    /// of the wait: their lease is still let go at the exit, within `TUI_RELEASE_WAIT`.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_aborted_task_still_leaves_the_release_its_share() {
+        let (backend, scope) = platform().await;
+        let collection = IndexedCollection::Workspace(scope.workspace_id);
+        let mut runtime = ConceptsRuntime::new(Arc::new(MemIndex::new()));
+        let taken = backend
+            .take_indexer_lease(
+                &collection,
+                BoxId::new(),
+                runtime.press_owner(),
+                TimeDelta::seconds(120),
+            )
+            .await
+            .expect("the memory store takes it");
+        assert_eq!(taken, LeaseTake::Taken);
+        runtime
+            .aborted
+            .push(tokio::spawn(std::future::pending::<()>()));
+
+        let started = tokio::time::Instant::now();
+        runtime.stop_index_job(&backend).await;
+        assert!(
+            started.elapsed() <= TUI_RELEASE_WAIT,
+            "{:?}",
+            started.elapsed()
+        );
+        let lease = backend
+            .indexer_lease(&collection)
+            .await
+            .expect("the memory store reads it")
+            .expect("taken once");
+        assert!(!lease.live, "let go despite the stuck task: {lease:?}");
+    }
+
+    /// MOD-159 M3 D7: a press superseded half-way leaves its lease under the runtime's one press
+    /// token, so the next press takes it back as its own and syncs (never asking its own box for a
+    /// pass), then lets it go.
+    #[tokio::test(start_paused = true)]
+    async fn a_ctrl_r_after_a_superseded_one_syncs_under_the_same_token() {
+        let (backend, scope) = platform().await;
+        let collection = IndexedCollection::Workspace(scope.workspace_id);
+        let index = Arc::new(MemIndex::new().delayed(Duration::from_secs(10)));
+        let mut runtime = ConceptsRuntime::new(index);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let press = |seq| {
+            envelope(
+                seq,
+                StoreRequest::IndexConcepts {
+                    scope: scope.clone(),
+                    scope_row_of: None,
+                },
+            )
+        };
+        let first = runtime.serve(&backend, &tx, &press(1));
+        assert!(matches!(first, ConceptsServed::Deferred), "{first:?}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            backend
+                .indexer_lease(&collection)
+                .await
+                .expect("the memory store reads it")
+                .is_some_and(|lease| lease.live),
+            "the first press holds it"
+        );
+        let second = runtime.serve(&backend, &tx, &press(2));
+        assert!(matches!(second, ConceptsServed::Deferred), "{second:?}");
+        assert_eq!(runtime.settle(Duration::from_secs(60)).await, 0);
+
+        let reply = rx.try_recv().expect("the second press answered");
+        assert_eq!(reply.seq, 2, "the superseded press never answers");
+        assert!(
+            matches!(outcome(&reply.reply), Ok(IndexOutcome::Synced(_))),
+            "{:?}",
+            reply.reply
+        );
+        assert!(rx.try_recv().is_err(), "one answer");
+        let lease = backend
+            .indexer_lease(&collection)
+            .await
+            .expect("the memory store reads it")
+            .expect("taken");
+        assert!(!lease.live, "the second press let it go: {lease:?}");
+    }
+
     /// MOD-159 M1 R2: one failing collection (stale, or another embedder's) is skipped and the
     /// others answer, for MCP's `Everywhere` and the TUI's named workspaces alike. A failure is
     /// the answer only when no workspace collection answered: the global one, empty on most
@@ -4254,10 +4478,11 @@ mod tests {
         let cache = htui_store::CacheStore::open(root.path(), "concepts-index-job", 1)
             .await
             .expect("open a throwaway mirror");
-        runtime.publish(&Backend::Online {
+        let backend = Backend::Online {
             pg: db.store.clone(),
             cache: cache.clone(),
-        });
+        };
+        runtime.publish(&backend);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !db
             .store
@@ -4279,7 +4504,7 @@ mod tests {
                 .expect("the lease renews"),
             "taken under the runtime's token"
         );
-        runtime.stop_index_job().await;
+        runtime.stop_index_job(&backend).await;
         let lease = db
             .store
             .indexer_lease(&first)

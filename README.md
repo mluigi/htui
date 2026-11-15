@@ -580,6 +580,9 @@ also starts.
 
    The first run downloads the embedding model (about 134 MB) into your user cache directory and
    checks it against a pinned hash.
+
+   When another htui (a TUI or `htui worker`) is already indexing a workspace, this run asks it to
+   reindex that workspace instead, and prints a line naming the box it runs on.
 3. Search:
 
    ```

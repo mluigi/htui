@@ -101,7 +101,7 @@ several workspaces names those whose search is unavailable.
 |---|---|---|---|---|
 | 1 | Lease and collections | A lease row per collection in Postgres (migration `0036`, mirrored or not as the plan decides); one collection per workspace plus a global collection replace `htui_concepts_v2` (dropped once); the worker's index job and a TUI index job run the full reconcile only under each collection's lease, for every collection; delete batches renew first and abandon on a zero-row renewal; TUI, CLI and MCP searches read the workspace's collection(s) plus the global one; `--search-items` names unavailable workspaces | complete | `.claude/plans/mod-159-m1-lease-and-collections.plan.md` |
 | 2 | Freshness | The holder runs a 60 s incremental cycle (rows written since its last pass minus the overlap window) between full reconciles; a new or edited item, requirement, item document or owner document is searchable within a cycle | complete | `.claude/plans/mod-159-m2-freshness.plan.md` |
-| 3 | Requests and holder visibility | `Ctrl+R` and `--index-items` take a free lease and index, otherwise record a pass request the holder serves on its next beat and show the holder's box; clean exit releases leases | pending | — |
+| 3 | Requests and holder visibility | `Ctrl+R` and `--index-items` take a free lease and index, otherwise record a pass request the holder serves on its next beat and show the holder's box; clean exit releases leases | complete | `.claude/plans/mod-159-m3-requests.plan.md` |
 
 ## Open Questions
 
@@ -123,4 +123,4 @@ several workspaces names those whose search is unavailable.
 | Store conformance and `fake_conformance` count pins move | High | Low | Repin `CASES` (324) with the new lease cases |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE — all three milestones landed (M1 `cd65d461..a61f879b`, M2 `b4509a9f..d9020fcf`, M3 `c9edd91a..cfa8d817`); item closed 2026-11-15 (`docs/decisions/mod/mod-159.md`).*

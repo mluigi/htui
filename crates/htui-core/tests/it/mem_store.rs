@@ -147,9 +147,9 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::INDEXER_LEASE_CASES.len(),
-        10,
-        "MOD-159 M1's eight indexer lease cases (plan D2, D3) and review R1's lapsed-`Ours` and \
-         single-release cases"
+        15,
+        "MOD-159 M1's eight indexer lease cases (plan D2, D3), review R1's lapsed-`Ours` and \
+         single-release cases, and MOD-159 M3's five pass-request cases (plan D2-D4)"
     );
     assert_eq!(
         conformance::INDEX_CHANGES_CASES.len(),

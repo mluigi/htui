@@ -108,12 +108,16 @@ workspaces is found once. `--cwd` searches its project in every workspace that h
 `--index-items` indexes a workspace's collection only when no other htui process is indexing it.
 Every TUI and `htui worker` connected to the database competes to index every collection, and the
 one holding a collection's lease indexes it (see `htui-worker.md`, "The concepts index"). For a
-workspace whose lease another box holds, `--index-items` prints
-`workspace <slug>: indexing runs on <box>; not indexed here` on standard error, where `<box>` is
-that box's hostname (or the last eight hex digits of its id when its row is gone), skips that
-workspace and goes on; the run still exits 0. It lets go of the leases it took when it ends. When
-it can take the global collection's lease it creates that collection, and drops the single shared
-collection earlier versions wrote (`htui_concepts_v2`).
+workspace whose lease another box holds, `--index-items` asks that holder for a pass, which the
+holder's index job runs as a full reconcile at its next beat (a holder with no index job, another
+`--index-items` or a `Ctrl+R` press, leaves it to the next index job to take the lease), and prints
+`workspace <slug>: indexing runs on <box>; asked it to reindex` on standard error, where `<box>` is
+that box's hostname (or the last eight hex digits of its id when its row is gone). When the lease
+changes hands so often that no request can be recorded (it tries three times), nothing is asked
+and the line is `workspace <slug>: indexing runs on <box>; not indexed here`. Either way it skips
+that workspace and goes on; the run still exits 0. It lets go of the leases it took when it ends.
+When it can take the global collection's lease it creates that collection, and drops the single
+shared collection earlier versions wrote (`htui_concepts_v2`).
 
 ## The envelope
 

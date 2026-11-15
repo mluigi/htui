@@ -1,0 +1,28 @@
+---
+source: crates/htui/src/ui/overlay/concepts_search.rs
+expression: frame
+---
+HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
+
+
+
+
+
+
+  ╭ Search concepts ─────────────────────────────────────────────────────────────────────────────╮
+  │scope all projects · decisions off                                                            │
+  │query                                                                                         │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │type a query; Enter searches                                                                  │
+  │indexing runs on hal (lease until 09:41); asked it to reindex                                 │
+  ╰ Enter search/open · ↑/↓ move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close ───╯

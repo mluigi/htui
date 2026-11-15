@@ -1,12 +1,13 @@
 //! The knowledge index's collections and the lease that names their one indexer (MOD-159 M1,
-//! plan D1, D3; `0038_indexer_lease.sql`), and what changed since a pass (MOD-159 M2, plan D2,
-//! D3).
+//! plan D1, D3; `0038_indexer_lease.sql`), what changed since a pass (MOD-159 M2, plan D2, D3),
+//! and a pass request (MOD-159 M3, plan D2, D4).
 //!
 //! Each workspace has its own Qdrant collection and there is one global one
 //! ([`IndexedCollection`]). Exactly one htui process indexes a collection: the holder of its
 //! `indexer_lease` row. [`IndexerLease`] is that row as people see it (which box holds it, until
 //! when) and never carries the holder's owner token, as `Run` keeps `lease_owner` out.
-//! [`LeaseTake`] is what a take answers.
+//! [`LeaseTake`] is what a take answers, and [`LeaseTurn`] what a take that asks a live holder
+//! for a pass answers ([`take_or_request_pass`](crate::store::take_or_request_pass)).
 //!
 //! Between full reconciles the indexer runs incremental passes: [`IndexCursor`] is where the last
 //! pass of a collection began, on the store's clock, and [`IndexChanges`] is what the store
@@ -103,6 +104,22 @@ pub enum LeaseTake {
     /// expiry moved.
     Ours,
     /// Another owner holds it live; nothing was written.
+    Held(IndexerLease),
+}
+
+/// What [`take_or_request_pass`](crate::store::take_or_request_pass) answers (MOD-159 M3 plan
+/// D4): the lease is the caller's to index under, or a live holder was asked for a pass, or no
+/// request could be recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseTurn {
+    /// The lease was free, released, lapsed or already the caller's, and is now the caller's
+    /// ([`LeaseTake::Taken`] or [`LeaseTake::Ours`]).
+    Ours,
+    /// Another owner holds it live and its row now carries a pass request; the holder as
+    /// `indexer_lease` shows it.
+    Requested(IndexerLease),
+    /// The holder the last take saw (possibly lapsed, so `live` may be `false`), and nothing was
+    /// recorded (each request found it let go, and each take found it held again).
     Held(IndexerLease),
 }
 

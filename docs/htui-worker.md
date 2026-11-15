@@ -489,6 +489,12 @@ for now).
   the next reconcile. A pass that fails is one `warn` line and is retried over the same window a
   cycle later. A process that takes a collection over, restarts, or sees the Qdrant URL change
   reconciles it in full first, then runs passes.
+- **A pass request is claimed on the next beat and runs a full reconcile at once**, whatever the
+  interval says (one `info` line). `Ctrl+R` and `htui --index-items` in another process record one
+  on a workspace collection's lease when this process holds it. The holder claims the request
+  before the reconcile reads anything, so a request made during the reconcile is served on the
+  beat after. A requested reconcile that fails has used its request up; the interval, or the next
+  request, retries it.
 - **On shutdown the worker lets go of its leases**, so another process takes its collections over
   on its next beat rather than after the lease lapses (it waits at most 5 seconds for that; the
   TUI, whose whole shutdown has 5 seconds, waits at most 1). A worker that dies without letting go
@@ -496,10 +502,16 @@ for now).
 - **The global collection's holder** creates that collection and drops `htui_concepts_v2`, the one
   shared collection earlier versions wrote, once per process (one `info` line when it was there).
 - `Ctrl+R` in the TUI's knowledge search and `htui --index-items` index a workspace only when its
-  lease is free or their own process's; otherwise they say which box indexes it. A `Ctrl+R` on a
+  lease is free or their own process's. When another process holds it, they ask that process to
+  reindex the workspace (a pass request, above) and name its box: `indexing runs on hal (lease
+  until 09:41); asked it to reindex`. Only when no request could be recorded (the holder let go and
+  the lease was taken again at every try) do they just say which box indexes it. A `Ctrl+R` on a
   free lease takes it for that one press and lets it go after; one the TUI's own index job holds
-  stays the job's. A `Ctrl+R` stopped half-way (a second press, or quitting) leaves its lease to
-  lapse within the time-to-live.
+  stays the job's. Every press of one TUI uses the same token, so a press stopped half-way by a
+  second press leaves its lease under that token: the second press waits for the first to stop,
+  then, on the same workspace, takes the lease back as its own. Another workspace's lease lapses
+  within the time-to-live, or is let go when the TUI quits. Quitting the TUI lets a press's lease
+  go (it waits at most 1 second for that, beside the index job's stop).
 - **MCP `search_concepts`** reads every workspace's collection; one that fails (a stale
   collection, or one another embedder wrote) is skipped and logged while the others answer. The
   search fails only when no workspace collection answered.

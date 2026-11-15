@@ -3980,9 +3980,9 @@ pub(crate) fn spawn_with_concepts(
             htui_orch::tools::ToolHost::close(host.as_ref());
         }
         // MOD-159 M1 R2: the `Ctrl+R` tasks are aborted first, so none syncs on while the index
-        // job lets go of its leases.
+        // job lets go of its leases; M3 D7: and the presses' leases go too, once those are gone.
         concepts.shutdown();
-        concepts.stop_index_job().await;
+        concepts.stop_index_job(&backend).await;
 
         if let Some(refresher) = refresher {
             refresher.abort();

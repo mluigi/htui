@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH asked AS (\n                UPDATE indexer_lease SET pass_requested_at = clock_timestamp()\n                 WHERE collection = $1 AND lease_owner IS NOT NULL\n                   AND lease_expires_at > clock_timestamp()\n                RETURNING collection, lease_box_id, lease_expires_at)\n            SELECT a.collection AS \"collection!\", a.lease_box_id, b.hostname AS \"box_name?\",\n                   a.lease_expires_at\n              FROM asked a LEFT JOIN box b ON b.id = a.lease_box_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "collection!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "indexer_lease",
+            "name": "collection"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "lease_box_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "indexer_lease",
+            "name": "lease_box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "box_name?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "hostname"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "indexer_lease",
+            "name": "lease_expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "7e8bd57892394132a6cc11817363ee550aff8e0a67d09696ccbdf95b0a3b808e"
+}
