@@ -13,7 +13,11 @@ use htui::app::{Action, register_all};
 use htui::store_worker::{Origin, ReplyEnvelope, StoreReply};
 use htui::testkit::Harness;
 use htui::ui::overlay::WaitingList;
+use htui::ui::tabs::WorkspacesTab;
 use htui_agent::registry::DriverFactory;
+use htui_core::fixtures::ids;
+use htui_core::model::{ItemId, NewItem};
+use htui_core::store::{MemStore, WriteStore as _};
 
 /// A `StoreState` reply addressed to the shell, as the fourth-tick refresh receives it.
 fn store_state(label: &str, migrations_pending: Option<usize>) -> Action {
@@ -360,10 +364,110 @@ async fn the_help_box_on_the_workspaces_tab() {
     harness.key("?");
     assert!(harness.app().help_visible);
     let frame = harness.render();
-    for line in ["Workspaces: o open workspace", "?/F1 closes this box"] {
-        assert!(frame.contains(line), "`{line}` is in the box: {frame}");
-    }
+    let headings = [
+        "Workspaces: o open workspace",
+        "List: ",
+        "Pane: ",
+        "Layout: ",
+        "History: ",
+        "Global: ",
+    ];
+    let rows: Vec<usize> = headings
+        .iter()
+        .map(|heading| {
+            let found: Vec<usize> = frame
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains(heading))
+                .map(|(row, _)| row)
+                .collect();
+            assert_eq!(found.len(), 1, "one `{heading}` line: {frame}");
+            found[0]
+        })
+        .collect();
+    assert!(
+        rows.windows(2).all(|pair| pair[0] < pair[1]),
+        "the tab's own verb first, then a line per layer in order: {frame}"
+    );
+    assert!(frame.contains("?/F1 closes this box"), "{frame}");
     assert!(!frame.contains("Backlog: "), "no other tab's line: {frame}");
+}
+
+/// MOD-116 M1 R1 F1 (D12): started in `run`'s order into a remembered workspace that is not the
+/// first by name, `w` lands on the open workspace's row and overview, not the first one's (the
+/// switcher's "opens on the workspace the shell is already inside").
+#[tokio::test]
+async fn w_lands_on_the_workspace_the_shell_reopened() {
+    use htui::ui::state_file::{UiState, UiStore};
+
+    let ui = UiStore::memory();
+    ui.save(&UiState {
+        last_workspace: Some(ids::WORKSPACE_PLATFORM),
+        ..UiState::default()
+    })
+    .expect("a memory save");
+    let mut harness = Harness::demo()
+        .with_ui_store(ui)
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .registered_as_run();
+    harness.drive_to_end().await;
+    assert_eq!(harness.app().top_bar.workspace, "Platform");
+    harness.key("w");
+    harness.drive_to_end().await;
+    assert_eq!(harness.app().tabs.active_id(), Some(WorkspacesTab::ID));
+    let frame = harness.render();
+    let selected = frame
+        .lines()
+        .find(|line| line.starts_with("\u{2502}\u{258c}"))
+        .unwrap_or_else(|| panic!("no row is selected: {frame}"));
+    assert!(
+        selected.contains("\u{258c}\u{25be} Platform"),
+        "{selected}\n{frame}"
+    );
+    assert!(
+        frame.contains("\u{256d}\u{2500} Platform \u{2500}"),
+        "{frame}"
+    );
+}
+
+/// MOD-116 M1 R1 F2 (D7): every activation reads the overview again: an item added while another
+/// tab was in front is counted when `w` comes back, though no run count moved.
+#[tokio::test]
+async fn w_reads_the_overview_again() {
+    let store = MemStore::demo();
+    let mut harness =
+        Harness::over(store.clone()).with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    register_all(harness.app());
+    harness.drive_to_end().await;
+    harness.key("w");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("  2 items \u{b7} 0 running"), "{frame}");
+    harness.key("2");
+    harness.drive_to_end().await;
+    assert_ne!(harness.app().tabs.active_id(), Some(WorkspacesTab::ID));
+
+    store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_VULKAN,
+            kind_id: ids::KIND_VULKAN_FEAT,
+            title: "Add a shadow-mapping chapter".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            target_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("the mint lands");
+    harness.key("w");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("  3 items \u{b7} 0 running"), "{frame}");
 }
 
 /// The hints of a 100x30 frame (MOD-67 M6 T2): MOD-115 draws them on the body's bottom border,
@@ -551,7 +655,7 @@ async fn a_ten_row_frame_drops_the_about_panel() {
 async fn requirements_shell(keys: Option<&str>) -> Harness {
     use htui::ui::tabs::RequirementsTab;
 
-    let mut harness = Harness::over(htui_core::store::MemStore::demo());
+    let mut harness = Harness::over(MemStore::demo());
     if let Some(file) = keys {
         harness = harness.with_keys(htui::keys::load_str(file).expect("the keys load"));
     }

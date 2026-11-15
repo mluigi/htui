@@ -11,16 +11,19 @@
 //! machine's home directory (`<home>/workspaces/<slug>` is the lib test's, over a temp home).
 #![cfg(feature = "testkit")]
 
+use std::sync::{Arc, Mutex};
+
 use chrono::Utc;
 use htui::app::Action;
 use htui::keys::KeyChord;
 use htui::store_worker::StoreReply;
 use htui::testkit::{Harness, SectionBench};
+use htui::ui::state_file::UiStore;
 use htui::ui::tabs::{Tab as _, WorkspacesTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    DocumentId, NewOwnerDocument, NewRepo, RepoBoxPath, RepoId, RunStatus, StopMode,
-    WorkspaceBoxPath,
+    DocumentId, NewOwnerDocument, NewProject, NewRepo, ProjectId, RepoBoxPath, RepoId, RunStatus,
+    StopMode, WorkspaceBoxPath, WorkspaceProject,
 };
 use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
 use htui_store::{Backend, CacheStore, PgStore};
@@ -63,6 +66,15 @@ fn group(frame: &str, name: &str) -> String {
         .to_owned()
 }
 
+/// The list's selected row (the cursor's `▌` in the list's first column).
+fn selected(frame: &str) -> String {
+    frame
+        .lines()
+        .find(|line| line.starts_with("\u{2502}\u{258c}"))
+        .unwrap_or_else(|| panic!("no row is selected:\n{frame}"))
+        .to_owned()
+}
+
 /// The frame's row after the one that holds `needle`.
 fn row_after(frame: &str, needle: &str) -> String {
     let mut lines = frame.lines().skip_while(|line| !line.contains(needle));
@@ -94,7 +106,7 @@ async fn demo() -> MemStore {
 }
 
 /// A `goals` document on `owner` with `body`.
-async fn write_goals(store: &MemStore, owner: htui_core::model::ProjectId, body: &str) {
+async fn write_goals(store: &MemStore, owner: ProjectId, body: &str) {
     store
         .write_owner_document(NewOwnerDocument {
             id: DocumentId::new(),
@@ -484,4 +496,211 @@ async fn a_scope_row_target_reads_as_set() {
         row_with(&frame, "default target").contains("default target      this box"),
         "{frame}"
     );
+}
+
+/// MOD-116 M1 R1 F3 (D7): a refused overview is not held: the next refresh asks again though no
+/// count moved, and the answer replaces the refusal; neither reaches the status line.
+#[tokio::test]
+async fn a_refused_overview_is_asked_again_on_the_next_refresh() {
+    let mut harness = open_over(demo().await, 100, 30).await;
+    // `o` on the open workspace enters it again, and the activation reads the overview again.
+    harness.key("o");
+    harness.settle_refusing("workspace_overview", "gone").await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("the overview needs the database: gone"),
+        "{frame}"
+    );
+    refresh(&mut harness).await;
+    let frame = harness.render();
+    assert!(!frame.contains("needs the database"), "{frame}");
+    assert!(
+        frame.contains("folder on this box  /srv/graphics"),
+        "{frame}"
+    );
+    assert_eq!(harness.app().status, None);
+}
+
+/// MOD-116 M1 R1 F2 (D7): a project added after the overview was read shows the reading state,
+/// not a blank pane, once the list holds it and until the overview read again lands; then its
+/// own overview.
+#[tokio::test]
+async fn a_project_added_after_the_read_reads_then_shows_its_overview() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    let shaders = store
+        .create_project(NewProject {
+            id: ProjectId::new(),
+            slug: "shaders".to_owned(),
+            name: "Shaders".to_owned(),
+            description: "Shader experiments".to_owned(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("a project is created");
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            project_id: shaders.id,
+            position: 10,
+        })
+        .await
+        .expect("it joins Graphics");
+    // `o` on the open workspace reads the list again, then the overview: the list lands alone.
+    harness.key("o");
+    assert!(harness.serve_next().await, "the list is served");
+    // Graphics, overview, Vulkan Tutorials, Shaders.
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    let frame = harness.render();
+    assert!(selected(&frame).contains("Shaders"), "{frame}");
+    assert!(frame.contains("reading the overview"), "{frame}");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("Shader experiments"), "{frame}");
+    assert!(!frame.contains("reading the overview"), "{frame}");
+}
+
+/// MOD-116 M1 R1 F4 (MOD-115 M2 D1, D12): a `ui-state.toml` that failed to load is left as it is
+/// by the startup scope, which is no change of the user's; an `o` onto another workspace saves.
+#[tokio::test]
+async fn startup_leaves_a_ui_state_that_failed_to_load_alone_and_o_saves() {
+    let broken = "version = \"two\"\n";
+    let text = Arc::new(Mutex::new(Some(broken.to_owned())));
+    let ui = UiStore::Memory(Arc::clone(&text));
+    assert!(ui.load().notice.is_some(), "the file does not load");
+    let mut harness = Harness::over(demo().await)
+        .size(100, 30)
+        .with_ui_store(ui)
+        .with_tab(Box::new(WorkspacesTab::new()));
+    harness.settle().await;
+    assert_eq!(harness.app().top_bar.workspace, "Graphics");
+    assert_eq!(
+        text.lock().expect("the lock").as_deref(),
+        Some(broken),
+        "the startup scope saved nothing"
+    );
+    // Graphics, overview, Vulkan Tutorials, Platform.
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("o");
+    harness.settle().await;
+    let saved = text
+        .lock()
+        .expect("the lock")
+        .clone()
+        .expect("the file is there");
+    assert!(
+        saved.contains(&format!("last = \"{}\"", ids::WORKSPACE_PLATFORM)),
+        "{saved}"
+    );
+}
+
+/// MOD-116 M1 R1 F6 (D8 over D5): offline, the counts held are the last ones read, not current:
+/// the other workspaces read no state, the open one reads `● open`, and the header draws no
+/// background chip; back online both return.
+#[tokio::test]
+async fn offline_the_last_counts_are_not_shown_as_current() {
+    let mut harness = open_over(demo().await, 160, 30).await;
+    let background = "+1 in background \u{25d0} 1";
+    let frame = harness.render();
+    assert!(
+        group(&frame, "Platform").contains("\u{25d0} background \u{b7} 1 running"),
+        "{frame}"
+    );
+    assert!(
+        frame
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains(background),
+        "{frame}"
+    );
+
+    harness.app().top_bar.store = "offline \u{b7} 0s".to_owned();
+    let frame = harness.render();
+    let platform = group(&frame, "Platform");
+    assert!(
+        !platform.contains('\u{25d0}') && !platform.contains("running"),
+        "{frame}"
+    );
+    assert!(
+        group(&frame, "Graphics").contains("Graphics  \u{25cf} open"),
+        "{frame}"
+    );
+    assert!(
+        !frame
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains("background"),
+        "{frame}"
+    );
+
+    harness.app().top_bar.store = "memory".to_owned();
+    let frame = harness.render();
+    assert!(
+        group(&frame, "Platform").contains("\u{25d0} background \u{b7} 1 running"),
+        "{frame}"
+    );
+    assert!(
+        frame
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains(background),
+        "{frame}"
+    );
+}
+
+/// MOD-116 M1 R1 F7: the cursor stops at both ends (`k` on the first row, `j` past the last),
+/// and `ctrl-j`, which no list motion binds, does not move it.
+#[tokio::test]
+async fn the_cursor_stops_at_both_ends_and_ctrl_j_does_not_move_it() {
+    let mut harness = open_over(demo().await, 100, 30).await;
+    harness.key("k");
+    harness.settle().await;
+    assert!(
+        selected(&harness.render()).contains("\u{25be} Graphics"),
+        "k on the first row stays"
+    );
+    // Seven rows: Graphics, overview, Vulkan Tutorials, Platform, overview, htui, agy.
+    for _ in 0..10 {
+        harness.key("j");
+    }
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(selected(&frame).contains("agy"), "{frame}");
+    harness.key("k");
+    harness.key("ctrl-j");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        selected(&frame).contains("htui"),
+        "ctrl-j moved nothing: {frame}"
+    );
+}
+
+/// MOD-116 M1 R1 F7 (D8): `list.fold` on a child row folds its group (`▸`, its rows hidden) and
+/// takes the cursor up to the group's row.
+#[tokio::test]
+async fn folding_from_a_child_row_hides_the_group_s_rows() {
+    let mut harness = open_over(demo().await, 100, 30).await;
+    // Graphics, overview, Vulkan Tutorials.
+    harness.key("j");
+    harness.key("j");
+    harness.key("enter");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        selected(&frame).contains("\u{25b8} Graphics"),
+        "the cursor is on the folded group: {frame}"
+    );
+    assert!(
+        row_after(&frame, "\u{25b8} Graphics").contains("\u{25be} Platform"),
+        "its rows are hidden: {frame}"
+    );
+    insta::assert_snapshot!("folded_100", frame);
 }

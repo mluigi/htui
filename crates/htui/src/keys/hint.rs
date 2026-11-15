@@ -747,6 +747,22 @@ mod tests {
                  · ?/F1 help · F9 about · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
             ]
         );
+        // MOD-116 M1 R1 F7: the Workspaces tab's box, its own verb first, as the switcher's was.
+        assert_eq!(
+            texts(keys.help_lines(views::WORKSPACES_BROWSE, all)),
+            [
+                "Workspaces: o open workspace",
+                "List: j/Down down · k/Up up · g/Home top · G/End bottom · Enter fold",
+                "Pane: J scroll down · K scroll up · PgDn page down · PgUp page up",
+                "Layout: p next layout · P previous layout · > wider list · < narrower list \
+                 · }/Ctrl+Down larger activity · {/Ctrl+Up smaller activity · F2/Alt+1 \
+                 show/hide list · F3/Alt+2 show/hide activity · z zoom",
+                HISTORY_LINE,
+                "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab \
+                 · ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue \
+                 · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
+            ]
+        );
         assert_eq!(
             texts(keys.help_lines(views::MIGRATION, all)),
             [

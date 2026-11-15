@@ -86,6 +86,8 @@ pub struct Harness {
     /// The `HTUI_QDRANT_*` overrides the Settings > Qdrant requests are served under: none unless
     /// a test hands some in (blueprint P-13), never this process's.
     qdrant_env: QdrantEnv,
+    /// While [`Harness::settle_refusing`] runs: the request name it refuses and the message.
+    refusing: Option<(&'static str, String)>,
 }
 
 impl core::fmt::Debug for Harness {
@@ -155,6 +157,7 @@ impl Harness {
             term: terminal(width, height),
             pending: VecDeque::new(),
             qdrant_env: QdrantEnv::default(),
+            refusing: None,
         }
     }
 
@@ -606,29 +609,7 @@ impl Harness {
     pub async fn settle(&mut self) {
         for _ in 0..SETTLE_ROUNDS {
             let mut served = false;
-            while let Ok(envelope) = self.rx.try_recv() {
-                let reply = match (&envelope.request, &self.store_state) {
-                    (StoreRequest::StoreState, Some((label, migrations_pending))) => {
-                        StoreReply::StoreState {
-                            label: label.clone(),
-                            migrations_pending: *migrations_pending,
-                            below_target: None,
-                        }
-                    }
-                    (request, _) => {
-                        store_worker::serve_with_qdrant_env(
-                            &self.backend,
-                            request,
-                            &self.qdrant_env,
-                        )
-                        .await
-                    }
-                };
-                self.app.update(Action::Reply(ReplyEnvelope {
-                    seq: envelope.seq,
-                    origin: envelope.origin,
-                    reply,
-                }));
+            while self.serve_next().await {
                 served = true;
             }
             if served {
@@ -640,6 +621,62 @@ impl Harness {
             }
         }
         panic!("the shell never settled: a view is issuing a request for every reply");
+    }
+
+    /// Serves the oldest queued request alone and hands the shell its reply, as
+    /// [`settle`](Self::settle) does for each: how a case draws the frame between two replies
+    /// (MOD-116 M1 R1: a list that has landed before the overview it asked for). `false` when
+    /// nothing is queued.
+    pub async fn serve_next(&mut self) -> bool {
+        let Ok(envelope) = self.rx.try_recv() else {
+            return false;
+        };
+        let reply = match (&envelope.request, &self.store_state, &self.refusing) {
+            (request, _, Some((name, message))) if request.name() == *name => StoreReply::Failed {
+                request: name,
+                message: message.clone(),
+            },
+            (StoreRequest::StoreState, Some((label, migrations_pending)), _) => {
+                StoreReply::StoreState {
+                    label: label.clone(),
+                    migrations_pending: *migrations_pending,
+                    below_target: None,
+                }
+            }
+            (request, ..) => {
+                store_worker::serve_with_qdrant_env(&self.backend, request, &self.qdrant_env).await
+            }
+        };
+        self.app.update(Action::Reply(ReplyEnvelope {
+            seq: envelope.seq,
+            origin: envelope.origin,
+            reply,
+        }));
+        true
+    }
+
+    /// [`settle`](Self::settle), with every request named `request` ([`StoreRequest::name`])
+    /// refused with `message`, as a store that cannot answer it refuses it (MOD-116 M1 R1: an
+    /// overview refused once, then answered).
+    pub async fn settle_refusing(&mut self, request: &'static str, message: &str) {
+        self.refusing = Some((request, message.to_owned()));
+        self.settle().await;
+        self.refusing = None;
+    }
+
+    /// Registers every view in `run`'s order (MOD-116 M1 R1): [`register_all`] first, then
+    /// [`App::start`], so the tabs' first requests are queued before the shell's, as they are in
+    /// the binary. The constructor's own `start` requests are withdrawn unserved and asked again,
+    /// so call it before anything else queues a request (after `with_ui_store`, before
+    /// `with_tab`).
+    ///
+    /// [`register_all`]: crate::app::register_all
+    #[must_use]
+    pub fn registered_as_run(mut self) -> Self {
+        while self.rx.try_recv().is_ok() {}
+        crate::app::register_all(&mut self.app);
+        self.app.start();
+        self
     }
 
     /// Feeds one key, written the way [`KeyChord::parse`] reads it: `"j"`, `"Enter"`,
@@ -935,10 +972,10 @@ mod tests {
 
     /// MOD-116 M1 D9: opening another workspace while a run of this one walks neither stops nor
     /// restarts the walk (the executor is the process's, not the scope's), and the header counts
-    /// the workspace left behind while it has a `running` run: Platform's `RUN_4`, not the walk
-    /// that rested at its approval.
+    /// Platform, left behind, by the demo's own `running` run, `RUN_4`: the walk rests at its
+    /// approval before the counts are read, so it is not the run counted (R1 F9).
     #[tokio::test]
-    async fn opening_another_workspace_leaves_its_runs_walking_and_counts_them() {
+    async fn opening_another_workspace_leaves_its_runs_walking_and_the_header_counts_platform() {
         use crate::run_worker::OrchRequest;
         use crate::run_worker::tests::{Fixture, only_run};
         use htui_core::fixtures::ids;
