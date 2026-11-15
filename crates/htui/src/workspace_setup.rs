@@ -3,9 +3,10 @@
 //! writer as this user, with identity and every path resolved here and never on the render side.
 //!
 //! - D4 [`StoreRequest::NewWorkspace`]: the folder is prepared first (made when missing, used as
-//!   it is when present, refused when it is a file or a git repository: `R-ID-4`, htui writes the
-//!   workspace's files into it and never into a repository), then the workspace row, then a
-//!   `workspace_box_path` row only when the folder is not the slug's default.
+//!   it is when present, refused when it is a file, names `..`, or is or lies inside a git
+//!   repository: `R-ID-4`, htui writes the workspace's files into it and never into a repository),
+//!   then the workspace row, then a `workspace_box_path` row only when the folder is not the
+//!   slug's default; a folder row that cannot be written takes the workspace back (R1a A7).
 //! - D5 [`StoreRequest::EditWorkspace`]: the folder prepared the same way and **never moved**,
 //!   then `update_workspace` under compare-and-set; the folder row follows an applied edit.
 //! - D6 [`StoreRequest::NewProject`]: an existing checkout registered where it is, a git URL
@@ -40,7 +41,7 @@ use htui_core::store::{
 };
 use htui_orch::infer::{redact_remote, redact_urls};
 use htui_orch::isolate::IsolateError;
-use htui_orch::isolate::git::{Cli, repo_facts};
+use htui_orch::isolate::git::{Cli, enclosing_repository, repo_facts};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::hierarchy::{self, MirrorAfterDelete};
@@ -198,6 +199,29 @@ struct Setup<'a> {
     home: Option<&'a Path>,
 }
 
+/// MOD-116 M3 R1a A7/A9: the failures a test injects into one request, scoped to its task by
+/// [`FAULTS`]: a folder row the store does not write, a destination that is not removed.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+struct Faults {
+    /// `upsert_workspace_box_path` answers a `Backend` error and writes nothing.
+    folder_row: bool,
+    /// [`remove_tree`] removes nothing and answers that it could not.
+    remove: bool,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// The [`Faults`] of the request served inside the scope; none outside one.
+    static FAULTS: Faults;
+}
+
+/// Whether the request being served has the fault `pick` names (never outside a test).
+#[cfg(test)]
+fn faulted(pick: impl FnOnce(&Faults) -> bool) -> bool {
+    FAULTS.try_with(|faults| pick(faults)).unwrap_or(false)
+}
+
 /// A checkout ready to register (D6): where it is and what its primary repo row says.
 struct Checkout {
     /// The canonical path stored as this box's `repo_box_path`.
@@ -219,6 +243,97 @@ impl Setup<'_> {
             request: self.request.name(),
             reason: reason.into(),
         }
+    }
+
+    /// This box's folder row of a workspace, written (the one store write a test can fail).
+    async fn write_folder_row(&self, row: &WorkspaceBoxPath) -> Result<()> {
+        #[cfg(test)]
+        if faulted(|faults| faults.folder_row) {
+            return Err(StoreError::Backend(
+                "the folder row could not be written (an injected fault)".to_owned(),
+            ));
+        }
+        self.writer.upsert_workspace_box_path(row).await
+    }
+
+    /// A7: takes back a workspace whose folder row could not be written after its row was: the
+    /// row is deleted (the mirror rebuilt, as `DeleteWorkspace` does) and the folder this request
+    /// made removed. `err` is the failure; what could not be taken back is added to it.
+    async fn take_back_workspace(
+        &self,
+        workspace: &Workspace,
+        err: StoreError,
+        made: bool,
+        canonical: &Path,
+    ) -> StoreError {
+        let mut tail = String::new();
+        match self.writer.delete_workspace(workspace.id).await {
+            Ok(_) => {
+                if let MirrorAfterDelete::Failed(mirror) =
+                    hierarchy::rebuild_mirror(self.backend).await
+                {
+                    tracing::warn!(id = %workspace.id, %mirror, "new_workspace: the mirror was not rebuilt");
+                }
+            }
+            Err(delete) => {
+                tracing::warn!(id = %workspace.id, %delete, "new_workspace: the workspace stays");
+                tail = format!(
+                    " and workspace `{}` stays without its folder row",
+                    workspace.slug
+                );
+            }
+        }
+        let tail = undo_folder(tail, made, canonical).await;
+        amended(err, &tail)
+    }
+
+    /// A7 (D5: the folder never moves): an applied edit whose folder row could not be written.
+    /// With no row before it and a new slug, the workspace would now resolve to the new slug's
+    /// default, so the edit is undone under compare-and-set; when that is not applied (or there is
+    /// no home to name a default) the failure says where the workspace's folder is.
+    async fn edit_without_folder_row(
+        &self,
+        before: &Workspace,
+        applied: &Workspace,
+        has_row: bool,
+        err: StoreError,
+    ) -> StoreError {
+        if has_row || applied.slug == before.slug {
+            return err;
+        }
+        let undo = WorkspacePatch {
+            slug: Some(before.slug.clone()),
+            name: Some(before.name.clone()),
+            description: Some(before.description.clone()),
+        };
+        let undone = self
+            .writer
+            .update_workspace(applied.id, applied.updated_at, undo)
+            .await;
+        if matches!(undone, Ok(CasOutcome::Applied(_))) {
+            return amended(
+                err,
+                " (the folder row could not be written, so the edit was undone)",
+            );
+        }
+        let shown = |slug: &str| {
+            self.home
+                .and_then(|home| workspace_folder(slug, None, home))
+                .map_or_else(
+                    || "its default folder".to_owned(),
+                    |path| format!("`{}`", path.display()),
+                )
+        };
+        amended(
+            err,
+            &format!(
+                " (the folder row could not be written and the edit could not be undone: `{}` now \
+                 resolves to {}; its folder is {})",
+                applied.slug,
+                shown(&applied.slug),
+                shown(&before.slug)
+            ),
+        )
     }
 
     /// This box's id, when the store has a row for it.
@@ -287,14 +402,19 @@ impl Setup<'_> {
             }
         };
         if let Some(box_id) = row_box {
-            self.writer
-                .upsert_workspace_box_path(&WorkspaceBoxPath {
+            let written = self
+                .write_folder_row(&WorkspaceBoxPath {
                     workspace_id: workspace.id,
                     box_id,
                     folder_path: stored.clone(),
                     updated_at: Utc::now(),
                 })
-                .await?;
+                .await;
+            if let Err(err) = written {
+                return Err(self
+                    .take_back_workspace(&workspace, err, made, &canonical)
+                    .await);
+            }
         }
         Ok(StoreReply::WorkspaceCreated {
             workspace: self.summary(workspace.id, this_box).await?,
@@ -359,21 +479,36 @@ impl Setup<'_> {
                 .unwrap_or_default();
             return Ok(self.refused(undo_folder(reason, made, &canonical).await));
         }
-        let outcome = match self
+        let updated = match self
             .writer
             .update_workspace(id, expected, patch.clone())
-            .await?
+            .await
         {
+            Ok(updated) => updated,
+            Err(err) => {
+                // A7: a refused write takes the folder it made with it.
+                let tail = undo_folder(String::new(), made, &canonical).await;
+                return Err(amended(err, &tail));
+            }
+        };
+        let outcome = match updated {
             CasOutcome::Applied(workspace) => {
                 if has_row || !self.is_default(&workspace.slug, &canonical).await? {
-                    self.writer
-                        .upsert_workspace_box_path(&WorkspaceBoxPath {
+                    let written = self
+                        .write_folder_row(&WorkspaceBoxPath {
                             workspace_id: id,
                             box_id: hierarchy::box_id(this_box)?,
                             folder_path: stored.clone(),
                             updated_at: Utc::now(),
                         })
-                        .await?;
+                        .await;
+                    if let Err(err) = written {
+                        let err = self
+                            .edit_without_folder_row(&current, &workspace, has_row, err)
+                            .await;
+                        let tail = undo_folder(String::new(), made, &canonical).await;
+                        return Err(amended(err, &tail));
+                    }
                 }
                 EditOutcome::Applied {
                     workspace: self.summary(id, this_box).await?,
@@ -453,10 +588,11 @@ impl Setup<'_> {
             }),
             Err(err) => {
                 self.unregister(id).await;
-                if let Some(dest) = &checkout.made {
-                    let _ = remove_tree(dest.clone()).await;
-                }
-                Err(err)
+                let left = match &checkout.made {
+                    Some(dest) => remove_tree(dest.clone()).await.err().unwrap_or_default(),
+                    None => String::new(),
+                };
+                Err(amended(err, &left))
             }
         }
     }
@@ -600,36 +736,100 @@ async fn prepare(folder: &str) -> Result<std::result::Result<(PathBuf, bool), St
 }
 
 /// D4 step 2, sync (called under `spawn_blocking`): the canonical folder and whether it was made
-/// now. Absolute, else refused; a missing path is created with its parents; an existing
-/// directory is used as it is and nothing in it is touched; a non-directory is refused; a
-/// directory that opens as a git repository is refused (`R-ID-4`). Every sentence names the path
-/// as typed.
+/// now. Absolute, else refused; a `..` component is refused (R1a A2: `new/../empty` would make
+/// nothing yet resolve to an existing folder); a folder that is, or lies inside, a git repository
+/// is refused before anything is made (`R-ID-4`, R1a A3: htui writes the workspace's files into
+/// it, never into a repository); then the leaf is made with its parents, and `made` is true only
+/// when this call's `mkdir` of the leaf made it (R1a A2: an existing directory is used as it is
+/// and nothing in it is touched); a non-directory is refused. Every sentence names the path as
+/// typed.
 fn prepare_folder(path: &Path) -> std::result::Result<(PathBuf, bool), String> {
     if !path.is_absolute() {
         return Err(RootRefusal::Relative(path.to_path_buf()).to_string());
     }
-    let made = match std::fs::symlink_metadata(path) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(path)
+    if path
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "`{}` names a parent folder (`..`); type the folder itself",
+            path.display()
+        ));
+    }
+    if let Some(reason) = repository_refusal(&format!("`{}`", path.display()), path) {
+        return Err(reason);
+    }
+    let made = match path.parent() {
+        Some(parent) => {
+            std::fs::create_dir_all(parent)
                 .map_err(|err| format!("`{}` could not be created: {err}", path.display()))?;
-            true
+            match std::fs::create_dir(path) {
+                Ok(()) => true,
+                // A file, a link or a folder: `canonical_root` names what it is.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(err) => {
+                    return Err(format!("`{}` could not be created: {err}", path.display()));
+                }
+            }
         }
-        // Anything else (a file, a link, an unreadable parent) is `canonical_root`'s to name.
-        _ => false,
+        None => false,
     };
     let canonical = canonical_root(path).map_err(|refusal| refusal.to_string())?;
-    match repo_facts(&canonical) {
-        Ok(None) => Ok((canonical, made)),
-        Ok(Some(_)) => Err(format!(
-            "`{}` is a git repository; htui writes the workspace's files into this folder, and \
-             never into a repository (R-ID-4)",
-            path.display()
-        )),
-        Err(err) => Err(format!(
-            "`{}` could not be read: {}",
-            path.display(),
-            isolate_reason(err)
-        )),
+    Ok((canonical, made))
+}
+
+/// R1a A3 (`R-ID-4`): the refusal of `path` (shown as `what`) when it is a git repository or lies
+/// inside one, a bare repository or a `.git` included; `None` when it does not. `path` need not
+/// exist: its nearest existing ancestor is resolved (links and all) and asked, so nothing has to
+/// be made inside a repository to find out.
+fn repository_refusal(what: &str, path: &Path) -> Option<String> {
+    let (existing, itself) = path
+        .ancestors()
+        .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
+        .map(|ancestor| (ancestor, ancestor == path))?;
+    let Ok(resolved) = std::fs::canonicalize(existing) else {
+        // An existing path that does not resolve is `canonical_root`'s to name.
+        return None;
+    };
+    let unreadable =
+        |err: IsolateError| format!("{what} could not be read: {}", isolate_reason(err));
+    let sentence = |shape: String| {
+        format!(
+            "{what} {shape}; htui writes the workspace's files into this folder, and never into a \
+             repository (R-ID-4)"
+        )
+    };
+    match repo_facts(&resolved) {
+        Ok(Some(_)) if itself => return Some(sentence("is a git repository".to_owned())),
+        Ok(Some(_)) => {
+            return Some(sentence(format!(
+                "is inside the git repository `{}`",
+                resolved.display()
+            )));
+        }
+        Ok(None) => {}
+        Err(err) => return Some(unreadable(err)),
+    }
+    match enclosing_repository(&resolved) {
+        Ok(Some(repo)) => Some(sentence(format!(
+            "is inside the git repository `{}`",
+            repo.display()
+        ))),
+        Ok(None) => None,
+        Err(err) => Some(unreadable(err)),
+    }
+}
+
+/// `err` with `tail` added to its words, its kind kept (an `Unreachable` still drops the backend).
+fn amended(err: StoreError, tail: &str) -> StoreError {
+    if tail.is_empty() {
+        return err;
+    }
+    match err {
+        StoreError::Constraint(message) => StoreError::Constraint(format!("{message}{tail}")),
+        StoreError::Unreachable(message) => StoreError::Unreachable(format!("{message}{tail}")),
+        StoreError::Backend(message) => StoreError::Backend(format!("{message}{tail}")),
+        other => StoreError::Backend(format!("{other}{tail}")),
     }
 }
 
@@ -673,6 +873,10 @@ async fn undo_folder(reason: String, made: bool, folder: &Path) -> String {
 /// the sentence suffix when it could not be.
 async fn remove_tree(dest: PathBuf) -> std::result::Result<(), String> {
     let shown = dest.display().to_string();
+    #[cfg(test)]
+    if faulted(|faults| faults.remove) {
+        return Err(format!(" and `{shown}` could not be removed"));
+    }
     let removed = off_task(move || match std::fs::remove_dir_all(&dest) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.to_string()),
         _ => Ok(()),
@@ -713,19 +917,16 @@ async fn existing(typed: &str) -> Result<std::result::Result<Checkout, String>> 
                 ));
             }
         };
-        if facts.bare {
+        // `gix::open` also opens a repository's `.git` directory, and a linked worktree's or a
+        // submodule's git directory inside it: what is registered is the work tree the
+        // repository names (R1a A8), never the typed path.
+        let Some(workdir) = facts.workdir else {
             return Err(format!(
                 "`{typed}` is a bare repository; register a checkout, not a bare repository"
             ));
-        }
-        // `gix::open` also opens a repository's `.git` directory: what is registered is the work
-        // tree it belongs to, never the typed path.
-        let work = match canonical.file_name() {
-            Some(name) if name == ".git" => canonical
-                .parent()
-                .map_or_else(|| canonical.clone(), Path::to_path_buf),
-            _ => canonical,
         };
+        let work =
+            canonical_root(&canonical.join(workdir)).map_err(|refusal| refusal.to_string())?;
         let name = work
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -745,6 +946,8 @@ async fn existing(typed: &str) -> Result<std::result::Result<Checkout, String>> 
 const MAIN: &str = "main";
 
 /// D6: `<root>/projects/<slug>`, which must not exist yet; `words` end the refusal when it does.
+/// R1a A3 (`R-ID-4`): a workspace folder that is, or lies inside, a git repository is refused
+/// first, before `projects/` is made in it. A check only: [`claim`] is what takes the folder.
 async fn destination(
     root: &Path,
     slug: &str,
@@ -753,11 +956,40 @@ async fn destination(
     let Some(dest) = project_folder(root, slug) else {
         return Ok(Err(format!("project slug `{slug}` cannot name a folder")));
     };
+    let root = root.to_path_buf();
     off_task(move || {
-        if std::fs::symlink_metadata(&dest).is_ok() {
-            Err(format!("`{}` already exists; {words}", dest.display()))
+        let what = format!("the workspace folder `{}`", root.display());
+        if let Some(reason) = repository_refusal(&what, &root) {
+            Err(reason)
+        } else if std::fs::symlink_metadata(&dest).is_ok() {
+            Err(already_exists(&dest, words))
         } else {
             Ok(dest)
+        }
+    })
+    .await
+}
+
+/// D6's refusal of a destination that exists.
+fn already_exists(dest: &Path, words: &str) -> String {
+    format!("`{}` already exists; {words}", dest.display())
+}
+
+/// R1a A4: `dest` taken for this request: its parents made, then the leaf by one `mkdir` that
+/// fails on a folder already there (refused as [`destination`] refuses it, and left as it is).
+/// Only a folder claimed here is ever removed again.
+async fn claim(dest: PathBuf, words: &'static str) -> Result<std::result::Result<PathBuf, String>> {
+    off_task(move || {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("`{}` could not be created: {err}", parent.display()))?;
+        }
+        match std::fs::create_dir(&dest) {
+            Ok(()) => Ok(dest),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(already_exists(&dest, words))
+            }
+            Err(err) => Err(format!("`{}` could not be created: {err}", dest.display())),
         }
     })
     .await
@@ -814,18 +1046,11 @@ async fn clone(
         Ok(git) => git,
         Err(reason) => return Ok(Err(reason)),
     };
-    let parent = dest.parent().map(Path::to_path_buf).unwrap_or_default();
-    let made_parent = off_task({
-        let parent = parent.clone();
-        move || std::fs::create_dir_all(&parent)
-    })
-    .await?;
-    if let Err(err) = made_parent {
-        return Ok(Err(format!(
-            "`{}` could not be created: {err}",
-            parent.display()
-        )));
-    }
+    // git clones into an empty folder that exists, so the claimed one is used.
+    let dest = match claim(dest, "nothing was cloned").await? {
+        Ok(dest) => dest,
+        Err(reason) => return Ok(Err(reason)),
+    };
     if let Err(err) = git.clone_repo(url, &dest).await {
         let reason = match err {
             IsolateError::Refused(reason) => reason,
@@ -848,17 +1073,10 @@ async fn new_repo(root: &Path, slug: &str) -> Result<std::result::Result<Checkou
         Ok(git) => git,
         Err(reason) => return Ok(Err(reason)),
     };
-    let made = off_task({
-        let dest = dest.clone();
-        move || std::fs::create_dir_all(&dest)
-    })
-    .await?;
-    if let Err(err) = made {
-        return Ok(Err(format!(
-            "`{}` could not be created: {err}",
-            dest.display()
-        )));
-    }
+    let dest = match claim(dest, "nothing was created").await? {
+        Ok(dest) => dest,
+        Err(reason) => return Ok(Err(reason)),
+    };
     if let Err(err) = git.init_with_empty_commit(&dest, MAIN).await {
         let left = remove_tree(dest).await.err().unwrap_or_default();
         return Ok(Err(format!("{}{left}", isolate_reason(err))));
@@ -1688,6 +1906,448 @@ mod tests {
             "new_project",
         );
         assert_eq!(reason, "this workspace has no folder on this box");
+    }
+
+    // ---- R1a ----
+
+    /// The `R-ID-4` refusal of a folder inside `repo` (canonical), worded for `what`.
+    fn inside(what: &str, repo: &Path) -> String {
+        format!(
+            "{what} is inside the git repository `{}`; htui writes the workspace's files into \
+             this folder, and never into a repository (R-ID-4)",
+            canonical(repo).display()
+        )
+    }
+
+    /// Platform's folder on the memory store's box is `folder`, as typed.
+    async fn platform_at(backend: &Backend, folder: &Path) {
+        let this_box = backend
+            .box_info()
+            .await
+            .expect("a memory read")
+            .expect("the demo has a box")
+            .box_id;
+        backend
+            .writer()
+            .expect("a memory backend writes")
+            .upsert_workspace_box_path(&htui_core::model::WorkspaceBoxPath {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                box_id: this_box,
+                folder_path: text(folder),
+                updated_at: Utc::now(),
+            })
+            .await
+            .expect("the folder row is written");
+    }
+
+    /// `request` served with `home` under `faults`.
+    async fn faulted(
+        backend: &Backend,
+        request: StoreRequest,
+        home: &Path,
+        faults: super::Faults,
+    ) -> htui_core::store::Result<StoreReply> {
+        super::FAULTS
+            .scope(faults, serve_with_home(backend, &request, Some(home)))
+            .await
+    }
+
+    /// A2: `new/../empty` resolves to `empty`, which exists; the typed path is refused before
+    /// anything is made, so `new` is never made and `empty` never removed.
+    #[tokio::test]
+    async fn a_folder_through_a_parent_component_is_refused_and_nothing_is_made() {
+        let backend = demo();
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let empty = home.path().join("empty");
+        std::fs::create_dir(&empty).expect("an existing empty folder");
+        let typed = home.path().join("new").join("..").join("empty");
+
+        let reason = refusal(
+            served(&backend, new_workspace("mobile", &typed), Some(home.path())).await,
+            "new_workspace",
+        );
+        assert_eq!(
+            reason,
+            format!(
+                "`{}` names a parent folder (`..`); type the folder itself",
+                typed.display()
+            )
+        );
+        assert!(empty.is_dir());
+        assert!(!home.path().join("new").exists(), "nothing is made");
+        assert!(!has_workspace(&backend, "mobile").await);
+    }
+
+    /// A2: an existing empty folder is never this request's to remove, however it was typed.
+    #[tokio::test]
+    async fn an_existing_empty_folder_survives_a_failed_create() {
+        let backend = demo();
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let empty = home.path().join("empty");
+        std::fs::create_dir(&empty).expect("an existing empty folder");
+
+        for typed in [
+            empty.clone(),
+            home.path().join("new").join("..").join("empty"),
+        ] {
+            // `graphics` is the demo's: the store refuses it after the folder is prepared.
+            let result = serve_with_home(
+                &backend,
+                &new_workspace("graphics", &typed),
+                Some(home.path()),
+            )
+            .await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(StoreError::Constraint(_)) | Ok(StoreReply::SetupRefused { .. })
+                ),
+                "{result:?}"
+            );
+            assert!(empty.is_dir(), "{} survives", typed.display());
+        }
+    }
+
+    /// A2: `made` tells the truth: an existing folder is not made, a missing one is.
+    #[test]
+    fn made_is_decided_by_the_leaf_itself() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let existing = tmp.path().join("existing");
+        std::fs::create_dir(&existing).expect("an existing folder");
+        let missing = tmp.path().join("a").join("missing");
+
+        assert_eq!(
+            super::prepare_folder(&existing).expect("an existing folder is used"),
+            (canonical(&existing), false)
+        );
+        assert_eq!(
+            super::prepare_folder(&missing).expect("a missing folder is made"),
+            (canonical(&missing), true)
+        );
+    }
+
+    /// A3 (`R-ID-4`): a folder inside a repository's work tree, made or existing, is refused, and
+    /// nothing is made inside the repository.
+    #[tokio::test]
+    async fn a_folder_inside_a_repository_is_refused_and_nothing_is_made_in_it() {
+        let backend = demo();
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let repo = home.path().join("api");
+        std::fs::create_dir(&repo).expect("the repo dir");
+        repo_with_one_commit(&repo);
+        let existing = repo.join("docs");
+        std::fs::create_dir(&existing).expect("a folder in the work tree");
+
+        for typed in [repo.join("ws"), repo.join("a").join("ws"), existing.clone()] {
+            let reason = refusal(
+                served(&backend, new_workspace("mobile", &typed), Some(home.path())).await,
+                "new_workspace",
+            );
+            assert_eq!(reason, inside(&format!("`{}`", typed.display()), &repo));
+        }
+        assert!(!repo.join("ws").exists());
+        assert!(!repo.join("a").exists());
+        assert!(existing.is_dir());
+        assert!(!has_workspace(&backend, "mobile").await);
+
+        let workspace = backend
+            .writer()
+            .expect("a memory backend writes")
+            .workspace(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect("a memory read")
+            .expect("Platform exists");
+        let reason = refusal(
+            served(
+                &backend,
+                edit(
+                    ids::WORKSPACE_PLATFORM,
+                    workspace.updated_at,
+                    WorkspacePatch::default(),
+                    &repo.join("ws"),
+                ),
+                Some(home.path()),
+            )
+            .await,
+            "edit_workspace",
+        );
+        assert_eq!(
+            reason,
+            inside(&format!("`{}`", repo.join("ws").display()), &repo)
+        );
+        assert!(!repo.join("ws").exists());
+    }
+
+    /// A3 (`R-ID-4`), D6: a workspace whose stored folder lies inside a repository takes no
+    /// cloned or new project: refused before `projects/` (or the folder itself) is made.
+    #[tokio::test]
+    async fn a_project_into_a_workspace_folder_inside_a_repository_is_refused_before_any_write() {
+        let backend = demo();
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let repo = home.path().join("api");
+        std::fs::create_dir(&repo).expect("the repo dir");
+        repo_with_one_commit(&repo);
+        let folder = repo.join("ws");
+        platform_at(&backend, &folder).await;
+        let before = project_slugs(&backend, ids::WORKSPACE_PLATFORM).await;
+
+        for source in [
+            ProjectSource::NewRepo,
+            ProjectSource::Clone {
+                url: "file:///nowhere.git".to_owned(),
+            },
+        ] {
+            let reason = refusal(
+                served(&backend, new_project("fresh", source), Some(home.path())).await,
+                "new_project",
+            );
+            assert_eq!(
+                reason,
+                inside(
+                    &format!("the workspace folder `{}`", folder.display()),
+                    &repo
+                )
+            );
+        }
+        assert!(!folder.exists(), "nothing is written in the repository");
+        assert_eq!(
+            project_slugs(&backend, ids::WORKSPACE_PLATFORM).await,
+            before
+        );
+    }
+
+    /// A4: a destination that appears between the check and the claim is refused at the claim
+    /// and left as it is.
+    #[tokio::test]
+    async fn a_destination_made_between_the_check_and_the_claim_is_refused_and_kept() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = tmp.path().join("ws");
+
+        let dest = super::destination(&root, "api", "nothing was cloned")
+            .await
+            .expect("the check runs")
+            .expect("the destination is free at the check");
+        std::fs::create_dir_all(&dest).expect("someone else makes it meanwhile");
+        std::fs::write(dest.join("mine.txt"), "mine\n").expect("and writes into it");
+
+        let reason = super::claim(dest.clone(), "nothing was cloned")
+            .await
+            .expect("the claim runs")
+            .expect_err("the claim is refused");
+        assert_eq!(
+            reason,
+            format!("`{}` already exists; nothing was cloned", dest.display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("mine.txt")).expect("the file stays"),
+            "mine\n"
+        );
+
+        let free = root.join("projects").join("web");
+        let claimed = super::claim(free.clone(), "nothing was created")
+            .await
+            .expect("the claim runs")
+            .expect("a free destination is claimed");
+        assert_eq!(claimed, free);
+        assert!(free.is_dir(), "the claim makes the folder");
+    }
+
+    /// A7: a folder row that cannot be written after the workspace row takes the workspace and
+    /// the folder this request made back.
+    #[tokio::test]
+    async fn a_failed_folder_row_takes_the_new_workspace_and_its_folder_back() {
+        let backend = demo();
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let elsewhere = tempfile::tempdir().expect("a throwaway place");
+        let folder = elsewhere.path().join("mobile");
+
+        let result = faulted(
+            &backend,
+            new_workspace("mobile", &folder),
+            home.path(),
+            super::Faults {
+                folder_row: true,
+                ..super::Faults::default()
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(StoreError::Backend(message)) if message.contains("folder row")),
+            "{result:?}"
+        );
+        assert!(
+            !has_workspace(&backend, "mobile").await,
+            "the workspace goes"
+        );
+        assert!(!folder.exists(), "the folder it made goes");
+    }
+
+    /// A7: an edit the store refuses removes the folder the edit made.
+    #[tokio::test]
+    async fn a_refused_edit_removes_the_folder_it_made() {
+        let backend = demo();
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let default = home.path().join("workspaces").join("mobile");
+        let (workspace, _, _) = created(&backend, &default, Some(home.path())).await;
+        let new = home.path().join("new");
+
+        let patch = WorkspacePatch {
+            slug: Some("graphics".to_owned()),
+            ..WorkspacePatch::default()
+        };
+        let expected = token(&backend, workspace).await;
+        let result = serve_with_home(
+            &backend,
+            &edit(workspace, expected, patch, &new),
+            Some(home.path()),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(StoreError::Constraint(_))),
+            "{result:?}"
+        );
+        assert!(!new.exists(), "the folder the edit made goes");
+        assert!(default.is_dir());
+    }
+
+    /// A7 (D5: the folder never moves): a slug change whose folder row cannot be written would
+    /// leave the workspace at the new slug's default; the edit is undone under compare-and-set.
+    #[tokio::test]
+    async fn a_slug_change_whose_folder_row_fails_is_undone() {
+        let backend = demo();
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let default = home.path().join("workspaces").join("mobile");
+        let (workspace, _, _) = created(&backend, &default, Some(home.path())).await;
+
+        let patch = WorkspacePatch {
+            slug: Some("apps".to_owned()),
+            name: Some("Apps".to_owned()),
+            ..WorkspacePatch::default()
+        };
+        let expected = token(&backend, workspace).await;
+        let result = faulted(
+            &backend,
+            edit(workspace, expected, patch, &default),
+            home.path(),
+            super::Faults {
+                folder_row: true,
+                ..super::Faults::default()
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(StoreError::Backend(message)) if message.contains("the edit was undone")),
+            "{result:?}"
+        );
+        let row = backend
+            .writer()
+            .expect("a memory backend writes")
+            .workspace(workspace)
+            .await
+            .expect("a memory read")
+            .expect("the workspace stays");
+        assert_eq!((row.slug.as_str(), row.name.as_str()), ("mobile", "Mobile"));
+        assert!(rows(&backend, workspace).await.is_empty());
+        assert!(!home.path().join("workspaces").join("apps").exists());
+    }
+
+    /// A9: a destination that could not be removed after a failed registration is named in the
+    /// failure.
+    #[tokio::test]
+    async fn a_failed_registration_names_a_destination_it_could_not_remove() {
+        let Some(_git) = skip_without_git!() else {
+            return;
+        };
+        let backend = demo();
+        backend
+            .writer()
+            .expect("a memory backend writes")
+            .create_project(NewProject {
+                id: ProjectId::new(),
+                slug: "api".to_owned(),
+                name: "Someone else's".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("an unlinked project");
+        let home = tempfile::tempdir().expect("a throwaway home");
+
+        let result = faulted(
+            &backend,
+            new_project("api", ProjectSource::NewRepo),
+            home.path(),
+            super::Faults {
+                remove: true,
+                ..super::Faults::default()
+            },
+        )
+        .await;
+
+        let dest = home
+            .path()
+            .join("workspaces")
+            .join("platform")
+            .join("projects")
+            .join("api");
+        assert!(
+            matches!(
+                &result,
+                Err(StoreError::Constraint(message))
+                    if message.ends_with(&format!(" and `{}` could not be removed", dest.display()))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A8: a linked worktree typed by its git directory (inside the main checkout's `.git`)
+    /// registers the worktree itself.
+    #[tokio::test]
+    async fn a_linked_worktree_typed_by_its_git_dir_registers_the_worktree() {
+        let Some(git) = skip_without_git!() else {
+            return;
+        };
+        let backend = demo();
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let tmp = tempfile::tempdir().expect("a throwaway place");
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).expect("the main checkout");
+        repo_with_one_commit(&main);
+        let linked = tmp.path().join("linked");
+        git_out(
+            &git,
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                &text(&linked),
+            ],
+        )
+        .await;
+
+        let reply = served(
+            &backend,
+            new_project(
+                "web",
+                ProjectSource::Existing {
+                    path: text(&main.join(".git").join("worktrees").join("linked")),
+                },
+            ),
+            Some(home.path()),
+        )
+        .await;
+        let (project, repo_path) = project_created(reply);
+        assert_eq!(repo_path, text(&canonical(&linked)));
+        let (repo, paths) = the_repo(&backend, project.project_id).await;
+        assert_eq!(repo.name, "linked");
+        assert_eq!(repo.default_branch, "feature");
+        assert_eq!(paths, [repo_path]);
     }
 
     // ---- D9 ----
