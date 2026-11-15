@@ -438,6 +438,9 @@ impl ReadStore for PgStore {
                    r.mode             AS "mode: htui_core::model::RunMode",
                    r.status           AS "status: htui_core::model::RunStatus",
                    r.target_box_id    AS "target_box_id: htui_core::model::BoxId",
+                   r.target_id        AS "target_id?: TargetId",
+                   t.name             AS "target_name?",
+                   r.target_source    AS "target_source?: TargetSource",
                    r.executing_box_id AS "executing_box_id: htui_core::model::BoxId",
                    COALESCE(b.hostname, '') AS "box_hostname!",
                    r.queued_at,
@@ -446,6 +449,7 @@ impl ReadStore for PgStore {
                    r.failure
               FROM run r
               LEFT JOIN box b ON b.id = COALESCE(r.executing_box_id, r.target_box_id)
+              LEFT JOIN target t ON t.id = r.target_id
              WHERE r.item_id = $1
              ORDER BY r.queued_at DESC
             "#,

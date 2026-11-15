@@ -1792,6 +1792,15 @@ pub struct RunSummary {
     pub status: RunStatus,
     /// `run.target_box_id`.
     pub target_box_id: BoxId,
+    /// `run.target_id` (MOD-130 M4, D7): the target the cascade chose, as stored at enqueue.
+    /// `None` on a chat run and on every run queued before M2.
+    pub target_id: Option<TargetId>,
+    /// `target.name` of [`RunSummary::target_id`] through a join; `None` when the run names no
+    /// target. A retired target still names itself.
+    pub target_name: Option<String>,
+    /// `run.target_source` (MOD-130 M4, D7): the cascade level that chose the target; `None`
+    /// with [`RunSummary::target_id`].
+    pub target_source: Option<TargetSource>,
     /// `run.executing_box_id`.
     pub executing_box_id: Option<BoxId>,
     /// `box.hostname` of the executing box, or of the target box when nothing is executing yet:
@@ -2175,6 +2184,9 @@ mod tests {
                 mode: r.mode,
                 status: r.status,
                 target_box_id: r.target_box_id,
+                target_id: None,
+                target_name: None,
+                target_source: None,
                 executing_box_id: None,
                 box_hostname: String::new(),
                 queued_at: r.queued_at,

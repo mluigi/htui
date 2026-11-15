@@ -524,6 +524,8 @@ pub const CASES: &[&str] = &[
     "create_run_records_the_target_and_source",
     "create_run_refuses_an_unknown_or_retired_target",
     "delete_target_refuses_a_target_with_runs",
+    // MOD-130 M4 T1: the Runs read names each run's target (D7, P2)
+    "runs_name_their_target_and_source",
     // MOD-130 M3 T1: runs name their driver (D8, P6)
     "create_run_records_the_driving_box",
     // MOD-130 M3 T2: the claim keys on the driver; tags check the box the work runs on (P4)
@@ -1684,6 +1686,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "delete_target_refuses_a_target_with_runs" => {
             boxed(delete_target_refuses_a_target_with_runs, store).await;
+        }
+        "runs_name_their_target_and_source" => {
+            boxed(runs_name_their_target_and_source, store).await;
         }
         "create_run_records_the_driving_box" => {
             boxed(create_run_records_the_driving_box, store).await;
@@ -42288,6 +42293,119 @@ async fn create_run_refuses_an_unknown_or_retired_target<S: WriteStore>(store: &
         store.runs(ids::HTUI_ANA_2).await.expect(CASE),
         before,
         "{CASE}: the item's runs are unchanged"
+    );
+}
+
+/// MOD-130 M4 T1 (D7, P2): `runs` names each run's target and the level that chose it: the
+/// target's id, its name through the join, and `run.target_source`, as stored. A run on the
+/// local default reads the seeded `local` target with `default`; a run with no target reads
+/// `None` for all three; a retired target still names itself.
+async fn runs_name_their_target_and_source<S: WriteStore>(store: &S) {
+    const CASE: &str = "runs_name_their_target_and_source";
+    type Triple = (Option<TargetId>, Option<String>, Option<TargetSource>);
+    async fn triples<S: ReadStore>(
+        store: &S,
+        item: ItemId,
+    ) -> std::collections::HashMap<RunId, Triple> {
+        store
+            .runs(item)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|run| (run.id, (run.target_id, run.target_name, run.target_source)))
+            .collect()
+    }
+
+    // A live run holds its item, so each run is cancelled before the next is queued.
+    async fn queued_then_cancelled<S: WriteStore>(store: &S, request: NewRun) -> Run {
+        let run = store.create_run(request).await.expect(CASE);
+        assert!(
+            store
+                .transition_run(
+                    run.id,
+                    RunStatus::Queued,
+                    RunStatus::Cancelled,
+                    seam_clock()
+                )
+                .await
+                .expect(CASE),
+            "{CASE}: queued -> cancelled"
+        );
+        run
+    }
+
+    let docker = store
+        .create_target(new_target("docker here", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let on_docker = queued_then_cancelled(
+        store,
+        NewRun {
+            target: Some(ResolvedTarget {
+                target: docker.id,
+                source: TargetSource::Project,
+            }),
+            ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+        },
+    )
+    .await;
+    let on_local = queued_then_cancelled(
+        store,
+        NewRun {
+            target: Some(ResolvedTarget {
+                target: seed::LOCAL_TARGET_ID,
+                source: TargetSource::Default,
+            }),
+            ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+        },
+    )
+    .await;
+    let chat = queued_then_cancelled(
+        store,
+        new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()),
+    )
+    .await;
+
+    let read = triples(store, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        read.get(&on_docker.id),
+        Some(&(
+            Some(docker.id),
+            Some("docker here".to_owned()),
+            Some(TargetSource::Project)
+        )),
+        "{CASE}: a run on a named target reads its id, name and source"
+    );
+    assert_eq!(
+        read.get(&on_local.id),
+        Some(&(
+            Some(seed::LOCAL_TARGET_ID),
+            Some(seed::LOCAL_TARGET_NAME.to_owned()),
+            Some(TargetSource::Default)
+        )),
+        "{CASE}: a run on the local default reads the seeded target"
+    );
+    assert_eq!(
+        read.get(&chat.id),
+        Some(&(None, None, None)),
+        "{CASE}: a run with no target reads None for all three"
+    );
+
+    let retired = applied(
+        CASE,
+        store
+            .retire_target(docker.id, docker.updated_at)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        triples(store, ids::HTUI_ANA_2).await.get(&on_docker.id),
+        Some(&(
+            Some(retired.id),
+            Some("docker here".to_owned()),
+            Some(TargetSource::Project)
+        )),
+        "{CASE}: a retired target still names itself"
     );
 }
 

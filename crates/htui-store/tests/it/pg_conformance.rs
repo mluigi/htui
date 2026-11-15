@@ -78,15 +78,16 @@ use htui_store::testkit as common;
 /// and MOD-133 M2's three landing-state, refused-waiting-row and retry cases (E1-E5) make it 349,
 /// and MOD-130 M3 T1's driving-box case (D8, P6) makes it 350,
 /// and MOD-130 M3 T2's three driver-keyed claim cases (D8, D9, P4) make it 353,
-/// and MOD-133 M3's five pushed `pull_request` record cases (plan D5) make it 358.
-const EXPECTED_CASES: usize = 358;
+/// and MOD-133 M3's five pushed `pull_request` record cases (plan D5) make it 358,
+/// and MOD-130 M4 T1's Runs-read target case (D7, P2) makes it 359.
+const EXPECTED_CASES: usize = 359;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (358 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (359 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -109,7 +110,8 @@ fn case_list_matches_mem_store() {
              T4's five level, default, retire and delete cases, and MOD-130 M2 T2's three \
              recorded-target cases, and MOD-133 M2's three landing, refusal and retry cases, and \
              MOD-130 M3 T1's driving-box case, and MOD-130 M3 T2's three driver-keyed claim \
-             cases, and MOD-133 M3's five pushed `pull_request` record cases)"
+             cases, and MOD-133 M3's five pushed `pull_request` record cases, and MOD-130 M4 T1's one Runs-read \
+             target case)"
     );
 }
 
