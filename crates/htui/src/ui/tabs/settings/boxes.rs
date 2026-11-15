@@ -1163,6 +1163,19 @@ impl BoxesSection {
             ),
             read("probed tags", tag_list(&row.probed_tags)),
         ];
+        // MOD-130 M4 P4: `kind` follows `host`, and a container names the machine it runs on.
+        let mut placement = vec![read("kind", row.kind.as_str().to_owned())];
+        if let Some(parent) = row.parent_box_id {
+            placement.push(read(
+                "parent",
+                snapshot
+                    .boxes
+                    .iter()
+                    .find(|other| other.row.id == parent)
+                    .map_or_else(|| "(not listed)".to_owned(), |p| p.row.hostname.clone()),
+            ));
+        }
+        fields.splice(1..1, placement);
         let mut focus = None;
 
         match &self.mode {
@@ -1326,8 +1339,16 @@ fn list_label(record: &BoxRecord, snapshot: &BoxesSnapshot, room: usize) -> Stri
     if snapshot.this_box == Some(row.id) {
         tail.push_str(" (this box)");
     }
-    let host_room = room.saturating_sub(cell_width(&tail)).max(1);
-    let mut label = cells::clip(&row.hostname, host_room);
+    // MOD-130 M4 P4: a container hangs under its machine; the branch is part of what survives.
+    let branch = if row.parent_box_id.is_some() {
+        "\u{2514} "
+    } else {
+        ""
+    };
+    let host_room = room
+        .saturating_sub(cell_width(&tail) + cell_width(branch))
+        .max(1);
+    let mut label = format!("{branch}{}", cells::clip(&row.hostname, host_room));
     label.push_str(&tail);
     cells::clip(&label, room)
 }
@@ -1535,6 +1556,57 @@ mod tests {
         assert!(cell_width(&out) <= room, "{out:?} against {room}");
         // ` (this box)` takes 11 cells and leaves the hostname 13: six two-cell clusters and `…`.
         assert_eq!(out, format!("{}\u{2026} (this box)", "\u{6f22}".repeat(6)));
+    }
+
+    /// MOD-130 M4 P4: a container's row is prefixed `\u{2514} `, and the prefix, like the
+    /// marker, survives a long hostname.
+    #[test]
+    fn a_child_row_carries_the_branch_prefix() {
+        let parent = record("host");
+        let mut child = record("box-in-docker");
+        child.row.parent_box_id = Some(parent.row.id);
+        let snapshot = BoxesSnapshot {
+            this_box: None,
+            boxes: vec![parent.clone(), child.clone()],
+            spec: SpecView {
+                digest: String::new(),
+                overlay: false,
+                error: None,
+                stored: None,
+            },
+        };
+
+        assert_eq!(list_label(&parent, &snapshot, 30), "host");
+        assert_eq!(list_label(&child, &snapshot, 30), "\u{2514} box-in-docker");
+        let tight = list_label(&child, &snapshot, 8);
+        assert!(tight.starts_with("\u{2514} "), "{tight:?}");
+        assert!(cell_width(&tight) <= 8, "{tight:?}");
+    }
+
+    /// The prefix, the id suffix and the marker all survive a hostname too long for the room.
+    #[test]
+    fn a_child_keeps_prefix_and_marker_beside_a_long_hostname() {
+        let room = 24;
+        let parent = record("host");
+        let mut child = record(&"x".repeat(40));
+        child.row.parent_box_id = Some(parent.row.id);
+        let snapshot = BoxesSnapshot {
+            this_box: Some(child.row.id),
+            boxes: vec![parent, child.clone()],
+            spec: SpecView {
+                digest: String::new(),
+                overlay: false,
+                error: None,
+                stored: None,
+            },
+        };
+
+        let out = list_label(&child, &snapshot, room);
+
+        assert!(cell_width(&out) <= room, "{out:?} against {room}");
+        assert!(out.starts_with("\u{2514} x"), "{out:?}");
+        assert!(out.ends_with(" (this box)"), "{out:?}");
+        assert!(out.contains('\u{2026}'), "{out:?}");
     }
 
     /// MOD-69 D7 (blueprint H-14): `Ctrl+W` is the global waiting list, so over a listed box it

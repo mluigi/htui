@@ -3,6 +3,7 @@ source: crates/htui/tests/box_settings.rs
 expression: frame
 ---
 ▌DESKTOP-HTUI (this box)      host            DESKTOP-HTUI (this box)
+                              kind            machine
                               os              Windows 10.0.26200 · x86_64
                               cpu             AMD Ryzen 9 7950X
                               ram             65536 MB
@@ -20,7 +21,6 @@ expression: frame
                               tools           cargo 1.98.0, cmake, git 2.51.0, rustc 1.98.0
 
                               probe spec: seed · <digest>
-
 
 
 

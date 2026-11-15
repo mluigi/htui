@@ -69,13 +69,38 @@ pub fn spec_view(stored: Option<StoredSetting>) -> SpecView {
 /// Whatever the store reports.
 pub async fn snapshot(backend: &Backend, writer: &Writer) -> Result<BoxesSnapshot> {
     let this_box = backend.box_info().await?.map(|info| info.box_id);
-    let boxes = writer.boxes().await?;
+    let boxes = tree_order(writer.boxes().await?);
     let stored = writer.box_probe_spec().await?;
     Ok(BoxesSnapshot {
         this_box,
         boxes,
         spec: spec_view(stored),
     })
+}
+
+/// The boxes as the section lists them (MOD-130 M4 P4): a machine, then its containers by
+/// hostname and id, machines in the order given. A container whose parent is not in `boxes` (a
+/// read race, or a parent of another user) comes after every machine, by hostname and id. Pure;
+/// applied once where the snapshot is built, so the cursor indexes the one order.
+#[must_use]
+pub fn tree_order(boxes: Vec<BoxRecord>) -> Vec<BoxRecord> {
+    let (machines, mut children): (Vec<_>, Vec<_>) = boxes
+        .into_iter()
+        .partition(|record| record.row.parent_box_id.is_none());
+    children.sort_by(|a, b| (&a.row.hostname, a.row.id).cmp(&(&b.row.hostname, b.row.id)));
+    let mut ordered = Vec::with_capacity(machines.len() + children.len());
+    for machine in machines {
+        let id = machine.row.id;
+        ordered.push(machine);
+        let (own, rest): (Vec<_>, Vec<_>) = children
+            .into_iter()
+            .partition(|child| child.row.parent_box_id == Some(id));
+        ordered.extend(own);
+        children = rest;
+    }
+    // What is left has a parent that is not listed.
+    ordered.extend(children);
+    ordered
 }
 
 /// Serves `Boxes`, `EditBox`, `SetProbeSpec` and `SetBoxLogLevel` (D45, D46; MOD-51 D4; MOD-122
@@ -175,3 +200,111 @@ pub const REQUEST_NAMES: [&str; 4] = ["boxes", "edit_box", "set_probe_spec", "se
 /// The **read**'s name: a refused read leaves the section with no list; a refused write leaves the
 /// editor over its text.
 pub const READ_NAME: &str = REQUEST_NAMES[0];
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use htui_core::model::{BoxKind, BoxRow, OsFamily, UserId};
+
+    use super::*;
+
+    /// A box called `hostname`, a child of `parent` when there is one.
+    fn record(hostname: &str, parent: Option<BoxId>) -> BoxRecord {
+        let at = DateTime::<Utc>::UNIX_EPOCH;
+        BoxRecord {
+            row: BoxRow {
+                id: BoxId::new(),
+                user_id: UserId::from_uuid(uuid::Uuid::nil()),
+                hostname: hostname.to_owned(),
+                os_family: Some(OsFamily::Linux),
+                os_version: "6.8".to_owned(),
+                arch: "x86_64".to_owned(),
+                cpu: String::new(),
+                ram_mb: None,
+                gpu_present: false,
+                gpu_vendor: None,
+                htui_version: "0.1.0".to_owned(),
+                probed_tags: Vec::new(),
+                declared_tags: Vec::new(),
+                quirks: String::new(),
+                settings: serde_json::json!({}),
+                registered_at: at,
+                last_seen_at: at,
+                last_probed_at: None,
+                updated_at: at,
+                edit_version: 0,
+                kind: if parent.is_some() {
+                    BoxKind::Container
+                } else {
+                    BoxKind::Machine
+                },
+                parent_box_id: parent,
+            },
+            tools: Vec::new(),
+            probe_spec_digest: None,
+        }
+    }
+
+    fn names(boxes: &[BoxRecord]) -> Vec<&str> {
+        boxes.iter().map(|b| b.row.hostname.as_str()).collect()
+    }
+
+    #[test]
+    fn machines_only_keep_the_order_the_store_gave() {
+        let boxes = vec![
+            record("zed", None),
+            record("alpha", None),
+            record("mid", None),
+        ];
+        let ordered = tree_order(boxes.clone());
+        assert_eq!(ordered, boxes);
+    }
+
+    #[test]
+    fn a_parent_is_followed_by_its_children_by_hostname() {
+        let parent = record("host", None);
+        let other = record("other", None);
+        let b = record("b-box", Some(parent.row.id));
+        let a = record("a-box", Some(parent.row.id));
+        // The store gives the children ahead of, and between, the machines.
+        let ordered = tree_order(vec![b, other, a, parent]);
+        assert_eq!(names(&ordered), ["other", "host", "a-box", "b-box"]);
+    }
+
+    #[test]
+    fn two_machines_each_keep_their_own_child() {
+        let one = record("one", None);
+        let two = record("two", None);
+        let under_two = record("under-two", Some(two.row.id));
+        let under_one = record("under-one", Some(one.row.id));
+        let ordered = tree_order(vec![one, under_two, two, under_one]);
+        assert_eq!(names(&ordered), ["one", "under-one", "two", "under-two"]);
+    }
+
+    #[test]
+    fn a_child_of_an_unlisted_parent_comes_last() {
+        let machine = record("machine", None);
+        let orphan = record("orphan", Some(BoxId::new()));
+        let child = record("child", Some(machine.row.id));
+        let ordered = tree_order(vec![orphan, machine, child]);
+        assert_eq!(names(&ordered), ["machine", "child", "orphan"]);
+    }
+
+    #[test]
+    fn a_same_host_pair_of_children_falls_back_to_id() {
+        let parent = record("host", None);
+        let mut first = record("same", Some(parent.row.id));
+        let mut second = record("same", Some(parent.row.id));
+        first.row.id = BoxId::from_uuid(uuid::Uuid::from_u128(2));
+        second.row.id = BoxId::from_uuid(uuid::Uuid::from_u128(1));
+        let ordered = tree_order(vec![parent, first, second]);
+        assert_eq!(
+            ordered[1].row.id,
+            BoxId::from_uuid(uuid::Uuid::from_u128(1))
+        );
+        assert_eq!(
+            ordered[2].row.id,
+            BoxId::from_uuid(uuid::Uuid::from_u128(2))
+        );
+    }
+}
