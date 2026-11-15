@@ -126,6 +126,7 @@ pub mod prompt_bridge;
 pub mod record;
 pub mod registry;
 pub mod replay;
+pub mod target_channel;
 pub mod tools;
 
 pub use acp::{

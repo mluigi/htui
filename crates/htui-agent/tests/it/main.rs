@@ -25,6 +25,7 @@ mod probe_live;
 mod recorder;
 mod relay;
 mod replay;
+mod target_channel;
 #[path = "../../../../tests/rust/write_executable.rs"]
 mod write_executable;
 
