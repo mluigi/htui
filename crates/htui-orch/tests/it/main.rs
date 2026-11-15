@@ -5,5 +5,6 @@ mod infer;
 mod landing;
 mod review_loop;
 mod run_branch;
+mod target_bundle;
 #[path = "../../../../tests/rust/write_executable.rs"]
 mod write_executable;

@@ -44,6 +44,10 @@ pub const VERB_TIMEOUT: Duration = Duration::from_secs(120);
 /// [`VERB_TIMEOUT`].
 pub const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// MOD-132 plan P10: the budget of a verb that moves a whole history — `bundle create` and both
+/// `index-pack`s — taken through [`Cli::with_transfer_budget`]: 15 minutes.
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// MOD-133 F2 M1: the ssh options both network verbs append: never prompt, and give up on a host
 /// that does not answer the connect within 20 s (ssh has no connect timeout of its own).
 pub const SSH_OPTIONS: &str = "-o BatchMode=yes -o ConnectTimeout=20";
@@ -179,6 +183,52 @@ fn timed_out(verb: &str, budget: Duration) -> String {
 /// A verb exited with no code at all, which on Unix means a signal killed it.
 fn killed_by_signal(verb: &str) -> String {
     format!("git {verb}: killed by signal")
+}
+
+/// MOD-132: a verb's stdin file could not be opened or positioned.
+fn stdin_unreadable(verb: &str, path: &Path, err: &std::io::Error) -> String {
+    format!("git {verb}: cannot read {}: {err}", path.display())
+}
+
+/// MOD-132: [`Cli::bundle_create`] never overwrites; `out` is already there.
+#[must_use]
+pub fn bundle_out_exists(out: &Path) -> String {
+    format!("git bundle create: {} already exists", out.display())
+}
+
+/// MOD-132: `git bundle verify` in `repo` refused `file`; `line` is its classifying stderr line.
+#[must_use]
+pub fn bundle_unverified(repo: &Path, file: &Path, line: &str) -> String {
+    format!(
+        "git bundle verify in {}: {} does not verify: {line}",
+        repo.display(),
+        file.display()
+    )
+}
+
+/// MOD-132: `git index-pack` in `repo` refused the pack in `file`; `line` is its stderr line.
+#[must_use]
+pub fn pack_refused(repo: &Path, file: &Path, line: &str) -> String {
+    format!(
+        "git index-pack in {}: the pack in {} is refused: {line}",
+        repo.display(),
+        file.display()
+    )
+}
+
+/// MOD-132: [`Cli::bundle_create`] takes a full ref name and an absolute output path.
+#[must_use]
+pub fn bundle_args_refused(full_ref: &str, out: &Path) -> String {
+    format!(
+        "git bundle create: {full_ref} must be a full ref name and {} an absolute path",
+        out.display()
+    )
+}
+
+/// MOD-132: [`Cli::connected`] was handed something that is not a full hash.
+#[must_use]
+pub fn not_a_hash(repo: &Path, text: &str) -> String {
+    format!("in {}: {text} is not a full lowercase hash", repo.display())
 }
 
 /// `120s` for the production budget, `200ms` for a test's; never `0s` for a sub-second one.
@@ -331,6 +381,18 @@ impl Cli {
         }
     }
 
+    /// MOD-132 plan P10: the same `git` under [`TRANSFER_TIMEOUT`], for the verbs that move a
+    /// whole history ([`bundle_create`](Cli::bundle_create), [`index_pack`](Cli::index_pack)).
+    /// Every verb runs under the budget of the `Cli` it is called on; this is how a caller asks
+    /// for the long one.
+    #[must_use]
+    pub fn with_transfer_budget(&self) -> Self {
+        Self {
+            budget: TRANSFER_TIMEOUT,
+            ..self.clone()
+        }
+    }
+
     /// The one place a `git` child's environment and stdio are shaped.
     ///
     /// `SCRUBBED_ENV` is removed, and so is `HTUI_OWN_ENV` (MOD-158 D5, `R-SEC-2`: a verb runs
@@ -397,7 +459,7 @@ impl Cli {
         stdout: Capture,
     ) -> Result<Exited, IsolateError> {
         let captured = self
-            .run_captured(verb, cwd, args, extra_env, stdout)
+            .run_captured(verb, cwd, args, extra_env, stdout, Input::Null)
             .await?;
         Ok(Exited {
             code: captured.code,
@@ -408,7 +470,8 @@ impl Cli {
 
     /// MOD-9 D130: [`run_capturing`](Cli::run_capturing)'s body, with stdout handed back as the
     /// undecoded sink, so [`name_only`](Cli::name_only) can read bytes where every other verb
-    /// reads text.
+    /// reads text. `stdin` is [`Input::Null`] for every verb but
+    /// [`index_pack`](Cli::index_pack) (MOD-132).
     async fn run_captured(
         &self,
         verb: &'static str,
@@ -416,12 +479,26 @@ impl Cli {
         args: &[&OsStr],
         extra_env: &[(&str, &str)],
         stdout: Capture,
+        stdin: Input<'_>,
     ) -> Result<Captured, IsolateError> {
+        let stdin = match stdin {
+            Input::Null => None,
+            Input::File { path, offset } => Some(
+                open_at(path, offset)
+                    .map_err(|err| IsolateError::Git(stdin_unreadable(verb, path, &err)))?,
+            ),
+        };
         let build = || {
             let mut command = self.command(cwd);
             command.args(args);
             for (key, value) in extra_env {
                 command.env(key, value);
+            }
+            // A clone of the one open handle, so a second build (Windows' job-object downgrade)
+            // reads on from the same offset; a clone that fails leaves stdin null, and the verb
+            // then fails on an empty input rather than reading the wrong bytes.
+            if let Some(file) = stdin.as_ref().and_then(|file| file.try_clone().ok()) {
+                command.stdin(file);
             }
             command
         };
@@ -483,6 +560,29 @@ enum Capture {
     Head,
     /// MOD-9 D130: the first [`DIFF_CAP`] bytes, never decoded.
     HeadBytes,
+}
+
+/// MOD-132: what a verb reads on stdin.
+#[derive(Debug, Clone, Copy)]
+enum Input<'a> {
+    /// Nothing: every verb but [`Cli::index_pack`].
+    Null,
+    /// A file on this box, read from `offset` to its end.
+    File {
+        /// The file.
+        path: &'a Path,
+        /// The first byte read.
+        offset: u64,
+    },
+}
+
+/// `path` opened for reading and positioned at `offset`.
+fn open_at(path: &Path, offset: u64) -> std::io::Result<std::fs::File> {
+    use std::io::{Seek as _, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    Ok(file)
 }
 
 /// MOD-9 D130: one verb's exit and its undecoded stdout sink.
@@ -1016,7 +1116,7 @@ impl Cli {
             OsStr::new("--"),
         ];
         let captured = self
-            .run_captured("diff", repo, &args, &[], Capture::HeadBytes)
+            .run_captured("diff", repo, &args, &[], Capture::HeadBytes, Input::Null)
             .await?;
         if captured.code != Some(0) {
             return Err(Exited {
@@ -1028,6 +1128,194 @@ impl Cli {
         }
         let (bytes, overflowed) = captured.stdout.into_bytes();
         Ok(parse_name_only(&bytes, overflowed))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-132: the bundle verbs a target's seed and collect are built from. None runs a hook: each
+// is spawned under `-c core.hooksPath=/dev/null`, and none of them checks a tree out.
+// ---------------------------------------------------------------------------------------------
+
+/// The config pair every bundle verb runs under.
+const NO_HOOKS: [&str; 2] = ["-c", "core.hooksPath=/dev/null"];
+
+impl Cli {
+    /// MOD-132 plan P5: `git bundle create <out> <full_ref>` in `repo`: every commit `full_ref`
+    /// reaches, as one bundle file. `full_ref` must be a full ref name (B3: a bundle tip is a
+    /// ref, never a bare hash) and `out` an absolute path that does not exist yet; nothing is ever
+    /// overwritten. Runs under this `Cli`'s budget: call it on
+    /// [`with_transfer_budget`](Cli::with_transfer_budget).
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`bundle_out_exists`] or [`bundle_args_refused`];
+    /// [`IsolateError::Git`] for a spawn or budget failure, a non-zero exit (B2's empty bundle
+    /// among them), or no file written.
+    pub async fn bundle_create(
+        &self,
+        repo: &Path,
+        full_ref: &str,
+        out: &Path,
+    ) -> Result<(), IsolateError> {
+        if !full_ref.starts_with("refs/")
+            || gix::validate::reference::name(full_ref.as_bytes().into()).is_err()
+            || out.is_relative()
+        {
+            return Err(IsolateError::Refused(bundle_args_refused(full_ref, out)));
+        }
+        if out.symlink_metadata().is_ok() {
+            return Err(IsolateError::Refused(bundle_out_exists(out)));
+        }
+        let exited = self
+            .run(
+                "bundle create",
+                repo,
+                &[
+                    OsStr::new(NO_HOOKS[0]),
+                    OsStr::new(NO_HOOKS[1]),
+                    OsStr::new("bundle"),
+                    OsStr::new("create"),
+                    out.as_os_str(),
+                    OsStr::new(full_ref),
+                ],
+                &[],
+            )
+            .await?;
+        if !exited.ok() {
+            return Err(exited.failure("bundle create"));
+        }
+        if !out.is_file() {
+            return Err(broken_post_condition(
+                "bundle create",
+                "no bundle file was written",
+            ));
+        }
+        Ok(())
+    }
+
+    /// MOD-132 plan P6: `git bundle verify <file>` in `repo`: the file is a bundle and `repo`
+    /// holds every prerequisite it names.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`bundle_unverified`] for a non-zero exit;
+    /// [`IsolateError::Git`] for a spawn or budget failure or a signal.
+    pub async fn bundle_verify(&self, repo: &Path, file: &Path) -> Result<(), IsolateError> {
+        let exited = self
+            .run(
+                "bundle verify",
+                repo,
+                &[
+                    OsStr::new(NO_HOOKS[0]),
+                    OsStr::new(NO_HOOKS[1]),
+                    OsStr::new("bundle"),
+                    OsStr::new("verify"),
+                    file.as_os_str(),
+                ],
+                &[],
+            )
+            .await?;
+        refused_unless_ok(&exited, "bundle verify", |line| {
+            bundle_unverified(repo, file, line)
+        })
+    }
+
+    /// MOD-132 plan P5, P6: `git index-pack --stdin --fix-thin [--strict]` in `repo`, its stdin
+    /// the bytes of `file` from `offset` on (a bundle's pack starts after its header). With
+    /// `strict`, every object is fsck'd before any is kept (B6): the check `git fetch` skips on
+    /// a bundle (B5). A refused pack leaves no object behind. Runs under this `Cli`'s budget:
+    /// call it on [`with_transfer_budget`](Cli::with_transfer_budget).
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`pack_refused`] for a non-zero exit;
+    /// [`IsolateError::Git`] when `file` cannot be read, for a spawn or budget failure, or a
+    /// signal.
+    pub async fn index_pack(
+        &self,
+        repo: &Path,
+        file: &Path,
+        offset: u64,
+        strict: bool,
+    ) -> Result<(), IsolateError> {
+        let mut args = vec![
+            OsStr::new(NO_HOOKS[0]),
+            OsStr::new(NO_HOOKS[1]),
+            OsStr::new("index-pack"),
+            OsStr::new("--stdin"),
+            OsStr::new("--fix-thin"),
+        ];
+        if strict {
+            args.push(OsStr::new("--strict"));
+        }
+        let captured = self
+            .run_captured(
+                "index-pack",
+                repo,
+                &args,
+                &[],
+                Capture::Tail,
+                Input::File { path: file, offset },
+            )
+            .await?;
+        let exited = Exited {
+            code: captured.code,
+            stdout: String::new(),
+            stderr: captured.stderr,
+        };
+        refused_unless_ok(&exited, "index-pack", |line| pack_refused(repo, file, line))
+    }
+
+    /// MOD-132 plan P6: whether `tip` is connected in `repo`: `git rev-list --objects --quiet
+    /// <tip> --not <not>…` exits 0, so every object `tip` reaches, short of the commits in `not`,
+    /// is present. A missing parent, tree or blob is `false`. Not retried: a read.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`not_a_hash`] when `tip` or an entry of `not` is not a
+    /// full lowercase hash (so none can be read as an option); [`IsolateError::Git`] for a spawn
+    /// or budget failure or a signal.
+    pub async fn connected(
+        &self,
+        repo: &Path,
+        tip: &str,
+        not: &[String],
+    ) -> Result<bool, IsolateError> {
+        if let Some(bad) = std::iter::once(tip)
+            .chain(not.iter().map(String::as_str))
+            .find(|hash| !crate::target::bundle::is_full_hash(hash))
+        {
+            return Err(IsolateError::Refused(not_a_hash(repo, bad)));
+        }
+        let mut args = vec![
+            OsStr::new("rev-list"),
+            OsStr::new("--objects"),
+            OsStr::new("--quiet"),
+            OsStr::new(tip),
+            OsStr::new("--not"),
+        ];
+        args.extend(not.iter().map(OsStr::new));
+        let exited = self.run("rev-list", repo, &args, &[]).await?;
+        match exited.code {
+            Some(0) => Ok(true),
+            Some(_) => Ok(false),
+            None => Err(exited.failure("rev-list")),
+        }
+    }
+}
+
+/// `Ok` for exit 0; a signal is [`IsolateError::Git`]; any other exit is
+/// [`IsolateError::Refused`] with `sentence` over the classifying stderr line.
+fn refused_unless_ok(
+    exited: &Exited,
+    verb: &str,
+    sentence: impl FnOnce(&str) -> String,
+) -> Result<(), IsolateError> {
+    match exited.code {
+        Some(0) => Ok(()),
+        None => Err(exited.failure(verb)),
+        Some(code) => {
+            let fallback = format!("exit status {code} with no stderr");
+            Err(IsolateError::Refused(sentence(
+                exited.message().unwrap_or(&fallback),
+            )))
+        }
     }
 }
 
@@ -2332,18 +2620,74 @@ fn busy_with(admin: &Path, full_ref: &str) -> bool {
 /// # Errors
 /// [`IsolateError::Git`] when the ref store cannot be read or the reference does not peel.
 pub fn branch_target(path: &Path, name: &str) -> Result<Option<String>, IsolateError> {
+    ref_target(path, &format!("refs/heads/{name}"))
+}
+
+/// MOD-132: what the full ref `full_ref` points at, peeled, or `None` when it does not exist:
+/// [`branch_target`] for any ref, collect's temp ref (`refs/htui-collect/…`) among them.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the ref store cannot be read or the reference does not peel.
+pub fn ref_target(path: &Path, full_ref: &str) -> Result<Option<String>, IsolateError> {
     let repo = open(path)?;
-    let full = format!("refs/heads/{name}");
     let Some(mut reference) = repo
-        .try_find_reference(full.as_str())
-        .map_err(|err| IsolateError::Git(format!("cannot look up {full}: {err}")))?
+        .try_find_reference(full_ref)
+        .map_err(|err| IsolateError::Git(format!("cannot look up {full_ref}: {err}")))?
     else {
         return Ok(None);
     };
     let id = reference
         .peel_to_id()
-        .map_err(|err| IsolateError::Git(format!("cannot peel {full}: {err}")))?;
+        .map_err(|err| IsolateError::Git(format!("cannot peel {full_ref}: {err}")))?;
     Ok(Some(id.detach().to_hex().to_string()))
+}
+
+/// MOD-132 plan P6: creates the full ref `full_ref` at `target`, refusing one that exists
+/// (`PreviousValue::MustNotExist`): [`create_branch`] for any ref, collect's temp ref among
+/// them. Called through [`with_retry`], as [`create_branch`] is.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the name is invalid, the target is not a hash, or the reference
+/// already exists.
+pub fn create_ref(path: &Path, full_ref: &str, target: &str) -> Result<(), IsolateError> {
+    let id = parse_oid(target)?;
+    let repo = open(path)?;
+    repo.reference(
+        full_ref,
+        id,
+        gix::refs::transaction::PreviousValue::MustNotExist,
+        "htui: collect",
+    )
+    .map(|_| ())
+    .map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot create {full_ref} in {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+/// MOD-132 plan P6: deletes the full ref `full_ref`: `true` when it was there, `false` when it
+/// was already absent. The delete is a compare-and-swap on the target just read, so a ref
+/// moved in between is refused rather than deleted. Called through [`with_retry`].
+///
+/// # Errors
+/// [`IsolateError::Git`] when the ref store cannot be read or the delete fails.
+pub fn delete_ref(path: &Path, full_ref: &str) -> Result<bool, IsolateError> {
+    let repo = open(path)?;
+    let Some(reference) = repo
+        .try_find_reference(full_ref)
+        .map_err(|err| IsolateError::Git(format!("cannot look up {full_ref}: {err}")))?
+    else {
+        return Ok(false);
+    };
+    reference.delete().map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot delete {full_ref} in {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(true)
 }
 
 /// The `<s>` of every `refs/heads/htui/<s>` label whose target lies on the first-parent line of
@@ -2938,6 +3282,23 @@ mod tests {
         SCRUBBED_ENV, TailBuffer, ancestor_walk, is_lock_error, merge_walk, parse_name_only,
     };
     use crate::isolate::IsolateError;
+
+    /// MOD-132 P10: the transfer budget replaces the verb budget and nothing else.
+    #[test]
+    fn the_transfer_budget_is_fifteen_minutes() {
+        let cli = Cli {
+            binary: PathBuf::from("git"),
+            version: MIN_GIT,
+            budget: super::VERB_TIMEOUT,
+        };
+        let long = cli.with_transfer_budget();
+        assert_eq!(long.budget, super::TRANSFER_TIMEOUT);
+        assert_eq!(super::TRANSFER_TIMEOUT, Duration::from_secs(900));
+        assert_eq!(
+            (long.binary(), long.version()),
+            (cli.binary(), cli.version())
+        );
+    }
 
     /// A repository this crate made with `gix` alone reads back through this crate's own `head`.
     #[test]
