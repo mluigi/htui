@@ -46,7 +46,7 @@ use crate::model::{
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
     StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry, UserId,
     VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
+    WorkspacePatch, WorkspaceProject, WorkspaceRunCounts, WorkspaceStop, canonical_declared_tags,
     executor_scrub_refusal, missing_tags_failure,
 };
 use crate::model::{
@@ -330,6 +330,8 @@ pub const CASES: &[&str] = &[
     "cancel_and_resume_of_one_stopped_run_race_on_one_cas",
     // MOD-125 M4 (plan D4): the CLI verbs' read of a workspace's unfinished runs
     "workspace_live_runs_lists_the_workspaces_unfinished_runs",
+    // MOD-116 M1 (plan D3): every workspace's run counts and stop row in one read
+    "workspace_run_counts_tally_every_workspace_and_its_stop",
     // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
     "replace_graph_applies_nodes_edges_and_bumps_revision",
     "replace_graph_refuses_a_stale_revision_and_writes_nothing",
@@ -1152,6 +1154,13 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         "workspace_live_runs_lists_the_workspaces_unfinished_runs" => {
             boxed(
                 workspace_live_runs_lists_the_workspaces_unfinished_runs,
+                store,
+            )
+            .await;
+        }
+        "workspace_run_counts_tally_every_workspace_and_its_stop" => {
+            boxed(
+                workspace_run_counts_tally_every_workspace_and_its_stop,
                 store,
             )
             .await;
@@ -13179,6 +13188,144 @@ async fn workspace_live_runs_lists_the_workspaces_unfinished_runs<S: WriteStore>
             .expect(CASE),
         Vec::new(),
         "{CASE}: an unknown workspace answers empty"
+    );
+}
+
+/// MOD-116 M1 D3: `workspace_run_counts()` answers one row per workspace, zeros included, in
+/// workspace-id order: its runs counted by unfinished status (`queued`, `running`,
+/// `awaiting_approval`, `stopped`) and its `workspace_stop` row. Finished runs (`done`,
+/// `cancelled`) count nowhere, nor does a run without a workspace. The stopped run is reached as an
+/// executor reaches it (a stop row, a lease, `stop_run`), never by a bare transition (M3 D1).
+/// Other cases' workspaces may be present on a shared database: the case reads only its own three.
+async fn workspace_run_counts_tally_every_workspace_and_its_stop<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_run_counts_tally_every_workspace_and_its_stop";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = fresh_workspace(CASE, store, "counted").await;
+    let elsewhere = fresh_workspace(CASE, store, "elsewhere").await;
+    let idle = fresh_workspace(CASE, store, "idle").await;
+    let ws = Some(workspace);
+
+    // The two claims fill the box's two slots; the other runs move by bare transitions (no lease).
+    let running_item = mint_tagged(CASE, store, "Running", &[]).await;
+    claimed_in(CASE, store, running_item, ws, owner).await;
+    let stopped_item = mint_tagged(CASE, store, "Stopped", &[]).await;
+    let stopped = claimed_in(CASE, store, stopped_item, ws, owner).await;
+    let elsewhere_item = mint_tagged(CASE, store, "Elsewhere", &[]).await;
+    let elsewhere_run = create_scoped_run(CASE, store, elsewhere_item, Some(elsewhere)).await;
+    assert!(
+        store
+            .transition_run(elsewhere_run, RunStatus::Queued, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the other workspace's run starts"
+    );
+    let unscoped_item = mint_tagged(CASE, store, "Unscoped", &[]).await;
+    create_scoped_run(CASE, store, unscoped_item, None).await;
+
+    let queued_item = mint_tagged(CASE, store, "Queued", &[]).await;
+    create_scoped_run(CASE, store, queued_item, ws).await;
+    let parked_item = mint_tagged(CASE, store, "Parked", &[]).await;
+    let parked = create_scoped_run(CASE, store, parked_item, ws).await;
+    for (from, to) in [
+        (RunStatus::Queued, RunStatus::Running),
+        (RunStatus::Running, RunStatus::AwaitingApproval),
+    ] {
+        assert!(
+            store
+                .transition_run(parked, from, to, at)
+                .await
+                .expect(CASE),
+            "{CASE}: the parked run moves {from} -> {to}"
+        );
+    }
+    let done_item = mint_tagged(CASE, store, "Done", &[]).await;
+    let done = create_scoped_run(CASE, store, done_item, ws).await;
+    assert!(
+        store
+            .transition_run(done, RunStatus::Queued, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the done run starts"
+    );
+    store
+        .finish_run(done, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+    let cancelled_item = mint_tagged(CASE, store, "Cancelled", &[]).await;
+    let cancelled = create_scoped_run(CASE, store, cancelled_item, ws).await;
+    store
+        .finish_run(cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect(CASE);
+
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store.stop_run(stopped, owner).await.expect(CASE),
+        "{CASE}: the poll stops one run of the workspace"
+    );
+    let stop = store.workspace_stop(workspace).await.expect(CASE);
+    assert!(stop.is_some(), "{CASE}: the workspace holds its stop row");
+
+    let all = store.workspace_run_counts().await.expect(CASE);
+    let mine: Vec<&WorkspaceRunCounts> = all
+        .iter()
+        .filter(|row| [workspace, elsewhere, idle].contains(&row.workspace_id))
+        .collect();
+    let mut in_order = vec![workspace, elsewhere, idle];
+    in_order.sort_unstable();
+    assert_eq!(
+        mine.iter().map(|row| row.workspace_id).collect::<Vec<_>>(),
+        in_order,
+        "{CASE}: each workspace once, in workspace-id order"
+    );
+    let all_ids: Vec<WorkspaceId> = all.iter().map(|row| row.workspace_id).collect();
+    let mut sorted_ids = all_ids.clone();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    assert_eq!(
+        all_ids, sorted_ids,
+        "{CASE}: the whole answer is in workspace-id order, one row per workspace"
+    );
+    let row_of = |id: WorkspaceId| {
+        mine.iter()
+            .copied()
+            .find(|row| row.workspace_id == id)
+            .cloned()
+            .expect(CASE)
+    };
+    assert_eq!(
+        row_of(workspace),
+        WorkspaceRunCounts {
+            workspace_id: workspace,
+            queued: 1,
+            running: 1,
+            awaiting_approval: 1,
+            stopped: 1,
+            stop,
+        },
+        "{CASE}: one run of each unfinished status and the stop row; never the done {done}, \
+         the cancelled {cancelled} or the run without a workspace"
+    );
+    assert_eq!(
+        row_of(elsewhere),
+        WorkspaceRunCounts {
+            workspace_id: elsewhere,
+            queued: 0,
+            running: 1,
+            awaiting_approval: 0,
+            stopped: 0,
+            stop: None,
+        },
+        "{CASE}: the other workspace counts its own running run, without a stop row"
+    );
+    assert_eq!(
+        row_of(idle),
+        WorkspaceRunCounts::tally(idle, [], None),
+        "{CASE}: a workspace without runs answers zeros"
     );
 }
 

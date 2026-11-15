@@ -44,7 +44,7 @@ use htui_core::model::{
     SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
     StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount,
     UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceRunCounts, WorkspaceStop,
 };
 use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::model::{Integration, LandOutcome};
@@ -1257,6 +1257,13 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.workspace_live_runs(workspace).await,
             Self::Online(pg) => pg.workspace_live_runs(workspace).await,
+        }
+    }
+
+    async fn workspace_run_counts(&self) -> Result<Vec<WorkspaceRunCounts>> {
+        match self {
+            Self::Memory(store) => store.workspace_run_counts().await,
+            Self::Online(pg) => pg.workspace_run_counts().await,
         }
     }
 
