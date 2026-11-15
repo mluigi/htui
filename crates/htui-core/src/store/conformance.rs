@@ -41643,9 +41643,10 @@ async fn claim_run_checks_tags_on_the_box_the_work_runs_on<S: WriteStore>(store:
 }
 
 /// MOD-130 M3 T2 (D9, P4): a child-box run takes its driver's slot and meets its driver's
-/// overlap set. With the machine's limit at one and a local run running, the machine's claim of
-/// a child-box run is `SlotFull`; once admitted, the child-box run holds its repo against a local
-/// run of the machine.
+/// overlap set. While it is still `queued` it already names its driver (D8) yet holds neither:
+/// a local run sharing its repo takes the machine's one free slot. With the machine's limit at
+/// one and a local run running, the machine's claim of a child-box run is `SlotFull`; once
+/// admitted, the child-box run holds its repo against a local run of the machine.
 async fn claim_run_counts_a_child_box_run_on_the_driver<S: WriteStore>(store: &S) {
     const CASE: &str = "claim_run_counts_a_child_box_run_on_the_driver";
     let owner = Uuid::now_v7();
@@ -41672,6 +41673,48 @@ async fn claim_run_counts_a_child_box_run_on_the_driver<S: WriteStore>(store: &S
         .await
         .expect(CASE)
         .id;
+    let child = driven_child_box(CASE, store, "counted child").await;
+    let driven = run_on_box(
+        CASE,
+        store,
+        ids::HTUI_CLEAN_1,
+        vec![repo],
+        child,
+        Some(ids::BOX),
+    )
+    .await;
+    let queued = run_row(CASE, store, driven).await;
+    assert_eq!(queued.status, RunStatus::Queued, "{CASE}: queued");
+    assert_eq!(
+        queued.executing_box_id,
+        Some(ids::BOX),
+        "{CASE}: a queued child-box run already names its driver (D8)"
+    );
+
+    // Its `executing_box_id` is the machine's, so a slot or overlap set that read that column
+    // without the status would count it here and refuse the probe.
+    let probe_item = mint_tagged(CASE, store, "Shares the queued run's repo", &[]).await;
+    let probe = store
+        .create_run(new_run(ids::PROJECT_HTUI, probe_item, vec![repo]))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(probe, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: a queued child-box run holds neither its driver's one slot nor its repo"
+    );
+    assert!(
+        store
+            .transition_run(probe, RunStatus::Running, RunStatus::Done, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the probe finishes, freeing the slot and the repo"
+    );
+
     let local = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -41686,16 +41729,6 @@ async fn claim_run_counts_a_child_box_run_on_the_driver<S: WriteStore>(store: &S
         "{CASE}: a local run takes the machine's one slot"
     );
 
-    let child = driven_child_box(CASE, store, "counted child").await;
-    let driven = run_on_box(
-        CASE,
-        store,
-        ids::HTUI_CLEAN_1,
-        vec![repo],
-        child,
-        Some(ids::BOX),
-    )
-    .await;
     assert_eq!(
         store
             .claim_run(driven, ids::BOX, owner, at, LEASE)
