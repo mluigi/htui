@@ -1380,7 +1380,9 @@ where
     /// # Errors
     /// [`EngineError::Resolve`] (rung 4, after its note on the item),
     /// [`EngineError::MissingTags`] (`R-ORCH-10`, after its note on the item, before resolution),
-    /// and the store's refusals.
+    /// [`EngineError::TargetRefused`] (MOD-130 M2 P10: the cascade's target cannot run here, after
+    /// its note on the item, after resolution), and the store's refusals, among them `create_run`'s
+    /// for a target retired since it was read (P8).
     pub async fn enqueue(
         &self,
         item: ItemId,
