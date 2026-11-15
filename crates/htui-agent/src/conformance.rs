@@ -1183,6 +1183,26 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     ) -> StoreResult<CasOutcome<Option<Binding>>> {
         self.inner.set_skill_binding(key, expected, change).await
     }
+    async fn mcp_servers(&self) -> StoreResult<Vec<htui_core::model::McpServer>> {
+        self.inner.mcp_servers().await
+    }
+    async fn create_mcp_server(
+        &self,
+        new: htui_core::model::NewMcpServer,
+    ) -> StoreResult<htui_core::model::McpServer> {
+        self.inner.create_mcp_server(new).await
+    }
+    async fn update_mcp_server(
+        &self,
+        id: htui_core::model::McpServerId,
+        expected: DateTime<Utc>,
+        patch: htui_core::model::McpServerPatch,
+    ) -> StoreResult<CasOutcome<htui_core::model::McpServer>> {
+        self.inner.update_mcp_server(id, expected, patch).await
+    }
+    async fn delete_mcp_server(&self, id: htui_core::model::McpServerId) -> StoreResult<u64> {
+        self.inner.delete_mcp_server(id).await
+    }
     async fn personas(&self) -> StoreResult<Vec<htui_core::model::Persona>> {
         self.inner.personas().await
     }

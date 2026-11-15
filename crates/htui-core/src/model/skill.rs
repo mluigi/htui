@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{
-    ItemKindId, PhaseId, ProjectId, SkillBindingId, SkillId, UserId, WorkspaceId,
+    ItemKindId, McpServerId, PhaseId, ProjectId, SkillBindingId, SkillId, UserId, WorkspaceId,
 };
 use crate::model::skill_glob::SkillGlobs;
 
@@ -63,6 +63,8 @@ impl BindingKind {
 pub enum BindingRef {
     /// A `skill` row.
     Skill(SkillId),
+    /// An `mcp_server` row (MOD-127 M2).
+    McpServer(McpServerId),
 }
 
 impl BindingRef {
@@ -71,6 +73,7 @@ impl BindingRef {
     pub const fn kind(self) -> BindingKind {
         match self {
             Self::Skill(_) => BindingKind::Skill,
+            Self::McpServer(_) => BindingKind::McpServer,
         }
     }
 }
@@ -78,6 +81,12 @@ impl BindingRef {
 impl From<SkillId> for BindingRef {
     fn from(skill: SkillId) -> Self {
         Self::Skill(skill)
+    }
+}
+
+impl From<McpServerId> for BindingRef {
+    fn from(server: McpServerId) -> Self {
+        Self::McpServer(server)
     }
 }
 
@@ -835,7 +844,9 @@ mod tests {
 
     /// One attachment row at the level `key` names, `Always`, unpinned, at position 0.
     fn attach_at(key: BindingKey, name: &str) -> (Binding, String) {
-        let BindingRef::Skill(skill) = key.target;
+        let BindingRef::Skill(skill) = key.target else {
+            panic!("a skill key");
+        };
         let (mut row, name) = attach(
             skill,
             name,

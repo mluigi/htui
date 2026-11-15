@@ -63,33 +63,34 @@ use crate::model::link::{
     ArtifactLinkKind, DocumentLink, DocumentRef, ItemLink, LinkKind, ProposeDocumentLink,
     ProposeLink, WithdrawDocumentLink, WithdrawLink,
 };
+use crate::model::mcp::{McpServer, McpServerPatch, NewMcpServer};
 use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
 use crate::model::skill_language;
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, Binding, BindingChange,
-    BindingKey, BindingLevel, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, CancelRequest,
-    ChatRunSpec, CitationKind, Claim, CommandLog, CommandRun, CommandRunId, CommandRunStatus,
-    CoverageRow, CoverageState, Document, DocumentHead, DocumentId, FollowUpRequest,
-    FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph, MemoryEntry,
-    MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource, MemoryState, MemorySupersede,
-    MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
-    NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate,
-    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
-    RunMemoryWrite, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
-    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop,
+    BindingKey, BindingLevel, BindingRef, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
+    CancelRequest, ChatRunSpec, CitationKind, Claim, CommandLog, CommandRun, CommandRunId,
+    CommandRunStatus, CoverageRow, CoverageState, Document, DocumentHead, DocumentId,
+    FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
+    McpServerId, MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource,
+    MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
+    NewItemKind, NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunMemory,
+    NewRunPlan, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note,
+    OpenPermission, OwnerDocument, PendingStop, PermissionChoice, PermissionId, PermissionStatus,
+    Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, ProjectType, PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedInput, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunMemoryWrite, RunPlan, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount,
+    UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::model::{Integration, LandOutcome};
@@ -1329,6 +1330,50 @@ pub trait WriteStore: ReadStore {
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
     ) -> Result<CasOutcome<Option<Binding>>>;
+
+    // mcp_server (MOD-127 M2 D2)
+    //
+    // A global registry like `skill`, without versions: one row, edited under CAS on `updated_at`.
+    // Attached by `set_skill_binding` with a `BindingRef::McpServer` key (D1). The refusal
+    // sentences are `model::mcp`'s pure helpers, so both stores word them once.
+
+    /// Every MCP server, ordered by `name` bytes (`COLLATE "C"`).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn mcp_servers(&self) -> Result<Vec<McpServer>>;
+
+    /// Inserts one server; both stamps are the store's clock. Order:
+    /// [`new_mcp_server_refusal`](crate::model::new_mcp_server_refusal)'s sentences, then a taken id
+    /// (`already_exists("mcp_server", id)`), then a taken name
+    /// (`already_exists("mcp_server", name)`), then a `created_by` that names no user.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as above. Nothing is
+    /// written.
+    async fn create_mcp_server(&self, new: NewMcpServer) -> Result<McpServer>;
+
+    /// Edits a server under CAS on `mcp_server.updated_at`, `update_skill`'s order:
+    /// `NotFound { entity: "mcp_server" }` for an unknown id, then `Stale(current)` for a spent
+    /// token (even with bad input), then `Constraint` for [`mcp_server_patch_refusal`](crate::model::mcp_server_patch_refusal)'s sentences
+    /// or a taken name (`already_exists("mcp_server", name)`). A started run never sees the edit:
+    /// it reads its snapshot.
+    ///
+    /// # Errors
+    /// As above.
+    async fn update_mcp_server(
+        &self,
+        id: McpServerId,
+        expected: DateTime<Utc>,
+        patch: McpServerPatch,
+    ) -> Result<CasOutcome<McpServer>>;
+
+    /// Deletes a server and every `toolbox_binding` row that names it (`ref_id` has no foreign
+    /// key, M1 D3), returning how many bindings went with it.
+    ///
+    /// # Errors
+    /// `NotFound { entity: "mcp_server" }` for an unknown id.
+    async fn delete_mcp_server(&self, id: McpServerId) -> Result<u64>;
 
     // persona (MOD-26 milestone 1, plan D4; milestone 2, D14)
     //
@@ -3797,6 +3842,17 @@ pub fn glob_names_unknown_repo(glob: &str, repo: &str, project_slug: &str) -> St
 pub const GLOB_NEEDS_GLOBS: &str =
     "an attachment with activation `glob` needs at least one glob or language";
 
+/// MOD-127 M2 D4: an `mcp_server` attachment has no versions, so nothing to pin.
+pub const MCP_BINDING_HAS_NO_VERSIONS: &str =
+    "an mcp_server attachment has no versions, so it cannot be pinned";
+
+/// MOD-127 M2 D4: an `mcp_server` attachment is `always` or `off`.
+pub const MCP_BINDING_NEVER_GLOBS: &str =
+    "an mcp_server attachment is `always` or `off`: there is no path to match a glob against";
+
+/// MOD-127 M2 D4: an `mcp_server` attachment carries no globs or languages.
+pub const MCP_BINDING_HAS_NO_GLOBS: &str = "an mcp_server attachment takes no globs or languages";
+
 /// What a store looked up before [`check_attachment`] (D88): the facts the rule needs, so the
 /// rule itself is pure and has one definition.
 #[derive(Debug, Clone, Copy)]
@@ -3819,6 +3875,11 @@ pub struct BindingFacts<'a> {
     pub repos: &'a [String],
     /// `key.project`'s slug (empty for a global key), for D79's sentence.
     pub project_slug: &'a str,
+    /// Whether `key.target` names a stored row. Defence in depth, like `workspace_exists`: both
+    /// stores answer `NotFound` for an unknown skill or server before they build the facts, so a
+    /// store never passes `false`; the refusal keeps the rule total on its own (`ref_id` has no
+    /// foreign key, M1 D3).
+    pub target_exists: bool,
 }
 
 /// The columns [`check_attachment`] derives: what is stored beside the attachment's own three.
@@ -3875,6 +3936,12 @@ fn check_key_shape(facts: &BindingFacts<'_>) -> core::result::Result<(), String>
 ///    → [`workspace_glob_names_a_repo`]; repo not in `repos` → [`glob_names_unknown_repo`];
 /// 7. `Glob` with no canonical glob → [`GLOB_NEEDS_GLOBS`].
 ///
+/// An `mcp_server` target (MOD-127 M2 D4) takes rules 0 to 2, then its own chain in place of 3 to
+/// 7: a target that does not exist → [`references_no_row`]; a pin →
+/// [`MCP_BINDING_HAS_NO_VERSIONS`]; `Glob` activation → [`MCP_BINDING_NEVER_GLOBS`]; globs or
+/// languages → [`MCP_BINDING_HAS_NO_GLOBS`]; `position < 0` → [`negative_position`]. Nothing is
+/// stored beside the attachment.
+///
 /// # Errors
 /// The sentence.
 pub fn check_attachment(
@@ -3896,6 +3963,9 @@ pub fn check_attachment(
         if facts.phase_project != Some(project) {
             return Err(phase_not_in_project(phase, project));
         }
+    }
+    if let BindingRef::McpServer(server) = key.target {
+        return check_mcp_attachment(facts, server, attachment);
     }
     if let Some(pin) = attachment.pinned_version
         && !facts.versions.contains(&pin)
@@ -3929,6 +3999,37 @@ pub fn check_attachment(
     Ok(StoredAttachment {
         globs,
         languages: skill_language::normalise(&attachment.languages),
+    })
+}
+
+/// [`check_attachment`]'s rules for an `mcp_server` target (MOD-127 M2 D4), after the key shape.
+fn check_mcp_attachment(
+    facts: &BindingFacts<'_>,
+    server: McpServerId,
+    attachment: &Attachment,
+) -> core::result::Result<StoredAttachment, String> {
+    if !facts.target_exists {
+        return Err(references_no_row(
+            "toolbox_binding.ref_id",
+            server,
+            "mcp_server",
+        ));
+    }
+    if attachment.pinned_version.is_some() {
+        return Err(MCP_BINDING_HAS_NO_VERSIONS.to_owned());
+    }
+    if attachment.activation == Activation::Glob {
+        return Err(MCP_BINDING_NEVER_GLOBS.to_owned());
+    }
+    if !attachment.globs.is_empty() || !attachment.languages.is_empty() {
+        return Err(MCP_BINDING_HAS_NO_GLOBS.to_owned());
+    }
+    if attachment.position < 0 {
+        return Err(negative_position(attachment.position));
+    }
+    Ok(StoredAttachment {
+        globs: Vec::new(),
+        languages: Vec::new(),
     })
 }
 

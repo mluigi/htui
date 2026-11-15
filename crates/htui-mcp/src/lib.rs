@@ -25,8 +25,9 @@ mod tools;
 pub use channel::{Address, Refusal, RelayError, Token, relay};
 pub use host::{McpClient, McpHost};
 
-/// The server name the agent sees: tools read `mcp__htui__<tool>`.
-pub const SERVER_NAME: &str = "htui";
+/// The server name the agent sees: tools read `mcp__htui__<tool>`. Defined in `htui-core`
+/// (MOD-127 M2 D2) so the toolbox's name rule can refuse it without a dependency cycle.
+pub use htui_core::model::SERVER_NAME;
 
 /// The environment variable naming the listener's address (a socket path or a pipe name).
 pub const ENV_ADDR: &str = "HTUI_MCP_ADDR";

@@ -4555,7 +4555,7 @@ mod queue_store_errors {
     use htui_agent::registry::DriverFactory;
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        AgentBox, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
+        AgentBox, AgentSummary, BatchId, BoundMcp, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
         DocumentHead, Item, ItemId, ItemSummary, PhaseAgent, PhaseId, ProjectId, PromptTemplate,
         QueueBatch, QueueEntry, RepoBoxPath, ResolveScope, ResolvedGraph, Run, RunId, RunStep,
         RunSummary, Scope, Status, UserId, WorkspaceSummary,
@@ -4694,6 +4694,9 @@ mod queue_store_errors {
         }
         async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
             WorkerHost::bound_skills(&self.inner, scope).await
+        }
+        async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+            WorkerHost::bound_mcp_servers(&self.inner, scope).await
         }
         async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
             WorkerHost::missing_tags(&self.inner, item, box_id).await

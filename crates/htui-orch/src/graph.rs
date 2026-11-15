@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Attachment, Binding, BindingChange, BindingKey, BindingRef,
+    Agent, AgentBox, AgentId, Attachment, Binding, BindingChange, BindingKey, BindingRef, BoundMcp,
     BoundSkill, BoxId, CapError, EdgeId, Gate, GraphBody, GraphSnapshot, Isolation, Item, ItemId,
     ItemPatch, NewStepGraph, NodeBody, PhaseAgent, PhaseId, PhasePart, Project, ProjectCaps,
     ProjectId, ProjectSettings, PromptTemplate, RepoId, ResolveScope, ResolvedGraph, ResolvedPhase,
@@ -136,6 +136,14 @@ pub trait GraphSource: Sync {
     /// # Errors
     /// The backend's own failures; `Backend` offline refuses with `PROMPT_ON_SERVER_ONLY`.
     async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>>;
+
+    /// One step's MCP servers (MOD-127 M2 D5): the attachments that apply in `scope`, resolved
+    /// most-specific-wins by `htui_core::model::resolve_mcp` and ordered by server name bytes.
+    /// An `off` winner is **included**, inactive: the step record shows it.
+    ///
+    /// # Errors
+    /// The backend's own failures.
+    async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>>;
 
     /// `R-ORCH-10`'s read (MOD-7 milestone 3, D75): the entries of `item.required_tags` that
     /// `box_id` has neither probed nor declared (`box.probed_tags ∪ box.declared_tags`), compared
@@ -1533,6 +1541,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                     versions: &versions,
                     repos: &repos,
                     project_slug: &project_slug,
+                    target_exists: true,
                 },
                 &Attachment::of(binding),
             )
@@ -2245,7 +2254,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, CasOutcome, GraphSnapshot,
+        Agent, AgentBox, AgentId, BTreeMap, BoundMcp, BoundSkill, BoxId, CasOutcome, GraphSnapshot,
         GraphSource, Isolation, Item, ItemId, NotRunnable, PhaseAgent, PhaseId, PhasePart,
         ProjectId, PromptTemplate, ResolveError, Resolved, ResolvedGraph, Result, RunBounds,
         RunMode, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase, Value, WriteStore,
@@ -2481,6 +2490,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
 
         async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
             self.store.bound_skills(scope).await
+        }
+
+        async fn bound_mcp_servers(&self, _scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+            Ok(Vec::new())
         }
 
         async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {

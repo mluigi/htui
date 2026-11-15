@@ -3806,7 +3806,10 @@ impl PgStore {
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub(crate) async fn skill_binding_row(&self, key: BindingKey) -> Result<Option<Binding>> {
-        let BindingRef::Skill(skill) = key.target;
+        // MOD-127 M2 T2 stub: no `mcp_server` row is read here until T3.
+        let BindingRef::Skill(skill) = key.target else {
+            return Ok(None);
+        };
         sqlx::query_as!(
             Binding,
             r#"

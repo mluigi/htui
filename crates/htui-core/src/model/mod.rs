@@ -94,6 +94,7 @@ pub mod item_spec;
 pub mod key;
 pub mod kind;
 pub mod link;
+pub mod mcp;
 pub mod memory;
 pub mod note;
 pub mod overlap;
@@ -139,9 +140,9 @@ pub use hierarchy::{
 };
 pub use ids::{
     AgentId, ArtifactLinkId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId,
-    MemoryEntryId, NoteId, PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId,
-    RelaySessionId, RepoId, RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId,
-    SkillBindingId, SkillId, StepGraphId, StepId, TargetId, UserId, WorkspaceId,
+    McpServerId, MemoryEntryId, NoteId, PermissionId, PersonaId, PhaseId, ProjectId,
+    PromptTemplateId, RelaySessionId, RepoId, RequirementAreaId, RequirementId, RunCommandId,
+    RunId, RunPlanId, SkillBindingId, SkillId, StepGraphId, StepId, TargetId, UserId, WorkspaceId,
 };
 pub use indexer::{
     IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, LeaseTurn,
@@ -164,6 +165,11 @@ pub use kind::{
 pub use link::{
     ArtifactLinkKind, DocumentLink, DocumentRef, ItemArtifactLink, ItemLink, LinkEdge, LinkGraph,
     LinkKind, LinkNode, LinkedDocument, ProposeDocumentLink, UpstreamEntry, WithdrawDocumentLink,
+};
+pub use mcp::{
+    BoundMcp, EnvValue, McpCandidate, McpServer, McpServerPatch, McpTransport, NewMcpServer,
+    SERVER_NAME, invalid_mcp_name, mcp_server_patch_refusal, new_mcp_server_refusal, resolve_mcp,
+    validate_mcp_name,
 };
 pub use memory::{
     MEMORY_BODY_MAX, MEMORY_RUN_WRITE_CAP, MEMORY_SUBJECT_MAX, MemoryBody, MemoryCitation,

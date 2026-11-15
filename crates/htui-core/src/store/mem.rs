@@ -5276,7 +5276,12 @@ impl State {
         change: BindingChange,
         now: DateTime<Utc>,
     ) -> Result<CasOutcome<Option<Binding>>> {
-        let BindingRef::Skill(skill) = key.target;
+        // MOD-127 M2 T2 stub: the stores keep `mcp_server` attachments from T3 on.
+        let BindingRef::Skill(skill) = key.target else {
+            return Err(StoreError::Constraint(
+                "mcp_server attachments are not stored yet".to_owned(),
+            ));
+        };
         let current = self.skill_binding_at(key).cloned();
         if current.as_ref().map(|row| row.updated_at) != expected {
             return Ok(CasOutcome::Stale(current));
@@ -5368,6 +5373,7 @@ impl State {
                 versions: &versions,
                 repos: &repos,
                 project_slug: &project_slug,
+                target_exists: true,
             },
             &attachment,
         )
@@ -12546,6 +12552,39 @@ impl WriteStore for MemStore {
     ) -> Result<CasOutcome<Option<Binding>>> {
         let now = self.now();
         self.write(|state| state.set_skill_binding(key, expected, change, now))
+    }
+
+    // MOD-127 M2 T2 stubs: T3 replaces them with the table's real reads and writes.
+    async fn mcp_servers(&self) -> Result<Vec<crate::model::McpServer>> {
+        Ok(Vec::new())
+    }
+
+    async fn create_mcp_server(
+        &self,
+        _new: crate::model::NewMcpServer,
+    ) -> Result<crate::model::McpServer> {
+        Err(StoreError::Constraint(
+            "mcp servers are not stored yet".to_owned(),
+        ))
+    }
+
+    async fn update_mcp_server(
+        &self,
+        id: crate::model::McpServerId,
+        _expected: DateTime<Utc>,
+        _patch: crate::model::McpServerPatch,
+    ) -> Result<CasOutcome<crate::model::McpServer>> {
+        Err(StoreError::NotFound {
+            entity: "mcp_server",
+            id: id.to_string(),
+        })
+    }
+
+    async fn delete_mcp_server(&self, id: crate::model::McpServerId) -> Result<u64> {
+        Err(StoreError::NotFound {
+            entity: "mcp_server",
+            id: id.to_string(),
+        })
     }
 
     async fn personas(&self) -> Result<Vec<Persona>> {

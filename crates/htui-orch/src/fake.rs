@@ -34,11 +34,11 @@ use htui_agent::record::{Control, Signal};
 use htui_core::fixtures::ids;
 use htui_core::model::Transport;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BatchId, BoundSkill, BoxId, Document, DocumentId, GraphSnapshot,
-    Isolation, Item, ItemId, ItemState, LandOutcome, NewDocument, PartMerge, PartPremerge,
-    PhaseAgent, PhaseId, PremergeReport, ProjectId, PromptTemplate, RepoId, RepoPremerge,
-    ResolveScope, ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase,
-    StepId, UserId, VerifyOutcome, latest_graph_run,
+    Agent, AgentBox, AgentId, BatchId, BoundMcp, BoundSkill, BoxId, Document, DocumentId,
+    GraphSnapshot, Isolation, Item, ItemId, ItemState, LandOutcome, NewDocument, PartMerge,
+    PartPremerge, PhaseAgent, PhaseId, PremergeReport, ProjectId, PromptTemplate, RepoId,
+    RepoPremerge, ResolveScope, ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree,
+    SnapshotPhase, StepId, UserId, VerifyOutcome, latest_graph_run,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::secret::SecretSource;
@@ -1672,6 +1672,11 @@ impl GraphSource for MemStore {
         self.bound_skills(scope).await
     }
 
+    // MOD-127 M2 T2 stub: T3 resolves the table's rows.
+    async fn bound_mcp_servers(&self, _scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        Ok(Vec::new())
+    }
+
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         self.missing_tags(item, box_id).await
     }
@@ -1816,6 +1821,10 @@ impl GraphSource for FakeGraphSource<'_> {
 
     async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
         GraphSource::bound_skills(self.store, scope).await
+    }
+
+    async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        GraphSource::bound_mcp_servers(self.store, scope).await
     }
 
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {

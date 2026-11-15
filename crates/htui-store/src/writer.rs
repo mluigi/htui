@@ -1039,6 +1039,42 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn mcp_servers(&self) -> Result<Vec<htui_core::model::McpServer>> {
+        match self {
+            Self::Memory(store) => store.mcp_servers().await,
+            Self::Online(pg) => pg.mcp_servers().await,
+        }
+    }
+
+    async fn create_mcp_server(
+        &self,
+        new: htui_core::model::NewMcpServer,
+    ) -> Result<htui_core::model::McpServer> {
+        match self {
+            Self::Memory(store) => store.create_mcp_server(new).await,
+            Self::Online(pg) => pg.create_mcp_server(new).await,
+        }
+    }
+
+    async fn update_mcp_server(
+        &self,
+        id: htui_core::model::McpServerId,
+        expected: DateTime<Utc>,
+        patch: htui_core::model::McpServerPatch,
+    ) -> Result<CasOutcome<htui_core::model::McpServer>> {
+        match self {
+            Self::Memory(store) => store.update_mcp_server(id, expected, patch).await,
+            Self::Online(pg) => pg.update_mcp_server(id, expected, patch).await,
+        }
+    }
+
+    async fn delete_mcp_server(&self, id: htui_core::model::McpServerId) -> Result<u64> {
+        match self {
+            Self::Memory(store) => store.delete_mcp_server(id).await,
+            Self::Online(pg) => pg.delete_mcp_server(id).await,
+        }
+    }
+
     async fn personas(&self) -> Result<Vec<Persona>> {
         match self {
             Self::Memory(store) => store.personas().await,

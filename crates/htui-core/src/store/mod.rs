@@ -29,6 +29,7 @@ pub use mem::MemStore;
 pub use traits::{
     BLANK_PERSONA_BODY, BLANK_SKILL_BODY, BindingFacts, BindingHome, CasOutcome, DeleteReach,
     DeleteTarget, GLOB_NEEDS_GLOBS, MAX_LEASE_TTL, MAX_PARENT_DEPTH, MAX_UPSTREAM_HOPS,
+    MCP_BINDING_HAS_NO_GLOBS, MCP_BINDING_HAS_NO_VERSIONS, MCP_BINDING_NEVER_GLOBS,
     MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, MODEL_REFUSED, ParkOutcome,
     PersonaNotInSnapshot, QueueStored, QueueTarget, QueueToken, RULE_MATCHES_EVERYTHING, ReadStore,
     SettingRung, StepFence, StoredAttachment, StoredSetting, TransitionLaw, UpdateOutcome,

@@ -42,8 +42,8 @@ use crate::model::link::{
     WithdrawLink,
 };
 use crate::model::{
-    AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    CancelRequest, Claim, CommandLog, CommandRun, CommandRunId, CommandRunStatus, Document,
+    AgentBox, AgentId, AgentSummary, BatchId, BoundMcp, BoundSkill, BoxId, BoxInfo, BoxProfile,
+    BoxRow, CancelRequest, Claim, CommandLog, CommandRun, CommandRunId, CommandRunStatus, Document,
     DocumentHead, DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary,
     MemoryEntry, MemoryState, NewCommandRun, NewDocument, NewNote, NewRun, NewRunMemory,
     NewRunPlan, NewRunStep, Note, OpenPermission, PendingStop, PermissionChoice, PermissionId,
@@ -689,6 +689,11 @@ pub trait WorkerHost: Clone + Send + Sync + 'static {
         &self,
         scope: ResolveScope,
     ) -> impl Future<Output = Result<Vec<BoundSkill>>> + Send;
+    /// `Backend::bound_mcp_servers` (MOD-127 M2 D5).
+    fn bound_mcp_servers(
+        &self,
+        scope: ResolveScope,
+    ) -> impl Future<Output = Result<Vec<BoundMcp>>> + Send;
     /// `Backend::missing_tags`.
     fn missing_tags(
         &self,

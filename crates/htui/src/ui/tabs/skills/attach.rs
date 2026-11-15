@@ -1511,7 +1511,9 @@ mod tests {
     /// The pane over an empty scope (only the `global` row), its form open on `form`, drawn at
     /// 100 x 20 in `theme`, as the buffer and its rows.
     fn drawn_form(form: Form, theme: &crate::ui::Theme) -> (ratatui::buffer::Buffer, Vec<String>) {
-        let BindingRef::Skill(skill) = form.key.target;
+        let BindingRef::Skill(skill) = form.key.target else {
+            panic!("a skill key");
+        };
         drawn(AttachMode::Form(form), skill, &no_projects(), theme)
     }
 
@@ -1679,7 +1681,9 @@ mod tests {
         for theme in both_themes() {
             let mut form = activation_form(Activation::Glob);
             form.key.project = Some(project);
-            let BindingRef::Skill(skill) = form.key.target;
+            let BindingRef::Skill(skill) = form.key.target else {
+                panic!("a skill key");
+            };
             let mode = AttachMode::Picker { form, cursor: 1 };
             let (buffer, rows) = drawn(mode, skill, &snapshot, &theme);
             let top = row_of(&rows, "repos of ");
