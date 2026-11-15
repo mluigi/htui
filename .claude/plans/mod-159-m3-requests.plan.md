@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-159-knowledge-indexer.prd.md`
 **Selected Milestone**: 3 — Requests and holder visibility
 **Complexity**: Medium (no migration; two `.sqlx` entries; three crates)
-**Status**: fact-checked
+**Status**: complete (`c9edd91a..cfa8d817`, review fix round R1 `2025c1e9..cfa8d817`)
 **Run**: `/handoff-run MOD-159` in an hr sandbox (`hr/MOD-159`); CONFIRM waived by `/handoff-run`. Lane shape: one
 serial lane T1 → T2 → T3. T2 and T3 have disjoint file sets but both edit and build the `htui` crate, so they may run
 side by side only in separate worktrees (as M2's T2/T3, C49 there); on one tree, T2 then T3. Verifier on T1
