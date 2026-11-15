@@ -215,7 +215,10 @@ down      = ["down"]    # next hit
 why       = ["ctrl-e"]  # why search is unavailable
 
 [workspaces]
-open = ["o"]  # open workspace
+open   = ["o"]           # open workspace
+stop   = ["s"]           # stop runs
+resume = ["r"]           # resume runs
+yes    = ["y", "enter"]  # yes
 
 [migration]
 yes = ["y", "Y"]  # yes

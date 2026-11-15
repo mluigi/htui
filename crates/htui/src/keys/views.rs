@@ -1001,6 +1001,11 @@ pub const RUNS_CONFIRM: Stack<'static> = Stack::new(&[
 pub const RUNS_CANCEL: Stack<'static> =
     Stack::new(&[Layer::view(Context::BacklogRuns, &[]), CONFIRM, MODAL]);
 
+/// The Workspaces tab's stop or resume question (MOD-116 M2 D6): yes or no, no choice; the
+/// `[workspaces]` view default adds `enter` to `confirm.yes`.
+pub const WORKSPACES_CONFIRM: Stack<'static> =
+    Stack::new(&[Layer::view(Context::Workspaces, &[]), CONFIRM, MODAL]);
+
 /// Backlog > Runs, while the close-out counts (it can only be left).
 pub const RUNS_COUNTING: Stack<'static> =
     Stack::new(&[Layer::view(Context::BacklogRuns, &[]), NO, MODAL]);
@@ -1218,10 +1223,18 @@ pub const LOGS_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
-/// The Workspaces tab (MOD-116 M1 D10): its own verb, every list act (the moves and the fold),
-/// the pane scroll, then the layout and history layers of a list + detail tab.
+/// The Workspaces tab (MOD-116 M1 D10): its own verbs (open, and MOD-116 M2 D6's stop and
+/// resume), every list act (the moves and the fold), the pane scroll, then the layout and history
+/// layers of a list + detail tab.
 pub const WORKSPACES_BROWSE: Stack<'static> = Stack::new(&[
-    Layer::view(Context::Workspaces, &[Act::WorkspacesOpen]),
+    Layer::view(
+        Context::Workspaces,
+        &[
+            Act::WorkspacesOpen,
+            Act::WorkspacesStop,
+            Act::WorkspacesResume,
+        ],
+    ),
     LIST_ALL,
     PANE_SCROLL,
     LAYOUT,
@@ -1517,6 +1530,7 @@ mod tests {
         CHAT_REPLAY,
         LOGS_BROWSE,
         WORKSPACES_BROWSE,
+        WORKSPACES_CONFIRM,
         ACTIVITY_BROWSE,
         QUEUE_OVERLAY,
         HIERARCHY_PICKER,
@@ -1969,6 +1983,15 @@ mod tests {
         assert_eq!(resolve(WORKSPACES_BROWSE, "J"), [Act::PaneScrollDown]);
         assert_eq!(resolve(WORKSPACES_BROWSE, "w"), [Act::Workspaces]);
         assert_eq!(resolve(WORKSPACES_BROWSE, "backspace"), [Act::HistoryBack]);
+        // MOD-116 M2 D6: `s` stops, `r` resumes; the question answers `y`/`enter` and `n`/`esc`,
+        // and swallows the list's keys.
+        assert_eq!(resolve(WORKSPACES_BROWSE, "s"), [Act::WorkspacesStop]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "r"), [Act::WorkspacesResume]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "y"), [Act::ConfirmYes]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "enter"), [Act::ConfirmYes]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "n"), [Act::ConfirmNo]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "esc"), [Act::ConfirmNo]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "j"), []);
         // MOD-122 M3 D10: the activity panel's `enter` and `f` are its own (no `list.fold`, no
         // `backlog` layer), its `G` is `list.bottom` (F8), and it has no pane scroll.
         assert_eq!(resolve(ACTIVITY_BROWSE, "enter"), [Act::ActivityOpen]);
@@ -2248,8 +2271,8 @@ mod tests {
         // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
         // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94; MOD-122
         // M3 D10: the activity panel's, 95; MOD-116 M1 D10: the Workspaces tab's took the retired
-        // switcher's place, still 95.
-        assert_eq!(views.len(), 95);
+        // switcher's place, still 95; MOD-116 M2 D6: its question's, 96.
+        assert_eq!(views.len(), 96);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

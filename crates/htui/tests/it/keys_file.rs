@@ -400,7 +400,13 @@ mod binary {
             "the [global] change is applied: {stdout}"
         );
         assert!(
-            stdout.contains("[workspaces]\nopen = [\"o\"]  # open workspace\n"),
+            stdout.contains(
+                "[workspaces]\n\
+                 open   = [\"o\"]           # open workspace\n\
+                 stop   = [\"s\"]           # stop runs\n\
+                 resume = [\"r\"]           # resume runs\n\
+                 yes    = [\"y\", \"enter\"]  # yes\n"
+            ),
             "[workspaces] is at its default: {stdout}"
         );
         assert!(!stdout.contains("[switcher]"), "{stdout}");

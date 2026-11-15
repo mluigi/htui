@@ -1474,8 +1474,9 @@ quit = ["x", "shift-a"]
             errors("[workspaces]\nclose = \"f2\"\n"),
             one(
                 2,
-                "[workspaces] close: no such action; [workspaces] has open, and may override down, \
-                 up, top, bottom, fold, scroll_down, scroll_up, page_down, page_up"
+                "[workspaces] close: no such action; [workspaces] has open, stop, resume, and may \
+                 override down, up, top, bottom, fold, scroll_down, scroll_up, page_down, page_up, \
+                 yes, no"
             )
         );
         assert_eq!(

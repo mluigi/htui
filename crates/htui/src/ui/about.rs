@@ -89,10 +89,15 @@ const LOGS: About = About {
     ],
 };
 
-/// The Workspaces tab (MOD-116 M1).
+/// The Workspaces tab (MOD-116 M1; M2 D6 stops and resumes).
 const WORKSPACES: About = About {
     purpose: "Every workspace and what it is doing: open one; the others keep running in the background.",
-    actions: &[(Act::WorkspacesOpen, "open"), (Act::ListFold, "fold")],
+    actions: &[
+        (Act::WorkspacesOpen, "open"),
+        (Act::WorkspacesStop, "stop"),
+        (Act::WorkspacesResume, "resume"),
+        (Act::ListFold, "fold"),
+    ],
 };
 
 /// The about text of `tab`, if it has one: the seven main tabs do, anything else (a test double)

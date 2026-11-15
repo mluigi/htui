@@ -219,11 +219,18 @@ close = []  # close; Esc always"#;
             ),
             "{printed}"
         );
-        // MOD-116 M1 D10: `[workspaces]` sits where the retired `[switcher]` did.
+        // MOD-116 M1 D10: `[workspaces]` sits where the retired `[switcher]` did; M2 D6 adds
+        // stop, resume and the question's `enter`.
         assert!(
             printed.contains("[concepts]")
-                && printed
-                    .contains("\n[workspaces]\nopen = [\"o\"]  # open workspace\n\n[migration]\n")
+                && printed.contains(
+                    "\n[workspaces]\n\
+                     open   = [\"o\"]           # open workspace\n\
+                     stop   = [\"s\"]           # stop runs\n\
+                     resume = [\"r\"]           # resume runs\n\
+                     yes    = [\"y\", \"enter\"]  # yes\n\
+                     \n[migration]\n"
+                )
                 && !printed.contains("[switcher]"),
             "{printed}"
         );
