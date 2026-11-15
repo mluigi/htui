@@ -15224,7 +15224,9 @@ fn attachment(activation: Activation, position: i32) -> Attachment {
 fn key(skill: SkillId, project: Option<ProjectId>, phase: Option<PhaseId>) -> SkillBindingKey {
     SkillBindingKey {
         skill,
+        workspace: None,
         project,
+        item_kind: None,
         phase,
     }
 }

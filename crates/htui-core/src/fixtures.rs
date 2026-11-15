@@ -667,7 +667,9 @@ fn skill_bindings() -> Vec<SkillBinding> {
         |(id, skill_id, phase_id, pinned_version, position)| SkillBinding {
             id,
             skill_id,
+            workspace_id: None,
             project_id: Some(ids::PROJECT_HTUI),
+            item_kind_id: None,
             phase_id,
             pinned_version,
             position,

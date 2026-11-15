@@ -5352,7 +5352,9 @@ impl State {
         let row = SkillBinding {
             id: current.map_or_else(SkillBindingId::new, |row| row.id),
             skill_id: key.skill,
+            workspace_id: key.workspace,
             project_id: key.project,
+            item_kind_id: key.item_kind,
             phase_id: key.phase,
             pinned_version: attachment.pinned_version,
             position: attachment.position,
@@ -14892,7 +14894,9 @@ mod tests {
         data.skill_bindings.push(crate::model::SkillBinding {
             id: crate::model::SkillBindingId::new(),
             skill_id: house,
+            workspace_id: None,
             project_id: None,
+            item_kind_id: None,
             phase_id: None,
             pinned_version: None,
             position: 5,

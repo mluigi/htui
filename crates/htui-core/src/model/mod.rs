@@ -228,8 +228,8 @@ pub use run::{
 pub use scope::{PromptScope, Scope};
 pub use skill::{
     Activation, Attachment, BindingChange, BoundSkill, ChoiceReason, NewSkill, NewSkillVersion,
-    Skill, SkillBinding, SkillBindingKey, SkillChoice, SkillLevel, SkillPatch, SkillVersion,
-    StepFiles, needs_files,
+    ResolveScope, Skill, SkillBinding, SkillBindingKey, SkillChoice, SkillLevel, SkillPatch,
+    SkillVersion, StepFiles, needs_files,
 };
 pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
