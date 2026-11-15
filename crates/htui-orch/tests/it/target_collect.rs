@@ -457,6 +457,76 @@ async fn a_host_executing_path_needs_consent_for_its_tip_and_list() {
     world.assert_clean();
 }
 
+/// P9: a changed name that is not UTF-8 is still matched (on its lossy decoding, which keeps
+/// every ASCII byte the patterns are made of), so a skill or a `build.rs` under such a name cannot
+/// slip past consent; a non-UTF-8 name outside the patterns is not listed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_non_utf8_host_executing_path_still_needs_consent() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Some((cli, world)) = world().await else {
+        return;
+    };
+    let channel = world.channel();
+    let clone = world.clone_dir();
+    for name in [
+        &b".claude/skills/ev\xffil/SKILL.md"[..],
+        b"cr\xfeate/build.rs",
+        b"docs/n\xffote.txt",
+    ] {
+        let file = clone.join(std::ffi::OsStr::from_bytes(name));
+        std::fs::create_dir_all(file.parent().expect("a parent")).expect("a directory");
+        std::fs::write(&file, "x\n").expect("the file is written");
+    }
+    world.stdout(&clone, &["add", "--all"]);
+    world.stdout(
+        &clone,
+        &[
+            "-c",
+            "user.name=Agent",
+            "-c",
+            "user.email=agent@localhost",
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "-m",
+            "non-utf-8 names",
+        ],
+    );
+    let tip = world.stdout(&clone, &["rev-parse", "HEAD"]);
+
+    let listed = vec![
+        ".claude/skills/ev\u{fffd}il/SKILL.md".to_owned(),
+        "cr\u{fffd}ate/build.rs".to_owned(),
+    ];
+    let outcome = collect(&cli, &channel, &world.request()).await;
+    assert_eq!(
+        outcome.expect("collect"),
+        CollectOutcome::NeedsConsent {
+            tip: tip.clone(),
+            rewritten_from: None,
+            config_paths: listed.clone(),
+        }
+    );
+    assert_eq!(world.local(), None, "nothing was created");
+    world.assert_clean();
+
+    let mut req = world.request();
+    req.consent = Some(Consent {
+        tip: tip.clone(),
+        force: false,
+        config_paths: listed,
+    });
+    let outcome = collect(&cli, &channel, &req).await;
+    assert_eq!(
+        outcome.expect("collect"),
+        CollectOutcome::Created { tip: tip.clone() }
+    );
+    assert_eq!(world.local(), Some(tip));
+    world.assert_clean();
+}
+
 #[tokio::test]
 async fn a_local_branch_checked_out_in_a_worktree_is_refused() {
     let Some((cli, world)) = world().await else {

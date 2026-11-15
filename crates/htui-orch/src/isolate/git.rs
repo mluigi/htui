@@ -1324,27 +1324,35 @@ fn refused_unless_ok(
 pub struct NameOnly {
     /// Repo-relative, `/`-separated names; a non-UTF-8 or empty one was dropped.
     pub paths: Vec<String>,
+    /// MOD-132 P9: the non-UTF-8 names [`paths`](Self::paths) dropped, lossily decoded, in git's
+    /// order. A lossy decode keeps every ASCII byte, so a reader matching ASCII patterns (collect's
+    /// host-executing paths) still sees a name it must not miss; never a path to open.
+    pub unreadable: Vec<String>,
     /// The output overflowed [`DIFF_CAP`]; the partial last entry was dropped.
     pub truncated: bool,
 }
 
 /// MOD-9 D130: NUL-split; the final segment is always dropped (empty when git finished its last
-/// entry, partial when the cap cut it); a non-UTF-8 or empty entry is dropped; `truncated =
-/// overflowed`.
+/// entry, partial when the cap cut it); an empty entry is dropped, a non-UTF-8 one goes to
+/// `unreadable` lossily decoded (MOD-132 P9); `truncated = overflowed`.
 fn parse_name_only(bytes: &[u8], overflowed: bool) -> NameOnly {
     let mut segments: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
     // `-z` ends every whole entry with a NUL, so the last segment is empty when git finished and
     // the cut entry when the cap stopped it: either way it is not a name.
     segments.pop();
-    NameOnly {
-        paths: segments
-            .into_iter()
-            .filter(|segment| !segment.is_empty())
-            .filter_map(|segment| std::str::from_utf8(segment).ok())
-            .map(str::to_owned)
-            .collect(),
+    let mut names = NameOnly {
         truncated: overflowed,
+        ..NameOnly::default()
+    };
+    for segment in segments.into_iter().filter(|segment| !segment.is_empty()) {
+        match std::str::from_utf8(segment) {
+            Ok(path) => names.paths.push(path.to_owned()),
+            Err(_) => names
+                .unreadable
+                .push(String::from_utf8_lossy(segment).into_owned()),
+        }
     }
+    names
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5387,12 +5395,14 @@ mod tests {
                 ]
                 .map(str::to_owned)
                 .to_vec(),
+                unreadable: Vec::new(),
                 truncated: false,
             }
         );
     }
 
-    /// MOD-9 D119: a name that is not UTF-8 is dropped, never decoded into a plausible path.
+    /// MOD-9 D119: a name that is not UTF-8 is dropped from `paths`, never decoded into a
+    /// plausible path; MOD-132 P9 keeps its lossy decoding apart in `unreadable`.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn name_only_drops_a_non_utf8_name() {
@@ -5415,6 +5425,7 @@ mod tests {
                 .expect("the names read"),
             NameOnly {
                 paths: vec!["ok.rs".to_owned()],
+                unreadable: vec!["\u{fffd}\u{fffd}.rs".to_owned()],
                 truncated: false,
             }
         );
@@ -5459,6 +5470,7 @@ mod tests {
     fn name_only_drops_a_partial_last_entry_when_capped() {
         let names = |paths: &[&str], truncated: bool| NameOnly {
             paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            unreadable: Vec::new(),
             truncated,
         };
         assert_eq!(
@@ -5476,6 +5488,15 @@ mod tests {
             names(&["a.rs", "b.rs"], false)
         );
         assert_eq!(parse_name_only(b"", false), NameOnly::default());
+        assert_eq!(
+            parse_name_only(b"a.rs\0\xffb.rs\0", false),
+            NameOnly {
+                paths: vec!["a.rs".to_owned()],
+                unreadable: vec!["\u{fffd}b.rs".to_owned()],
+                truncated: false,
+            },
+            "a non-UTF-8 name is kept apart, lossily decoded"
+        );
     }
 
     /// A-3's read: whether an object database holds a commit, with no subprocess.

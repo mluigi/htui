@@ -700,7 +700,10 @@ impl Collect<'_> {
         }
 
         let old = local.clone().unwrap_or_else(|| req.base.clone());
-        let changed = self.cli.name_only(&req.repo, &old, &tip).await?;
+        let mut changed = self.cli.name_only(&req.repo, &old, &tip).await?;
+        // A non-UTF-8 name is matched on its lossy decoding: a skill or a `build.rs` under one
+        // must not slip past consent (P9).
+        changed.paths.append(&mut changed.unreadable);
         let mut config_paths = host_executing(&changed.paths, &req.extra_confirm_paths);
         if changed.truncated {
             config_paths.push(UNLISTED_PATHS.to_owned());
