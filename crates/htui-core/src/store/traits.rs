@@ -45,6 +45,11 @@
 //! **MOD-163** (plan D6, D7) adds two `ReadStore` reads and four `WriteStore` writers over
 //! `memory_entry` and `memory_entry_revision`. Neither table is mirrored, so `CacheStore` answers both
 //! reads `None` ("not available here"), as it answers `requirement_revisions`.
+//!
+//! **MOD-133** (plan D6) adds three `WriteStore` methods over `integration`, beside `repos`'
+//! writer-side reads: [`WriteStore::integrations`], [`WriteStore::take_integrations`] and
+//! [`WriteStore::settle_integration`]. The mirror holds the table for its readiness read only, so
+//! neither `ReadStore` nor `CacheStore` grows.
 
 use std::collections::HashMap;
 
@@ -87,6 +92,7 @@ use crate::model::{
     WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
+use crate::model::{Integration, LandOutcome};
 use crate::model::{PLAN_SUFFIX, STAGE_KEYS, StepRole};
 use crate::model::{PlanAdmission, PlanStatus, PlanToAdmit, RunPlanId};
 use crate::prompt::settings::{Rungs, SettingKey, validate};
@@ -2160,6 +2166,12 @@ pub trait WriteStore: ReadStore {
     /// Ends a graph run (ANA-2 §4.3 verdict 3; milestone 2 plan D7). The item is not written
     /// (MOD-144: its state derives from the run, ANA-35 §7.1).
     ///
+    /// MOD-133 D4: `to = done` also writes, in the same transaction, one `pending`
+    /// [`Integration`] per entry of the run's `graph_snapshot.integrate` whose repo has at least
+    /// one `run_step_commit` with an `after_hash` in this run, carrying the snapshot's mode, remote
+    /// and target and the run's project (`ON CONFLICT DO NOTHING`). `failed` and `cancelled`
+    /// write none, nor does a repo the run did not change.
+    ///
     /// `to` must be terminal (`done`, `failed`, `cancelled`). The run moves `<current> -> to`
     /// under [`legal_move`], `finished_at = COALESCE(finished_at, at)`, and `failure` is written
     /// when `to = failed`.
@@ -2180,6 +2192,48 @@ pub trait WriteStore: ReadStore {
         failure: Option<&str>,
         at: DateTime<Utc>,
     ) -> Result<()>;
+
+    /// MOD-133 D6: the `integration` records of `run`, ordered by `repo_id` bytes; empty for a run
+    /// that wrote none (every `local` run) and for an unknown run.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn integrations(&self, run: RunId) -> Result<Vec<Integration>>;
+
+    /// MOD-133 D6: leases and returns every `pending` record whose run's `executing_box_id` is
+    /// `box_id` (and whose `run_id` is `run`, when given) and whose lease is free, expired **by the
+    /// store's clock**, or already `owner`'s: `lease_box_id = box_id`, `lease_owner = owner`,
+    /// `lease_expires_at` = the store's clock plus `ttl` (the [`claim_run`](Self::claim_run)
+    /// rule). Ordered by `(run_id, repo_id)` bytes; empty when nothing is takeable, an unknown box
+    /// or run included. A record under another owner's live lease is left alone, so two sweeps of
+    /// one box never land one record twice.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` outside
+    /// [`lease_ttl_micros`]'s range, before anything is read.
+    async fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> Result<Vec<Integration>>;
+
+    /// MOD-133 D6: settles one record that is `pending` under `owner`'s lease:
+    /// [`LandOutcome::Landed`] → `landed` with `landed_hash`, [`LandOutcome::Refused`] →
+    /// `refused` with `refusal`; the lease is cleared and `updated_at` moves. `Ok(false)`, writing
+    /// nothing, when the row is not this owner's `pending` row (a lost lease, an already-settled
+    /// record, an unknown pair): never an error, so a sweep that lost the race moves on.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+    ) -> Result<bool>;
 
     /// `R-TUI-9`'s three effects, one transaction (plan D6): the summary document at its next
     /// version, the commits upserted, and the item set to `closed` with `resolution` and

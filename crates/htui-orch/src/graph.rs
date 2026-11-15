@@ -29,7 +29,8 @@ use htui_core::model::{
     sort_snapshot_edges,
 };
 use htui_core::model::{
-    MemoryState, PlanScope, SnapshotCapture, SnapshotCaptureModel, SnapshotMemory,
+    IntegrateMode, IntegrateSnapshot, MemoryState, PlanScope, SnapshotCapture,
+    SnapshotCaptureModel, SnapshotMemory,
 };
 use htui_core::prompt::{
     MEMORY_TOKEN_CAP, TokenEstimator, resolve_light_model, select_memory,
@@ -337,9 +338,42 @@ pub enum ResolveError {
         /// What `divide::admission_refusal` answered.
         reason: crate::status::RunFailure,
     },
+    /// MOD-133 D3: a repo of the run's scope cannot integrate as its mode asks: the project's
+    /// `integrate` default is unreadable, a non-`local` repo has no `remote_url`, or a repo asks
+    /// for `pull_request` (MOD-133 milestone 3). The reason is the whole sentence
+    /// ([`integrate_default_unreadable`], [`integrate_without_remote`],
+    /// [`integrate_pull_request`]).
+    #[error("{reason}")]
+    IntegrateRefused {
+        /// `repo.name`.
+        repo: String,
+        /// The sentence.
+        reason: String,
+    },
     /// The store said no.
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// MOD-133 D3: the project's `integrate` setting is not a mode; `value` is its JSON text.
+#[must_use]
+pub fn integrate_default_unreadable(value: &str) -> String {
+    format!("project setting `integrate` is {value}, not one of local, push, pull_request")
+}
+
+/// MOD-133 D3: a non-`local` repo with no `remote_url` has nowhere to land.
+#[must_use]
+pub fn integrate_without_remote(repo: &str, mode: IntegrateMode) -> String {
+    format!("`{repo}` integrates by `{mode}` but has no remote URL: set one, or set it to `local`")
+}
+
+/// MOD-133 D3: `pull_request` lands with milestone 3.
+#[must_use]
+pub fn integrate_pull_request(repo: &str) -> String {
+    format!(
+        "`{repo}` integrates by `pull_request`, which lands with MOD-133 milestone 3: set it to \
+         `local` or `push`"
+    )
 }
 
 /// MOD-138 D6: why a graph this version cannot walk is refused before its run exists.
@@ -452,10 +486,99 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
             // resume (`resolve_or_refused`, phases only) reads it or can fail on it. Boxed for
             // the 2 MiB debug stack, as the graph read is.
             resolved.snapshot.memory = Box::pin(frozen_memory(store, item.project_id)).await?;
+            // MOD-133 D3: here, on a resolved graph only, so a v1 run's resume
+            // (`resolve_or_refused`) never meets an integrate refusal.
+            resolved.snapshot.integrate = Box::pin(frozen_integrate(
+                store,
+                item.project_id,
+                &resolved.repo_scope,
+            ))
+            .await?;
             Ok(resolved)
         }
         Resolution::Refused { refusal, .. } => Err(refusal),
     }
+}
+
+/// MOD-133 D3: how each repo of `scope` integrates, frozen for `GraphSnapshot::integrate`: one
+/// entry per non-`local` repo, its mode (`repo.integrate`, else the project's default, read only
+/// when some repo of the scope needs it) with its `remote_url` and `default_branch`. Scope order
+/// decides which refusal is raised first.
+///
+/// # Errors
+/// [`ResolveError::IntegrateRefused`] for an unreadable project default, a non-`local` repo with
+/// no remote URL, or a `pull_request` repo; a missing `project` row is
+/// [`StoreError::NotFound`].
+async fn frozen_integrate<S: htui_core::store::WorkerStore>(
+    store: &S,
+    project: ProjectId,
+    scope: &[RepoId],
+) -> std::result::Result<BTreeMap<RepoId, IntegrateSnapshot>, ResolveError> {
+    let mut frozen = BTreeMap::new();
+    if scope.is_empty() {
+        return Ok(frozen);
+    }
+    let repos = store.repos(project).await?;
+    let mut default: Option<std::result::Result<IntegrateMode, String>> = None;
+    for repo in scope
+        .iter()
+        .filter_map(|id| repos.iter().find(|repo| repo.id == *id))
+    {
+        let mode = match repo.integrate {
+            Some(mode) => mode,
+            None => {
+                if default.is_none() {
+                    let settings = store
+                        .project(project)
+                        .await?
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "project",
+                            id: project.to_string(),
+                        })?
+                        .settings;
+                    default = Some(IntegrateMode::project_default(&settings));
+                }
+                match default.clone().unwrap_or(Ok(IntegrateMode::Local)) {
+                    Ok(mode) => mode,
+                    Err(value) => {
+                        return Err(ResolveError::IntegrateRefused {
+                            repo: repo.name.clone(),
+                            reason: integrate_default_unreadable(&value),
+                        });
+                    }
+                }
+            }
+        };
+        if mode == IntegrateMode::Local {
+            continue;
+        }
+        let Some(remote) = repo
+            .remote_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|remote| !remote.is_empty())
+        else {
+            return Err(ResolveError::IntegrateRefused {
+                repo: repo.name.clone(),
+                reason: integrate_without_remote(&repo.name, mode),
+            });
+        };
+        if mode == IntegrateMode::PullRequest {
+            return Err(ResolveError::IntegrateRefused {
+                repo: repo.name.clone(),
+                reason: integrate_pull_request(&repo.name),
+            });
+        }
+        frozen.insert(
+            repo.id,
+            IntegrateSnapshot {
+                mode,
+                remote: remote.to_owned(),
+                target_branch: repo.default_branch.clone(),
+            },
+        );
+    }
+    Ok(frozen)
 }
 
 /// MOD-163 D11, D12: the project's `Active` memory entries, selected under
@@ -718,6 +841,7 @@ pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: Grap
         // a v1 run's resume, which keeps only these phases, never reads it.
         memory: None,
         capture: frozen_capture(source, &project, app).await?,
+        integrate: BTreeMap::new(),
     };
     // MOD-139 M3 D10 (blueprint P-11): what admission would refuse, over the frozen settings and
     // expanded phases; after every `NotYetRunnable`, so each of those outranks it.

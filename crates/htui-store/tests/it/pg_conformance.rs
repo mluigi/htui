@@ -67,15 +67,16 @@ use htui_store::testkit as common;
 /// and MOD-150 M2's four close-out link cases (plan D2, D3) make it 312,
 /// and MOD-150 M3's five document link cases (plan D1-D8) make it 317,
 /// and MOD-149's seven key, nesting, refinement and coverage cases (plan D2-D9) make it 324,
-/// and MOD-125 M4's `workspace_live_runs` case (plan D4) makes it 325.
-const EXPECTED_CASES: usize = 325;
+/// and MOD-125 M4's `workspace_live_runs` case (plan D4) makes it 325,
+/// and MOD-133 M1's seven integration cases (plan D2, D4, D6, D7) make it 332.
+const EXPECTED_CASES: usize = 332;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (325 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (332 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -92,7 +93,8 @@ fn case_list_matches_mem_store() {
          three `pending_stops` cases, its M-3 case and its L-3 case and its R1 cancel-and-stop \
          case, and MOD-152 T1's three command-log cases, and MOD-125 M3's five resume and \
          stopped-run cancel cases, and MOD-164's six capture-write and two usage-tally cases and its F2 person-amended and evidence cases, and MOD-150 M2's four close-out link cases, and MOD-150 M3's five document link cases, and MOD-149's seven key, nesting, \
-             refinement and coverage cases, and MOD-125 M4's `workspace_live_runs` case)"
+             refinement and coverage cases, and MOD-125 M4's `workspace_live_runs` case, and MOD-133 M1's seven integration \
+             cases)"
     );
 }
 
@@ -355,5 +357,381 @@ async fn pg_store_indexer_lease_concurrent_takes_have_one_winner() {
             }
         }
     }
+    db.drop_db().await;
+}
+
+/// MOD-133 D7, Postgres only: the two readiness sites the conformance suite does not reach, the
+/// inherent `ready_items` and `queue_rows`' open-blocker list, release a `blocked_by` target whose
+/// latest graph run is `done` only when every `integration` record of that run is `landed` or
+/// `pr_merged`. The fixture's `agy` FIX-1 is blocked by `agy` ANA-1, whose latest graph run
+/// (`RUN_7`) is `done`: ready with no record, held by a `pending`, `refused`, `pr_open` or
+/// `pr_closed` one, released again once it is `landed` or `pr_merged`. `items(ready)` agrees.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_ready_items_and_queue_rows_wait_for_landed_integrations() {
+    use chrono::{SubsecRound as _, Utc};
+    use htui_core::fixtures::ids;
+    use htui_core::model::{ItemFilter, Scope, TIMESTAMPTZ_DIGITS};
+    use htui_core::store::ReadStore as _;
+
+    let Some(db) = Box::pin(common::demo_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let pg = &db.store;
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let scope = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+    };
+    pg.queue_item(ids::AGY_FIX_1, ids::BOX, None, ids::USER, at)
+        .await
+        .expect("queue agy FIX-1");
+    let blocker: String = sqlx::query_scalar("SELECT key FROM item WHERE id = $1")
+        .bind(ids::AGY_ANA_1.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read agy ANA-1's key");
+    let repo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO repo (project_id, name, remote_url) \
+         VALUES ($1, 'landed', 'git@example.invalid:landed.git') RETURNING id",
+    )
+    .bind(ids::PROJECT_AGY.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("plant a repo");
+
+    let observe = async |case: &str| -> (bool, bool, Vec<String>) {
+        let ready = pg
+            .ready_items(&scope, ids::BOX)
+            .await
+            .expect(case)
+            .iter()
+            .any(|row| row.id == ids::AGY_FIX_1);
+        let listed = pg
+            .items(
+                &scope,
+                &ItemFilter {
+                    ready: Some(true),
+                    ..ItemFilter::default()
+                },
+            )
+            .await
+            .expect(case)
+            .iter()
+            .any(|row| row.id == ids::AGY_FIX_1);
+        let blockers = pg
+            .queue_rows(ids::BOX)
+            .await
+            .expect(case)
+            .into_iter()
+            .find(|row| row.entry.item_id == ids::AGY_FIX_1)
+            .unwrap_or_else(|| panic!("{case}: agy FIX-1 is on the box's queue"))
+            .open_blockers;
+        (ready, listed, blockers)
+    };
+
+    assert_eq!(
+        observe("no record").await,
+        (true, true, Vec::new()),
+        "a `done` blocker run with no record (`local`) releases, as before MOD-133"
+    );
+    sqlx::query(
+        "INSERT INTO integration (run_id, repo_id, project_id, mode, remote, target_branch) \
+         VALUES ($1, $2, $3, 'push', 'git@example.invalid:landed.git', 'main')",
+    )
+    .bind(ids::RUN_7.as_uuid())
+    .bind(repo)
+    .bind(ids::PROJECT_AGY.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("a pending record of RUN_7");
+    for (state, refusal, released) in [
+        ("pending", None, false),
+        (
+            "refused",
+            Some("non_fast_forward: main on the remote has moved"),
+            false,
+        ),
+        ("pr_open", None, false),
+        ("pr_closed", None, false),
+        ("landed", None, true),
+        ("pr_merged", None, true),
+    ] {
+        sqlx::query("UPDATE integration SET state = $2, refusal = $3 WHERE run_id = $1")
+            .bind(ids::RUN_7.as_uuid())
+            .bind(state)
+            .bind(refusal)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(|err| panic!("move the record to {state}: {err}"));
+        let expected = if released {
+            (true, true, Vec::new())
+        } else {
+            (false, false, vec![blocker.clone()])
+        };
+        assert_eq!(
+            observe(state).await,
+            expected,
+            "a `{state}` record {} its dependent",
+            if released { "releases" } else { "holds" }
+        );
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-133 D6, Postgres only: eight `take_integrations` at once, by distinct owners of the box
+/// the run executed on, lease each `pending` record to exactly one of them (the compare-and-set
+/// re-checks the lease after a row-lock wait), and only that owner settles it. `MemStore` takes
+/// under one lock, so there is no race to lose, and it is not a conformance case.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn pg_concurrent_integration_takes_lease_each_record_once() {
+    use chrono::TimeDelta;
+    use futures::future::join_all;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{LandOutcome, RepoId, RunId};
+    use htui_core::store::WriteStore as _;
+    use uuid::Uuid;
+
+    const TAKERS: usize = 8;
+    const RECORDS: usize = 3;
+    let Some(db) = Box::pin(common::demo_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let pg = &db.store;
+    sqlx::query("UPDATE run SET executing_box_id = $2 WHERE id = $1")
+        .bind(ids::RUN_7.as_uuid())
+        .bind(ids::BOX.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("RUN_7 executed on the fixture box");
+    let mut planted: Vec<(RunId, RepoId)> = Vec::new();
+    for index in 0..RECORDS {
+        let repo: Uuid = sqlx::query_scalar(
+            "INSERT INTO repo (project_id, name, remote_url) \
+             VALUES ($1, $2, 'git@example.invalid:raced.git') RETURNING id",
+        )
+        .bind(ids::PROJECT_AGY.as_uuid())
+        .bind(format!("raced-{index}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("plant a repo");
+        sqlx::query(
+            "INSERT INTO integration (run_id, repo_id, project_id, mode, remote, target_branch) \
+             VALUES ($1, $2, $3, 'push', 'git@example.invalid:raced.git', 'main')",
+        )
+        .bind(ids::RUN_7.as_uuid())
+        .bind(repo)
+        .bind(ids::PROJECT_AGY.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("plant a pending record");
+        planted.push((ids::RUN_7, RepoId(repo)));
+    }
+    planted.sort_unstable();
+
+    let owners: Vec<Uuid> = (0..TAKERS).map(|_| Uuid::now_v7()).collect();
+    let answers = join_all(
+        owners
+            .iter()
+            .map(|&owner| pg.take_integrations(ids::BOX, owner, TimeDelta::minutes(5), None)),
+    )
+    .await;
+    let mut taken: Vec<((RunId, RepoId), Uuid)> = Vec::new();
+    for (answer, owner) in answers.into_iter().zip(&owners) {
+        for row in answer.expect("a concurrent take") {
+            taken.push(((row.run_id, row.repo_id), *owner));
+        }
+    }
+    taken.sort_unstable();
+    assert_eq!(
+        taken.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        planted,
+        "every record is leased, and to one owner only: {taken:?}"
+    );
+    let landed = LandOutcome::Landed {
+        hash: "4444444444444444444444444444444444444444".to_owned(),
+    };
+    for ((run, repo), holder) in &taken {
+        for owner in &owners {
+            if owner != holder {
+                assert!(
+                    !pg.settle_integration(*run, *repo, *owner, &landed)
+                        .await
+                        .expect("a settle"),
+                    "only the lease's holder settles {repo}"
+                );
+            }
+        }
+        assert!(
+            pg.settle_integration(*run, *repo, *holder, &landed)
+                .await
+                .expect("a settle"),
+            "the holder settles {repo}"
+        );
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-133 fix round F1: plants `count` `pending` push records of `RUN_7`, which it marks as
+/// executed on the fixture box, each on a repo of its own, and returns their keys in order.
+#[cfg(feature = "demo")]
+async fn plant_box_integrations(
+    db: &common::TestDb,
+    tag: &str,
+    count: usize,
+) -> Vec<(htui_core::model::RunId, htui_core::model::RepoId)> {
+    use htui_core::fixtures::ids;
+    use htui_core::model::RepoId;
+    use uuid::Uuid;
+
+    sqlx::query("UPDATE run SET executing_box_id = $2 WHERE id = $1")
+        .bind(ids::RUN_7.as_uuid())
+        .bind(ids::BOX.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("RUN_7 executed on the fixture box");
+    let mut planted = Vec::new();
+    for index in 0..count {
+        let repo: Uuid = sqlx::query_scalar(
+            "INSERT INTO repo (project_id, name, remote_url) \
+             VALUES ($1, $2, 'git@example.invalid:raced.git') RETURNING id",
+        )
+        .bind(ids::PROJECT_AGY.as_uuid())
+        .bind(format!("{tag}-{index}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("plant a repo");
+        sqlx::query(
+            "INSERT INTO integration (run_id, repo_id, project_id, mode, remote, target_branch) \
+             VALUES ($1, $2, $3, 'push', 'git@example.invalid:raced.git', 'main')",
+        )
+        .bind(ids::RUN_7.as_uuid())
+        .bind(repo)
+        .bind(ids::PROJECT_AGY.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("plant a pending record");
+        planted.push((ids::RUN_7, RepoId(repo)));
+    }
+    planted.sort_unstable();
+    planted
+}
+
+/// MOD-133 fix round F1 (review L1), Postgres only: the walk's take (filtered to its run) and the
+/// sweep's take (every run on the box), by different owners at once over two records of one run,
+/// both answer `Ok` - neither is killed as a deadlock victim (`40P01`) - and together lease each
+/// record exactly once. Repeated, because a deadlock needs the two scans to interleave.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_walk_and_sweep_takes_of_one_run_never_deadlock() {
+    use chrono::TimeDelta;
+    use htui_core::fixtures::ids;
+    use htui_core::store::WriteStore as _;
+    use uuid::Uuid;
+
+    const ROUNDS: usize = 40;
+    let Some(db) = Box::pin(common::demo_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let pg = &db.store;
+    let planted = plant_box_integrations(&db, "walked", 2).await;
+    for round in 0..ROUNDS {
+        sqlx::query(
+            "UPDATE integration \
+                SET lease_box_id = NULL, lease_owner = NULL, lease_expires_at = NULL \
+              WHERE run_id = $1",
+        )
+        .bind(ids::RUN_7.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("free every lease");
+        let (walk_owner, sweep_owner) = (Uuid::now_v7(), Uuid::now_v7());
+        let (walk, sweep) = tokio::join!(
+            pg.take_integrations(
+                ids::BOX,
+                walk_owner,
+                TimeDelta::minutes(5),
+                Some(ids::RUN_7)
+            ),
+            pg.take_integrations(ids::BOX, sweep_owner, TimeDelta::minutes(5), None),
+        );
+        let walk = walk.unwrap_or_else(|err| panic!("round {round}: the walk's take: {err}"));
+        let sweep = sweep.unwrap_or_else(|err| panic!("round {round}: the sweep's take: {err}"));
+        let mut taken: Vec<_> = walk
+            .iter()
+            .chain(&sweep)
+            .map(|row| (row.run_id, row.repo_id))
+            .collect();
+        taken.sort_unstable();
+        assert_eq!(
+            taken, planted,
+            "round {round}: every record is leased, to one owner only"
+        );
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-133 fix round F1 (review L1), Postgres only: a take never waits on a row lock. With one
+/// record held `FOR UPDATE` by another transaction, a take answers at once with the other record
+/// only; once the lock is gone, the next take leases the held one.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_integration_take_skips_a_record_another_transaction_holds() {
+    use chrono::TimeDelta;
+    use htui_core::fixtures::ids;
+    use htui_core::store::WriteStore as _;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    let Some(db) = Box::pin(common::demo_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let pg = &db.store;
+    let planted = plant_box_integrations(&db, "held", 2).await;
+    let (held, free) = (planted[0], planted[1]);
+    let mut tx = db.pool.begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM integration WHERE run_id = $1 AND repo_id = $2 FOR UPDATE")
+        .bind(held.0.as_uuid())
+        .bind(held.1.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("hold one record");
+
+    let first = Uuid::now_v7();
+    let taken = tokio::time::timeout(
+        Duration::from_secs(10),
+        pg.take_integrations(ids::BOX, first, TimeDelta::minutes(5), None),
+    )
+    .await
+    .expect("the take does not wait on the held row")
+    .expect("a take");
+    assert_eq!(
+        taken
+            .iter()
+            .map(|row| (row.run_id, row.repo_id))
+            .collect::<Vec<_>>(),
+        vec![free],
+        "the held record is skipped, the free one leased"
+    );
+
+    tx.rollback().await.expect("release the lock");
+    let second = Uuid::now_v7();
+    let taken = pg
+        .take_integrations(ids::BOX, second, TimeDelta::minutes(5), None)
+        .await
+        .expect("a take");
+    assert_eq!(
+        taken
+            .iter()
+            .map(|row| (row.run_id, row.repo_id))
+            .collect::<Vec<_>>(),
+        vec![held],
+        "the released record is leased; the other stays with its first owner"
+    );
+
     db.drop_db().await;
 }

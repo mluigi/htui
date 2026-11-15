@@ -27,6 +27,7 @@ use htui_core::model::{
     StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, WorkspaceId,
     WorkspaceStop, WorkspaceSummary,
 };
+use htui_core::model::{Integration, LandOutcome};
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
 use uuid::Uuid;
@@ -392,6 +393,27 @@ impl htui_core::store::WorkerStore for PgStore {
         at: DateTime<Utc>,
     ) -> Result<()> {
         WriteStore::finish_run(self, run, to, failure, at).await
+    }
+    async fn integrations(&self, run: RunId) -> Result<Vec<Integration>> {
+        WriteStore::integrations(self, run).await
+    }
+    async fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> Result<Vec<Integration>> {
+        WriteStore::take_integrations(self, box_id, owner, ttl, run).await
+    }
+    async fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+    ) -> Result<bool> {
+        WriteStore::settle_integration(self, run, repo, owner, outcome).await
     }
     async fn close_out(
         &self,
@@ -961,6 +983,27 @@ impl htui_core::store::WorkerStore for Writer {
         at: DateTime<Utc>,
     ) -> Result<()> {
         WriteStore::finish_run(self, run, to, failure, at).await
+    }
+    async fn integrations(&self, run: RunId) -> Result<Vec<Integration>> {
+        WriteStore::integrations(self, run).await
+    }
+    async fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> Result<Vec<Integration>> {
+        WriteStore::take_integrations(self, box_id, owner, ttl, run).await
+    }
+    async fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+    ) -> Result<bool> {
+        WriteStore::settle_integration(self, run, repo, owner, outcome).await
     }
     async fn close_out(
         &self,

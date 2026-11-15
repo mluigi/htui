@@ -87,6 +87,7 @@ pub mod hand_written;
 pub mod hierarchy;
 pub mod ids;
 pub mod indexer;
+pub mod integration;
 pub mod item;
 pub mod item_merge;
 pub mod item_spec;
@@ -144,6 +145,7 @@ pub use ids::{
 pub use indexer::{
     IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, ProjectChanges,
 };
+pub use integration::{IntegrateMode, Integration, IntegrationState, LandOutcome};
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution, Status,
 };
@@ -209,15 +211,16 @@ pub use requirement::{
 };
 pub use run::{
     CAPTURE_KEY, CAPTURE_POSITION, COMMAND_LOG_CAP, COMMAND_LOG_STORE_MAX, ChatRunSpec, CommandLog,
-    CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun, NewRunPlan,
-    NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge, PlanAdmission, PlanStatus,
-    PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind, RunMode, RunPlan, RunStatus,
-    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, RuntimeChanges, STAGE_KEYS,
-    SnapshotCandidate, SnapshotCapture, SnapshotCaptureModel, SnapshotDivide, SnapshotEdge,
-    SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings,
-    SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus,
-    StoredCommandLog, TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges,
-    edge_sort_key, latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
+    CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, IntegrateSnapshot, NewCommandRun,
+    NewRun, NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge, PlanAdmission,
+    PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind, RunMode,
+    RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotCapture, SnapshotCaptureModel,
+    SnapshotDivide, SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase,
+    SnapshotSeat, SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow, StepOpening,
+    StepOutcome, StepRole, StepStatus, StoredCommandLog, TIMESTAMPTZ_DIGITS, ToolCallCount,
+    VerifyOutcome, default_snapshot_edges, edge_sort_key, latest_graph_run, latest_live_graph_run,
+    prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{

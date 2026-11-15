@@ -642,6 +642,10 @@ pub struct PhaseAgent {
 /// Read-only (plan D11) and every field defaults, so `'{}'` decodes. Nothing re-serialises the
 /// struct onto the row, which is what keeps unknown keys alive: MOD-15's key-level `set_setting`
 /// is the column's only writer.
+///
+/// MOD-133 D2: the `integrate` key is deliberately **not** a field. It is read strictly and on its
+/// own by [`IntegrateMode::project_default`](crate::model::IntegrateMode::project_default): a bad
+/// value here would fail this whole decode and reset every key, `default_isolation` included.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectSettings {

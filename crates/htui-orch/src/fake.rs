@@ -35,10 +35,10 @@ use htui_core::fixtures::ids;
 use htui_core::model::Transport;
 use htui_core::model::{
     Agent, AgentBox, AgentId, BatchId, BoundSkill, BoxId, Document, DocumentId, GraphSnapshot,
-    Isolation, Item, ItemId, ItemState, NewDocument, PartMerge, PartPremerge, PhaseAgent, PhaseId,
-    PremergeReport, ProjectId, PromptTemplate, RepoId, RepoPremerge, ResolvedGraph, Run, RunId,
-    RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId, VerifyOutcome,
-    latest_graph_run,
+    Isolation, Item, ItemId, ItemState, LandOutcome, NewDocument, PartMerge, PartPremerge,
+    PhaseAgent, PhaseId, PremergeReport, ProjectId, PromptTemplate, RepoId, RepoPremerge,
+    ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId,
+    VerifyOutcome, latest_graph_run,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::secret::SecretSource;
@@ -67,8 +67,8 @@ use crate::command::{Command, CommandOutcome, EngineError};
 use crate::engine::{ControlFor, DeadWalks, PolicyFor, SessionKey, Tails};
 use crate::graph::GraphSource;
 use crate::isolate::{
-    ChangedPaths, Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, IsolatorFuture, PartTip,
-    Prepared, PreparedTree, ResetReport,
+    ChangedPaths, Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, IsolatorFuture, LandRequest,
+    PartTip, Prepared, PreparedTree, ResetReport,
 };
 use crate::tools::{ToolHost, ToolHostError, ToolLease, ToolScope};
 use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
@@ -199,6 +199,11 @@ pub struct FakeIsolator {
     /// MOD-125 M3 D5a: scripted [`reacquire`](Isolator::reacquire) refusals, FIFO, one consumed
     /// per call.
     reacquire_refusals: Mutex<VecDeque<String>>,
+    /// MOD-133 D8: scripted [`land`](Isolator::land) answers, FIFO, one consumed per call;
+    /// unscripted is `Landed` at the request's last commit, or forty `0`s.
+    land_answers: Mutex<VecDeque<std::result::Result<LandOutcome, IsolateError>>>,
+    /// MOD-133 D8: every [`land`](Isolator::land) request, in call order.
+    land_requests: Mutex<Vec<LandRequest>>,
 }
 
 /// One scripted `premerge` answer (by part key, blueprint P-15: part step ids are minted at
@@ -242,6 +247,8 @@ pub enum IsolatorCall {
     Unmerged(StepId),
     /// MOD-125 M3 D5a: `reacquire` of a stopped step's trees.
     Reacquire(StepId),
+    /// MOD-133 D8: `land` of one integration record, by its repo.
+    Land(RepoId),
 }
 
 /// Which of a step's two isolator windows is open (MOD-138 M3 T3).
@@ -784,6 +791,32 @@ impl FakeIsolator {
             .find(|(_, held_step)| *held_step == step)
             .copied();
         key.and_then(|key| held.remove(&key))
+    }
+
+    /// MOD-133 D8: the next [`land`](Isolator::land) answers `outcome`.
+    pub fn script_land(&self, outcome: LandOutcome) {
+        self.land_answers
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Ok(outcome));
+    }
+
+    /// MOD-133 D8: the next [`land`](Isolator::land) fails with `err`, which leaves the record
+    /// `pending`.
+    pub fn fail_land(&self, err: IsolateError) {
+        self.land_answers
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Err(err));
+    }
+
+    /// MOD-133 D8: every [`land`](Isolator::land) request so far, in call order.
+    #[must_use]
+    pub fn land_requests(&self) -> Vec<LandRequest> {
+        self.land_requests
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
     }
 
     /// MOD-138 M3 T3: every call this isolator has seen, in order (see [`IsolatorCall`]).
@@ -1382,6 +1415,32 @@ impl Isolator for FakeIsolator {
                 }),
             );
             Ok(())
+        })
+    }
+
+    /// MOD-133 D8: logged and recorded; the next scripted answer, else `Landed` at the
+    /// request's last commit (forty `0`s when it has none).
+    fn land<'a>(&'a self, request: &'a LandRequest) -> IsolatorFuture<'a, LandOutcome> {
+        Box::pin(async move {
+            self.log(IsolatorCall::Land(request.repo));
+            self.land_requests
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push(request.clone());
+            let scripted = self
+                .land_answers
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front();
+            scripted.unwrap_or_else(|| {
+                Ok(LandOutcome::Landed {
+                    hash: request
+                        .commits
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "0".repeat(40)),
+                })
+            })
         })
     }
 }
@@ -3355,6 +3414,15 @@ impl FakeOrchestrator {
     /// The adoption's own store error; a run's recovery failure is its `Next::Error`.
     pub async fn sweep(&self) -> std::result::Result<Vec<crate::engine::Adopted>, EngineError> {
         crate::engine::sweep_fake(self).await
+    }
+
+    /// `Engine::land` over the same parts (MOD-133 D9): take and land this box's `pending`
+    /// integration records (only `run`'s, when given).
+    ///
+    /// # Errors
+    /// As `Engine::land`.
+    pub async fn land(&self, run: Option<RunId>) -> std::result::Result<usize, EngineError> {
+        crate::engine::land_fake(self, run).await
     }
 
     /// `Engine::resume` over the same parts (ANA-2 §12 criterion 3).

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ids::{BoxId, ProjectId, RepoId, UserId, WorkspaceId};
+use crate::model::integration::IntegrateMode;
 use crate::secret::SecretScope;
 
 /// A row of `workspace` (§5.3): the scope the TUI is always inside (plan D10).
@@ -184,6 +185,11 @@ pub struct Repo {
     pub default_branch: String,
     /// `repo.is_primary`: at most one primary repository per project.
     pub is_primary: bool,
+    /// MOD-133 D2: `repo.integrate`, how a finished run's work reaches the remote; `None` is the
+    /// project's default ([`IntegrateMode::project_default`]). Absent from the JSON when `None`,
+    /// so a repo row serialised before MOD-133 keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrate: Option<IntegrateMode>,
     /// `repo.created_at`.
     pub created_at: DateTime<Utc>,
     /// `repo.updated_at`.
@@ -227,6 +233,15 @@ pub struct RepoPatch {
     /// `repo.is_primary`; `Some(true)` demotes the project's current primary in the same
     /// transaction, `Some(false)` only unsets this row.
     pub is_primary: Option<bool>,
+    /// MOD-133 D2: `repo.integrate`, doubly wrapped as `remote_url` is: `Some(None)` clears it
+    /// back to the project's default. On the wire an absent key is `None` and `null` is
+    /// `Some(None)`, as [`ProjectPatch::secret`] reads.
+    #[serde(
+        default,
+        deserialize_with = "crate::model::kind::present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub integrate: Option<Option<IntegrateMode>>,
 }
 
 /// A row of `repo_box_path` (§5.3): where a repository lives on one box (`R-BOX-4`).
@@ -383,5 +398,56 @@ mod tests {
             let read: ProjectPatch = serde_json::from_str(json).expect("the literal deserialises");
             assert_eq!(read.secret, secret, "`{json}` reads as {secret:?}");
         }
+    }
+
+    /// MOD-133 D2: `RepoPatch.integrate`'s three states survive a JSON round trip, `null`
+    /// meaning "clear it back to the project default", as `ProjectPatch.secret`'s do.
+    #[test]
+    fn repo_patch_integrate_round_trips_all_three_states() {
+        for (integrate, json) in [
+            (None, "{}"),
+            (Some(None), r#"{"integrate":null}"#),
+            (Some(Some(IntegrateMode::Push)), r#"{"integrate":"push"}"#),
+        ] {
+            let patch = RepoPatch {
+                integrate,
+                ..RepoPatch::default()
+            };
+            let text = serde_json::to_string(&patch).expect("a patch serialises");
+            let back: RepoPatch = serde_json::from_str(&text).expect("a patch deserialises");
+            assert_eq!(back, patch, "`{text}` round-trips");
+            let read: RepoPatch = serde_json::from_str(json).expect("the literal deserialises");
+            assert_eq!(read.integrate, integrate, "`{json}` reads as {integrate:?}");
+        }
+    }
+
+    /// MOD-133 D2: a repo on its project's default serialises without the key, so JSON written
+    /// before MOD-133 keeps its bytes and still decodes.
+    #[test]
+    fn repo_without_integrate_keeps_its_json() {
+        let mut repo = Repo {
+            id: RepoId::default(),
+            project_id: ProjectId::default(),
+            name: "core".to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            is_primary: true,
+            integrate: None,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            updated_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        let text = serde_json::to_string(&repo).expect("a repo serialises");
+        assert!(!text.contains("integrate"), "{text}");
+        assert_eq!(
+            serde_json::from_str::<Repo>(&text).expect("it decodes"),
+            repo
+        );
+        repo.integrate = Some(IntegrateMode::PullRequest);
+        let text = serde_json::to_string(&repo).expect("a repo serialises");
+        assert!(text.contains(r#""integrate":"pull_request""#), "{text}");
+        assert_eq!(
+            serde_json::from_str::<Repo>(&text).expect("it decodes"),
+            repo
+        );
     }
 }

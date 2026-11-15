@@ -12,8 +12,8 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 75 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
-//! MOD-139 M1 `run_plans`), 8 [`WriteStore`] reads, 29 writes (MOD-139 M1 adds `insert_run_plan`,
+//! `WorkerStore` is 78 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
+//! MOD-139 M1 `run_plans`), 9 [`WriteStore`] reads, 31 writes (MOD-139 M1 adds `insert_run_plan`,
 //! MOD-139 M2 `admit_plan` and `abandon_plans`),
 //! `write_document`, MOD-42's three command methods, MOD-11's
 //! four agent writes and
@@ -21,7 +21,8 @@
 //! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`, MOD-125 M2 the read
 //! `pending_stops`; MOD-144 R1 adds the write
 //! `block_if_idle`; MOD-125 M3 the read `pending_resumes` and the writes `resume_run`,
-//! `cancel_stopped_run` and `record_opening`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
+//! `cancel_stopped_run` and `record_opening`; MOD-133 the read `integrations` and the writes
+//! `take_integrations` and `settle_integration`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`;
 //! MOD-12 M2 adds two (`batch_spend`, `project_settings`), 31.
@@ -52,6 +53,7 @@ use crate::model::{
     StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
     UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
+use crate::model::{Integration, LandOutcome};
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
 use crate::store::traits::{ParkOutcome, ReadStore, StepFence, WriteStore};
@@ -441,6 +443,24 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         failure: Option<&str>,
         at: DateTime<Utc>,
     ) -> impl Future<Output = Result<()>> + Send;
+    /// [`WriteStore::integrations`] (MOD-133 D6): close-out's integration section.
+    fn integrations(&self, run: RunId) -> impl Future<Output = Result<Vec<Integration>>> + Send;
+    /// [`WriteStore::take_integrations`] (MOD-133 D6): the land pass's lease.
+    fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> impl Future<Output = Result<Vec<Integration>>> + Send;
+    /// [`WriteStore::settle_integration`] (MOD-133 D6).
+    fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+    ) -> impl Future<Output = Result<bool>> + Send;
     /// [`WriteStore::close_out`].
     fn close_out(
         &self,
@@ -1060,6 +1080,27 @@ impl WorkerStore for MemStore {
         at: DateTime<Utc>,
     ) -> Result<()> {
         WriteStore::finish_run(self, run, to, failure, at).await
+    }
+    async fn integrations(&self, run: RunId) -> Result<Vec<Integration>> {
+        WriteStore::integrations(self, run).await
+    }
+    async fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> Result<Vec<Integration>> {
+        WriteStore::take_integrations(self, box_id, owner, ttl, run).await
+    }
+    async fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+    ) -> Result<bool> {
+        WriteStore::settle_integration(self, run, repo, owner, outcome).await
     }
     async fn close_out(
         &self,

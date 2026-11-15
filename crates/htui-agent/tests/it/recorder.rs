@@ -1158,6 +1158,29 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<()> {
         self.inner.finish_run(run, to, failure, at).await
     }
+    async fn integrations(&self, run: RunId) -> StoreResult<Vec<htui_core::model::Integration>> {
+        self.inner.integrations(run).await
+    }
+    async fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> StoreResult<Vec<htui_core::model::Integration>> {
+        self.inner.take_integrations(box_id, owner, ttl, run).await
+    }
+    async fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &htui_core::model::LandOutcome,
+    ) -> StoreResult<bool> {
+        self.inner
+            .settle_integration(run, repo, owner, outcome)
+            .await
+    }
     async fn close_out(
         &self,
         item: ItemId,

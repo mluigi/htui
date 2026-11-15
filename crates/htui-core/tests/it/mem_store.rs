@@ -62,7 +62,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        325,
+        332,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -121,7 +121,9 @@ async fn demo_store_loads_the_fixture() {
          and MOD-150 M2's four for the link a close-out records or requires (plan D2, D3), and \
          MOD-150 M3's five for links to documents (plan D1-D8), and MOD-149's seven for \
          requirement keys, nesting, cross-owner refinement, coverage and the workspace delete's \
-         detach (plan D2-D9), and MOD-125 M4's `workspace_live_runs` case (plan D4)"
+         detach (plan D2-D9), and MOD-125 M4's `workspace_live_runs` case (plan D4), and MOD-133 \
+         M1's seven integration cases: the record `finish_run(Done)` writes and the ones it does \
+         not, the lease, the settle, readiness and `repo.integrate` (plan D2, D4, D6, D7)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

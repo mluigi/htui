@@ -22,7 +22,7 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 58 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 59 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
@@ -34,7 +34,8 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `0032_worker_log.sql` (MOD-122 M2 plan D1), then the one of `0034_item_artifact_link.sql`
 /// (MOD-150 M3 plan D1), then the one of `0035_requirement_keys.sql` (MOD-149 plan D1), then the
 /// one of `0036_activity_event.sql` (MOD-122 M3 plan D2), then the
-/// one of `0038_indexer_lease.sql` (MOD-159 M1 plan D2).
+/// one of `0038_indexer_lease.sql` (MOD-159 M1 plan D2), then the one of
+/// `0039_integration.sql` (MOD-133 M1 plan D5).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -111,6 +112,8 @@ const TABLES: &[&str] = &[
     "activity_event",
     // 0038_indexer_lease.sql (MOD-159 M1)
     "indexer_lease",
+    // 0039_integration.sql (MOD-133 M1)
+    "integration",
 ];
 
 #[tokio::test]
@@ -133,7 +136,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -151,7 +154,8 @@ async fn migrations_apply_on_a_clean_database() {
          0030_link_kinds.sql, MOD-152's 0031_command_log.sql, MOD-122's 0032_worker_log.sql, \
          MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql, \
          MOD-149's 0035_requirement_keys.sql, MOD-122 M3's 0036_activity_event.sql, MOD-125 M4's \
-         0037_stopped_run_index.sql and MOD-159 M1's 0038_indexer_lease.sql, in ordinal order"
+         0037_stopped_run_index.sql, MOD-159 M1's 0038_indexer_lease.sql and MOD-133 M1's \
+         0039_integration.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -169,7 +173,7 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        58,
+        59,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
@@ -182,13 +186,14 @@ async fn migrations_apply_on_a_clean_database() {
          0032_worker_log.sql adds worker_log and MOD-150 M3's 0034_item_artifact_link.sql \
          adds item_artifact_link and MOD-149's 0035_requirement_keys.sql adds \
          requirement_child_counter and MOD-122 M3's 0036_activity_event.sql adds activity_event \
-         and MOD-159 M1's 0038_indexer_lease.sql adds indexer_lease"
+         and MOD-159 M1's 0038_indexer_lease.sql adds indexer_lease and MOD-133 M1's \
+         0039_integration.sql adds integration"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 58 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 59 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
          0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
          and MOD-146's 0021_project_type.sql (project_type) and MOD-163's 0022_memory.sql \
@@ -198,7 +203,7 @@ async fn migrations_apply_on_a_clean_database() {
          (item_artifact_link) and MOD-149's 0035_requirement_keys.sql \
          (requirement_child_counter) and MOD-122 M3's 0036_activity_event.sql \
          (activity_event) and MOD-159 M1's 0038_indexer_lease.sql \
-         (indexer_lease) and nothing else, \
+         (indexer_lease) and MOD-133 M1's 0039_integration.sql (integration) and nothing else, \
          got {present:?}"
     );
 
@@ -4300,8 +4305,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(38),
-        "thirty-eight embedded migrations, none applied (through MOD-159 M1's 0038_indexer_lease.sql)"
+        MigrationState::Pending(39),
+        "thirty-nine embedded migrations, none applied (through MOD-133 M1's 0039_integration.sql)"
     );
 
     db.drop_db().await;
@@ -4401,8 +4406,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(38),
-        "thirty-eight embedded migrations, through MOD-159 M1's 0038_indexer_lease.sql"
+        MigrationState::Pending(39),
+        "thirty-nine embedded migrations, through MOD-133 M1's 0039_integration.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4410,8 +4415,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(38),
-        "every one of the thirty-eight, through MOD-159 M1's 0038_indexer_lease.sql, is pending"
+        HeadlessError::MigrationsPending(39),
+        "every one of the thirty-nine, through MOD-133 M1's 0039_integration.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4433,8 +4438,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(38),
-        "every one of the thirty-eight, through MOD-159 M1's 0038_indexer_lease.sql, is pending"
+        HeadlessError::MigrationsPending(39),
+        "every one of the thirty-nine, through MOD-133 M1's 0039_integration.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4585,8 +4590,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        38,
-        "the later applies migrate nothing: the thirty-eight embedded migrations (through MOD-159 M1's 0038_indexer_lease.sql) are applied once"
+        39,
+        "the later applies migrate nothing: the thirty-nine embedded migrations (through MOD-133 M1's 0039_integration.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -8593,6 +8598,224 @@ async fn migration_0036_creates_indexer_lease() {
     assert!(
         comment.is_some_and(|text| text.contains("MOD-159") && text.contains("Not mirrored")),
         "the table says what it is and that the cache has no copy"
+    );
+
+    db.drop_db().await;
+}
+
+/// Inserts an `integration` record of `run` in `repo` at `state` with `refusal`, `mode` given.
+async fn insert_integration(
+    pool: &sqlx::PgPool,
+    (run, repo, project): (uuid::Uuid, uuid::Uuid, uuid::Uuid),
+    mode: &str,
+    state: &str,
+    refusal: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO integration (run_id, repo_id, project_id, mode, remote, target_branch, \
+                                  state, refusal) \
+         VALUES ($1, $2, $3, $4, 'git@example.invalid:core.git', 'main', $5, $6)",
+    )
+    .bind(run)
+    .bind(repo)
+    .bind(project)
+    .bind(mode)
+    .bind(state)
+    .bind(refusal)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// MOD-133 M1 (plan D2, D5): 0039 adds `repo.integrate` (NULL on every existing repo, one of the
+/// three modes or nothing) and creates `integration` keyed `(run_id, repo_id)`: `mode` never
+/// `local`, `state` one of the six, `refusal` set exactly when `refused`, the trigger moves
+/// `updated_at`, the two indexes exist, and a record goes with its run and with its project (a
+/// project delete is not refused by `repo_id`'s key). Staged at v38, as on a real box, over a repo
+/// and a run written before the migration.
+#[tokio::test]
+async fn migration_0039_creates_integration() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(38, &db.pool)
+        .await
+        .expect("apply 0001 through 0038");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod133").await;
+    let (project, _) = plant_project_kind(pool, user, "landed").await;
+    let box_id = insert_box(pool, user).await;
+    let repo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO repo (project_id, name, remote_url) \
+         VALUES ($1, 'core', 'git@example.invalid:core.git') RETURNING id",
+    )
+    .bind(project)
+    .fetch_one(pool)
+    .await
+    .expect("plant a v38 repo");
+    let run = insert_run(pool, project, "graph", "done", box_id, user).await;
+
+    MIGRATOR.run_to(39, pool).await.expect("apply 0039");
+
+    let integrate: Option<String> = sqlx::query_scalar("SELECT integrate FROM repo WHERE id = $1")
+        .bind(repo)
+        .fetch_one(pool)
+        .await
+        .expect("read repo.integrate");
+    assert_eq!(
+        integrate, None,
+        "an existing repo is on its project's default"
+    );
+    for mode in ["local", "push", "pull_request"] {
+        sqlx::query("UPDATE repo SET integrate = $2 WHERE id = $1")
+            .bind(repo)
+            .bind(mode)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|err| panic!("`{mode}` is a mode: {err}"));
+    }
+    let err = sqlx::query("UPDATE repo SET integrate = 'merge' WHERE id = $1")
+        .bind(repo)
+        .execute(pool)
+        .await
+        .expect_err("an unknown mode is refused");
+    assert_refused_by(err, "chk_repo_integrate", "repo.integrate = 'merge'");
+
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name::text, data_type::text, is_nullable::text \
+           FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'integration' \
+          ORDER BY ordinal_position",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read integration's columns");
+    let expected: Vec<(String, String, String)> = [
+        ("run_id", "uuid", "NO"),
+        ("repo_id", "uuid", "NO"),
+        ("project_id", "uuid", "NO"),
+        ("mode", "text", "NO"),
+        ("remote", "text", "NO"),
+        ("target_branch", "text", "NO"),
+        ("state", "text", "NO"),
+        ("refusal", "text", "YES"),
+        ("landed_hash", "text", "YES"),
+        ("pr_ref", "text", "YES"),
+        ("pr_url", "text", "YES"),
+        ("lease_box_id", "uuid", "YES"),
+        ("lease_owner", "uuid", "YES"),
+        ("lease_expires_at", "timestamp with time zone", "YES"),
+        ("created_at", "timestamp with time zone", "NO"),
+        ("updated_at", "timestamp with time zone", "NO"),
+    ]
+    .into_iter()
+    .map(|(name, kind, nullable)| (name.to_owned(), kind.to_owned(), nullable.to_owned()))
+    .collect();
+    assert_eq!(columns, expected, "integration is as plan D5 writes it");
+    for (index, definition) in [
+        (
+            "idx_integration_updated_at",
+            "CREATE INDEX idx_integration_updated_at ON public.integration USING btree (updated_at)",
+        ),
+        (
+            "idx_integration_pending",
+            "CREATE INDEX idx_integration_pending ON public.integration USING btree (run_id) \
+             WHERE (state = 'pending'::text)",
+        ),
+    ] {
+        let actual: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|err| panic!("read {index}: {err}"));
+        assert_eq!(actual, definition, "{index} is as D5 writes it");
+    }
+
+    let key = (run, repo, project);
+    let err = insert_integration(pool, key, "local", "pending", None)
+        .await
+        .expect_err("a `local` record is refused");
+    assert_refused_by(err, "chk_integration_mode", "integration.mode = 'local'");
+    let err = insert_integration(pool, key, "push", "merged", None)
+        .await
+        .expect_err("an unknown state is refused");
+    assert_refused_by(err, "chk_integration_state", "integration.state = 'merged'");
+    let err = insert_integration(pool, key, "push", "refused", None)
+        .await
+        .expect_err("a refusal without its reason is refused");
+    assert_refused_by(err, "chk_integration_refusal", "refused with no refusal");
+    let err = insert_integration(pool, key, "push", "pending", Some("no_target_branch: main"))
+        .await
+        .expect_err("a reason on a pending record is refused");
+    assert_refused_by(err, "chk_integration_refusal", "pending with a refusal");
+    for state in ["landed", "pr_open", "pr_merged", "pr_closed"] {
+        let err = insert_integration(pool, key, "push", state, Some("why"))
+            .await
+            .expect_err("a reason off `refused` is refused");
+        assert_refused_by(err, "chk_integration_refusal", "a reason off `refused`");
+    }
+    insert_integration(pool, key, "push", "pending", None)
+        .await
+        .expect("a pending push record");
+    let err = insert_integration(pool, key, "pull_request", "pending", None)
+        .await
+        .expect_err("a second record of the run and repo is refused");
+    assert_refused_by(err, "integration_pkey", "the same (run, repo) twice");
+
+    sqlx::query("UPDATE integration SET updated_at = '2000-01-01T00:00:00Z' WHERE run_id = $1")
+        .bind(run)
+        .execute(pool)
+        .await
+        .expect("backdate the record");
+    sqlx::query(
+        "UPDATE integration SET state = 'refused', refusal = 'not_on_target: 1111111 is not on \
+         main', lease_box_id = $2 WHERE run_id = $1",
+    )
+    .bind(run)
+    .bind(box_id)
+    .execute(pool)
+    .await
+    .expect("refuse the record");
+    let moved: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM integration WHERE run_id = $1")
+            .bind(run)
+            .fetch_one(pool)
+            .await
+            .expect("read the moved stamp");
+    assert!(
+        moved
+            > "2000-01-01T00:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .expect("a timestamp"),
+        "trg_integration_updated_at moves updated_at on an update"
+    );
+
+    sqlx::query("DELETE FROM run WHERE id = $1")
+        .bind(run)
+        .execute(pool)
+        .await
+        .expect("delete the run");
+    assert_eq!(
+        common::count(pool, "integration").await,
+        0,
+        "a run's delete takes its records"
+    );
+    let other = insert_run(pool, project, "graph", "done", box_id, user).await;
+    insert_integration(pool, (other, repo, project), "push", "pending", None)
+        .await
+        .expect("a record of another run");
+    sqlx::query("DELETE FROM project WHERE id = $1")
+        .bind(project)
+        .execute(pool)
+        .await
+        .expect("a project delete is not refused by the record's repo key");
+    assert_eq!(
+        common::count(pool, "integration").await,
+        0,
+        "a project's delete takes its records"
     );
 
     db.drop_db().await;

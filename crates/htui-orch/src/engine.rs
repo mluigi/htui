@@ -35,9 +35,9 @@ use htui_agent::record::{
 use htui_core::model::{
     AgentId, BatchId, BoundSkill, BoxId, BoxProfile, BranchFacts, Claim, CommandRunId,
     CommandRunStatus, Document, DocumentId, EdgeKind, EventKind, FOLLOW_UP_RUN_CANCELLED,
-    FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, IfPredicate, Isolation, Item,
-    ItemId, NewCommandRun, NewNote, NewRun, NewRunPlan, NewRunStep, NodeRole, NoteId,
-    PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, Project, ProjectId, ProjectSettings,
+    FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, IfPredicate, Integration, Isolation,
+    Item, ItemId, LandOutcome, NewCommandRun, NewNote, NewRun, NewRunPlan, NewRunStep, NodeRole,
+    NoteId, PlanAdmission, PlanScope, PlanStatus, PlanToAdmit, Project, ProjectId, ProjectSettings,
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunPlanId, RunStatus,
     RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotEdge,
     SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOpening,
@@ -72,8 +72,11 @@ use crate::fanout::{
 };
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput, Unmerged};
 use crate::graph::{self, GraphSource, ResolveError};
-use crate::isolate::{Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, PartTip, env_files};
+use crate::isolate::{
+    Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, LandRequest, PartTip, env_files,
+};
 use crate::kill_point::{KillPoint, Site};
+use crate::land;
 use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, NOT_RESET, StepKind};
 use crate::schedule;
@@ -1406,6 +1409,23 @@ where
             Some(batch),
             workspace,
         ))
+        .await
+    }
+
+    /// MOD-133 F2 L5: the queue runner could not start a run of `item` for `reason` (an
+    /// `IntegrateRefused` sentence, which writes nothing itself and leaves the item `open` and
+    /// queued): one note on the item, ``the queue cannot start a run: <reason>``, by this engine's
+    /// user on this box. The runner calls it once per batch and reason.
+    ///
+    /// # Errors
+    /// The store's own.
+    pub async fn note_queue_refusal(&self, item: ItemId, reason: &str) -> Result<(), EngineError> {
+        self.note(
+            item,
+            format!("the queue cannot start a run: {reason}"),
+            None,
+            self.now(),
+        )
         .await
     }
 
@@ -2809,6 +2829,11 @@ where
             ),
         };
         let repos = self.parts.store.repos(reads.item.project_id).await?;
+        // MOD-133 D11: every run's integration records, for the summary's section.
+        let mut integrations = Vec::new();
+        for run in &reads.summaries {
+            integrations.extend(self.parts.store.integrations(run.id).await?);
+        }
         let summary = closeout::summary(
             &reads.item,
             &reads.summaries,
@@ -2817,6 +2842,7 @@ where
             DocumentId::new(),
             self.parts.user,
             self.now(),
+            &integrations,
         );
         let written = self
             .parts
@@ -3650,6 +3676,133 @@ where
         })
     }
 
+    // -- MOD-133 D9: landing -------------------------------------------------------------------
+
+    /// MOD-133 D9: the land pass. Takes every `pending` integration record of a run this box
+    /// executed (only `run`'s, when given) under this engine's owner and the lease TTL
+    /// ([`WorkerStore::take_integrations`](htui_core::store::WorkerStore::take_integrations)),
+    /// then lands them ([`Self::land_taken`]). Called by the walk right after a run ends `done`,
+    /// for that run; the worker's sweep lands the whole box. A `refused` record is never taken:
+    /// it waits for a human (Unblock retry is MOD-133 milestone 2).
+    ///
+    /// # Errors
+    /// The store's own; an isolator's failure leaves its record `pending` and is logged.
+    pub async fn land(&self, run: Option<RunId>) -> Result<usize, EngineError> {
+        let records = self
+            .parts
+            .store
+            .take_integrations(
+                self.parts.box_id,
+                self.parts.owner,
+                self.lease_times().ttl,
+                run,
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(0);
+        }
+        Box::pin(self.land_taken(records)).await
+    }
+
+    /// MOD-133 D9: lands records already taken under this engine's owner, one at a time. Per
+    /// record: the run's steps and commit rows are read, its landed commits in the record's repo
+    /// computed ([`land::landed_commits`]), [`Isolator::land`] called, and the answer settled
+    /// under this owner. When the settle wrote (`true`), the item is noted:
+    /// ``integration landed: repo `<repo>` <target> at <short hash>``, or
+    /// ``integration refused for repo `<repo>` (<mode> to <target>): <reason>; the run's work has
+    /// not landed``. An `Err` from the isolator leaves the record `pending` (its lease lapses and
+    /// the next sweep retries it), is logged, and the loop goes on; F2 M1: the pass's later
+    /// records for the same remote are skipped (they stay `pending`, and this owner takes them
+    /// again next pass), so a remote that does not answer costs one verb budget a pass, not one
+    /// per record. Answers how many records were settled.
+    ///
+    /// # Errors
+    /// The store's own.
+    pub async fn land_taken(&self, records: Vec<Integration>) -> Result<usize, EngineError> {
+        let mut settled = 0;
+        let mut read: Option<LandReads> = None;
+        let mut repos: BTreeMap<ProjectId, Vec<Repo>> = BTreeMap::new();
+        let mut unreachable: BTreeSet<String> = BTreeSet::new();
+        for record in records {
+            if unreachable.contains(&record.remote) {
+                tracing::debug!(run = %record.run_id, repo = %record.repo_id, "the record's remote failed earlier in this pass; it stays pending");
+                continue;
+            }
+            if !matches!(&read, Some(reads) if reads.run == record.run_id) {
+                read = Some(self.land_reads(record.run_id).await?);
+            }
+            let Some(reads) = read.as_ref() else {
+                continue;
+            };
+            let request = LandRequest {
+                repo: record.repo_id,
+                remote: record.remote.clone(),
+                target_branch: record.target_branch.clone(),
+                commits: land::landed_commits(&reads.steps, &reads.commits, record.repo_id),
+            };
+            let outcome = match self.parts.isolator.land(&request).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    tracing::warn!(run = %record.run_id, repo = %record.repo_id, %err, "landing failed; the integration record, and this pass's later ones for the same remote, stay pending for the next sweep");
+                    unreachable.insert(record.remote.clone());
+                    continue;
+                }
+            };
+            if !self
+                .parts
+                .store
+                .settle_integration(record.run_id, record.repo_id, self.parts.owner, &outcome)
+                .await?
+            {
+                tracing::warn!(run = %record.run_id, repo = %record.repo_id, "the integration record is no longer this owner's to settle; nothing is noted");
+                continue;
+            }
+            settled += 1;
+            let Some(item) = reads.item else {
+                continue;
+            };
+            if let std::collections::btree_map::Entry::Vacant(slot) = repos.entry(record.project_id)
+            {
+                slot.insert(self.parts.store.repos(record.project_id).await?);
+            }
+            let repo = repos
+                .get(&record.project_id)
+                .and_then(|rows| rows.iter().find(|row| row.id == record.repo_id))
+                .map_or_else(|| record.repo_id.to_string(), |row| row.name.clone());
+            let target = &record.target_branch;
+            let body = match &outcome {
+                LandOutcome::Landed { hash } => format!(
+                    "integration landed: repo `{repo}` {target} at {}",
+                    land::short_hash(hash)
+                ),
+                LandOutcome::Refused { reason } => format!(
+                    "integration refused for repo `{repo}` ({} to {target}): {reason}; the run's \
+                     work has not landed",
+                    record.mode
+                ),
+            };
+            self.note(item, body, None, self.now()).await?;
+        }
+        Ok(settled)
+    }
+
+    /// MOD-133 D9: what landing reads of one run: its item, its steps and their commit rows (as
+    /// [`Self::close_out_reads`] reads them).
+    async fn land_reads(&self, run: RunId) -> Result<LandReads, EngineError> {
+        let row = self.run(run).await?;
+        let steps = self.parts.store.run_steps(run).await?;
+        let mut commits = Vec::with_capacity(steps.len());
+        for step in &steps {
+            commits.push((step.id, self.parts.store.step_commits(step.id).await?));
+        }
+        Ok(LandReads {
+            run,
+            item: row.item_id,
+            steps,
+            commits,
+        })
+    }
+
     /// Blueprint A-4: one run's recovery failed. Warned, noted on the item, and the lease given
     /// back so any process adopts the run at once. Since plan D139 the release clears the owner,
     /// so that includes this process's next sweep. The sweep goes on. Nothing here raises: a note
@@ -4428,6 +4581,12 @@ where
                             let now = self.now();
                             self.end_run(run, RunStatus::Done, None, now).await?;
                             self.cleanup_walk(run).await?;
+                            // MOD-133 D9: the run's integration records, landed now; a failure
+                            // is the sweep's to retry and never turns a finished walk into an
+                            // error.
+                            if let Err(err) = Box::pin(self.land(Some(run))).await {
+                                tracing::warn!(%run, %err, "landing the finished run failed; the sweep retries it");
+                            }
                             return Ok(Rest {
                                 run: RunStatus::Done,
                                 position: None,
@@ -10747,6 +10906,19 @@ struct CloseOutReads {
     commits: Vec<(StepId, Vec<RunStepCommit>)>,
 }
 
+/// What landing reads of one run (MOD-133 D9), once for all of its records.
+#[derive(Debug)]
+struct LandReads {
+    /// The run.
+    run: RunId,
+    /// `run.item_id`: the item the landing's note is written on.
+    item: Option<ItemId>,
+    /// `run_steps(run)`.
+    steps: Vec<RunStep>,
+    /// Every step's `run_step_commit` rows.
+    commits: Vec<(StepId, Vec<RunStepCommit>)>,
+}
+
 /// Stage 3's two outcomes that are the run's own rather than an engine fault (blueprint D195).
 #[derive(Debug)]
 enum StageThree {
@@ -11557,6 +11729,22 @@ pub async fn resume_stopped_fake(
     let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.resume_stopped(run).await
+}
+
+/// [`Engine::land`] over the same parts (MOD-133 D9).
+///
+/// # Errors
+/// As [`Engine::land`].
+#[cfg(feature = "test-support")]
+pub async fn land_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    run: Option<RunId>,
+) -> Result<usize, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = RunSecrets::new(orch.secret_source());
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.land(run).await
 }
 
 /// [`Engine::sweep`] over the same parts (plan D98): the second process's sweep in every

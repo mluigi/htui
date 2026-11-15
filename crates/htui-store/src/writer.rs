@@ -47,6 +47,7 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
+use htui_core::model::{Integration, LandOutcome};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, QueueStored, QueueTarget,
@@ -1427,6 +1428,39 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.finish_run(run, to, failure, at).await,
             Self::Online(pg) => pg.finish_run(run, to, failure, at).await,
+        }
+    }
+
+    async fn integrations(&self, run: RunId) -> Result<Vec<Integration>> {
+        match self {
+            Self::Memory(store) => store.integrations(run).await,
+            Self::Online(pg) => pg.integrations(run).await,
+        }
+    }
+
+    async fn take_integrations(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        ttl: TimeDelta,
+        run: Option<RunId>,
+    ) -> Result<Vec<Integration>> {
+        match self {
+            Self::Memory(store) => store.take_integrations(box_id, owner, ttl, run).await,
+            Self::Online(pg) => pg.take_integrations(box_id, owner, ttl, run).await,
+        }
+    }
+
+    async fn settle_integration(
+        &self,
+        run: RunId,
+        repo: RepoId,
+        owner: Uuid,
+        outcome: &LandOutcome,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.settle_integration(run, repo, owner, outcome).await,
+            Self::Online(pg) => pg.settle_integration(run, repo, owner, outcome).await,
         }
     }
 

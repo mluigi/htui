@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO integration (run_id, repo_id, project_id, mode, remote, target_branch)\n        SELECT r.id, e.key::uuid, r.project_id,\n               e.value->>'mode', e.value->>'remote', e.value->>'target_branch'\n          FROM run r\n         CROSS JOIN LATERAL jsonb_each(\n                   CASE WHEN jsonb_typeof(r.graph_snapshot->'integrate') = 'object'\n                        THEN r.graph_snapshot->'integrate'\n                        ELSE '{}'::jsonb END) e\n         WHERE r.id = $1\n           AND e.value->>'mode' IN ('push', 'pull_request')\n           AND jsonb_typeof(e.value->'remote') = 'string'\n           AND jsonb_typeof(e.value->'target_branch') = 'string'\n           AND EXISTS (SELECT 1 FROM run_step_commit c\n                         JOIN run_step s ON s.id = c.run_step_id\n                        WHERE s.run_id = r.id\n                          AND c.repo_id = e.key::uuid\n                          AND c.after_hash IS NOT NULL)\n         ORDER BY 2\n        ON CONFLICT DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c16a4bb476a07858b7fb7041c7dbf764cd82ef7d9003c2b4f424d25eb51d2278"
+}

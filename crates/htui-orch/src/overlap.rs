@@ -144,6 +144,7 @@ mod tests {
             is_primary,
             created_at: at,
             updated_at: at,
+            integrate: None,
         }
     }
 

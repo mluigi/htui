@@ -1,0 +1,172 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT run_id        AS \"run_id: RunId\",\n                   repo_id       AS \"repo_id: RepoId\",\n                   project_id    AS \"project_id: ProjectId\",\n                   mode          AS \"mode: IntegrateMode\",\n                   remote,\n                   target_branch,\n                   state         AS \"state: IntegrationState\",\n                   refusal,\n                   landed_hash,\n                   pr_ref,\n                   pr_url,\n                   created_at,\n                   updated_at\n              FROM integration\n             WHERE run_id = $1\n             ORDER BY repo_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repo_id: RepoId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "repo_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "mode: IntegrateMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "remote",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "remote"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "target_branch",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "target_branch"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "state: IntegrationState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "refusal",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "refusal"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "landed_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "landed_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "pr_ref",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "pr_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "pr_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "pr_url"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "integration",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "424e8b9fdd392c86f185c9773240f8be4ef22ea8604cc11e439927231acf039e"
+}

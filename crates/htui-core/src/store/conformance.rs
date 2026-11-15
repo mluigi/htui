@@ -57,6 +57,9 @@ use crate::model::{
 };
 use crate::model::{IndexChanges, ProjectChanges};
 use crate::model::{IndexedCollection, IndexerLease, LeaseTake};
+use crate::model::{
+    IntegrateMode, IntegrateSnapshot, Integration, IntegrationState, LandOutcome, Repo,
+};
 use crate::model::{ItemState, latest_graph_run};
 use crate::model::{
     LogShipLevel, NewWorkerLog, WORKER_LOG_TEXT_MAX, WorkerLogLevel, WorkerLogLine,
@@ -473,6 +476,14 @@ pub const CASES: &[&str] = &[
     "requirement_refinements_list_every_owner",
     "requirement_coverage_derives_from_splits",
     "workspace_delete_detaches_refining_requirements",
+    // MOD-133 M1: integration records, their lease and readiness (plan D2, D4, D6, D7)
+    "finish_done_writes_a_pending_integration_per_changed_non_local_repo",
+    "finish_failed_or_cancelled_writes_no_integration",
+    "take_integrations_leases_only_this_boxs_pending_records",
+    "take_integrations_takes_an_expired_lease",
+    "settle_integration_lands_or_refuses_once",
+    "an_unlanded_integration_holds_its_dependents",
+    "update_repo_sets_and_clears_integrate",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1532,6 +1543,35 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "workspace_delete_detaches_refining_requirements" => {
             boxed(workspace_delete_detaches_refining_requirements, store).await;
+        }
+        "finish_done_writes_a_pending_integration_per_changed_non_local_repo" => {
+            boxed(
+                finish_done_writes_a_pending_integration_per_changed_non_local_repo,
+                store,
+            )
+            .await;
+        }
+        "finish_failed_or_cancelled_writes_no_integration" => {
+            boxed(finish_failed_or_cancelled_writes_no_integration, store).await;
+        }
+        "take_integrations_leases_only_this_boxs_pending_records" => {
+            boxed(
+                take_integrations_leases_only_this_boxs_pending_records,
+                store,
+            )
+            .await;
+        }
+        "take_integrations_takes_an_expired_lease" => {
+            boxed(take_integrations_takes_an_expired_lease, store).await;
+        }
+        "settle_integration_lands_or_refuses_once" => {
+            boxed(settle_integration_lands_or_refuses_once, store).await;
+        }
+        "an_unlanded_integration_holds_its_dependents" => {
+            boxed(an_unlanded_integration_holds_its_dependents, store).await;
+        }
+        "update_repo_sets_and_clears_integrate" => {
+            boxed(update_repo_sets_and_clears_integrate, store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -8521,6 +8561,7 @@ fn run_snapshot() -> GraphSnapshot {
         capture: None,
         source: None,
         edges: Vec::new(),
+        integrate: std::collections::BTreeMap::new(),
     }
 }
 
@@ -20735,6 +20776,756 @@ async fn workspace_delete_detaches_refining_requirements<S: WriteStore>(store: &
         (survivor.key.as_str(), survivor.number),
         ("R-ENT-3", Some(3)),
         "{CASE}: R-ENT-3 stays R-ENT-3"
+    );
+}
+
+// ---- MOD-133 M1: integration records (plan D4, D6, D7) ------------------------------------
+//
+// A non-`local` repo of a run's snapshot (`GraphSnapshot::integrate`) gets one `pending` record
+// when `finish_run(Done)` sees the run changed it; the executing box leases it
+// (`take_integrations`) and settles it once (`settle_integration`); a `done` blocker releases its
+// dependents only when every record of that run is landed.
+
+/// MOD-133: a repo of `htui` named `name`, with the remote [`new_repo`] gives it.
+async fn integration_repo<S: WriteStore>(case: &str, store: &S, name: &str) -> Repo {
+    store
+        .create_repo(new_repo(ids::PROJECT_HTUI, name, false))
+        .await
+        .unwrap_or_else(|error| panic!("{case}: repo `{name}` is created: {error}"))
+}
+
+/// MOD-133 D3: `repo`'s snapshot entry under `mode`: its remote and default branch.
+fn integrate_entry(repo: &Repo, mode: IntegrateMode) -> (RepoId, IntegrateSnapshot) {
+    (
+        repo.id,
+        IntegrateSnapshot {
+            mode,
+            remote: repo
+                .remote_url
+                .clone()
+                .expect("new_repo gives every repo a remote"),
+            target_branch: repo.default_branch.clone(),
+        },
+    )
+}
+
+/// MOD-133: a graph run of `item` whose snapshot freezes `integrate`, claimed on the fixture box by
+/// `owner`, with one done step that committed `changed` (an `after_hash`) and touched `unchanged`
+/// (none), then finished `to`. Its scope is every repo named.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a case states the run's whole shape in one call"
+)]
+async fn integrated_run<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    integrate: &[(&Repo, IntegrateMode)],
+    changed: &[RepoId],
+    unchanged: &[RepoId],
+    owner: Uuid,
+    to: RunStatus,
+) -> RunId {
+    let mut scope: Vec<RepoId> = integrate
+        .iter()
+        .map(|(repo, _)| repo.id)
+        .chain(changed.iter().copied())
+        .chain(unchanged.iter().copied())
+        .collect();
+    scope.sort_unstable();
+    scope.dedup();
+    let mut spec = new_run(ids::PROJECT_HTUI, item, scope);
+    spec.graph_snapshot.integrate = integrate
+        .iter()
+        .map(|(repo, mode)| integrate_entry(repo, *mode))
+        .collect();
+    let run = store
+        .create_run(spec)
+        .await
+        .unwrap_or_else(|error| panic!("{case}: the run of {item} is created: {error}"))
+        .id;
+    let at = seam_clock();
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(case),
+        Claim::Admitted,
+        "{case}: the run of {item} is claimed on the fixture box"
+    );
+    let step = running_step(case, store, run, (0, 1, 0), at).await;
+    let commits: Vec<RunStepCommit> = changed
+        .iter()
+        .map(|repo| {
+            (
+                repo,
+                Some("1111111111111111111111111111111111111111".to_owned()),
+            )
+        })
+        .chain(unchanged.iter().map(|repo| (repo, None)))
+        .map(|(repo, after_hash)| RunStepCommit {
+            run_step_id: step,
+            repo_id: *repo,
+            before_hash: "0000000000000000000000000000000000000000".to_owned(),
+            after_hash,
+        })
+        .collect();
+    store
+        .record_commits(StepFence::Lease(owner), step, &commits)
+        .await
+        .expect(case);
+    assert!(
+        store
+            .transition_step(step, StepStatus::Running, StepStatus::Done, at)
+            .await
+            .expect(case),
+        "{case}: running -> done is a sanctioned move"
+    );
+    let failure = (to == RunStatus::Failed).then_some("boom");
+    store
+        .finish_run(run, to, failure, at)
+        .await
+        .unwrap_or_else(|error| panic!("{case}: run {run} finishes {to}: {error}"));
+    run
+}
+
+/// MOD-133: `(repo_id, state)` of `run`'s records, in the store's order.
+async fn integration_states<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+) -> Vec<(RepoId, IntegrationState)> {
+    store
+        .integrations(run)
+        .await
+        .expect(case)
+        .into_iter()
+        .map(|row| (row.repo_id, row.state))
+        .collect()
+}
+
+/// MOD-133: `(run_id, repo_id)` of the records a take answered, in its order.
+fn taken_keys(rows: &[Integration]) -> Vec<(RunId, RepoId)> {
+    rows.iter().map(|row| (row.run_id, row.repo_id)).collect()
+}
+
+/// MOD-133 D4: `finish_run(Done)` writes one `pending` record per snapshot entry whose repo the run
+/// changed, carrying the snapshot's mode, remote and target and the run's project, in `repo_id`
+/// order; none for a `local` repo (no entry) or for a repo whose commit row has no `after_hash`.
+async fn finish_done_writes_a_pending_integration_per_changed_non_local_repo<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "finish_done_writes_a_pending_integration_per_changed_non_local_repo";
+    let item = minted(CASE, store, "integrated").await;
+    let first = integration_repo(CASE, store, "pushed-a").await;
+    let second = integration_repo(CASE, store, "pushed-b").await;
+    let idle = integration_repo(CASE, store, "pushed-idle").await;
+    let local = integration_repo(CASE, store, "local").await;
+    let reviewed = integration_repo(CASE, store, "reviewed").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        item,
+        &[
+            (&first, IntegrateMode::Push),
+            (&second, IntegrateMode::Push),
+            (&idle, IntegrateMode::Push),
+            (&reviewed, IntegrateMode::PullRequest),
+        ],
+        &[second.id, first.id, local.id, reviewed.id],
+        &[idle.id],
+        Uuid::now_v7(),
+        RunStatus::Done,
+    )
+    .await;
+
+    let rows = store.integrations(run).await.expect(CASE);
+    let mut expected: Vec<(&Repo, IntegrateMode)> = vec![
+        (&first, IntegrateMode::Push),
+        (&second, IntegrateMode::Push),
+        (&reviewed, IntegrateMode::PullRequest),
+    ];
+    expected.sort_by_key(|(repo, _)| repo.id);
+    assert_eq!(
+        rows.iter().map(|row| row.repo_id).collect::<Vec<_>>(),
+        expected.iter().map(|(repo, _)| repo.id).collect::<Vec<_>>(),
+        "{CASE}: one record per changed non-local repo, in repo_id order; none for `local` or \
+         for the repo the run did not change"
+    );
+    for (row, (repo, mode)) in rows.iter().zip(&expected) {
+        let (_, entry) = integrate_entry(repo, *mode);
+        assert_eq!(
+            (
+                row.run_id,
+                row.project_id,
+                row.mode,
+                row.remote.as_str(),
+                row.target_branch.as_str(),
+                row.state,
+            ),
+            (
+                run,
+                ids::PROJECT_HTUI,
+                entry.mode,
+                entry.remote.as_str(),
+                entry.target_branch.as_str(),
+                IntegrationState::Pending,
+            ),
+            "{CASE}: `{}` carries the snapshot's landing and the run's project",
+            repo.name
+        );
+        assert_eq!(
+            (&row.refusal, &row.landed_hash, &row.pr_ref, &row.pr_url),
+            (&None, &None, &None, &None),
+            "{CASE}: a pending record has no outcome yet"
+        );
+        assert_eq!(
+            row.created_at, row.updated_at,
+            "{CASE}: a fresh record was written once"
+        );
+    }
+    assert_eq!(
+        store.integrations(RunId::new()).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: an unknown run has no records"
+    );
+}
+
+/// MOD-133 D4: only `done` writes records: a `failed` or `cancelled` run that changed a `push`
+/// repo writes none, and neither does a `done` run whose snapshot holds no entry (`local`).
+async fn finish_failed_or_cancelled_writes_no_integration<S: WriteStore>(store: &S) {
+    const CASE: &str = "finish_failed_or_cancelled_writes_no_integration";
+    let repo = integration_repo(CASE, store, "pushed").await;
+    for (to, integrate) in [
+        (RunStatus::Failed, vec![(&repo, IntegrateMode::Push)]),
+        (RunStatus::Cancelled, vec![(&repo, IntegrateMode::Push)]),
+        (RunStatus::Done, Vec::new()),
+    ] {
+        let item = minted(CASE, store, &format!("finished {to}")).await;
+        let run = integrated_run(
+            CASE,
+            store,
+            item,
+            &integrate,
+            &[repo.id],
+            &[],
+            Uuid::now_v7(),
+            to,
+        )
+        .await;
+        assert_eq!(
+            integration_states(CASE, store, run).await,
+            Vec::new(),
+            "{CASE}: a `{to}` run with {} snapshot entries writes no record",
+            integrate.len()
+        );
+    }
+}
+
+/// MOD-133 D6: `take_integrations` leases only the `pending` records of runs executing on its box,
+/// filtered by run when one is named; a live foreign lease is left alone and the owner's own is
+/// taken again; an out-of-range TTL is refused before anything is read.
+async fn take_integrations_leases_only_this_boxs_pending_records<S: WriteStore>(store: &S) {
+    const CASE: &str = "take_integrations_leases_only_this_boxs_pending_records";
+    let mine = Uuid::now_v7();
+    let theirs = Uuid::now_v7();
+    let first_repo = integration_repo(CASE, store, "first").await;
+    let second_repo = integration_repo(CASE, store, "second").await;
+    let first_item = minted(CASE, store, "first").await;
+    let second_item = minted(CASE, store, "second").await;
+    let first = integrated_run(
+        CASE,
+        store,
+        first_item,
+        &[(&first_repo, IntegrateMode::Push)],
+        &[first_repo.id],
+        &[],
+        mine,
+        RunStatus::Done,
+    )
+    .await;
+    let second = integrated_run(
+        CASE,
+        store,
+        second_item,
+        &[(&second_repo, IntegrateMode::Push)],
+        &[second_repo.id],
+        &[],
+        mine,
+        RunStatus::Done,
+    )
+    .await;
+
+    let refused = store
+        .take_integrations(ids::BOX, mine, TimeDelta::seconds(-1), None)
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: a negative TTL is refused, got {refused:?}"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(BoxId::new(), mine, LEASE, None)
+                .await
+                .expect(CASE)
+        ),
+        Vec::new(),
+        "{CASE}: another box takes nothing: neither run executed there"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, mine, LEASE, Some(RunId::new()))
+                .await
+                .expect(CASE)
+        ),
+        Vec::new(),
+        "{CASE}: an unknown run filters every record out"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, mine, LEASE, Some(second))
+                .await
+                .expect(CASE)
+        ),
+        vec![(second, second_repo.id)],
+        "{CASE}: a named run's records only"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, theirs, LEASE, None)
+                .await
+                .expect(CASE)
+        ),
+        vec![(first, first_repo.id)],
+        "{CASE}: another owner takes the free record and leaves the live lease alone"
+    );
+    let mut both = vec![(first, first_repo.id), (second, second_repo.id)];
+    both.sort_unstable();
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, mine, LEASE, None)
+                .await
+                .expect(CASE)
+        ),
+        both.into_iter()
+            .filter(|(run, _)| *run == second)
+            .collect::<Vec<_>>(),
+        "{CASE}: the owner takes its own lease again, and not the other owner's"
+    );
+    let row = store
+        .integrations(first)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{CASE}: the first run's record exists"));
+    assert_eq!(
+        row.state,
+        IntegrationState::Pending,
+        "{CASE}: a lease leaves the record pending"
+    );
+}
+
+/// MOD-133 D6: a lease whose expiry has passed by the store's clock is takeable by another owner,
+/// and the owner who lost it can no longer settle the record.
+async fn take_integrations_takes_an_expired_lease<S: WriteStore>(store: &S) {
+    const CASE: &str = "take_integrations_takes_an_expired_lease";
+    let lapsed = Uuid::now_v7();
+    let taker = Uuid::now_v7();
+    let repo = integration_repo(CASE, store, "pushed").await;
+    let item = minted(CASE, store, "expired lease").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        item,
+        &[(&repo, IntegrateMode::Push)],
+        &[repo.id],
+        &[],
+        lapsed,
+        RunStatus::Done,
+    )
+    .await;
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, lapsed, TimeDelta::zero(), Some(run))
+                .await
+                .expect(CASE)
+        ),
+        vec![(run, repo.id)],
+        "{CASE}: the first owner takes it with a lease that expires at once"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, taker, LEASE, Some(run))
+                .await
+                .expect(CASE)
+        ),
+        vec![(run, repo.id)],
+        "{CASE}: an expired lease is free to another owner"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, lapsed, LEASE, Some(run))
+                .await
+                .expect(CASE)
+        ),
+        Vec::new(),
+        "{CASE}: the new owner's lease is live, so the first owner cannot take it back"
+    );
+    let landed = LandOutcome::Landed {
+        hash: "2222222222222222222222222222222222222222".to_owned(),
+    };
+    assert!(
+        !store
+            .settle_integration(run, repo.id, lapsed, &landed)
+            .await
+            .expect(CASE),
+        "{CASE}: the owner that lost the lease settles nothing"
+    );
+    assert!(
+        store
+            .settle_integration(run, repo.id, taker, &landed)
+            .await
+            .expect(CASE),
+        "{CASE}: the lease's holder settles it"
+    );
+}
+
+/// MOD-133 D6: `settle_integration` lands or refuses a record once, under the owner's lease;
+/// a record nobody leased, a stale owner, a settled record and an unknown pair all answer `false`
+/// and write nothing; a settled record is never taken again.
+async fn settle_integration_lands_or_refuses_once<S: WriteStore>(store: &S) {
+    const CASE: &str = "settle_integration_lands_or_refuses_once";
+    let owner = Uuid::now_v7();
+    let stale = Uuid::now_v7();
+    let landing = integration_repo(CASE, store, "landing").await;
+    let refusing = integration_repo(CASE, store, "refusing").await;
+    let item = minted(CASE, store, "settled").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        item,
+        &[
+            (&landing, IntegrateMode::Push),
+            (&refusing, IntegrateMode::Push),
+        ],
+        &[landing.id, refusing.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    let hash = "3333333333333333333333333333333333333333".to_owned();
+    let landed = LandOutcome::Landed { hash: hash.clone() };
+    let reason = "non_fast_forward: main on the remote has moved".to_owned();
+    let refused = LandOutcome::Refused {
+        reason: reason.clone(),
+    };
+    let row_of = async |repo: RepoId| -> Integration {
+        store
+            .integrations(run)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .find(|row| row.repo_id == repo)
+            .unwrap_or_else(|| panic!("{CASE}: the record of {repo} exists"))
+    };
+
+    assert!(
+        !store
+            .settle_integration(run, landing.id, owner, &landed)
+            .await
+            .expect(CASE),
+        "{CASE}: a record nobody leased is nobody's to settle"
+    );
+    let mut both = vec![(run, landing.id), (run, refusing.id)];
+    both.sort_unstable();
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, owner, LEASE, Some(run))
+                .await
+                .expect(CASE)
+        ),
+        both,
+        "{CASE}: both records are leased, in repo_id order"
+    );
+    let before = row_of(landing.id).await;
+    assert!(
+        !store
+            .settle_integration(run, landing.id, stale, &landed)
+            .await
+            .expect(CASE),
+        "{CASE}: a stale owner settles nothing"
+    );
+    assert_eq!(
+        row_of(landing.id).await,
+        before,
+        "{CASE}: and writes nothing"
+    );
+
+    assert!(
+        store
+            .settle_integration(run, landing.id, owner, &landed)
+            .await
+            .expect(CASE),
+        "{CASE}: the owner lands it"
+    );
+    let row = row_of(landing.id).await;
+    assert_eq!(
+        (
+            row.state,
+            row.landed_hash.as_deref(),
+            row.refusal.as_deref()
+        ),
+        (IntegrationState::Landed, Some(hash.as_str()), None),
+        "{CASE}: landed, with the pushed tip"
+    );
+    assert!(
+        row.updated_at >= before.updated_at,
+        "{CASE}: updated_at never moves back"
+    );
+    assert!(
+        !store
+            .settle_integration(run, landing.id, owner, &refused)
+            .await
+            .expect(CASE),
+        "{CASE}: a settled record is settled once"
+    );
+    assert_eq!(
+        row_of(landing.id).await.state,
+        IntegrationState::Landed,
+        "{CASE}: the second settle wrote nothing"
+    );
+
+    assert!(
+        store
+            .settle_integration(run, refusing.id, owner, &refused)
+            .await
+            .expect(CASE),
+        "{CASE}: the owner refuses the other"
+    );
+    let row = row_of(refusing.id).await;
+    assert_eq!(
+        (
+            row.state,
+            row.landed_hash.as_deref(),
+            row.refusal.as_deref()
+        ),
+        (IntegrationState::Refused, None, Some(reason.as_str())),
+        "{CASE}: refused, with its typed reason"
+    );
+    assert!(
+        !store
+            .settle_integration(run, RepoId::new(), owner, &landed)
+            .await
+            .expect(CASE),
+        "{CASE}: an unknown record answers false, not an error"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, owner, LEASE, None)
+                .await
+                .expect(CASE)
+        ),
+        Vec::new(),
+        "{CASE}: settled records are never taken again (a refusal is retried by Unblock only)"
+    );
+}
+
+/// MOD-133 D7 (ANA-35 §7.1): a `blocked_by` target whose latest graph run is `done` releases its
+/// dependent only when no record of that run is outside `landed | pr_merged`: no records (`local`)
+/// releases, a `pending` or `refused` one holds, all landed releases.
+async fn an_unlanded_integration_holds_its_dependents<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_unlanded_integration_holds_its_dependents";
+    let owner = Uuid::now_v7();
+    let target = minted(CASE, store, "integrated blocker").await;
+    let dependent = minted(CASE, store, "its dependent").await;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, dependent, None).await;
+    propose_unleased(store, dependent, LinkKind::BlockedBy, target, step)
+        .await
+        .expect(CASE);
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    assert!(
+        !ready_ids(CASE, store).await.contains(&dependent),
+        "{CASE}: an open target with no run holds its dependent"
+    );
+    let repo = integration_repo(CASE, store, "pushed").await;
+
+    let local = integrated_run(
+        CASE,
+        store,
+        target,
+        &[],
+        &[repo.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    assert_eq!(integration_states(CASE, store, local).await, Vec::new());
+    assert!(
+        ready_ids(CASE, store).await.contains(&dependent),
+        "{CASE}: a `done` run with no records (`local`) releases, as before MOD-133"
+    );
+
+    let refused = integrated_run(
+        CASE,
+        store,
+        target,
+        &[(&repo, IntegrateMode::Push)],
+        &[repo.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    assert_eq!(
+        integration_states(CASE, store, refused).await,
+        vec![(repo.id, IntegrationState::Pending)]
+    );
+    assert!(
+        !ready_ids(CASE, store).await.contains(&dependent),
+        "{CASE}: a `done` run with a pending record holds its dependent"
+    );
+    store
+        .take_integrations(ids::BOX, owner, LEASE, Some(refused))
+        .await
+        .expect(CASE);
+    assert!(
+        store
+            .settle_integration(
+                refused,
+                repo.id,
+                owner,
+                &LandOutcome::Refused {
+                    reason: "not_on_target: 1111111 is not on main".to_owned(),
+                },
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the record is refused"
+    );
+    assert!(
+        !ready_ids(CASE, store).await.contains(&dependent),
+        "{CASE}: a refused record holds its dependent too"
+    );
+
+    let landed = integrated_run(
+        CASE,
+        store,
+        target,
+        &[(&repo, IntegrateMode::Push)],
+        &[repo.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    store
+        .take_integrations(ids::BOX, owner, LEASE, Some(landed))
+        .await
+        .expect(CASE);
+    assert!(
+        store
+            .settle_integration(
+                landed,
+                repo.id,
+                owner,
+                &LandOutcome::Landed {
+                    hash: "1111111111111111111111111111111111111111".to_owned(),
+                },
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the record lands"
+    );
+    assert!(
+        ready_ids(CASE, store).await.contains(&dependent),
+        "{CASE}: every record of the latest `done` run landed, so the dependent is released"
+    );
+}
+
+/// MOD-133 D2: `update_repo` sets `integrate`, leaves it on a patch that does not name it, and
+/// `Some(None)` clears it back to the project's default; a new repo is created on the default.
+async fn update_repo_sets_and_clears_integrate<S: WriteStore>(store: &S) {
+    const CASE: &str = "update_repo_sets_and_clears_integrate";
+    let repo = integration_repo(CASE, store, "configured").await;
+    assert_eq!(
+        repo.integrate, None,
+        "{CASE}: a repo is created on its project's default"
+    );
+    let set = applied(
+        CASE,
+        store
+            .update_repo(
+                repo.id,
+                repo.updated_at,
+                RepoPatch {
+                    integrate: Some(Some(IntegrateMode::Push)),
+                    ..RepoPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(set.integrate, Some(IntegrateMode::Push), "{CASE}: set");
+    let kept = applied(
+        CASE,
+        store
+            .update_repo(
+                repo.id,
+                set.updated_at,
+                RepoPatch {
+                    default_branch: Some("trunk".to_owned()),
+                    ..RepoPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        kept.integrate,
+        Some(IntegrateMode::Push),
+        "{CASE}: a patch that does not name it leaves it"
+    );
+    let read = store
+        .repos(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == repo.id)
+        .unwrap_or_else(|| panic!("{CASE}: the repo is listed"));
+    assert_eq!(read, kept, "{CASE}: `repos` reads the column back");
+    let cleared = applied(
+        CASE,
+        store
+            .update_repo(
+                repo.id,
+                kept.updated_at,
+                RepoPatch {
+                    integrate: Some(None),
+                    ..RepoPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        cleared.integrate, None,
+        "{CASE}: `Some(None)` clears it back to the project's default"
     );
 }
 

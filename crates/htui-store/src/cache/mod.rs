@@ -23,7 +23,7 @@ use crate::error::{map_migrate, map_sqlx};
 /// The mirror file inside [`CacheStore::dir`].
 pub const CACHE_FILE: &str = "cache.sqlite";
 
-/// The twenty-three mirrored tables of §4.4, in foreign-key order.
+/// The twenty-four mirrored tables of §4.4, in foreign-key order.
 ///
 /// The order is the one [`refresh::run_pass`] fills them in and the one [`CacheStore::rebuild`]
 /// empties them in; `cache_meta` and `cache_cursor` are local and deliberately absent.
@@ -48,7 +48,11 @@ pub const CACHE_FILE: &str = "cache.sqlite";
 /// `item_artifact_link` joined in MOD-150 M3 (plan D9): an offline `links` answers the reached
 /// items' document links off it. It holds live rows only; a tombstone is a delete, as for
 /// `item_link`.
-pub const MIRRORED_TABLES: [&str; 23] = [
+///
+/// `integration` joined in MOD-133 M1 (plan D5, D7): the readiness read (`ready_case`) releases a
+/// `done` blocker run only when every record of it is landed, so an offline `items(ready)` agrees
+/// with Postgres. The lease columns and `repo.integrate` are not mirrored.
+pub const MIRRORED_TABLES: [&str; 24] = [
     "app_user",
     "agent",
     "box",
@@ -67,6 +71,7 @@ pub const MIRRORED_TABLES: [&str; 23] = [
     "run_step_commit",
     "run_step_tree",
     "run_plan",
+    "integration",
     "session_event",
     "requirement_spec",
     "requirement_area",

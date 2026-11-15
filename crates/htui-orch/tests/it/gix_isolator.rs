@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex};
 
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePart, PremergeReport,
-    RepoBoxPath, RepoId, RunId, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    SnapshotCandidate, SnapshotPhase, Split, StepGraphId, StepGraphPhase, StepId, StepRole,
-    StepStatus, VerifyOutcome,
+    Gate, IntegrateMode, IntegrationState, Isolation, ItemId, ItemPatch, LandOutcome, NewRepo,
+    NewStepGraph, PhaseId, PhasePart, PremergeReport, RepoBoxPath, RepoId, RepoPatch, RunId,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SnapshotCandidate, SnapshotPhase,
+    Split, StepGraphId, StepGraphPhase, StepId, StepRole, StepStatus, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::scrub::MinimalScrubber;
@@ -37,7 +37,8 @@ use htui_core::store::{
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 use htui_orch::conformance::until_stalled;
 use htui_orch::engine::{
-    Adopted, DeadWalks, Engine, EngineParts, FirstCandidate, Next, Resume, SessionKey, SessionSink,
+    Adopted, DeadWalks, Engine, EngineParts, FirstCandidate, Next, NoSink, Resume, SessionKey,
+    SessionSink,
 };
 use htui_orch::fake::{FakeOrchestrator, RESTART_GAP, ScriptedStep, TestClock};
 use htui_orch::isolate::Clock as _;
@@ -49,7 +50,7 @@ use htui_orch::isolate::git::{Cli, IDENTITY_ENV, premerge_message};
 use htui_orch::isolate::real::{dirty_tree_not_reset, local_moved};
 use htui_orch::isolate::{
     ChangedPaths, EnvFiles, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture,
-    PartTip, Prepared, RepoCheckout, ResetReport,
+    LandRequest, PartTip, Prepared, RepoCheckout, ResetReport,
 };
 use htui_orch::secrets::RunSecrets;
 use htui_orch::skip_without_git;
@@ -2128,6 +2129,10 @@ impl Isolator for StallAfterReconcile<'_> {
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, ()> {
         self.inner.reacquire(run, step, trees)
+    }
+
+    fn land<'a>(&'a self, request: &'a LandRequest) -> IsolatorFuture<'a, LandOutcome> {
+        self.inner.land(request)
     }
 }
 
@@ -4512,4 +4517,465 @@ async fn a_landed_step_re_lands_over_a_dirty_primary_and_a_fresh_one_still_refus
         "an edit in the primary\n",
         "the edit is untouched"
     );
+}
+
+// -------------------------------------------------------------------------------------------------
+// MOD-133 D8, D9: landing over real git, against a local bare remote (no network).
+// -------------------------------------------------------------------------------------------------
+
+/// A bare repository at `<dir>/<name>.git` whose `main` is `from`'s `HEAD`.
+async fn bare_remote(git: &Cli, dir: &Path, name: &str, from: &Path) -> PathBuf {
+    let remote = dir.join(format!("{name}.git"));
+    git_out(
+        git,
+        dir,
+        &["init", "--quiet", "--bare", &remote.to_string_lossy()],
+    )
+    .await;
+    git_out(
+        git,
+        from,
+        &[
+            "push",
+            "--quiet",
+            "--",
+            &remote.to_string_lossy(),
+            "HEAD:refs/heads/main",
+        ],
+    )
+    .await;
+    remote
+}
+
+/// The remote's `main`.
+async fn remote_main(git: &Cli, remote: &Path) -> String {
+    git_out(git, remote, &["rev-parse", "refs/heads/main"]).await
+}
+
+impl Fixture {
+    /// `core`'s row turned `push` to `remote`.
+    async fn push_core_to(&self, remote: &Path) {
+        let row = self
+            .orch
+            .store
+            .repos(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.id == self.core.id)
+            .expect("the fixture made `core`");
+        let outcome = self
+            .orch
+            .store
+            .update_repo(
+                self.core.id,
+                row.updated_at,
+                RepoPatch {
+                    remote_url: Some(Some(remote.to_string_lossy().into_owned())),
+                    integrate: Some(Some(IntegrateMode::Push)),
+                    ..RepoPatch::default()
+                },
+            )
+            .await
+            .expect("the repo is there");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+    }
+
+    /// A request to land `core` to `remote`'s `target` with `commits`.
+    fn core_request(&self, remote: &Path, target: &str, commits: Vec<String>) -> LandRequest {
+        LandRequest {
+            repo: self.core.id,
+            remote: remote.to_string_lossy().into_owned(),
+            target_branch: target.to_owned(),
+            commits,
+        }
+    }
+}
+
+/// MOD-133 D8, D9 end to end: a `push` run over real `worktree` merges lands its work on the
+/// bare remote when the walk finishes, the record carries the pushed tip, the `local` repo of the
+/// scope writes no record, and landing again pushes nothing and moves nothing.
+#[tokio::test]
+async fn a_push_run_lands_on_its_remote_once() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+    fix.push_core_to(&remote).await;
+    repoint(&fix.orch.store, ids::HTUI_FEAT_3, |phase| {
+        phase.isolation = Some(Isolation::Worktree);
+        phase.gate = Gate::Never;
+    })
+    .await;
+    fix.orch
+        .script("review", 1, ScriptedStep::review("approve", "fine"));
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &[],
+    };
+
+    let run = fix.start(&sink).await;
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::Done);
+
+    let tip = git_out(&git, &fix.core.path, &["rev-parse", "refs/heads/main"]).await;
+    assert_ne!(tip, fix.core.head, "the run merged work into `core`");
+    assert_eq!(remote_main(&git, &remote).await, tip, "the remote has it");
+    let records = fix
+        .orch
+        .store
+        .integrations(run)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.repo_id, record.state, record.landed_hash.clone()))
+            .collect::<Vec<_>>(),
+        [(fix.core.id, IntegrationState::Landed, Some(tip.clone()))],
+        "one record, `core`'s: `docs` is `local`"
+    );
+
+    let again = engine_as!(
+        &fix,
+        &fix.orch.store,
+        &fix.isolator,
+        &fix.orch.clock,
+        fix.orch.owner(),
+        &NoSink,
+        |engine| engine.land(Some(run)).await
+    )
+    .expect("the pass runs");
+    assert_eq!(again, 0, "a landed record is not taken again");
+    // The isolator itself is idempotent: the remote already holds the tip.
+    let commits = fix
+        .orch
+        .store
+        .step_commits(fix.steps(run).await.last().expect("steps ran").id)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .filter(|row| row.repo_id == fix.core.id)
+        .filter_map(|row| row.after_hash)
+        .collect();
+    assert_eq!(
+        fix.isolator
+            .land(&fix.core_request(&remote, "main", commits))
+            .await
+            .expect("the landing runs"),
+        LandOutcome::Landed { hash: tip.clone() }
+    );
+    assert_eq!(remote_main(&git, &remote).await, tip, "nothing moved");
+}
+
+/// MOD-133 D8: a remote whose `main` moved refuses the fast-forward; nothing is forced and the
+/// remote keeps its own commit.
+#[tokio::test]
+async fn a_moved_remote_is_refused_and_left_alone() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let elsewhere = tempfile::tempdir().expect("a temporary directory");
+    let other = elsewhere.path().join("other");
+    std::fs::create_dir_all(&other).expect("the directory is made");
+    // `repo_with_one_commit` is deterministic, so the moved remote carries one commit more.
+    repo_with_one_commit(&other);
+    let foreign = commit_file(&other, "elsewhere.txt", "moved\n", "the remote moved");
+    let remote = bare_remote(&git, elsewhere.path(), "core", &other).await;
+    assert_eq!(remote_main(&git, &remote).await, foreign);
+    // `core` moved on from the same base: the two histories diverge.
+    let ours = commit_file(&fix.core.path, "ours.txt", "ours\n", "the run's work");
+
+    let outcome = fix
+        .isolator
+        .land(&fix.core_request(&remote, "main", vec![ours]))
+        .await
+        .expect("the landing runs");
+    assert_eq!(
+        outcome,
+        LandOutcome::Refused {
+            reason: "non_fast_forward: main on the remote has moved; merge it locally, then retry"
+                .to_owned()
+        }
+    );
+    assert_eq!(remote_main(&git, &remote).await, foreign, "never forced");
+}
+
+/// MOD-133 D8's local refusals: a landed commit on another branch is `not_on_target`, a missing
+/// local target is `no_target_branch`, a repo with no checkout here is `repo_unavailable`, and an
+/// unreachable remote is `push_failed` with git's own line. Nothing reaches the remote.
+#[tokio::test]
+async fn landing_refuses_what_is_not_on_the_target() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+
+    // The primary merged onto `side`, not onto `main`.
+    git_out(&git, &fix.core.path, &["checkout", "--quiet", "-b", "side"]).await;
+    let side = commit_file(&fix.core.path, "side.txt", "side\n", "on side");
+    git_out(&git, &fix.core.path, &["checkout", "--quiet", "main"]).await;
+
+    let refused = |reason: String| LandOutcome::Refused { reason };
+    assert_eq!(
+        fix.isolator
+            .land(&fix.core_request(&remote, "main", vec![fix.core.head.clone(), side.clone()]))
+            .await
+            .expect("the landing runs"),
+        refused(format!("not_on_target: {} is not on main", &side[..7]))
+    );
+    assert_eq!(
+        fix.isolator
+            .land(&fix.core_request(&remote, "release", Vec::new()))
+            .await
+            .expect("the landing runs"),
+        refused("no_target_branch: release".to_owned())
+    );
+    let mut stranger = fix.core_request(&remote, "main", Vec::new());
+    stranger.repo = RepoId::new();
+    assert_eq!(
+        fix.isolator
+            .land(&stranger)
+            .await
+            .expect("the landing runs"),
+        refused("repo_unavailable: no checkout for this repo on this box".to_owned())
+    );
+    assert_eq!(
+        remote_main(&git, &remote).await,
+        fix.core.head,
+        "nothing was pushed"
+    );
+
+    let missing = remote_dir.path().join("missing.git");
+    let LandOutcome::Refused { reason } = fix
+        .isolator
+        .land(&fix.core_request(&missing, "main", Vec::new()))
+        .await
+        .expect("the landing runs")
+    else {
+        panic!("an unreachable remote is refused");
+    };
+    assert!(
+        reason.starts_with("push_failed: fatal: ") && reason.contains("missing.git"),
+        "{reason}"
+    );
+}
+
+/// MOD-133 D8 (PRD Q2): read off a wrapper `git`: landing runs `ls-remote`, then one
+/// `push --porcelain --` of a plain `<tip>:refs/heads/main` refspec (never `--force`, never `+`),
+/// both under a `GIT_SSH_COMMAND` in batch mode; a second landing only asks `ls-remote`. F2 M1:
+/// both carry ssh's connect timeout and http's low-speed abort, and `ls-remote` has its own 30 s
+/// budget under the 120 s one. F2 L4: with no inherited `GIT_SSH_COMMAND` or `GIT_SSH`, the
+/// repository's `core.sshCommand` is the command the options are appended to.
+#[cfg(unix)]
+#[tokio::test]
+async fn landing_pushes_without_force_in_batch_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    assert_eq!(
+        htui_orch::isolate::git::LS_REMOTE_TIMEOUT,
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(
+        htui_orch::isolate::git::VERB_TIMEOUT,
+        std::time::Duration::from_secs(120)
+    );
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = remote_dir.path().join("fresh.git");
+    git_out(
+        &git,
+        remote_dir.path(),
+        &["init", "--quiet", "--bare", &remote.to_string_lossy()],
+    )
+    .await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &["config", "core.sshCommand", "ssh -i /k/id"],
+    )
+    .await;
+
+    let log = remote_dir.path().join("argv.log");
+    let wrapper = remote_dir.path().join("bin").join("git");
+    crate::write_executable::write_executable(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf 'CALL %s\\tSSH=%s\\tLIMIT=%s\\tTIME=%s\\n' \"$*\" \
+             \"${{GIT_SSH_COMMAND-unset}}\" \"${{GIT_HTTP_LOW_SPEED_LIMIT-unset}}\" \
+             \"${{GIT_HTTP_LOW_SPEED_TIME-unset}}\" >> '{}'\n\
+             exec '{}' \"$@\"\n",
+            log.display(),
+            git.binary().display()
+        ),
+    );
+    let wrapped = Cli::probe(wrapper).expect("the wrapper answers --version");
+    let mut config = fix.config.clone();
+    config.scratch_root = remote_dir.path().join("trees");
+    let isolator = GixIsolator::with_git(config, Ok(wrapped)).expect("the config is valid");
+
+    let request = fix.core_request(&remote, "main", vec![fix.core.head.clone()]);
+    for _ in 0..2 {
+        assert_eq!(
+            isolator.land(&request).await.expect("the landing runs"),
+            LandOutcome::Landed {
+                hash: fix.core.head.clone()
+            }
+        );
+    }
+    assert_eq!(remote_main(&git, &remote).await, fix.core.head);
+
+    let logged = std::fs::read_to_string(&log).expect("the wrapper logged");
+    // `(args, GIT_SSH_COMMAND, low-speed limit, low-speed time)` of every network verb.
+    let network: Vec<(&str, &str, &str, &str)> = logged
+        .lines()
+        .filter_map(|line| line.strip_prefix("CALL "))
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let args = fields.next()?;
+            let ssh = fields.next()?.strip_prefix("SSH=")?;
+            let limit = fields.next()?.strip_prefix("LIMIT=")?;
+            let time = fields.next()?.strip_prefix("TIME=")?;
+            Some((args, ssh, limit, time))
+        })
+        .filter(|(args, ..)| args.starts_with("ls-remote ") || args.starts_with("push "))
+        .collect();
+    let calls: Vec<&str> = network.iter().map(|(args, ..)| *args).collect();
+    let remote_text = remote.to_string_lossy();
+    assert_eq!(
+        calls,
+        [
+            format!("ls-remote -- {remote_text} refs/heads/main"),
+            format!(
+                "push --porcelain -- {remote_text} {}:refs/heads/main",
+                fix.core.head
+            ),
+            format!("ls-remote -- {remote_text} refs/heads/main"),
+        ],
+        "{logged}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.contains("--force") || args.contains(" +") || args.contains(" -f")),
+        "{logged}"
+    );
+    for (_, ssh, limit, time) in &network {
+        assert_eq!(
+            (*limit, *time),
+            ("1000", "30"),
+            "the low-speed abort: {logged}"
+        );
+        if std::env::var_os("GIT_SSH").is_none() {
+            assert!(
+                ssh.ends_with(" -o BatchMode=yes -o ConnectTimeout=20"),
+                "every network verb runs in batch mode with a connect timeout: {logged}"
+            );
+        }
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            assert_eq!(
+                *ssh, "ssh -i /k/id -o BatchMode=yes -o ConnectTimeout=20",
+                "the repository's core.sshCommand is kept: {logged}"
+            );
+        }
+    }
+}
+
+/// MOD-133 F2 L3: a remote that holds the run's tip and moved past it (a crash between the push
+/// and the settle, then someone else's push) has the work landed: nothing is pushed or refused.
+/// A remote past a commit this checkout lacks is still the push's to judge
+/// (`a_moved_remote_is_refused_and_left_alone`).
+#[tokio::test]
+async fn a_remote_past_the_tip_has_it_landed() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+    assert_eq!(remote_main(&git, &remote).await, fix.core.head);
+    // Someone moved the remote's `main` past the tip, from a commit this checkout holds.
+    git_out(
+        &git,
+        &fix.core.path,
+        &["checkout", "--quiet", "-b", "later"],
+    )
+    .await;
+    let later = commit_file(&fix.core.path, "later.txt", "later\n", "after the tip");
+    git_out(&git, &fix.core.path, &["checkout", "--quiet", "main"]).await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &[
+            "push",
+            "--quiet",
+            &remote.to_string_lossy(),
+            "later:refs/heads/main",
+        ],
+    )
+    .await;
+    assert_eq!(remote_main(&git, &remote).await, later);
+
+    assert_eq!(
+        fix.isolator
+            .land(&fix.core_request(&remote, "main", vec![fix.core.head.clone()]))
+            .await
+            .expect("the landing runs"),
+        LandOutcome::Landed {
+            hash: fix.core.head.clone()
+        }
+    );
+    assert_eq!(
+        remote_main(&git, &remote).await,
+        later,
+        "nothing was pushed"
+    );
+}
+
+/// MOD-133 D8 over a real divided run in `copy` mode: the landed commits are integrate's
+/// reconcile merge and the plain nodes', never a part's copy-local commits, so the landing is
+/// not refused `not_on_target` and the remote gets the primary's `main`.
+#[tokio::test]
+async fn a_divided_push_run_lands_without_a_part_commit_in_the_way() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Copy, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+    fix.push_core_to(&remote).await;
+    fix.divided(&["api", "ui"]).await;
+    let sink = MergingSink {
+        orch: &fix.orch,
+        git: &git,
+        core: fix.core.id,
+        shared: false,
+    };
+
+    let (run, _, _) = fix.divided_run(&sink).await;
+    let tip = git_out(&git, &fix.core.path, &["rev-parse", "refs/heads/main"]).await;
+    let records = fix
+        .orch
+        .store
+        .integrations(run)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record.state,
+                record.refusal.clone(),
+                record.landed_hash.clone()
+            ))
+            .collect::<Vec<_>>(),
+        [(IntegrationState::Landed, None, Some(tip.clone()))]
+    );
+    assert_eq!(remote_main(&git, &remote).await, tip);
 }
