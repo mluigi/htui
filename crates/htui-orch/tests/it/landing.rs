@@ -7,8 +7,9 @@
 
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Gate, IntegrateMode, IntegrationState, ItemId, ItemPatch, LandOutcome, NewRepo, NewStepGraph,
-    PhaseId, RepoId, RepoPatch, RunId, RunMode, RunStatus, Split, StepGraphId, StepGraphPhase,
+    Gate, IntegrateMode, IntegrationState, Isolation, ItemId, ItemPatch, LandOutcome, NewRepo,
+    NewStepGraph, PhaseId, RepoId, RepoPatch, RunId, RunMode, RunStatus, Split, StepGraphId,
+    StepGraphPhase,
 };
 use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer};
@@ -486,13 +487,15 @@ async fn a_repo_turned_push_mid_run_does_not_land_that_run() {
     assert!(orch.isolator.land_requests().is_empty());
 }
 
-/// D3: the three run-start refusals, each before a run row exists.
+/// D3: the run-start refusals, each before a run row exists. M3 D4: a `pull_request` repo
+/// refuses a phase that runs in place (`local` here), naming it.
 #[tokio::test]
 async fn an_unlandable_mode_refuses_the_run_at_start() {
-    for (remote, mode, settings, sentence) in [
+    for (remote, mode, settings, in_place, sentence) in [
         (
             None,
             Some(IntegrateMode::Push),
+            None,
             None,
             "`htui` integrates by `push` but has no remote URL: set one, or set it to `local`",
         ),
@@ -500,25 +503,37 @@ async fn an_unlandable_mode_refuses_the_run_at_start() {
             Some(REMOTE),
             Some(IntegrateMode::PullRequest),
             None,
-            "`htui` integrates by `pull_request`, which lands with MOD-133 milestone 3: set it \
-             to `local` or `push`",
+            Some("implement"),
+            "`htui` integrates by `pull_request`, which needs `worktree` or `copy` isolation, \
+             but phase `implement` runs `local`: set the phase's isolation, or set the repo to \
+             `local` or `push`",
         ),
         (
             Some(REMOTE),
             None,
             Some(serde_json::json!({ "integrate": "bogus" })),
+            None,
             "project setting `integrate` is \"bogus\", not one of local, push, pull_request",
         ),
         (
             None,
             None,
             Some(serde_json::json!({ "integrate": "push" })),
+            None,
             "`htui` integrates by `push` but has no remote URL: set one, or set it to `local`",
         ),
     ] {
         let orch = harness(&[]).await;
         if let Some(settings) = settings {
             orch.store.set_project_settings(ids::PROJECT_HTUI, settings);
+        }
+        if let Some(name) = in_place {
+            repoint(&orch.store, ids::HTUI_FEAT_3, |phase| {
+                if phase.name == name {
+                    phase.isolation = Some(Isolation::Local);
+                }
+            })
+            .await;
         }
         let repo = repo(&orch, remote, mode).await;
         let before = orch

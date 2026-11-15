@@ -30,7 +30,7 @@ use htui_core::model::{
 };
 use htui_core::model::{
     IntegrateMode, IntegrateSnapshot, MemoryState, PlanScope, SnapshotCapture,
-    SnapshotCaptureModel, SnapshotMemory,
+    SnapshotCaptureModel, SnapshotMemory, run_branch_name,
 };
 use htui_core::prompt::{
     MEMORY_TOKEN_CAP, TokenEstimator, resolve_light_model, select_memory,
@@ -343,10 +343,11 @@ pub enum ResolveError {
         reason: crate::status::RunFailure,
     },
     /// MOD-133 D3: a repo of the run's scope cannot integrate as its mode asks: the project's
-    /// `integrate` default is unreadable, a non-`local` repo has no `remote_url`, or a repo asks
-    /// for `pull_request` (MOD-133 milestone 3). The reason is the whole sentence
-    /// ([`integrate_default_unreadable`], [`integrate_without_remote`],
-    /// [`integrate_pull_request`]).
+    /// `integrate` default is unreadable, a non-`local` repo has no `remote_url`, or (M3 D4) a
+    /// `pull_request` repo meets a phase that runs in place or an item key that is no branch
+    /// name. The reason is the whole sentence ([`integrate_default_unreadable`],
+    /// [`integrate_without_remote`], [`integrate_pull_request_in_place`],
+    /// [`integrate_run_branch_invalid`]).
     #[error("{reason}")]
     IntegrateRefused {
         /// `repo.name`.
@@ -371,13 +372,23 @@ pub fn integrate_without_remote(repo: &str, mode: IntegrateMode) -> String {
     format!("`{repo}` integrates by `{mode}` but has no remote URL: set one, or set it to `local`")
 }
 
-/// MOD-133 D3: `pull_request` lands with milestone 3.
+/// MOD-133 M3 D4: a `pull_request` repo's steps reconcile into its run branch, which a phase
+/// that runs in place (`local`, `shared_serialized`) cannot do; `phase` is the first such phase in
+/// snapshot order.
 #[must_use]
-pub fn integrate_pull_request(repo: &str) -> String {
+pub fn integrate_pull_request_in_place(repo: &str, phase: &str, isolation: Isolation) -> String {
     format!(
-        "`{repo}` integrates by `pull_request`, which lands with MOD-133 milestone 3: set it to \
+        "`{repo}` integrates by `pull_request`, which needs `worktree` or `copy` isolation, but \
+         phase `{phase}` runs `{isolation}`: set the phase's isolation, or set the repo to \
          `local` or `push`"
     )
+}
+
+/// MOD-133 M3 D4: the item's key does not make a run branch name
+/// ([`htui_core::model::run_branch_name`]); real keys always do, so this is only a guard.
+#[must_use]
+pub fn integrate_run_branch_invalid(repo: &str, key: &str) -> String {
+    format!("`{repo}` integrates by `pull_request` but item key `{key}` is not a branch name")
 }
 
 /// MOD-138 D6: why a graph this version cannot walk is refused before its run exists.
@@ -496,6 +507,8 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
                 store,
                 item.project_id,
                 &resolved.repo_scope,
+                &item.key,
+                &resolved.snapshot.phases,
             ))
             .await?;
             Ok(resolved)
@@ -509,14 +522,20 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
 /// when some repo of the scope needs it) with its `remote_url` and `default_branch`. Scope order
 /// decides which refusal is raised first.
 ///
+/// MOD-133 M3 D4: a `pull_request` entry also freezes its run branch, `htui/item/<item_key>`.
+/// Every phase prepares the run's whole scope, so every phase of `phases` must isolate
+/// (`worktree` or `copy`) for its steps to reconcile into that branch.
+///
 /// # Errors
 /// [`ResolveError::IntegrateRefused`] for an unreadable project default, a non-`local` repo with
-/// no remote URL, or a `pull_request` repo; a missing `project` row is
-/// [`StoreError::NotFound`].
+/// no remote URL, or a `pull_request` repo with a phase that runs in place or an item key that is
+/// no branch name; a missing `project` row is [`StoreError::NotFound`].
 async fn frozen_integrate<S: htui_core::store::WorkerStore>(
     store: &S,
     project: ProjectId,
     scope: &[RepoId],
+    item_key: &str,
+    phases: &[SnapshotPhase],
 ) -> std::result::Result<BTreeMap<RepoId, IntegrateSnapshot>, ResolveError> {
     let mut frozen = BTreeMap::new();
     if scope.is_empty() {
@@ -567,19 +586,38 @@ async fn frozen_integrate<S: htui_core::store::WorkerStore>(
                 reason: integrate_without_remote(&repo.name, mode),
             });
         };
-        if mode == IntegrateMode::PullRequest {
-            return Err(ResolveError::IntegrateRefused {
-                repo: repo.name.clone(),
-                reason: integrate_pull_request(&repo.name),
-            });
-        }
+        let run_branch = if mode == IntegrateMode::PullRequest {
+            if let Some(phase) = phases.iter().find(|phase| {
+                matches!(
+                    phase.isolation,
+                    Isolation::Local | Isolation::SharedSerialized
+                )
+            }) {
+                return Err(ResolveError::IntegrateRefused {
+                    repo: repo.name.clone(),
+                    reason: integrate_pull_request_in_place(
+                        &repo.name,
+                        &phase.name,
+                        phase.isolation,
+                    ),
+                });
+            }
+            Some(
+                run_branch_name(item_key).map_err(|_| ResolveError::IntegrateRefused {
+                    repo: repo.name.clone(),
+                    reason: integrate_run_branch_invalid(&repo.name, item_key),
+                })?,
+            )
+        } else {
+            None
+        };
         frozen.insert(
             repo.id,
             IntegrateSnapshot {
                 mode,
                 remote: remote.to_owned(),
                 target_branch: repo.default_branch.clone(),
-                run_branch: None,
+                run_branch,
             },
         );
     }
@@ -2110,10 +2148,10 @@ async fn agent_name<G: GraphSource>(
 mod tests {
     use htui_core::fixtures::{DemoData, demo_data, ids};
     use htui_core::model::{
-        Activation, EdgeId, EdgeKind, Gate, GraphBody, GraphScope, ItemFilter, ItemPatch, NewRepo,
-        NewStepGraph, NodeBody, PersonaId, PhasePatch, PromptTemplateId, RepoId, RepoPatch,
-        RepoScope, RunScope, Scope, SkillBinding, SkillBindingId, SnapshotPersona, Split,
-        StepGraphEdge,
+        Activation, EdgeId, EdgeKind, Gate, GraphBody, GraphScope, IntegrateMode,
+        IntegrateSnapshot, ItemFilter, ItemPatch, NewRepo, NewStepGraph, NodeBody, PersonaId,
+        PhasePatch, PromptTemplateId, RepoId, RepoPatch, RepoScope, RunScope, Scope, SkillBinding,
+        SkillBindingId, SnapshotPersona, Split, StepGraphEdge,
     };
     use htui_core::model::{
         EdgePredicate, NodeRole, PlanScope, RuntimeChanges, SnapshotDivide, SnapshotEdge,
@@ -3071,6 +3109,165 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .expect("one local step is fine")
             .snapshot;
         assert_eq!(snapshot.phases[2].isolation, Isolation::Local);
+    }
+
+    /// A primary repo of the HTUI project with a remote, integrating by `mode`.
+    async fn integrating_repo(store: &MemStore, mode: IntegrateMode) -> RepoId {
+        let repo = store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "core".to_owned(),
+                remote_url: Some("https://forge.example/o/core.git".to_owned()),
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the fixture project takes a repo");
+        let outcome = store
+            .update_repo(
+                repo.id,
+                repo.updated_at,
+                RepoPatch {
+                    integrate: Some(Some(mode)),
+                    ..RepoPatch::default()
+                },
+            )
+            .await
+            .expect("the repo is there");
+        assert!(
+            matches!(outcome, CasOutcome::Applied(_)),
+            "the repo moved under the case: {outcome:?}"
+        );
+        repo.id
+    }
+
+    /// `resolve` of `FEAT-1` over `repo` alone.
+    async fn resolve_over(
+        store: &MemStore,
+        repo: RepoId,
+    ) -> std::result::Result<Resolved, ResolveError> {
+        let item = feat_1(store).await;
+        resolve(
+            store,
+            &TestSource::claude(store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            Some(&[repo][..]),
+            ids::BOX,
+        )
+        .await
+    }
+
+    /// MOD-133 M3 D4: a `pull_request` repo whose phases all isolate (the `worktree` default)
+    /// freezes the item's run branch beside its mode.
+    #[tokio::test]
+    async fn pull_request_freezes_its_run_branch() {
+        let store = MemStore::demo();
+        let repo = integrating_repo(&store, IntegrateMode::PullRequest).await;
+        let key = feat_1(&store).await.key;
+        let snapshot = resolve_over(&store, repo)
+            .await
+            .expect("a `pull_request` repo over `worktree` phases resolves")
+            .snapshot;
+        assert!(
+            snapshot
+                .phases
+                .iter()
+                .all(|phase| phase.isolation == Isolation::Worktree),
+            "every seeded phase resolves to the `worktree` default"
+        );
+        assert_eq!(
+            snapshot.integrate,
+            BTreeMap::from([(
+                repo,
+                IntegrateSnapshot {
+                    mode: IntegrateMode::PullRequest,
+                    remote: "https://forge.example/o/core.git".to_owned(),
+                    target_branch: "main".to_owned(),
+                    run_branch: Some(format!("htui/item/{key}")),
+                },
+            )])
+        );
+    }
+
+    /// MOD-133 M3 D4: a `pull_request` repo refuses a phase that runs in place, naming the first
+    /// such phase in snapshot order and its isolation; `local` refuses the same way.
+    #[tokio::test]
+    async fn pull_request_refuses_a_shared_serialized_phase_naming_it() {
+        for (isolation, first, sentence) in [
+            (
+                Isolation::SharedSerialized,
+                "plan",
+                "`core` integrates by `pull_request`, which needs `worktree` or `copy` \
+                 isolation, but phase `plan` runs `shared_serialized`: set the phase's \
+                 isolation, or set the repo to `local` or `push`",
+            ),
+            (
+                Isolation::Local,
+                "plan",
+                "`core` integrates by `pull_request`, which needs `worktree` or `copy` \
+                 isolation, but phase `plan` runs `local`: set the phase's isolation, or set \
+                 the repo to `local` or `push`",
+            ),
+        ] {
+            let store = store_with(|data| {
+                for phase in &mut data.phases {
+                    if phase.graph_id == ids::GRAPH_HTUI_FEAT
+                        && (phase.name == first || phase.name == "review")
+                    {
+                        phase.isolation = Some(isolation);
+                    }
+                }
+            });
+            let repo = integrating_repo(&store, IntegrateMode::PullRequest).await;
+            let error = resolve_over(&store, repo)
+                .await
+                .expect_err("`pull_request` cannot run in place");
+            assert_eq!(
+                error,
+                ResolveError::IntegrateRefused {
+                    repo: "core".to_owned(),
+                    reason: sentence.to_owned(),
+                }
+            );
+            assert_eq!(error.to_string(), sentence);
+        }
+
+        // A `copy` phase isolates, so it resolves.
+        let store = store_with(|data| {
+            for phase in &mut data.phases {
+                if phase.graph_id == ids::GRAPH_HTUI_FEAT && phase.name == "plan" {
+                    phase.isolation = Some(Isolation::Copy);
+                }
+            }
+        });
+        let repo = integrating_repo(&store, IntegrateMode::PullRequest).await;
+        resolve_over(&store, repo)
+            .await
+            .expect("`copy` isolates, so `pull_request` runs over it");
+    }
+
+    /// MOD-133 M3 D4: a `push` repo freezes no run branch, and its entry's JSON has no
+    /// `run_branch` key, so a `push` snapshot keeps M1's bytes.
+    #[tokio::test]
+    async fn a_push_snapshot_keeps_its_bytes() {
+        let store = MemStore::demo();
+        let repo = integrating_repo(&store, IntegrateMode::Push).await;
+        let snapshot = resolve_over(&store, repo)
+            .await
+            .expect("a `push` repo with a remote resolves")
+            .snapshot;
+        let entry = snapshot
+            .integrate
+            .get(&repo)
+            .expect("the push repo is frozen");
+        assert_eq!(entry.run_branch, None);
+        assert_eq!(
+            serde_json::to_string(entry).expect("the entry serialises"),
+            r#"{"mode":"push","remote":"https://forge.example/o/core.git","target_branch":"main"}"#
+        );
     }
 
     /// Plan D14, and the only case an empty scope is legitimate in.
