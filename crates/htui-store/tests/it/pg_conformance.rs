@@ -75,15 +75,17 @@ use htui_store::testkit as common;
 /// and MOD-130 M1 T4's five level, default, retire and delete cases (D3, D5, D11, D14) make it
 /// 343,
 /// and MOD-130 M2 T2's three recorded-target cases (D7, P7-P9) make it 346,
-/// and MOD-133 M2's three landing-state, refused-waiting-row and retry cases (E1-E5) make it 349.
-const EXPECTED_CASES: usize = 349;
+/// and MOD-133 M2's three landing-state, refused-waiting-row and retry cases (E1-E5) make it 349,
+/// and MOD-130 M3 T1's driving-box case (D8, P6) makes it 350,
+/// and MOD-130 M3 T2's three driver-keyed claim cases (D8, D9, P4) make it 353.
+const EXPECTED_CASES: usize = 353;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (349 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (353 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -104,7 +106,9 @@ fn case_list_matches_mem_store() {
              cases, and MOD-130 M1 T1's seeded local target case, and MOD-130 \
              M1 T2's four target cases, and MOD-130 M1 T3's item target case, and MOD-130 M1 \
              T4's five level, default, retire and delete cases, and MOD-130 M2 T2's three \
-             recorded-target cases, and MOD-133 M2's three landing, refusal and retry cases)"
+             recorded-target cases, and MOD-133 M2's three landing, refusal and retry cases, and \
+             MOD-130 M3 T1's driving-box case, and MOD-130 M3 T2's three driver-keyed claim \
+             cases)"
     );
 }
 
@@ -855,6 +859,172 @@ async fn pg_integration_take_skips_a_record_another_transaction_holds() {
             .collect::<Vec<_>>(),
         vec![held],
         "the released record is leased; the other stays with its first owner"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-130 M3 T2 (P4, fact-check C24), Postgres only: a claim of a child-box run reads the child
+/// box row `FOR SHARE`, so the tag check cannot race a re-probe or an `edit_box` of the box the
+/// work runs on. The claim cannot be paused after it takes that lock, so the conflict is shown
+/// from the other side: with the child's row held by an uncommitted tag edit, the driver's claim
+/// waits on the child row and, once the edit commits, decides on the edited tags. A local run
+/// takes no such lock: its claim answers at once while the child is held.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claim_run_holds_the_target_box_against_a_re_probe() {
+    use chrono::{SubsecRound as _, TimeDelta, Utc};
+    use htui_core::fixtures::ids;
+    use htui_core::model::{
+        BoxId, Claim, GraphSnapshot, Isolation, NewChildBox, NewRun, NewTarget, ResolvedTarget,
+        RunId, RunMode, SnapshotGraph, SnapshotSettings, TIMESTAMPTZ_DIGITS, TargetId, TargetKind,
+        TargetSource,
+    };
+    use htui_core::store::WriteStore as _;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    let Some(db) = Box::pin(common::demo_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let pg = &db.store;
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let lease = TimeDelta::minutes(5);
+    let owner = Uuid::now_v7();
+
+    let docker = pg
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "raced docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create the docker target");
+    let child = BoxId::new();
+    pg.attach_child_box(NewChildBox {
+        id: child,
+        parent: ids::BOX,
+        hostname: "raced-child".to_owned(),
+        target: docker.id,
+    })
+    .await
+    .expect("attach the child box");
+    sqlx::query("UPDATE item SET required_tags = '{gpu}' WHERE id = $1")
+        .bind(ids::HTUI_ANA_2.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("ANA-2 requires gpu");
+
+    let new_run = |item, on, driver, target| NewRun {
+        workspace_id: None,
+        id: RunId::new(),
+        project_id: ids::PROJECT_HTUI,
+        item_id: item,
+        mode: RunMode::Manual,
+        target_box_id: on,
+        executing_box_id: driver,
+        started_by: ids::USER,
+        graph_snapshot: GraphSnapshot {
+            v: GraphSnapshot::V,
+            graph: SnapshotGraph {
+                id: ids::GRAPH_HTUI_FEAT,
+                name: "feature".to_owned(),
+                is_override: false,
+                scope: None,
+                revision: None,
+            },
+            topology: "sha256:pg_conformance".to_owned(),
+            mode: RunMode::Manual,
+            phases: Vec::new(),
+            settings: SnapshotSettings {
+                default_isolation: Isolation::Worktree,
+                per_token_cap_run: None,
+                per_token_cap_batch: None,
+                max_fan_out: 4,
+                max_agents_per_run: 6,
+                max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+                max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+                max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+                runtime_changes: htui_core::model::RuntimeChanges::Ask,
+            },
+            scope: None,
+            personas: Vec::new(),
+            memory: None,
+            capture: None,
+            source: None,
+            edges: Vec::new(),
+            integrate: std::collections::BTreeMap::new(),
+        },
+        repo_scope: Vec::new(),
+        queued_at: at,
+        batch_id: None,
+        target,
+    };
+    let driven = pg
+        .create_run(new_run(
+            ids::HTUI_ANA_2,
+            child,
+            Some(ids::BOX),
+            Some(ResolvedTarget {
+                target: docker.id,
+                source: TargetSource::Item,
+            }),
+        ))
+        .await
+        .expect("queue the child-box run")
+        .id;
+    let local = pg
+        .create_run(new_run(ids::HTUI_CLEAN_1, ids::BOX, None, None))
+        .await
+        .expect("queue the local run")
+        .id;
+
+    // The holder: an uncommitted tag edit of the child, the row lock `edit_box` takes.
+    let mut holder = db.pool.begin().await.expect("begin the holder");
+    sqlx::query("UPDATE box SET declared_tags = '{gpu}' WHERE id = $1")
+        .bind(child.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("hold the child row");
+
+    let claimed = tokio::time::timeout(
+        Duration::from_secs(10),
+        pg.claim_run(local, ids::BOX, owner, at, lease),
+    )
+    .await
+    .expect("a local run's claim does not wait on the child row")
+    .expect("claim the local run");
+    assert_eq!(claimed, Claim::Admitted, "the local run is admitted");
+
+    let release = async {
+        for _ in 0..400 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                    AND wait_event_type = 'Lock' AND strpos(query, $1) > 0",
+            )
+            .bind("FROM box WHERE id = $1 FOR SHARE")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read pg_stat_activity");
+            if waiting > 0 {
+                holder.commit().await.expect("commit the tag edit");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the claim never waited on the child row");
+    };
+    let (claimed, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(pg.claim_run(driven, ids::BOX, owner, at, lease), release)
+    })
+    .await
+    .expect("the claim answers once the edit commits");
+    assert_eq!(
+        claimed.expect("claim the child-box run"),
+        Claim::Admitted,
+        "the claim waited for the edit and read the child's committed `gpu`"
     );
 
     db.drop_db().await;

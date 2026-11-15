@@ -180,6 +180,7 @@ async fn park_ana_2(store: &MemStore) -> (RunId, StepId) {
             item_id: ids::HTUI_ANA_2,
             mode: RunMode::Manual,
             target_box_id: ids::BOX,
+            executing_box_id: None,
             started_by: ids::USER,
             graph_snapshot: snapshot,
             repo_scope: Vec::new(),

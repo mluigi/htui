@@ -2755,11 +2755,12 @@ impl PgStore {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
-    /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11). No
-    /// index covers `(target_box_id, status)`; a per-user table scanned every 5 s is accepted
-    /// (R-6). MOD-125 M2 D8: less the queued runs of a stopped workspace (they hold no slot and
-    /// cannot be claimed until the resume); a run without a workspace makes the subquery empty,
-    /// so it stays.
+    /// The `queued` runs this box drives, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan
+    /// D11; MOD-130 M3 D8: keyed on `COALESCE(executing_box_id, target_box_id)`, so a child-box
+    /// run is its driver's). No index covers the predicate; a per-user table scanned every 5 s is
+    /// accepted (R-6, MOD-130 M3 P10). MOD-125 M2 D8: less the queued runs of a stopped
+    /// workspace (they hold no slot and cannot be claimed until the resume); a run without a
+    /// workspace makes the subquery empty, so it stays.
     ///
     /// # Errors
     ///
@@ -2769,7 +2770,7 @@ impl PgStore {
             r#"
             SELECT id AS "id: RunId", queued_at
               FROM run
-             WHERE target_box_id = $1 AND status = 'queued'
+             WHERE COALESCE(executing_box_id, target_box_id) = $1 AND status = 'queued'
                AND NOT EXISTS (SELECT 1 FROM workspace_stop ws WHERE ws.workspace_id = run.workspace_id)
              ORDER BY queued_at, id
             "#,
@@ -2815,8 +2816,9 @@ impl PgStore {
     }
 
     /// MOD-12 M3 D6: `box_id`'s entries in queue order (D2), each with its item's key, title,
-    /// status, priority and `created_at`, its latest graph run (target hostname, parked step), its
-    /// latest note and its open `blocked_by` keys. One statement.
+    /// status, priority and `created_at`, its latest graph run (target hostname; driving box,
+    /// `COALESCE(executing_box_id, target_box_id)`, and its hostname, MOD-130 M3 P5; parked step),
+    /// its latest note and its open `blocked_by` keys. One statement.
     ///
     /// Two latest runs, told apart (MOD-144, PD6). `lr`, the latest `kind = 'graph'` run by
     /// `(queued_at, id)` **cancelled included**, feeds [`QueueRunFact`] (what the queue overlay
@@ -2853,6 +2855,8 @@ impl PgStore {
                    lr.mode           AS "run_mode?: RunMode",
                    lr.target_box_id  AS "run_target?: BoxId",
                    lr.hostname       AS "run_hostname?",
+                   lr.driver_box_id  AS "run_driver?: BoxId",
+                   lr.driver_hostname AS "run_driver_hostname?",
                    lr.failure        AS "run_failure?",
                    lr.parked_step    AS "run_parked_step?: StepId",
                    ln.body           AS "note?",
@@ -2869,13 +2873,16 @@ impl PgStore {
               FROM queue_entry e
               JOIN item i ON i.id = e.item_id
               LEFT JOIN LATERAL (
-                    SELECT r.id, r.status, r.mode, r.target_box_id, tb.hostname, r.failure,
+                    SELECT r.id, r.status, r.mode, r.target_box_id, tb.hostname,
+                           COALESCE(r.executing_box_id, r.target_box_id) AS driver_box_id,
+                           db.hostname AS driver_hostname, r.failure,
                            (SELECT s.id FROM run_step s
                              WHERE s.run_id = r.id AND s.status = 'awaiting_approval'
                              ORDER BY s.position, s.attempt, s.fanout_index
                              LIMIT 1) AS parked_step
                       FROM run r
                       LEFT JOIN box tb ON tb.id = r.target_box_id
+                      LEFT JOIN box db ON db.id = COALESCE(r.executing_box_id, r.target_box_id)
                      WHERE r.item_id = i.id AND r.kind = 'graph'
                      ORDER BY r.queued_at DESC, r.id DESC
                      LIMIT 1
@@ -2922,18 +2929,30 @@ impl PgStore {
         Ok(rows
             .into_iter()
             .map(|row| {
-                let latest_run = match (row.run_id, row.run_status, row.run_mode, row.run_target) {
-                    (Some(id), Some(status), Some(mode), Some(target_box_id)) => {
-                        Some(QueueRunFact {
-                            id,
-                            status,
-                            mode,
-                            target_box_id,
-                            target_hostname: row.run_hostname,
-                            failure: row.run_failure,
-                            parked_step: row.run_parked_step,
-                        })
-                    }
+                let latest_run = match (
+                    row.run_id,
+                    row.run_status,
+                    row.run_mode,
+                    row.run_target,
+                    row.run_driver,
+                ) {
+                    (
+                        Some(id),
+                        Some(status),
+                        Some(mode),
+                        Some(target_box_id),
+                        Some(driver_box_id),
+                    ) => Some(QueueRunFact {
+                        id,
+                        status,
+                        mode,
+                        target_box_id,
+                        target_hostname: row.run_hostname,
+                        driver_box_id,
+                        driver_hostname: row.run_driver_hostname,
+                        failure: row.run_failure,
+                        parked_step: row.run_parked_step,
+                    }),
                     _ => None,
                 };
                 QueueRow {

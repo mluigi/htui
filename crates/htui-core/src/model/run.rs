@@ -307,7 +307,9 @@ pub struct Run {
     /// [`Run::target_id`]. `None` on a chat run and on every run queued before M2.
     #[serde(default)]
     pub target_source: Option<TargetSource>,
-    /// `run.executing_box_id`.
+    /// `run.executing_box_id`: the box that drives the run: written at enqueue when the work runs
+    /// on another box (MOD-130 M3, D8), else at claim; `NULL` while a run waits for its target
+    /// box's worker.
     pub executing_box_id: Option<BoxId>,
     /// `run.graph_snapshot` (`JSONB`): the graph, phases and agents as they were at start
     /// (`R-ORCH-11`).
@@ -333,6 +335,17 @@ pub struct Run {
     pub lease_expires_at: Option<DateTime<Utc>>,
     /// `run.updated_at`.
     pub updated_at: DateTime<Utc>,
+}
+
+impl Run {
+    /// The box that drives the run (MOD-130 M3, D8): `COALESCE(executing_box_id, target_box_id)`.
+    #[must_use]
+    pub const fn driver(&self) -> BoxId {
+        match self.executing_box_id {
+            Some(id) => id,
+            None => self.target_box_id,
+        }
+    }
 }
 
 /// A row of `run_step` (§5.8).
@@ -517,6 +530,10 @@ pub struct NewRun {
     pub mode: RunMode,
     /// `run.target_box_id`.
     pub target_box_id: BoxId,
+    /// `run.executing_box_id`: the driving box when it is not the target box (MOD-130 M3, D8, P1);
+    /// `None` = the target box drives.
+    #[serde(default)]
+    pub executing_box_id: Option<BoxId>,
     /// `run.started_by`.
     pub started_by: UserId,
     /// `run.graph_snapshot`, serialised by the store (`R-ORCH-11`).
@@ -2055,6 +2072,46 @@ mod tests {
             Some("plan"),
             "no sink with a readable kind: the highest position that has one"
         );
+    }
+
+    /// MOD-130 M3, D8: the driver is `COALESCE(executing_box_id, target_box_id)`.
+    #[test]
+    fn driver_is_the_executing_box_else_the_target() {
+        use super::{Run, RunId, RunKind, RunMode};
+        use crate::model::ids::{BoxId, ProjectId, UserId};
+        use chrono::{TimeZone as _, Utc};
+
+        let at = Utc.with_ymd_and_hms(2026, 11, 15, 9, 0, 0).unwrap();
+        let target = BoxId::from_uuid(Uuid::from_u128(1));
+        let driver = BoxId::from_uuid(Uuid::from_u128(2));
+        let mut run = Run {
+            id: RunId::from_uuid(Uuid::from_u128(1)),
+            project_id: ProjectId::from_uuid(Uuid::from_u128(1)),
+            item_id: None,
+            workspace_id: None,
+            kind: RunKind::Graph,
+            mode: RunMode::Manual,
+            status: RunStatus::Queued,
+            target_box_id: target,
+            executing_box_id: None,
+            graph_snapshot: None,
+            started_by: UserId::from_uuid(Uuid::from_u128(1)),
+            queued_at: at,
+            started_at: None,
+            finished_at: None,
+            failure: None,
+            repo_scope: Vec::new(),
+            lease_box_id: None,
+            lease_expires_at: None,
+            updated_at: at,
+            target_id: None,
+            target_source: None,
+        };
+        assert_eq!(run.driver(), target, "no executing box: the target drives");
+        run.executing_box_id = Some(driver);
+        assert_eq!(run.driver(), driver, "the executing box drives");
+        run.executing_box_id = Some(target);
+        assert_eq!(run.driver(), target);
     }
 
     /// MOD-144: the latest graph run skips `cancelled` and chat runs, orders by `queued_at`, and

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,\n                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,\n                             batch_id, workspace_id, target_id, target_source)\n            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10, $11,\n                    $12, $13)\n            RETURNING id               AS \"id: RunId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      item_id          AS \"item_id: ItemId\",\n                      workspace_id     AS \"workspace_id: WorkspaceId\",\n                      kind             AS \"kind: RunKind\",\n                      mode             AS \"mode: RunMode\",\n                      status           AS \"status: RunStatus\",\n                      target_box_id    AS \"target_box_id: BoxId\",\n                      target_id        AS \"target_id: TargetId\",\n                      target_source    AS \"target_source: TargetSource\",\n                      executing_box_id AS \"executing_box_id: BoxId\",\n                      graph_snapshot,\n                      started_by       AS \"started_by: UserId\",\n                      queued_at,\n                      started_at,\n                      finished_at,\n                      failure,\n                      repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                      lease_box_id     AS \"lease_box_id: BoxId\",\n                      lease_expires_at,\n                      updated_at\n            ",
+  "query": "\n            INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,\n                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,\n                             batch_id, workspace_id, target_id, target_source)\n            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, $14, $6, $7, $8, $9::uuid[], $10, $11,\n                    $12, $13)\n            RETURNING id               AS \"id: RunId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      item_id          AS \"item_id: ItemId\",\n                      workspace_id     AS \"workspace_id: WorkspaceId\",\n                      kind             AS \"kind: RunKind\",\n                      mode             AS \"mode: RunMode\",\n                      status           AS \"status: RunStatus\",\n                      target_box_id    AS \"target_box_id: BoxId\",\n                      target_id        AS \"target_id: TargetId\",\n                      target_source    AS \"target_source: TargetSource\",\n                      executing_box_id AS \"executing_box_id: BoxId\",\n                      graph_snapshot,\n                      started_by       AS \"started_by: UserId\",\n                      queued_at,\n                      started_at,\n                      finished_at,\n                      failure,\n                      repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                      lease_box_id     AS \"lease_box_id: BoxId\",\n                      lease_expires_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -249,7 +249,8 @@
         "Uuid",
         "Uuid",
         "Uuid",
-        "Text"
+        "Text",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -276,5 +277,5 @@
       false
     ]
   },
-  "hash": "39728fe2872744488b16fdee2bf738d89db2e8c6acd0217436df1dbc87c06563"
+  "hash": "e9971105ddfa174e910daa65f3b73bef81bbd86bc553869768fbe82b80ab0fd2"
 }

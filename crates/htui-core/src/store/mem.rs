@@ -1193,7 +1193,8 @@ impl MemStore {
         }))
     }
 
-    /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11).
+    /// The `queued` runs this box drives, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan
+    /// D11; MOD-130 M3 D8: keyed on [`Run::driver`], so a child-box run is its driver's).
     /// `RunId`'s `Ord` is uuid byte order, which is Postgres' uuid order. MOD-125 M2 D8: less the
     /// queued runs of a stopped workspace (they hold no slot and cannot be claimed until the
     /// resume).
@@ -1206,7 +1207,7 @@ impl MemStore {
                 .runs
                 .values()
                 .filter(|row| {
-                    row.target_box_id == box_id
+                    row.driver() == box_id
                         && row.status == RunStatus::Queued
                         // MOD-125 M2 D8: a stopped workspace's queued run takes no free slot and
                         // is not re-claimed every sweep; it reappears at the resume.
@@ -1795,6 +1796,20 @@ impl MemStore {
         })
     }
 
+    /// MOD-130 M3 P7: sets `target.probed_at` as no writer does until MOD-44/131 probe a target,
+    /// on this store and every clone of it; `updated_at` does not move. The engine tests that start
+    /// a run on a child-box target make it `ready` through it. Whether the target exists.
+    #[cfg(feature = "test-support")]
+    pub fn set_target_probed(&self, id: TargetId, at: DateTime<Utc>) -> bool {
+        self.write(|state| {
+            state
+                .targets
+                .get_mut(&id)
+                .map(|row| row.probed_at = Some(at))
+                .is_some()
+        })
+    }
+
     /// This handle's "now": its injected clock, else `Utc::now()` untruncated (blueprint B21).
     fn now(&self) -> DateTime<Utc> {
         self.clock.now()
@@ -2331,9 +2346,8 @@ impl State {
 
     /// `box.hostname` of the box a run is on: the executing one, else the target (blueprint B.4).
     fn run_hostname(&self, run: &Run) -> String {
-        let id = run.executing_box_id.unwrap_or(run.target_box_id);
         self.boxes
-            .get(&id)
+            .get(&run.driver())
             .map_or_else(String::new, |row| row.hostname.clone())
     }
 
@@ -6667,7 +6681,8 @@ impl State {
     }
 
     /// MOD-12 M3 D6: `item`'s latest `kind = 'graph'` run by `(queued_at, id)`, **cancelled
-    /// included** (PD6), with its target box's hostname and its first `awaiting_approval` step by
+    /// included** (PD6), with its target box's hostname, its driving box ([`Run::driver`],
+    /// MOD-130 M3 P5) and that box's hostname, and its first `awaiting_approval` step by
     /// `(position, attempt, fanout_index)`.
     fn latest_queue_run(&self, item: ItemId) -> Option<QueueRunFact> {
         let run = self
@@ -6683,6 +6698,11 @@ impl State {
             target_hostname: self
                 .boxes
                 .get(&run.target_box_id)
+                .map(|row| row.hostname.clone()),
+            driver_box_id: run.driver(),
+            driver_hostname: self
+                .boxes
+                .get(&run.driver())
                 .map(|row| row.hostname.clone()),
             failure: run.failure.clone(),
             parked_step: self
@@ -6935,6 +6955,16 @@ impl State {
                 "box",
             )));
         }
+        // MOD-130 M3 P6: `run.executing_box_id`'s foreign key, right after the target box's.
+        if let Some(driver) = new.executing_box_id
+            && !self.boxes.contains_key(&driver)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "run.executing_box_id",
+                driver,
+                "box",
+            )));
+        }
         // MOD-125 D3: `fk_run_workspace` (M2 D10: in the readable sentence).
         if let Some(workspace) = workspace_id
             && !self.workspaces.contains_key(&workspace)
@@ -6981,7 +7011,7 @@ impl State {
             mode: new.mode,
             status: RunStatus::Queued,
             target_box_id: new.target_box_id,
-            executing_box_id: None,
+            executing_box_id: new.executing_box_id,
             graph_snapshot: Some(snapshot),
             started_by: new.started_by,
             // Postgres keeps `timestamptz` to the microsecond (sqlx truncates toward zero), and
@@ -7023,7 +7053,8 @@ impl State {
                 id: box_id.to_string(),
             });
         }
-        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
+        // MOD-130 M3 (D8, P4): a run is claimable by the box that drives it, not by its target box.
+        if claimed.status != RunStatus::Queued || claimed.driver() != box_id {
             return Ok(Claim::NotClaimable);
         }
         // MOD-125 D5: after claimability, before the tags, so a stopped workspace never fails a run.
@@ -7037,11 +7068,12 @@ impl State {
         // and the overlap, so a permanent refusal wins over a transient one. A run whose item row
         // is absent has no tags to check, as the Postgres join finds none (D94). A chat run is not
         // such a run: `start_chat_run` inserts at `running`, so it is `NotClaimable` at the status
-        // half above and never reaches this check (MOD-58).
+        // half above and never reaches this check (MOD-58). The tags are the run's target box's,
+        // the box the work runs on, not the driver's (MOD-130 M3, D9, P4).
         let missing = claimed
             .item_id
             .and_then(|item| self.items.get(&item))
-            .map(|row| self.missing_for(&row.required_tags, box_id))
+            .map(|row| self.missing_for(&row.required_tags, claimed.target_box_id))
             .unwrap_or_default();
         if !missing.is_empty() {
             if let Some(row) = self.runs.get_mut(&run) {
@@ -7066,8 +7098,8 @@ impl State {
         // `status = 'running'` alone — "an `awaiting_approval` run consumes no compute and must
         // not hold a slot" — while the overlap predicate "ranges over non-terminal runs, including
         // `awaiting_approval` ones, because a parked run still owns its trees and its unmerged
-        // branch" (invariant 6). A `queued` run is in neither: it has no `executing_box_id` and no
-        // tree.
+        // branch" (invariant 6). A `queued` run is in neither, excluded by its status: it may
+        // already name its driver in `executing_box_id` (MOD-130 M3 D8), but it has no tree.
         // A `stopped` run is in the overlap set and not the slot (MOD-125 D2).
         let mut live: Vec<&Run> = self
             .runs
@@ -17834,6 +17866,7 @@ mod tests {
             item_id: item,
             mode: RunMode::Manual,
             target_box_id: ids::BOX,
+            executing_box_id: None,
             started_by: ids::USER,
             graph_snapshot: test_snapshot(),
             repo_scope: scope,
@@ -17932,6 +17965,40 @@ mod tests {
             "only the snapshot moved"
         );
         assert!(!store.set_run_snapshot(RunId::new(), serde_json::json!({})));
+    }
+
+    /// MOD-130 M3 P7's seam: `probed_at` is set on every clone, nothing else on the row moves,
+    /// and an unknown target answers `false`.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn set_target_probed_stamps_probed_at_and_nothing_else() {
+        use crate::model::{NewTarget, Target, TargetId, TargetKind};
+
+        let store = MemStore::demo();
+        let clone = store.clone();
+        let before = store
+            .create_target(NewTarget {
+                id: TargetId::new(),
+                name: "probed docker".to_owned(),
+                kind: TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("creates");
+        assert_eq!(before.probed_at, None, "no writer probes a target yet");
+        let at = before.created_at + TimeDelta::minutes(5);
+        assert!(store.set_target_probed(before.id, at));
+        let after = clone.target(before.id).await.expect("reads");
+        assert_eq!(after.probed_at, Some(at));
+        assert_eq!(
+            Target {
+                probed_at: None,
+                ..after
+            },
+            before,
+            "only probed_at moved"
+        );
+        assert!(!store.set_target_probed(TargetId::new(), at));
     }
 
     /// `create_run` is one transaction (plan D6): the `run` row lands and the item is not written
@@ -18453,6 +18520,120 @@ mod tests {
                 .expect("the read is answered"),
             expected,
             "this box's queued runs, the fixture's then this case's three, by `(queued_at, id)`"
+        );
+    }
+
+    /// A docker target and a child box of the fixture machine bound to it, hostname `hostname`
+    /// (MOD-130 M3 T3): a box whose work the machine drives.
+    async fn child_box_of_the_fixture(store: &MemStore, hostname: &str) -> BoxId {
+        use crate::model::{NewChildBox, NewTarget, TargetId, TargetKind};
+
+        let docker = store
+            .create_target(NewTarget {
+                id: TargetId::new(),
+                name: format!("{hostname} docker"),
+                kind: TargetKind::Docker,
+                locator: json!({}),
+            })
+            .await
+            .expect("the target is created");
+        let child = BoxId::new();
+        store
+            .attach_child_box(NewChildBox {
+                id: child,
+                parent: ids::BOX,
+                hostname: hostname.to_owned(),
+                target: docker.id,
+            })
+            .await
+            .expect("the child box is attached");
+        child
+    }
+
+    /// MOD-130 M3 T3 (D8, P5): `queued_runs_on_box` answers the queued runs `box_id` drives,
+    /// `COALESCE(executing_box_id, target_box_id)`: a child-box run the machine drives is the
+    /// machine's, not the child's; a run of another machine with no driver (MOD-43's shape) is
+    /// that machine's, not this one's; a local run is this box's. The Postgres half is
+    /// `pg_criteria.rs::queued_runs_on_box_lists_the_runs_this_box_drives`.
+    #[tokio::test]
+    async fn queued_runs_on_box_lists_the_runs_this_box_drives() {
+        let mut data = crate::fixtures::demo_data();
+        let mut elsewhere = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .clone();
+        let other = BoxId::new();
+        elsewhere.id = other;
+        elsewhere.hostname = "ELSEWHERE".to_owned();
+        data.boxes.push(elsewhere);
+        let store = MemStore::from_demo(data);
+        let child = child_box_of_the_fixture(&store, "driven-child").await;
+
+        let queue = |title: &'static str, target: BoxId, driver: Option<BoxId>| {
+            let store = &store;
+            async move {
+                let item = store
+                    .mint_item(NewItem {
+                        id: ItemId::new(),
+                        project_id: ids::PROJECT_HTUI,
+                        kind_id: ids::KIND_HTUI_FEAT,
+                        title: title.to_owned(),
+                        body: String::new(),
+                        required_tags: Vec::new(),
+                        touched_paths: Vec::new(),
+                        priority: 0,
+                        step_graph_id: None,
+                        target_id: None,
+                        created_by: ids::USER,
+                        box_id: Some(ids::BOX),
+                    })
+                    .await
+                    .expect("the mint lands")
+                    .id;
+                store
+                    .create_run(NewRun {
+                        target_box_id: target,
+                        executing_box_id: driver,
+                        ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
+                    })
+                    .await
+                    .expect("the run is queued")
+                    .id
+            }
+        };
+        let driven = queue("driven here, works on the child", child, Some(ids::BOX)).await;
+        let theirs = queue("another machine's, no driver", other, None).await;
+        let local = queue("local to this box", ids::BOX, None).await;
+
+        let listed = |box_id: BoxId| {
+            let store = &store;
+            async move {
+                store
+                    .queued_runs_on_box(box_id)
+                    .await
+                    .expect("the read is answered")
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let here = listed(ids::BOX).await;
+        assert!(
+            here.contains(&driven),
+            "the machine drives the child-box run"
+        );
+        assert!(here.contains(&local), "a local run is this box's");
+        assert!(
+            !here.contains(&theirs),
+            "another machine's run is not this box's"
+        );
+        assert_eq!(listed(child).await, [], "the child drives nothing");
+        assert_eq!(
+            listed(other).await,
+            [theirs],
+            "no driver: its target box drives it"
         );
     }
 
@@ -22212,6 +22393,8 @@ mod tests {
                 mode: RunMode::Manual,
                 target_box_id: ids::BOX,
                 target_hostname: Some("DESKTOP-HTUI".to_owned()),
+                driver_box_id: ids::BOX,
+                driver_hostname: Some("DESKTOP-HTUI".to_owned()),
                 failure: None,
                 parked_step: None,
             }),
@@ -22304,6 +22487,47 @@ mod tests {
             "AGY ANA-1 is done, so FIX-1 has no open blocker"
         );
         assert!(store.queue_rows(laptop).await.expect("read").is_empty());
+    }
+
+    /// MOD-130 M3 T3 (D8, P5): a queued child-box run's queue fact names both boxes: the machine
+    /// that drives it (`driver_box_id`, `driver_hostname`) and the child its work runs on
+    /// (`target_box_id`, `target_hostname`). The Postgres half is
+    /// `pg_criteria.rs::queue_rows_name_the_driving_box`.
+    #[tokio::test]
+    async fn queue_rows_name_the_driving_box() {
+        let store = MemStore::demo();
+        let child = child_box_of_the_fixture(&store, "queue-child").await;
+        let run = store
+            .create_run(NewRun {
+                target_box_id: child,
+                executing_box_id: Some(ids::BOX),
+                ..graph_run(ids::AGY_FIX_1, ids::PROJECT_AGY, Vec::new())
+            })
+            .await
+            .expect("a run on the child, driven by the machine")
+            .id;
+        store
+            .queue_item(ids::AGY_FIX_1, ids::BOX, None, ids::USER, Utc::now())
+            .await
+            .expect("queue");
+
+        let rows = store.queue_rows(ids::BOX).await.expect("read");
+        let fact = rows
+            .iter()
+            .find(|row| row.entry.item_id == ids::AGY_FIX_1)
+            .and_then(|row| row.latest_run.as_ref())
+            .expect("the run");
+        assert_eq!(fact.id, run);
+        assert_eq!(
+            (
+                fact.driver_box_id,
+                fact.driver_hostname.as_deref(),
+                fact.target_box_id,
+                fact.target_hostname.as_deref()
+            ),
+            (ids::BOX, Some("DESKTOP-HTUI"), child, Some("queue-child")),
+            "driven by the machine, its work on the child"
+        );
     }
 
     /// MOD-12 M3 D3: the first move writes `position = 1..n` over the current order, then swaps.

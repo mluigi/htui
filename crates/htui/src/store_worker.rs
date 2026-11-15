@@ -4822,6 +4822,7 @@ mod tests {
                 item_id: item,
                 mode: htui_core::model::RunMode::Manual,
                 target_box_id: ids::BOX,
+                executing_box_id: None,
                 started_by: ids::USER,
                 graph_snapshot: serde_json::from_value(snapshot).expect("RUN_1's snapshot"),
                 repo_scope: Vec::new(),

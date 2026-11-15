@@ -1257,6 +1257,7 @@ fn race_run(item: ItemId) -> NewRun {
         item_id: item,
         mode: RunMode::Manual,
         target_box_id: ids::BOX,
+        executing_box_id: None,
         started_by: ids::USER,
         graph_snapshot: GraphSnapshot {
             v: GraphSnapshot::V,
@@ -6429,6 +6430,111 @@ async fn queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order() {
             .expect("the read is answered"),
         expected,
         "this box's queued runs, the fixture's then this case's three, by `(queued_at, id)`"
+    );
+
+    db.drop_db().await;
+}
+
+/// A docker target and a child box of the fixture machine bound to it, hostname `hostname`
+/// (MOD-130 M3 T3): a box whose work the machine drives.
+async fn child_box_of_the_fixture(store: &PgStore, hostname: &str) -> BoxId {
+    let docker = store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: format!("{hostname} docker"),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("the target is created");
+    let child = BoxId::new();
+    store
+        .attach_child_box(NewChildBox {
+            id: child,
+            parent: ids::BOX,
+            hostname: hostname.to_owned(),
+            target: docker.id,
+        })
+        .await
+        .expect("the child box is attached");
+    child
+}
+
+/// MOD-130 M3 T3 (D8, P5): `queued_runs_on_box` answers the queued runs `box_id` drives,
+/// `COALESCE(executing_box_id, target_box_id)`: a child-box run the machine drives is the
+/// machine's, not the child's; a run of another machine with no driver (MOD-43's shape) is that
+/// machine's, not this one's; a local run is this box's. The `MemStore` half is
+/// `queued_runs_on_box_lists_the_runs_this_box_drives` in `store::mem`.
+///
+/// The second machine is planted raw (no `WriteStore` method creates one), untyped so `.sqlx/`
+/// stays where it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_runs_on_box_lists_the_runs_this_box_drives() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let other = BoxId::new();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), 'elsewhere', \
+                 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(other.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant the second machine");
+    let child = child_box_of_the_fixture(&db.store, "driven-child").await;
+
+    let queue = |title: &'static str, target: BoxId, driver: Option<BoxId>| {
+        let store = &db.store;
+        async move {
+            let item = store
+                .mint_item(race_item(ids::KIND_HTUI_FEAT, title))
+                .await
+                .expect("the mint lands")
+                .id;
+            store
+                .create_run(NewRun {
+                    target_box_id: target,
+                    executing_box_id: driver,
+                    ..race_run(item)
+                })
+                .await
+                .expect("the run is queued")
+                .id
+        }
+    };
+    let driven = queue("driven here, works on the child", child, Some(ids::BOX)).await;
+    let theirs = queue("another machine's, no driver", other, None).await;
+    let local = queue("local to this box", ids::BOX, None).await;
+
+    let listed = |box_id: BoxId| {
+        let store = &db.store;
+        async move {
+            store
+                .queued_runs_on_box(box_id)
+                .await
+                .expect("the read is answered")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        }
+    };
+    let here = listed(ids::BOX).await;
+    assert!(
+        here.contains(&driven),
+        "the machine drives the child-box run"
+    );
+    assert!(here.contains(&local), "a local run is this box's");
+    assert!(
+        !here.contains(&theirs),
+        "another machine's run is not this box's"
+    );
+    assert_eq!(listed(child).await, [], "the child drives nothing");
+    assert_eq!(
+        listed(other).await,
+        [theirs],
+        "no driver: its target box drives it"
     );
 
     db.drop_db().await;
@@ -13121,11 +13227,67 @@ async fn queue_rows_answer_alike_on_both_stores() {
         ),
         (facts.laptop, Some("LAPTOP-B"), Some(facts.steps[2]))
     );
+    assert_eq!(
+        (laptop.driver_box_id, laptop.driver_hostname.as_deref()),
+        (facts.laptop, Some("LAPTOP-B")),
+        "MOD-130 M3 P5: no driver, so the target box drives it, on both stores"
+    );
     assert!(
         pg.queue_rows(facts.laptop)
             .await
             .expect("an empty queue")
             .is_empty()
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-130 M3 T3 (D8, P5): a queued child-box run's queue fact names both boxes: the machine
+/// that drives it (`driver_box_id`, `driver_hostname`) and the child its work runs on
+/// (`target_box_id`, `target_hostname`). The `MemStore` half is `queue_rows_name_the_driving_box`
+/// in `store::mem`.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_rows_name_the_driving_box() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let store = &db.store;
+    let child = child_box_of_the_fixture(store, "queue-child").await;
+    let item = store
+        .mint_item(race_item(ids::KIND_HTUI_FEAT, "driven from the machine"))
+        .await
+        .expect("the mint lands")
+        .id;
+    let run = store
+        .create_run(NewRun {
+            target_box_id: child,
+            executing_box_id: Some(ids::BOX),
+            ..race_run(item)
+        })
+        .await
+        .expect("a run on the child, driven by the machine")
+        .id;
+    store
+        .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
+        .await
+        .expect("queue");
+
+    let rows = store.queue_rows(ids::BOX).await.expect("read");
+    let fact = rows
+        .iter()
+        .find(|row| row.entry.item_id == item)
+        .and_then(|row| row.latest_run.as_ref())
+        .expect("the run");
+    assert_eq!(fact.id, run);
+    assert_eq!(
+        (
+            fact.driver_box_id,
+            fact.driver_hostname.as_deref(),
+            fact.target_box_id,
+            fact.target_hostname.as_deref()
+        ),
+        (ids::BOX, Some("DESKTOP-HTUI"), child, Some("queue-child")),
+        "driven by the machine, its work on the child"
     );
 
     db.drop_db().await;

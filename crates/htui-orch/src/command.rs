@@ -438,15 +438,15 @@ pub enum EngineError {
         /// [`Claim::MissingTags`], which is [`EngineError::MissingTags`] (MOD-7 milestone 3, D85).
         claim: Claim,
     },
-    /// `R-ORCH-10` (MOD-7 milestone 3, D84): the item requires tags this box has neither probed
-    /// nor declared. At `StartRun`'s enqueue (`run: None`) no run row was written and the item is
-    /// `blocked` with a note; at the claim (`run: Some`) `claim_run` failed the run and blocked
-    /// its item inside the admission transaction, and the engine writes the note afterwards in a
-    /// separate call, outside that transaction (D85, as rung 4 does). If the walk is preempted or
-    /// a store call fails in between, the run stays `failed` and the item `blocked` without the
-    /// note, and `run.failure` (`missing_tags_failure`'s sentence) is the lasting record.
-    /// Permanent until the box gains the tags or the item drops them, so it is **not**
-    /// [`EngineError::ClaimRefused`] and nothing re-queues it.
+    /// `R-ORCH-10` (MOD-7 milestone 3, D84): the item requires tags the run's target box has
+    /// neither probed nor declared (MOD-130 M3 D9). At `StartRun`'s enqueue (`run: None`) no run
+    /// row was written and the item is `blocked` with a note; at the claim (`run: Some`)
+    /// `claim_run` failed the run and blocked its item inside the admission transaction, and the
+    /// engine writes the note afterwards in a separate call, outside that transaction (D85, as rung
+    /// 4 does). If the walk is preempted or a store call fails in between, the run stays `failed`
+    /// and the item `blocked` without the note, and `run.failure` (`missing_tags_failure`'s
+    /// sentence) is the lasting record. Permanent until the box gains the tags or the item drops
+    /// them, so it is **not** [`EngineError::ClaimRefused`] and nothing re-queues it.
     #[error("item {item}: {}", htui_core::model::missing_tags_failure(.missing))]
     MissingTags {
         /// The item refused.

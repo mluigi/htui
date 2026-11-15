@@ -101,10 +101,10 @@ pub enum RunFailure {
         /// The assembler's own sentence (`htui_core::prompt::AssembleError`'s `Display`).
         reason: String,
     },
-    /// `R-ORCH-10` (MOD-7 milestone 3, D83): the item requires tags this box has neither probed
-    /// nor declared. Carries them in byte order, deduplicated, as `GraphSource::missing_tags` and
-    /// `Claim::MissingTags` answer. The note at enqueue and at claim, and `run.failure` at claim,
-    /// read the same bytes (D78).
+    /// `R-ORCH-10` (MOD-7 milestone 3, D83): the item requires tags the run's target box has
+    /// neither probed nor declared (MOD-130 M3 D9). Carries them in byte order, deduplicated, as
+    /// `GraphSource::missing_tags` and `Claim::MissingTags` answer. The note at enqueue and at
+    /// claim, and `run.failure` at claim, read the same bytes (D78).
     MissingTags(Vec<String>),
     /// MOD-10 D5: a scrub refusal on a live step. It is either `TrimRecord::to_value` refusing the
     /// step's record, or the recorder's `finish` reporting a dropped row. Names the phase and the

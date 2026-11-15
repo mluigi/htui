@@ -1244,6 +1244,7 @@ async fn a_run_with_no_steps_says_so_in_the_flow() {
             item_id: ids::HTUI_ANA_2,
             mode: RunMode::Manual,
             target_box_id: ids::BOX,
+            executing_box_id: None,
             started_by: ids::USER,
             graph_snapshot: bare_snapshot(),
             repo_scope: Vec::new(),
@@ -3650,6 +3651,7 @@ async fn pausing_names_the_runs_still_running() {
                 item_id: item,
                 mode: RunMode::Auto,
                 target_box_id: ids::BOX,
+                executing_box_id: None,
                 started_by: ids::USER,
                 graph_snapshot: GraphSnapshot {
                     mode: RunMode::Auto,

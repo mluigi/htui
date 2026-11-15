@@ -237,7 +237,7 @@ pub use stop::{PendingStop, StopMode, WorkspaceStop, WorkspaceStopState};
 pub use target::{
     AttachedBox, DEFAULT_TARGET_KEY, DefaultTarget, NewChildBox, NewTarget, RUNNABLE_KINDS,
     ResolvedTarget, Target, TargetBinding, TargetEdit, TargetKind, TargetLevels, TargetRefusal,
-    TargetSource, TargetStatus, default_target_in, locator_refusal, resolve_target,
+    TargetSource, TargetStatus, default_target_in, driver_of, locator_refusal, resolve_target,
     run_start_refusal, runs_on, target_name_refusal,
 };
 pub use usage::UsageTotals;

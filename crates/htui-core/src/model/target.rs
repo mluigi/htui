@@ -280,6 +280,15 @@ pub fn runs_on(binding: &TargetBinding, here: BoxId) -> BoxId {
     binding.target.box_id.unwrap_or(here)
 }
 
+/// The box that drives a run on `binding` started on `here`, as `NewRun.executing_box_id`
+/// (MOD-130 M3, D8, P1): `None` for `enrolled` (its own worker drives it) and whenever the work
+/// runs on `here` (local), where `COALESCE(executing_box_id, target_box_id)` already names
+/// `here`; else `Some(here)`.
+#[must_use]
+pub fn driver_of(binding: &TargetBinding, here: BoxId) -> Option<BoxId> {
+    (binding.target.kind != TargetKind::Enrolled && runs_on(binding, here) != here).then_some(here)
+}
+
 /// The Settings level of the cascade (MOD-130 M2, P5, D3): the [`DEFAULT_TARGET_KEY`] entry of
 /// the `app_setting` map, `None` when absent. Same rule as [`DefaultTarget::parse`].
 ///
@@ -1113,6 +1122,63 @@ mod tests {
         assert_eq!(
             runs_on(&binding(docker, Some(child.clone()), None), here),
             child.id
+        );
+    }
+
+    /// MOD-130 M3, P1: only work that runs on another box than `here` names `here` as its driver;
+    /// `enrolled` is driven by its own worker, and local work is driven by its target box.
+    #[test]
+    fn driver_of_names_here_only_for_work_elsewhere() {
+        let here = BoxId::new();
+        assert_eq!(
+            driver_of(&binding(target(TargetKind::Local), None, None), here),
+            None,
+            "local"
+        );
+
+        let mut machine = a_box(&[], &[]);
+        machine.id = here;
+        let mut child = a_box(&[], &[]);
+        child.kind = BoxKind::Container;
+        child.parent_box_id = Some(here);
+        let mut docker = target(TargetKind::Docker);
+        docker.box_id = Some(child.id);
+        assert_eq!(
+            driver_of(
+                &binding(docker, Some(child.clone()), Some(machine.clone())),
+                here
+            ),
+            Some(here),
+            "docker on a child of here"
+        );
+
+        let other = a_box(&[], &[]);
+        let mut ssh = target(TargetKind::Ssh);
+        ssh.box_id = Some(other.id);
+        assert_eq!(
+            driver_of(
+                &binding(ssh.clone(), Some(other.clone()), Some(other.clone())),
+                here
+            ),
+            Some(here),
+            "ssh bound to another machine"
+        );
+        ssh.box_id = Some(here);
+        assert_eq!(
+            driver_of(
+                &binding(ssh, Some(machine.clone()), Some(machine.clone())),
+                here
+            ),
+            None,
+            "ssh bound to here itself"
+        );
+
+        let mut enrolled = target(TargetKind::Enrolled);
+        enrolled.box_id = Some(other.id);
+        assert_eq!(
+            driver_of(&binding(enrolled, Some(other.clone()), Some(other)), here),
+            None,
+            "enrolled on another machine"
         );
     }
 

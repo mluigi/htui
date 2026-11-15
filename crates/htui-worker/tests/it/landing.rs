@@ -197,6 +197,7 @@ impl Harness {
                 item_id: item,
                 mode: RunMode::Manual,
                 target_box_id: on_box,
+                executing_box_id: None,
                 started_by: ids::USER,
                 graph_snapshot: snapshot,
                 repo_scope: vec![repo],

@@ -131,7 +131,8 @@ pub fn scope_of(snapshot: &Value, repo_scope: &[RepoId]) -> RunScope {
 pub enum Claim {
     /// The run is now `running` on the box.
     Admitted,
-    /// Not `queued`, or `target_box_id != box`.
+    /// Not `queued`, or not driven by `box`: `COALESCE(executing_box_id, target_box_id) != box`
+    /// (MOD-130 M3, D8, P4).
     NotClaimable,
     /// MOD-125 D5: the run was started from a workspace that has a `workspace_stop` row. Writes
     /// nothing. Decided right after `NotClaimable` and before `MissingTags`, so a stopped
@@ -141,11 +142,12 @@ pub enum Claim {
         /// The run's `workspace_id`.
         workspace: WorkspaceId,
     },
-    /// `R-ORCH-10` at claim (MOD-7 milestone 3, D80, D81): the run's item requires tags the box
-    /// has neither probed nor declared. **The one refusal that writes**: inside the admission
-    /// transaction the run moved `queued -> failed` with [`missing_tags_failure`] as its
-    /// `failure`, and its item `open -> blocked`. Decided after `NotClaimable` and before the
-    /// slot and the overlap, so a permanent refusal wins over a transient one.
+    /// `R-ORCH-10` at claim (MOD-7 milestone 3, D80, D81): the run's item requires tags its target
+    /// box, the box the work runs on (MOD-130 M3, D9), has neither probed nor declared. **The one
+    /// refusal that writes**: inside the admission transaction the run moved `queued -> failed`
+    /// with [`missing_tags_failure`] as its `failure`, and its item `open -> blocked`. Decided
+    /// after `NotClaimable` and before the slot and the overlap, so a permanent refusal wins over
+    /// a transient one.
     MissingTags {
         /// The missing tags: byte order, deduplicated, never empty.
         missing: Vec<String>,

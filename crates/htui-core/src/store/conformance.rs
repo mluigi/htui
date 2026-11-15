@@ -518,6 +518,12 @@ pub const CASES: &[&str] = &[
     "create_run_records_the_target_and_source",
     "create_run_refuses_an_unknown_or_retired_target",
     "delete_target_refuses_a_target_with_runs",
+    // MOD-130 M3 T1: runs name their driver (D8, P6)
+    "create_run_records_the_driving_box",
+    // MOD-130 M3 T2: the claim keys on the driver; tags check the box the work runs on (P4)
+    "claim_run_keys_on_the_driving_box",
+    "claim_run_checks_tags_on_the_box_the_work_runs_on",
+    "claim_run_counts_a_child_box_run_on_the_driver",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -1653,6 +1659,18 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "delete_target_refuses_a_target_with_runs" => {
             boxed(delete_target_refuses_a_target_with_runs, store).await;
+        }
+        "create_run_records_the_driving_box" => {
+            boxed(create_run_records_the_driving_box, store).await;
+        }
+        "claim_run_keys_on_the_driving_box" => {
+            boxed(claim_run_keys_on_the_driving_box, store).await;
+        }
+        "claim_run_checks_tags_on_the_box_the_work_runs_on" => {
+            boxed(claim_run_checks_tags_on_the_box_the_work_runs_on, store).await;
+        }
+        "claim_run_counts_a_child_box_run_on_the_driver" => {
+            boxed(claim_run_counts_a_child_box_run_on_the_driver, store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -9107,6 +9125,7 @@ fn new_run(project: ProjectId, item: ItemId, scope: Vec<RepoId>) -> NewRun {
         item_id: item,
         mode: RunMode::Manual,
         target_box_id: ids::BOX,
+        executing_box_id: None,
         started_by: ids::USER,
         graph_snapshot: run_snapshot(),
         repo_scope: scope,
@@ -41944,6 +41963,471 @@ async fn delete_target_refuses_a_target_with_runs<S: WriteStore>(store: &S) {
         store.target(used.id).await.expect(CASE),
         used,
         "{CASE}: the refusal deleted nothing"
+    );
+}
+
+/// MOD-130 M3 T1 (D8, P6): `create_run` records `executing_box_id`, the box that drives a run
+/// whose work runs on another box. A run on a child box of the fixture machine, driven by the
+/// machine, reads back both boxes and its summary names the driver's hostname; `None` reads back
+/// `None`; a driver that names no box is `Constraint` and writes no run.
+async fn create_run_records_the_driving_box<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_run_records_the_driving_box";
+    let machine = fixture_box_row(store, CASE).await;
+    let docker = store
+        .create_target(new_target("driven docker", TargetKind::Docker, json!({})))
+        .await
+        .expect(CASE);
+    let child = BoxId::new();
+    store
+        .attach_child_box(NewChildBox {
+            id: child,
+            parent: ids::BOX,
+            hostname: "driven-child".to_owned(),
+            target: docker.id,
+        })
+        .await
+        .expect(CASE);
+
+    let driven = store
+        .create_run(NewRun {
+            target_box_id: child,
+            executing_box_id: Some(ids::BOX),
+            target: Some(ResolvedTarget {
+                target: docker.id,
+                source: TargetSource::Item,
+            }),
+            ..new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new())
+        })
+        .await
+        .expect(CASE);
+    let row = run_row(CASE, store, driven.id).await;
+    assert_eq!(
+        row.target_box_id, child,
+        "{CASE}: the work runs on the child"
+    );
+    assert_eq!(
+        row.executing_box_id,
+        Some(ids::BOX),
+        "{CASE}: the machine drives it"
+    );
+    assert_eq!(row.driver(), ids::BOX, "{CASE}: the driver is the machine");
+    assert_eq!(row.status, RunStatus::Queued, "{CASE}: still queued");
+    let summary = store
+        .runs(ids::HTUI_ANA_2)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|summary| summary.id == driven.id)
+        .unwrap_or_else(|| panic!("{CASE}: the driven run is listed"));
+    assert_eq!(
+        summary.box_hostname, machine.hostname,
+        "{CASE}: the summary names the driving box"
+    );
+
+    let local_item = mint_tagged(CASE, store, "Driven by its target", &[]).await;
+    let local = store
+        .create_run(new_run(ids::PROJECT_HTUI, local_item, Vec::new()))
+        .await
+        .expect(CASE);
+    let row = run_row(CASE, store, local.id).await;
+    assert_eq!(
+        row.executing_box_id, None,
+        "{CASE}: None = the target box drives"
+    );
+    assert_eq!(row.driver(), ids::BOX, "{CASE}");
+
+    let phantom_item = mint_tagged(CASE, store, "Driven by no box", &[]).await;
+    let before = store.runs(phantom_item).await.expect(CASE);
+    let request = NewRun {
+        executing_box_id: Some(BoxId::new()),
+        ..new_run(ids::PROJECT_HTUI, phantom_item, Vec::new())
+    };
+    let id = request.id;
+    let refused = store.create_run(request).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: a driver that names no box is Constraint, got {refused:?}"
+    );
+    assert!(
+        matches!(store.run(id).await, Ok(None)),
+        "{CASE}: the refusal wrote no run"
+    );
+    assert_eq!(
+        store.runs(phantom_item).await.expect(CASE),
+        before,
+        "{CASE}: the item's runs are unchanged"
+    );
+}
+
+/// A docker target named `name` and a child box of the fixture machine bound to it (MOD-130 M3
+/// T2): a box whose work is driven from another box.
+async fn driven_child_box<S: WriteStore>(case: &str, store: &S, name: &str) -> (BoxId, TargetId) {
+    let docker = store
+        .create_target(new_target(name, TargetKind::Docker, json!({})))
+        .await
+        .expect(case);
+    let child = BoxId::new();
+    store
+        .attach_child_box(NewChildBox {
+            id: child,
+            parent: ids::BOX,
+            hostname: format!("{name}-box"),
+            target: docker.id,
+        })
+        .await
+        .expect(case);
+    (child, docker.id)
+}
+
+/// A queued run of `item` whose work runs on `on` (bound to `target`) and which `driver` drives;
+/// `None` = `on` drives it (MOD-130 M3 T2, D8).
+async fn run_on_box<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    scope: Vec<RepoId>,
+    (on, target): (BoxId, TargetId),
+    driver: Option<BoxId>,
+) -> RunId {
+    store
+        .create_run(NewRun {
+            target_box_id: on,
+            executing_box_id: driver,
+            target: Some(ResolvedTarget {
+                target,
+                source: TargetSource::Item,
+            }),
+            ..new_run(ids::PROJECT_HTUI, item, scope)
+        })
+        .await
+        .expect(case)
+        .id
+}
+
+/// MOD-130 M3 T2 (D8, P4, P9): a run is claimable by the box that drives it,
+/// `COALESCE(executing_box_id, target_box_id)`, and by no other. A child-box run driven by the
+/// machine is not the child's to claim, and once the machine admits it the run is `running` on
+/// the machine with its work still on the child. A run with no driver (MOD-43's shape: another
+/// box's work, `executing_box_id = None`; a sibling box stands in for another machine, which the
+/// conformance suite has no writer for) is that box's alone, as an enrolled worker's run is.
+async fn claim_run_keys_on_the_driving_box<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_keys_on_the_driving_box";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+
+    let child = driven_child_box(CASE, store, "keyed child").await;
+    let driven = run_on_box(
+        CASE,
+        store,
+        ids::HTUI_ANA_2,
+        Vec::new(),
+        child,
+        Some(ids::BOX),
+    )
+    .await;
+    let queued = run_row(CASE, store, driven).await;
+    assert_eq!(
+        store
+            .claim_run(driven, child.0, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::NotClaimable,
+        "{CASE}: the child is the run's target box but not its driver"
+    );
+    assert_eq!(
+        run_row(CASE, store, driven).await,
+        queued,
+        "{CASE}: the refused claim wrote nothing"
+    );
+    assert_eq!(
+        store
+            .claim_run(driven, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the driving machine claims it"
+    );
+    let running = run_row(CASE, store, driven).await;
+    assert_eq!(running.status, RunStatus::Running, "{CASE}: now running");
+    assert_eq!(
+        running.executing_box_id,
+        Some(ids::BOX),
+        "{CASE}: executing on the driver"
+    );
+    assert_eq!(
+        running.lease_box_id,
+        Some(ids::BOX),
+        "{CASE}: leased by the driver"
+    );
+    assert_eq!(
+        running.target_box_id, child.0,
+        "{CASE}: the work still runs on the child"
+    );
+
+    let other = driven_child_box(CASE, store, "keyed other").await;
+    let elsewhere = run_on_box(CASE, store, ids::HTUI_CLEAN_1, Vec::new(), other, None).await;
+    let queued = run_row(CASE, store, elsewhere).await;
+    assert_eq!(
+        store
+            .claim_run(elsewhere, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::NotClaimable,
+        "{CASE}: a run with no driver is its target box's, not this machine's"
+    );
+    assert_eq!(
+        run_row(CASE, store, elsewhere).await,
+        queued,
+        "{CASE}: and that refusal wrote nothing"
+    );
+    assert_eq!(
+        store
+            .claim_run(elsewhere, other.0, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: its target box claims it (the enrolled-worker rule, P9)"
+    );
+    let running = run_row(CASE, store, elsewhere).await;
+    assert_eq!(running.status, RunStatus::Running, "{CASE}");
+    assert_eq!(running.executing_box_id, Some(other.0), "{CASE}");
+    assert_eq!(running.lease_box_id, Some(other.0), "{CASE}");
+}
+
+/// MOD-130 M3 T2 (D9, P4): `R-ORCH-10` at claim reads the tags of the box the work runs on, the
+/// run's `target_box_id`, not the driver's. A child that declares `gpu` admits a `gpu` item's run
+/// the machine drives though the machine lacks `gpu`; a `vulkan` item's run on the same child is
+/// refused for `vulkan` though the machine declares it, failing the run and blocking the item.
+async fn claim_run_checks_tags_on_the_box_the_work_runs_on<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_checks_tags_on_the_box_the_work_runs_on";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+
+    let child = driven_child_box(CASE, store, "tagged child").await;
+    let machine = fixture_box_row(store, CASE).await;
+    for tag in ["gpu", "vulkan"] {
+        assert!(
+            !machine.probed_tags.iter().any(|probed| probed == tag),
+            "{CASE}: the fixture machine has not probed `{tag}`"
+        );
+    }
+    applied(
+        CASE,
+        store
+            .edit_box(
+                ids::BOX,
+                machine.edit_version,
+                BoxEdit {
+                    declared_tags: Some(tags(&["vulkan"])),
+                    quirks: None,
+                    executor: None,
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    applied(
+        CASE,
+        store
+            .edit_box(
+                child.0,
+                0,
+                BoxEdit {
+                    declared_tags: Some(tags(&["gpu"])),
+                    quirks: None,
+                    executor: None,
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+
+    let gpu_item = mint_tagged(CASE, store, "Needs a gpu", &["gpu"]).await;
+    let gpu = run_on_box(CASE, store, gpu_item, Vec::new(), child, Some(ids::BOX)).await;
+    assert_eq!(
+        store
+            .claim_run(gpu, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the child declares `gpu`; the machine's lack of it does not matter"
+    );
+
+    let vulkan_item = mint_tagged(CASE, store, "Needs vulkan", &["vulkan"]).await;
+    let vulkan = run_on_box(CASE, store, vulkan_item, Vec::new(), child, Some(ids::BOX)).await;
+    let missing = tags(&["vulkan"]);
+    assert_eq!(
+        store
+            .claim_run(vulkan, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::MissingTags {
+            missing: missing.clone()
+        },
+        "{CASE}: the child lacks `vulkan`; the machine's having it does not matter"
+    );
+    let failed = run_row(CASE, store, vulkan).await;
+    assert_eq!(failed.status, RunStatus::Failed, "{CASE}: the run failed");
+    assert_eq!(
+        failed.failure,
+        Some(missing_tags_failure(&missing)),
+        "{CASE}: with the one sentence"
+    );
+    assert_eq!(
+        failed.executing_box_id,
+        Some(ids::BOX),
+        "{CASE}: its driver is still recorded"
+    );
+    assert_eq!(failed.lease_box_id, None, "{CASE}: and no lease was taken");
+    assert_eq!(
+        item_row(CASE, store, vulkan_item).await.status,
+        Status::Blocked,
+        "{CASE}: the item is blocked"
+    );
+}
+
+/// MOD-130 M3 T2 (D9, P4): a child-box run takes its driver's slot and meets its driver's
+/// overlap set. While it is still `queued` it already names its driver (D8) yet holds neither:
+/// a local run sharing its repo takes the machine's one free slot. With the machine's limit at
+/// one and a local run running, the machine's claim of a child-box run is `SlotFull`; once
+/// admitted, the child-box run holds its repo against a local run of the machine.
+async fn claim_run_counts_a_child_box_run_on_the_driver<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_counts_a_child_box_run_on_the_driver";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let limit = async |value: u32| {
+        let version = fixture_box_row(store, CASE).await.edit_version;
+        applied(
+            CASE,
+            store
+                .set_queue_setting(
+                    QueueTarget::Box(ids::BOX),
+                    QueueSetting::MaxConcurrentItems,
+                    json!(value),
+                    QueueToken::EditVersion(version),
+                )
+                .await
+                .expect(CASE),
+        );
+    };
+    limit(1).await;
+
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let child = driven_child_box(CASE, store, "counted child").await;
+    let driven = run_on_box(
+        CASE,
+        store,
+        ids::HTUI_CLEAN_1,
+        vec![repo],
+        child,
+        Some(ids::BOX),
+    )
+    .await;
+    let queued = run_row(CASE, store, driven).await;
+    assert_eq!(queued.status, RunStatus::Queued, "{CASE}: queued");
+    assert_eq!(
+        queued.executing_box_id,
+        Some(ids::BOX),
+        "{CASE}: a queued child-box run already names its driver (D8)"
+    );
+
+    // Its `executing_box_id` is the machine's, so a slot or overlap set that read that column
+    // without the status would count it here and refuse the probe.
+    let probe_item = mint_tagged(CASE, store, "Shares the queued run's repo", &[]).await;
+    let probe = store
+        .create_run(new_run(ids::PROJECT_HTUI, probe_item, vec![repo]))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(probe, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: a queued child-box run holds neither its driver's one slot nor its repo"
+    );
+    assert!(
+        store
+            .transition_run(probe, RunStatus::Running, RunStatus::Done, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the probe finishes, freeing the slot and the repo"
+    );
+
+    let local = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(local, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: a local run takes the machine's one slot"
+    );
+
+    assert_eq!(
+        store
+            .claim_run(driven, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::SlotFull {
+            running: 1,
+            limit: 1
+        },
+        "{CASE}: the child-box run is counted against its driver's slot"
+    );
+    assert_eq!(
+        run_row(CASE, store, driven).await.status,
+        RunStatus::Queued,
+        "{CASE}: and stays queued"
+    );
+
+    assert!(
+        store
+            .transition_run(local, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the local run parks, freeing the slot"
+    );
+    assert_eq!(
+        store
+            .claim_run(driven, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the child-box run takes the freed slot"
+    );
+
+    limit(2).await;
+    let rival_item = mint_tagged(CASE, store, "Same repo", &[]).await;
+    let rival = store
+        .create_run(new_run(ids::PROJECT_HTUI, rival_item, vec![repo]))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(rival, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Overlaps {
+            with: driven,
+            rule: OverlapRule::NotIsolated
+        },
+        "{CASE}: the child-box run holds its repo in its driver's overlap set"
+    );
+    assert_eq!(
+        run_row(CASE, store, rival).await.status,
+        RunStatus::Queued,
+        "{CASE}: and the refused local run stays queued"
     );
 }
 
