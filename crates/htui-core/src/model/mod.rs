@@ -147,7 +147,7 @@ pub use indexer::{
     IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, LeaseTurn,
     ProjectChanges,
 };
-pub use integration::{IntegrateMode, Integration, IntegrationState, LandOutcome};
+pub use integration::{IntegrateMode, Integration, IntegrationState, LandOutcome, run_branch_name};
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution,
     RunLanding, Status,

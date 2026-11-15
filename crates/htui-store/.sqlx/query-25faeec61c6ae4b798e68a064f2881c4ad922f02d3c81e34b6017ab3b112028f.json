@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE integration SET state            = $4, landed_hash      = $5, refusal          = $6, lease_box_id     = NULL, lease_owner      = NULL, lease_expires_at = NULL WHERE run_id = $1 AND repo_id = $2 AND state = 'pending' AND lease_owner = $3 AND (NOT $7::boolean OR mode = 'pull_request')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "25faeec61c6ae4b798e68a064f2881c4ad922f02d3c81e34b6017ab3b112028f"
+}

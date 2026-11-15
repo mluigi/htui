@@ -46,11 +46,14 @@ use htui_orch::isolate::copy;
 use htui_orch::isolate::git::testkit::{
     commit_file, repo_with_one_commit, usable_git, worktree_list,
 };
-use htui_orch::isolate::git::{Cli, IDENTITY_ENV, premerge_message};
-use htui_orch::isolate::real::{dirty_tree_not_reset, local_moved};
+use htui_orch::isolate::git::{Cli, IDENTITY_ENV, merge_conflict, premerge_message};
+use htui_orch::isolate::real::{
+    dirty_landing_tree, dirty_tree_not_reset, local_moved, run_branch_checked_out,
+    run_branch_in_place,
+};
 use htui_orch::isolate::{
-    ChangedPaths, EnvFiles, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture,
-    LandRequest, PartTip, Prepared, RepoCheckout, ResetReport,
+    ChangedPaths, EnvFiles, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig,
+    IsolatorFuture, LandRequest, PartTip, Prepared, RepoCheckout, ResetReport, RunBranches,
 };
 use htui_orch::secrets::RunSecrets;
 use htui_orch::skip_without_git;
@@ -2063,14 +2066,25 @@ impl Isolator for StallAfterReconcile<'_> {
         self.inner.env_files(cwd, extra_dirs)
     }
 
-    fn reconcile<'a>(
+    fn run_branches<'a>(
+        &'a self,
+        branches: &'a BTreeMap<RepoId, String>,
+    ) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
+        self.inner.run_branches(branches)
+    }
+
+    fn reconcile_onto<'a>(
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
         siblings: &'a [StepId],
+        onto: Option<RunBranches<'a>>,
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
-            let merged = self.inner.reconcile(winner, trees, siblings).await?;
+            let merged = self
+                .inner
+                .reconcile_onto(winner, trees, siblings, onto)
+                .await?;
             let call = {
                 let mut calls = self
                     .calls
@@ -3987,10 +4001,7 @@ async fn a_second_isolated_run_that_conflicts_takes_the_merge_conflict_path() {
         .expect_err("the collision is refused");
     assert_eq!(
         err.to_string(),
-        format!(
-            "isolation refused: {}",
-            htui_orch::isolate::git::merge_conflict(&["f".to_owned()])
-        )
+        format!("isolation refused: {}", merge_conflict(&["f".to_owned()]))
     );
     assert_eq!(head_of(&git, &fix.core.path).await, m1);
     assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
@@ -4588,6 +4599,7 @@ impl Fixture {
             remote: remote.to_string_lossy().into_owned(),
             target_branch: target.to_owned(),
             commits,
+            run_branch: None,
         }
     }
 }
@@ -4978,4 +4990,916 @@ async fn a_divided_push_run_lands_without_a_part_commit_in_the_way() {
         [(IntegrationState::Landed, None, Some(tip.clone()))]
     );
     assert_eq!(remote_main(&git, &remote).await, tip);
+}
+
+// -------------------------------------------------------------------------------------------------
+// MOD-133 M3 D1, D3, D5: a `pull_request` run's run branch over real git.
+// -------------------------------------------------------------------------------------------------
+
+/// The run branch every case below works on.
+const RUN_BRANCH: &str = "htui/item/FEAT-3";
+
+impl Fixture {
+    /// `core`'s run branch, as the engine hands it to the isolator.
+    fn core_branches(&self) -> BTreeMap<RepoId, String> {
+        BTreeMap::from([(self.core.id, RUN_BRANCH.to_owned())])
+    }
+
+    /// [`Isolator::run_branches`] over `core`: the run branch's tip.
+    async fn ensure_run_branch(&self) -> String {
+        self.isolator
+            .run_branches(&self.core_branches())
+            .await
+            .expect("the run branch is ensured")[&self.core.id]
+            .clone()
+    }
+
+    /// `run`'s landing tree of `core` (D3 step 3).
+    fn landing_tree(&self, run: RunId) -> PathBuf {
+        self.canonical_root()
+            .join(run.to_string())
+            .join("landing")
+            .join("core")
+    }
+
+    /// [`Isolator::reconcile_onto`] of `step`'s rows onto `core`'s run branch.
+    async fn reconcile_onto(
+        &self,
+        run: RunId,
+        step: StepId,
+        rows: &[RunStepTree],
+    ) -> Result<Vec<RunStepCommit>, IsolateError> {
+        let branches = self.core_branches();
+        self.isolator
+            .reconcile_onto(
+                step,
+                rows,
+                &[],
+                Some(RunBranches {
+                    run,
+                    branches: &branches,
+                }),
+            )
+            .await
+    }
+
+    /// [`Self::reconcile_onto`]'s merge, failing the case on anything else.
+    async fn merged_onto(&self, run: RunId, step: StepId, rows: &[RunStepTree]) -> String {
+        self.reconcile_onto(run, step, rows)
+            .await
+            .expect("the step reconciles onto the run branch")[0]
+            .after_hash
+            .clone()
+            .expect("the step committed, so there is a merge")
+    }
+
+    /// A request landing `core`'s run branch to `remote` (the pull request's base is `main`).
+    fn run_branch_request(&self, remote: &Path, commits: Vec<String>) -> LandRequest {
+        LandRequest {
+            run_branch: Some(RUN_BRANCH.to_owned()),
+            ..self.core_request(remote, "main", commits)
+        }
+    }
+}
+
+/// `refs/heads/<branch>` of `repo` (a bare one too), or `None`.
+async fn branch_at(git: &Cli, repo: &Path, branch: &str) -> Option<String> {
+    let reference = format!("refs/heads/{branch}");
+    let (ok, out) = git_as(
+        git,
+        repo,
+        &["rev-parse", "--verify", "--quiet", reference.as_str()],
+    )
+    .await;
+    ok.then(|| out.trim().to_owned())
+}
+
+/// `[commit, parents…]` of `commit` in `repo`.
+async fn parents_of(git: &Cli, repo: &Path, commit: &str) -> Vec<String> {
+    git_out(git, repo, &["rev-list", "--parents", "-n", "1", commit])
+        .await
+        .split(' ')
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A step of `run` in the fixture's isolation that started from the run branch's `tip` (D2's
+/// width-1 slot) and committed `name`.
+async fn run_branch_step(
+    fix: &Fixture,
+    run: RunId,
+    tip: &str,
+    name: &str,
+    body: &str,
+) -> (StepId, String, Vec<RunStepTree>) {
+    let step = StepId::new();
+    let base = BTreeMap::from([(fix.core.id, tip.to_owned())]);
+    let prepared = fix
+        .isolator
+        .prepare(
+            run,
+            step,
+            &[fix.core.id],
+            fix.isolation,
+            Some(FanoutSlot {
+                index: 0,
+                width: 1,
+                base: &base,
+            }),
+        )
+        .await
+        .expect("the step prepares on the run branch");
+    let rows = rows_of(&prepared);
+    assert_eq!(rows[0].base_ref, tip, "the step starts at the run branch");
+    let after = commit_file(Path::new(&rows[0].path), name, body, "the step commits");
+    fix.isolator
+        .capture(step, &rows)
+        .await
+        .expect("the step captures");
+    (step, after, rows)
+}
+
+/// The primary is where the fixture left it: `HEAD` at its first commit, on `main`, clean.
+async fn assert_primary_untouched(git: &Cli, fix: &Fixture) {
+    assert_eq!(head_of(git, &fix.core.path).await, fix.core.head);
+    assert_eq!(
+        git_out(git, &fix.core.path, &["symbolic-ref", "HEAD"]).await,
+        "refs/heads/main"
+    );
+    assert_eq!(porcelain_status(git, &fix.core.path).await, "");
+}
+
+/// MOD-133 M3 D1: an absent run branch is cut at the primary's `HEAD`, which stays on `main`; a
+/// second call answers the same tip; a branch ahead of `HEAD` (a step merged onto it) is reused
+/// where it is.
+#[tokio::test]
+async fn run_branches_cuts_at_head_then_reuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    assert_eq!(branch_at(&git, &fix.core.path, RUN_BRANCH).await, None);
+
+    let tip = fix.ensure_run_branch().await;
+    assert_eq!(tip, fix.core.head, "cut at the primary's HEAD");
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(tip.as_str())
+    );
+    assert_eq!(
+        fix.ensure_run_branch().await,
+        tip,
+        "a second call reuses it"
+    );
+
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let merged = fix.merged_onto(run, step, &rows).await;
+    assert_eq!(
+        fix.ensure_run_branch().await,
+        merged,
+        "a run branch ahead of HEAD is reused, not moved back"
+    );
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D1: a run branch behind the primary's `HEAD` is fast-forwarded to it.
+#[tokio::test]
+async fn run_branches_fast_forwards_a_branch_behind_head() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    assert_eq!(fix.ensure_run_branch().await, fix.core.head);
+    let moved = commit_file(
+        &fix.core.path,
+        "later.txt",
+        "later\n",
+        "the primary moves on",
+    );
+
+    assert_eq!(fix.ensure_run_branch().await, moved);
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(moved.as_str())
+    );
+    assert_eq!(head_of(&git, &fix.core.path).await, moved);
+}
+
+/// MOD-133 M3 D1 (maintainer: reuse): a run branch that diverged from the primary's `HEAD` is
+/// kept as it is, so a re-run continues the same pull request.
+#[tokio::test]
+async fn run_branches_keeps_a_diverged_branch() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let merged = fix.merged_onto(run, step, &rows).await;
+    let moved = commit_file(
+        &fix.core.path,
+        "later.txt",
+        "later\n",
+        "the primary moves on",
+    );
+
+    assert_eq!(fix.ensure_run_branch().await, merged, "kept");
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(merged.as_str())
+    );
+    assert_eq!(head_of(&git, &fix.core.path).await, moved);
+}
+
+/// MOD-133 M3 D1 (probe C12): a run branch checked out in the primary, or in a linked worktree,
+/// is refused naming where; an `update-ref` would leave that tree stale. Nothing moves.
+#[tokio::test]
+async fn run_branches_refuses_a_branch_checked_out_in_the_primary() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &["checkout", "--quiet", "-b", RUN_BRANCH],
+    )
+    .await;
+    let refused = fix
+        .isolator
+        .run_branches(&fix.core_branches())
+        .await
+        .expect_err("a checked-out run branch is refused");
+    assert!(
+        matches!(&refused, IsolateError::Refused(reason)
+            if *reason == run_branch_checked_out(RUN_BRANCH, &fix.core.path)),
+        "{refused}"
+    );
+
+    git_out(&git, &fix.core.path, &["checkout", "--quiet", "main"]).await;
+    let elsewhere = tempfile::tempdir().expect("a temporary directory");
+    let linked = elsewhere.path().join("linked");
+    git_out(
+        &git,
+        &fix.core.path,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            &linked.to_string_lossy(),
+            RUN_BRANCH,
+        ],
+    )
+    .await;
+    let linked = std::fs::canonicalize(&linked).expect("the linked tree exists");
+    let refused = fix
+        .isolator
+        .run_branches(&fix.core_branches())
+        .await
+        .expect_err("a run branch checked out in a linked worktree is refused");
+    assert!(
+        matches!(&refused, IsolateError::Refused(reason)
+            if *reason == run_branch_checked_out(RUN_BRANCH, &linked)),
+        "{refused}"
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(fix.core.head.as_str())
+    );
+}
+
+/// MOD-133 M3 D3 (`worktree`): the step is merged `--no-ff` onto the run branch in a detached,
+/// locked landing tree, and the ref moves to the merge; the primary's `HEAD`, branch and files
+/// never move.
+#[tokio::test]
+async fn reconcile_onto_merges_into_the_run_branch_and_leaves_the_primary_head_and_tree() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, after, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+
+    let commits = fix
+        .reconcile_onto(run, step, &rows)
+        .await
+        .expect("the step reconciles onto the run branch");
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].before_hash, tip);
+    let merged = commits[0].after_hash.clone().expect("a merge");
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(merged.as_str())
+    );
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &merged).await,
+        [merged.clone(), tip.clone(), after]
+    );
+    assert_eq!(
+        git_out(&git, &fix.core.path, &["show", &format!("{merged}:a.txt")]).await,
+        "a"
+    );
+    assert_primary_untouched(&git, &fix).await;
+    assert!(!fix.core.path.join("a.txt").exists());
+
+    let landing = fix.landing_tree(run);
+    assert_eq!(head_of(&git, &landing).await, merged);
+    let entry = worktree_list(&git, &fix.core.path)
+        .await
+        .into_iter()
+        .find(|entry| entry.path == landing)
+        .expect("the landing tree is a linked worktree of `core`");
+    assert_eq!(entry.branch, None, "detached");
+    assert_eq!(entry.locked, Some(format!("htui run {run}")));
+}
+
+/// MOD-133 M3 D3 (`copy`): the copy's range is written into `core`'s object database, then
+/// merged onto the run branch in the landing tree; the primary never moves.
+#[tokio::test]
+async fn reconcile_onto_copy_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Copy, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, after, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+
+    let merged = fix.merged_onto(run, step, &rows).await;
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(merged.as_str())
+    );
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &merged).await,
+        [merged.clone(), tip, after]
+    );
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3: a conflicting step is aborted (`merge_conflict`), the landing tree is left
+/// clean with no `MERGE_HEAD`, and the run branch stays at the first step's merge.
+#[tokio::test]
+async fn reconcile_onto_conflict_aborts_and_leaves_the_branch() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (a, _, a_rows) = run_branch_step(&fix, run, &tip, "same.txt", "a\n").await;
+    let (b, _, b_rows) = run_branch_step(&fix, run, &tip, "same.txt", "b\n").await;
+    let first = fix.merged_onto(run, a, &a_rows).await;
+
+    let refused = fix
+        .reconcile_onto(run, b, &b_rows)
+        .await
+        .expect_err("the second step conflicts");
+    assert!(
+        matches!(&refused, IsolateError::Refused(reason)
+            if *reason == merge_conflict(&["same.txt".to_owned()])),
+        "{refused}"
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(first.as_str())
+    );
+    let landing = fix.landing_tree(run);
+    assert_eq!(head_of(&git, &landing).await, first);
+    assert_eq!(porcelain_status(&git, &landing).await, "");
+    assert!(
+        !git_as(
+            &git,
+            &landing,
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+        )
+        .await
+        .0,
+        "the merge was aborted"
+    );
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3 (D136): a step whose merge the run branch already holds, even under a later
+/// step's merge, answers that merge and merges nothing again.
+#[tokio::test]
+async fn reconcile_onto_is_idempotent_after_the_ref_moved() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (a, _, a_rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let (b, b_after, b_rows) = run_branch_step(&fix, run, &tip, "b.txt", "b\n").await;
+    let first = fix.merged_onto(run, a, &a_rows).await;
+    let second = fix.merged_onto(run, b, &b_rows).await;
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &second).await,
+        [second.clone(), first.clone(), b_after],
+        "the second merge sits on the first"
+    );
+
+    assert_eq!(fix.merged_onto(run, a, &a_rows).await, first);
+    assert_eq!(fix.merged_onto(run, b, &b_rows).await, second);
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(second.as_str())
+    );
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3: a crash between the merge and the ref move leaves an orphan merge in the
+/// landing tree and the run branch where it was; the next attempt resyncs the tree and merges
+/// again onto the branch.
+#[tokio::test]
+async fn reconcile_onto_recovers_a_merge_whose_ref_move_never_happened() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, after, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let orphan = fix.merged_onto(run, step, &rows).await;
+    let reference = format!("refs/heads/{RUN_BRANCH}");
+    git_out(
+        &git,
+        &fix.core.path,
+        &["update-ref", reference.as_str(), &tip, &orphan],
+    )
+    .await;
+    let landing = fix.landing_tree(run);
+    assert_eq!(head_of(&git, &landing).await, orphan, "the orphan merge");
+
+    let merged = fix.merged_onto(run, step, &rows).await;
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(merged.as_str())
+    );
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &merged).await,
+        [merged.clone(), tip, after]
+    );
+    assert_eq!(head_of(&git, &landing).await, merged);
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3 steps 4-5: a landing tree with uncommitted work is a scratch tree, reset to the
+/// tip and landed on; one that cannot be reset (its `index.lock` held past every retry) is
+/// refused naming the landing tree, never the person's checkout, and the run branch does not
+/// move.
+#[tokio::test]
+async fn reconcile_onto_resets_a_dirty_landing_tree_and_refuses_one_it_cannot_reset() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (a, _, a_rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let (b, b_after, b_rows) = run_branch_step(&fix, run, &tip, "b.txt", "b\n").await;
+    let (c, _, c_rows) = run_branch_step(&fix, run, &tip, "c.txt", "c\n").await;
+    let first = fix.merged_onto(run, a, &a_rows).await;
+    let landing = fix.landing_tree(run);
+    std::fs::write(landing.join("f"), "edited\n").expect("the landing tree is written to");
+
+    let second = fix.merged_onto(run, b, &b_rows).await;
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &second).await,
+        [second.clone(), first, b_after]
+    );
+    assert_eq!(
+        porcelain_status(&git, &landing).await,
+        "",
+        "the edit was reset"
+    );
+
+    std::fs::write(landing.join("f"), "edited again\n").expect("the landing tree is written to");
+    let admin = PathBuf::from(
+        git_ok(&git, &landing, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .trim(),
+    );
+    std::fs::write(admin.join("index.lock"), "").expect("the landing tree's index is locked");
+    let refused = fix
+        .reconcile_onto(run, c, &c_rows)
+        .await
+        .expect_err("a landing tree that cannot be reset is refused");
+    assert!(
+        matches!(&refused, IsolateError::Refused(reason)
+            if *reason == dirty_landing_tree(&landing)),
+        "{refused}"
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(second.as_str())
+    );
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3 (probe C12): a run branch checked out in the primary after the step was
+/// prepared is refused at the landing, naming the primary; the branch does not move and the
+/// primary stays clean.
+#[tokio::test]
+async fn reconcile_onto_refuses_a_run_branch_checked_out_since_the_step_began() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    git_out(&git, &fix.core.path, &["checkout", "--quiet", RUN_BRANCH]).await;
+
+    let refused = fix
+        .reconcile_onto(run, step, &rows)
+        .await
+        .expect_err("a checked-out run branch is refused");
+    assert!(
+        matches!(&refused, IsolateError::Refused(reason)
+            if *reason == run_branch_checked_out(RUN_BRANCH, &fix.core.path)),
+        "{refused}"
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(tip.as_str()),
+        "the run branch did not move"
+    );
+    assert_eq!(head_of(&git, &fix.core.path).await, tip);
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+    assert!(!fix.core.path.join("a.txt").exists());
+}
+
+/// MOD-133 M3 D3 steps 4-5: a merge killed mid-way in the landing tree (`MERGE_HEAD` and a
+/// conflicted index, `HEAD` still at the tip) is aborted and reset, not refused for good: the
+/// next step lands.
+#[tokio::test]
+async fn reconcile_onto_resets_a_landing_tree_left_mid_merge() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (a, _, a_rows) = run_branch_step(&fix, run, &tip, "same.txt", "a\n").await;
+    let (_, b_after, _) = run_branch_step(&fix, run, &tip, "same.txt", "b\n").await;
+    let (c, c_after, c_rows) = run_branch_step(&fix, run, &tip, "c.txt", "c\n").await;
+    let first = fix.merged_onto(run, a, &a_rows).await;
+    let landing = fix.landing_tree(run);
+    let (merged, _) = git_as(&git, &landing, &["merge", "--no-ff", "--no-edit", &b_after]).await;
+    assert!(!merged, "the left-over merge conflicts");
+    assert!(
+        git_as(
+            &git,
+            &landing,
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+        )
+        .await
+        .0,
+        "the landing tree is mid-merge"
+    );
+    assert_eq!(
+        head_of(&git, &landing).await,
+        first,
+        "HEAD is still the tip"
+    );
+
+    let second = fix.merged_onto(run, c, &c_rows).await;
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &second).await,
+        [second.clone(), first, c_after]
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(second.as_str())
+    );
+    assert_eq!(head_of(&git, &landing).await, second);
+    assert_eq!(porcelain_status(&git, &landing).await, "");
+    assert!(
+        !git_as(
+            &git,
+            &landing,
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+        )
+        .await
+        .0,
+        "the merge was aborted"
+    );
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3 step 9: a run branch moved by someone else between two landings (a commit on
+/// its tip, the base still an ancestor) leaves the landing tree behind it; the next landing
+/// resyncs the tree, merges onto the moved tip and moves the ref from there.
+#[tokio::test]
+async fn reconcile_onto_follows_a_run_branch_moved_between_landings() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (a, _, a_rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let (b, b_after, b_rows) = run_branch_step(&fix, run, &tip, "b.txt", "b\n").await;
+    let first = fix.merged_onto(run, a, &a_rows).await;
+    let tree = format!("{first}^{{tree}}");
+    let foreign = git_ok(
+        &git,
+        &fix.core.path,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &first,
+            "-m",
+            "a commit of someone else",
+        ],
+    )
+    .await
+    .trim()
+    .to_owned();
+    let reference = format!("refs/heads/{RUN_BRANCH}");
+    git_ok(
+        &git,
+        &fix.core.path,
+        &["update-ref", &reference, &foreign, &first],
+    )
+    .await;
+    let landing = fix.landing_tree(run);
+    assert_eq!(
+        head_of(&git, &landing).await,
+        first,
+        "the landing tree is behind"
+    );
+
+    let second = fix.merged_onto(run, b, &b_rows).await;
+    assert_eq!(
+        parents_of(&git, &fix.core.path, &second).await,
+        [second.clone(), foreign, b_after]
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(second.as_str())
+    );
+    assert_eq!(head_of(&git, &landing).await, second);
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D3 (defence in depth behind D4): an in-place tree of a repo with a run branch is
+/// refused, and nothing is read.
+#[tokio::test]
+async fn reconcile_onto_refuses_an_in_place_tree() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    let run = RunId::new();
+    let step = StepId::new();
+    let prepared = fix
+        .isolator
+        .prepare(run, step, &[fix.core.id], Isolation::Local, None)
+        .await
+        .expect("the local mode prepares");
+    let refused = fix
+        .reconcile_onto(run, step, &rows_of(&prepared))
+        .await
+        .expect_err("an in-place tree is refused");
+    assert!(
+        matches!(&refused, IsolateError::Refused(reason) if *reason == run_branch_in_place()),
+        "{refused}"
+    );
+}
+
+/// MOD-133 M3 D3: cleanup removes the run's landing tree (`git worktree remove`, no entry left
+/// under the scratch root) and keeps the run branch.
+#[tokio::test]
+async fn cleanup_removes_the_landing_tree_and_keeps_the_branch() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let merged = fix.merged_onto(run, step, &rows).await;
+    let landing = fix.landing_tree(run);
+    assert!(landing.exists());
+
+    fix.isolator
+        .cleanup(run, &rows)
+        .await
+        .expect("cleanup removes every tree");
+    assert!(!landing.exists());
+    let root = fix.canonical_root();
+    assert!(
+        worktree_list(&git, &fix.core.path)
+            .await
+            .iter()
+            .all(|entry| !entry.path.starts_with(&root)),
+        "no entry is left under the scratch root"
+    );
+    assert_eq!(
+        branch_at(&git, &fix.core.path, RUN_BRANCH).await.as_deref(),
+        Some(merged.as_str()),
+        "the run branch survives cleanup"
+    );
+}
+
+/// MOD-133 M3 D3: a landing tree whose directory is already gone still has its `git` entry
+/// removed at cleanup, so nothing is left under the scratch root.
+#[tokio::test]
+async fn cleanup_removes_the_entry_of_a_landing_tree_whose_directory_is_gone() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    fix.merged_onto(run, step, &rows).await;
+    let landing = fix.landing_tree(run);
+    std::fs::remove_dir_all(&landing).expect("the landing directory is deleted behind git's back");
+
+    fix.isolator
+        .cleanup(run, &rows)
+        .await
+        .expect("cleanup removes every tree");
+    assert!(
+        worktree_list(&git, &fix.core.path)
+            .await
+            .iter()
+            .all(|entry| entry.path != landing),
+        "the landing tree's entry is gone"
+    );
+}
+
+/// MOD-133 M3 D5: the run branch is pushed (created) on the remote and answered `Pushed`; a
+/// second landing finds it there and answers `Pushed` again. The target branch is never pushed.
+#[tokio::test]
+async fn land_pushes_the_run_branch_to_a_bare_remote_once_and_answers_pushed() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let merged = fix.merged_onto(run, step, &rows).await;
+
+    let request = fix.run_branch_request(&remote, vec![merged.clone()]);
+    for _ in 0..2 {
+        assert_eq!(
+            fix.isolator.land(&request).await.expect("the landing runs"),
+            LandOutcome::Pushed {
+                hash: merged.clone()
+            }
+        );
+    }
+    assert_eq!(
+        branch_at(&git, &remote, RUN_BRANCH).await.as_deref(),
+        Some(merged.as_str())
+    );
+    assert_eq!(remote_main(&git, &remote).await, fix.core.head);
+    assert_primary_untouched(&git, &fix).await;
+}
+
+/// MOD-133 M3 D5: a run branch the remote holds at a commit this box lacks is refused, and the
+/// remote's branch is left alone (never forced).
+#[tokio::test]
+async fn land_refuses_a_run_branch_that_moved_on_the_remote() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let merged = fix.merged_onto(run, step, &rows).await;
+
+    let other = remote_dir.path().join("other");
+    std::fs::create_dir_all(&other).expect("the directory is made");
+    repo_with_one_commit(&other);
+    let foreign = commit_file(&other, "elsewhere.txt", "moved\n", "someone else's push");
+    let refspec = format!("HEAD:refs/heads/{RUN_BRANCH}");
+    git_out(
+        &git,
+        &other,
+        &[
+            "push",
+            "--quiet",
+            &remote.to_string_lossy(),
+            refspec.as_str(),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        fix.isolator
+            .land(&fix.run_branch_request(&remote, vec![merged]))
+            .await
+            .expect("the landing runs"),
+        LandOutcome::Refused {
+            reason: format!(
+                "non_fast_forward: `{RUN_BRANCH}` on the remote has commits this box lacks; \
+                 merge them into the local branch, then retry"
+            )
+        }
+    );
+    assert_eq!(
+        branch_at(&git, &remote, RUN_BRANCH).await.as_deref(),
+        Some(foreign.as_str()),
+        "never forced"
+    );
+}
+
+/// MOD-133 M3 D5: a run branch the local target already holds (every committing step lost a
+/// fan-out) is `Landed` at its tip with nothing pushed.
+#[tokio::test]
+async fn land_of_an_empty_run_branch_is_landed_without_a_push() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+    let tip = fix.ensure_run_branch().await;
+
+    assert_eq!(
+        fix.isolator
+            .land(&fix.run_branch_request(&remote, Vec::new()))
+            .await
+            .expect("the landing runs"),
+        LandOutcome::Landed { hash: tip }
+    );
+    assert_eq!(branch_at(&git, &remote, RUN_BRANCH).await, None);
+}
+
+/// MOD-133 M3 D5, read off a wrapper `git`: the run branch's landing runs `ls-remote` of the run
+/// branch, then one plain `<tip>:refs/heads/<run branch>` push (never `--force`, never `+`); a
+/// second landing only asks `ls-remote`.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_run_branch_push_argv_never_forces() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let remote_dir = tempfile::tempdir().expect("a temporary directory");
+    let remote = bare_remote(&git, remote_dir.path(), "core", &fix.core.path).await;
+    let tip = fix.ensure_run_branch().await;
+    let run = RunId::new();
+    let (step, _, rows) = run_branch_step(&fix, run, &tip, "a.txt", "a\n").await;
+    let merged = fix.merged_onto(run, step, &rows).await;
+
+    let log = remote_dir.path().join("argv.log");
+    let wrapper = remote_dir.path().join("bin").join("git");
+    crate::write_executable::write_executable(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf 'CALL %s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            git.binary().display()
+        ),
+    );
+    let wrapped = Cli::probe(wrapper).expect("the wrapper answers --version");
+    let mut config = fix.config.clone();
+    config.scratch_root = remote_dir.path().join("trees");
+    let isolator = GixIsolator::with_git(config, Ok(wrapped)).expect("the config is valid");
+
+    let request = fix.run_branch_request(&remote, vec![merged.clone()]);
+    for _ in 0..2 {
+        assert_eq!(
+            isolator.land(&request).await.expect("the landing runs"),
+            LandOutcome::Pushed {
+                hash: merged.clone()
+            }
+        );
+    }
+    let logged = std::fs::read_to_string(&log).expect("the wrapper logged");
+    let calls: Vec<&str> = logged
+        .lines()
+        .filter_map(|line| line.strip_prefix("CALL "))
+        .filter(|args| args.starts_with("ls-remote ") || args.starts_with("push "))
+        .collect();
+    let remote_text = remote.to_string_lossy();
+    assert_eq!(
+        calls,
+        [
+            format!("ls-remote -- {remote_text} refs/heads/{RUN_BRANCH}"),
+            format!("push --porcelain -- {remote_text} {merged}:refs/heads/{RUN_BRANCH}"),
+            format!("ls-remote -- {remote_text} refs/heads/{RUN_BRANCH}"),
+        ],
+        "{logged}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.contains("--force") || args.contains(" +") || args.contains(" -f")),
+        "{logged}"
+    );
 }

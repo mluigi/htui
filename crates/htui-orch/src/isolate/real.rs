@@ -26,7 +26,7 @@ use super::env_files::{self, EnvFiles};
 use super::git::{self, Cli, MergeAttempt, blocking};
 use super::{
     ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, LandRequest, PartTip,
-    Prepared, PreparedTree, ResetReport,
+    Prepared, PreparedTree, ResetReport, RunBranches,
 };
 use crate::{infer, land};
 
@@ -1203,20 +1203,7 @@ impl GixIsolator {
         checkout: &RepoCheckout,
     ) -> Result<Option<String>, IsolateError> {
         let local = checkout.local_path.clone();
-        let tip = match tree.mode {
-            Isolation::Copy => {
-                let path = PathBuf::from(&tree.path);
-                if !path.join(".git").is_dir() {
-                    return Err(IsolateError::Refused(copy_tree_vanished(&path)));
-                }
-                Some(blocking(move || git::head(&path)).await?)
-            }
-            _ => {
-                let (repo, name) = (local.clone(), format!("htui/{step}"));
-                blocking(move || git::branch_target(&repo, &name)).await?
-            }
-        };
-        let Some(after) = tip.filter(|tip| *tip != tree.base_ref) else {
+        let Some(after) = isolated_tip(step, tree, &local).await? else {
             return Ok(None);
         };
 
@@ -1283,6 +1270,220 @@ impl GixIsolator {
         #[cfg(test)]
         self.probe_reconcile_admin(tree.repo_id);
         Ok(Some(merged.commit))
+    }
+
+    /// MOD-133 M3 D3: `reconcile` of a `worktree` or `copy` tree onto `branch`, the run branch of
+    /// its repo, in the run's detached landing tree; the primary's `HEAD`, index and files are
+    /// never touched. Everything from the branch read to the ref move runs under the repository's
+    /// admin lock (D70), which nothing below takes again (the `tokio` mutex is not reentrant):
+    ///
+    /// 1. the branch's tip, or `no_run_branch`; a branch checked out in the checkout or any of
+    ///    its linked worktrees is refused `run_branch_checked_out` (probe C12);
+    /// 2. D136: a merge of the step on the branch's first-parent line back to the base is
+    ///    answered as it is (refs and objects are shared with the landing tree);
+    /// 3. the landing tree `<scratch root>/<run>/landing/<repo name>`, found or (re-)added detached
+    ///    at the tip;
+    /// 4. a landing tree off the tip (an orphan merge a crash left before the ref move), mid-merge
+    ///    (`MERGE_HEAD`, a `git merge` killed with a conflicted index) or dirty has any merge
+    ///    aborted and is reset to the tip: a scratch tree, nothing to lose;
+    /// 5. a reset that fails, or leaves the tree dirty, is refused `dirty_landing_tree`;
+    /// 6. a branch off the base's line, or already holding the step with no merge naming it, is
+    ///    refused `run_branch_moved`;
+    /// 7. under `copy` the step's range is written into the checkout's object database first;
+    /// 8. `merge --no-ff` onto the tip in the landing tree ([`Cli::merge_no_ff`]: hooks, abort and
+    ///    `merge_conflict` unchanged);
+    /// 9. `run_branch_checked_out` is asked again, then the branch moves from the tip to the
+    ///    merge by compare-and-swap ([`git::move_branch`]): a branch moved by anyone else in
+    ///    between fails the run's landing as a `Git` error, and the next attempt resyncs the
+    ///    landing tree (step 4) and merges again.
+    async fn reconcile_onto_branch(
+        &self,
+        step: StepId,
+        tree: &RunStepTree,
+        checkout: &RepoCheckout,
+        run: RunId,
+        branch: &str,
+    ) -> Result<Option<String>, IsolateError> {
+        let local = checkout.local_path.clone();
+        let Some(after) = isolated_tip(step, tree, &local).await? else {
+            return Ok(None);
+        };
+        let git = self.cli()?.clone();
+        let _admin = self.admin_guard(tree.repo_id).await;
+        #[cfg(test)]
+        self.probe_reconcile_admin(tree.repo_id);
+
+        let (read, name) = (local.clone(), branch.to_owned());
+        let Some(tip) = blocking(move || git::branch_target(&read, &name)).await? else {
+            return Err(IsolateError::Refused(no_run_branch(branch)));
+        };
+        refuse_checked_out(&local, branch).await?;
+        if tip != tree.base_ref {
+            let (read, at, base, merged) = (
+                local.clone(),
+                tip.clone(),
+                tree.base_ref.clone(),
+                after.clone(),
+            );
+            if let Some(merge) = blocking(move || git::merge_of(&read, &at, &base, &merged)).await?
+            {
+                return Ok(Some(merge));
+            }
+        }
+
+        let landing = self
+            .config
+            .scratch_root
+            .join(run.to_string())
+            .join("landing")
+            .join(&checkout.name);
+        self.landing_tree_at(&git, &local, &landing, run, &tip)
+            .await?;
+        let (read, at) = (landing.clone(), tip.clone());
+        let stale = blocking(move || {
+            Ok(git::head(&read)? != at || git::merge_in_progress(&read)? || git::is_dirty(&read)?)
+        })
+        .await?;
+        if stale {
+            let reset = async {
+                git::with_retry("merge --abort", || git.abort_merge(&landing)).await?;
+                git::with_retry("reset --hard", || git.reset_hard(&landing, &tip)).await
+            };
+            if let Err(err) = reset.await {
+                tracing::warn!(landing = %landing.display(), %err, "the landing tree could not be reset to its run branch");
+                return Err(IsolateError::Refused(dirty_landing_tree(&landing)));
+            }
+            let read = landing.clone();
+            if blocking(move || git::is_dirty(&read)).await? {
+                return Err(IsolateError::Refused(dirty_landing_tree(&landing)));
+            }
+        }
+        if tip != tree.base_ref {
+            let (read, base, at) = (local.clone(), tree.base_ref.clone(), tip.clone());
+            if !blocking(move || git::is_ancestor(&read, &base, &at)).await? {
+                return Err(IsolateError::Refused(run_branch_moved(branch, &tip)));
+            }
+            let (read, merged, at) = (local.clone(), after.clone(), tip.clone());
+            if blocking(move || git::is_ancestor(&read, &merged, &at)).await? {
+                return Err(IsolateError::Refused(run_branch_moved(branch, &tip)));
+            }
+        }
+
+        if tree.mode == Isolation::Copy {
+            // OQ-5: the copy's own object database holds the range; the landing tree shares the
+            // checkout's.
+            let (from, to) = (PathBuf::from(&tree.path), local.clone());
+            let (base, copied) = (tree.base_ref.clone(), after.clone());
+            git::with_retry("copy objects", move || {
+                let (from, to, base, copied) =
+                    (from.clone(), to.clone(), base.clone(), copied.clone());
+                async move { blocking(move || git::copy_range(&from, &to, &base, &copied)).await }
+            })
+            .await?;
+        }
+
+        let merged =
+            git::with_retry("merge", || git.merge_no_ff(&landing, step, &tip, &after)).await?;
+        refuse_checked_out(&local, branch).await?;
+        let (at, name, from, to) = (
+            local.clone(),
+            branch.to_owned(),
+            tip.clone(),
+            merged.commit.clone(),
+        );
+        git::with_retry("move branch", move || {
+            let (at, name, from, to) = (at.clone(), name.clone(), from.clone(), to.clone());
+            async move { blocking(move || git::move_branch(&at, &name, &from, &to)).await }
+        })
+        .await?;
+        #[cfg(test)]
+        self.probe_reconcile_admin(tree.repo_id);
+        Ok(Some(merged.commit))
+    }
+
+    /// MOD-133 M3 D3 step 3: the run's landing tree at `path`, detached at `tip` when it is made.
+    /// A tree `git` lists and whose `HEAD` reads is reused as it is (step 4 resyncs it); anything
+    /// else at `path` is removed (`worktree remove` tolerates a tree that is not there) and the
+    /// tree added again. The caller holds the repository's admin lock.
+    async fn landing_tree_at(
+        &self,
+        git: &Cli,
+        local: &Path,
+        path: &Path,
+        run: RunId,
+        tip: &str,
+    ) -> Result<(), IsolateError> {
+        let (main, tree) = (local.to_path_buf(), path.to_path_buf());
+        let listed = blocking(move || git::worktree_by_path(&main, &tree))
+            .await?
+            .is_some();
+        if listed && path.join(".git").exists() {
+            let read = path.to_path_buf();
+            if blocking(move || git::head(&read)).await.is_ok() {
+                return Ok(());
+            }
+        }
+        git::with_retry("worktree remove", || git.remove_worktree(local, path)).await?;
+        remove_directory(path).await?;
+        if let Some(parent) = path.parent() {
+            create_directory(parent).await?;
+        }
+        git::with_retry("worktree add", || {
+            git.add_detached_worktree(local, path, run, tip)
+        })
+        .await
+    }
+
+    /// MOD-133 M3 D1: one repository's run branch made sure of, under its admin lock (see
+    /// [`Isolator::run_branches`]); answers its tip.
+    async fn ensure_run_branch(
+        &self,
+        repo: RepoId,
+        checkout: &RepoCheckout,
+        branch: &str,
+    ) -> Result<String, IsolateError> {
+        let _admin = self.admin_guard(repo).await;
+        let local = checkout.local_path.clone();
+        refuse_checked_out(&local, branch).await?;
+        let head = self.head_of(checkout).await?;
+        let (read, name) = (local.clone(), branch.to_owned());
+        let found = blocking(move || git::branch_target(&read, &name)).await?;
+        let tip = match found {
+            Some(tip) => tip,
+            None => {
+                let (at, name, target) = (local.clone(), branch.to_owned(), head.clone());
+                let created = git::with_retry("create branch", move || {
+                    let (at, name, target) = (at.clone(), name.clone(), target.clone());
+                    async move { blocking(move || git::create_branch(&at, &name, &target)).await }
+                })
+                .await;
+                match created {
+                    Ok(()) => return Ok(head),
+                    // Another process created it first: its branch stands, and is read again.
+                    Err(err) => {
+                        let (read, name) = (local.clone(), branch.to_owned());
+                        blocking(move || git::branch_target(&read, &name))
+                            .await?
+                            .ok_or(err)?
+                    }
+                }
+            }
+        };
+        if tip == head {
+            return Ok(tip);
+        }
+        let (read, from, to) = (local.clone(), tip.clone(), head.clone());
+        if !blocking(move || git::is_ancestor(&read, &from, &to)).await? {
+            // Diverged (or ahead of `HEAD`): kept, so a re-run continues the same pull request.
+            return Ok(tip);
+        }
+        let (at, name, from, to) = (local, branch.to_owned(), tip, head.clone());
+        git::with_retry("move branch", move || {
+            let (at, name, from, to) = (at.clone(), name.clone(), from.clone(), to.clone());
+            async move { blocking(move || git::move_branch(&at, &name, &from, &to)).await }
+        })
+        .await?;
+        Ok(head)
     }
 
     /// `reconcile` for a tree that is the checkout itself: nothing to merge, because the step
@@ -1709,6 +1910,84 @@ pub fn dirty_primary_tree() -> String {
     "dirty_primary_tree".to_owned()
 }
 
+/// MOD-133 M3 D1, D3 (probe C12): `Refused(run_branch_checked_out)` when `branch` is checked out
+/// in `local` or one of its linked worktrees ([`git::checked_out_at`]). The caller holds the
+/// repository's admin lock.
+async fn refuse_checked_out(local: &Path, branch: &str) -> Result<(), IsolateError> {
+    let (read, full) = (local.to_path_buf(), format!("refs/heads/{branch}"));
+    match blocking(move || git::checked_out_at(&read, &full)).await? {
+        Some(path) => Err(IsolateError::Refused(run_branch_checked_out(branch, &path))),
+        None => Ok(()),
+    }
+}
+
+/// MOD-133 M3 D1 (probe C12): the run branch is checked out at `path`, so moving it by
+/// `update-ref` would leave that tree's index and files behind its `HEAD`.
+#[must_use]
+pub fn run_branch_checked_out(branch: &str, path: &Path) -> String {
+    format!(
+        "run_branch_checked_out: `{branch}` is checked out at {}; switch that tree off it",
+        path.display()
+    )
+}
+
+/// MOD-133 M3 D3, D5: the checkout has no `refs/heads/<branch>` to land onto or to push.
+#[must_use]
+pub fn no_run_branch(branch: &str) -> String {
+    format!("no_run_branch: `{branch}`")
+}
+
+/// MOD-133 M3 D3: the run's landing tree at `path` carries uncommitted work. Never
+/// [`dirty_primary_tree`], which would blame the person's own checkout.
+#[must_use]
+pub fn dirty_landing_tree(path: &Path) -> String {
+    format!("dirty_landing_tree: {}", path.display())
+}
+
+/// MOD-133 M3 D3: the run branch is not on the step's base line (or already holds the step with
+/// no merge naming it), so there is nothing safe to merge onto; [`primary_moved`]'s run-branch
+/// twin.
+#[must_use]
+pub fn run_branch_moved(branch: &str, tip: &str) -> String {
+    format!(
+        "run_branch_moved: `{branch}` is at {}",
+        land::short_hash(tip)
+    )
+}
+
+/// MOD-133 M3 D3 (defence in depth behind the snapshot's D4 refusal): a `local` or
+/// `shared_serialized` tree of a repo that integrates by `pull_request` committed into the
+/// primary checkout itself, which a run branch never holds.
+#[must_use]
+pub fn run_branch_in_place() -> String {
+    "run_branch_in_place".to_owned()
+}
+
+/// The winner's tip of an isolated tree, `None` when it is the base (nothing committed): read
+/// from the `htui/<step>` branch for a `worktree` (the tree itself may be gone — D27 removed it),
+/// and from the copy's own `HEAD` for a `copy`, whose label never moved past the base
+/// (blueprint A-2).
+async fn isolated_tip(
+    step: StepId,
+    tree: &RunStepTree,
+    local: &Path,
+) -> Result<Option<String>, IsolateError> {
+    let tip = match tree.mode {
+        Isolation::Copy => {
+            let path = PathBuf::from(&tree.path);
+            if !path.join(".git").is_dir() {
+                return Err(IsolateError::Refused(copy_tree_vanished(&path)));
+            }
+            Some(blocking(move || git::head(&path)).await?)
+        }
+        _ => {
+            let (repo, name) = (local.to_path_buf(), format!("htui/{step}"));
+            blocking(move || git::branch_target(&repo, &name)).await?
+        }
+    };
+    Ok(tip.filter(|tip| *tip != tree.base_ref))
+}
+
 /// `remove_dir_all` where an absent directory is the outcome asked for, not a failure.
 ///
 /// On the blocking pool, like every other filesystem walk here: a tree under the scratch root can
@@ -1787,6 +2066,29 @@ impl Isolator for GixIsolator {
                 base.insert(repo, self.head_of(&checkout).await?);
             }
             Ok(base)
+        })
+    }
+
+    /// MOD-133 M3 D1: `GixIsolator::ensure_run_branch` per repo, in `RepoId` order. `gix`
+    /// reads and ref edits only: no `git` child, no tree touched.
+    fn run_branches<'a>(
+        &'a self,
+        branches: &'a BTreeMap<RepoId, String>,
+    ) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
+        Box::pin(async move {
+            let mut tips = BTreeMap::new();
+            for (repo, branch) in branches {
+                let checkout = self
+                    .config
+                    .repos
+                    .get(repo)
+                    .ok_or_else(|| IsolateError::Refused(no_checkout_for_repo()))?;
+                tips.insert(
+                    *repo,
+                    self.ensure_run_branch(*repo, checkout, branch).await?,
+                );
+            }
+            Ok(tips)
         })
     }
 
@@ -1892,23 +2194,44 @@ impl Isolator for GixIsolator {
         })
     }
 
-    fn reconcile<'a>(
+    /// MOD-133 M3 D3: an in-place tree of a repo with a run branch refuses before any tree is
+    /// read or merged; then per tree, a `worktree`/`copy` tree with a run branch lands onto it
+    /// (`GixIsolator::reconcile_onto_branch`) and every other tree as before.
+    fn reconcile_onto<'a>(
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
         siblings: &'a [StepId],
+        onto: Option<RunBranches<'a>>,
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
+            let branch_of = |tree: &RunStepTree| {
+                onto.and_then(|onto| {
+                    onto.branches
+                        .get(&tree.repo_id)
+                        .map(|branch| (onto.run, branch.as_str()))
+                })
+            };
+            if trees.iter().any(|tree| {
+                matches!(tree.mode, Isolation::Local | Isolation::SharedSerialized)
+                    && branch_of(tree).is_some()
+            }) {
+                return Err(IsolateError::Refused(run_branch_in_place()));
+            }
             let mut commits = Vec::with_capacity(trees.len());
             for tree in trees {
                 let checkout = self.checkout_of(tree)?.clone();
-                let after = match tree.mode {
-                    Isolation::Local | Isolation::SharedSerialized => {
+                let after = match (tree.mode, branch_of(tree)) {
+                    (Isolation::Local | Isolation::SharedSerialized, _) => {
                         self.reconcile_in_place(winner, tree, &checkout, siblings)
                             .await?
                     }
+                    (Isolation::Worktree | Isolation::Copy, Some((run, branch))) => {
+                        self.reconcile_onto_branch(winner, tree, &checkout, run, branch)
+                            .await?
+                    }
                     // D54(d): a fan-out winner is merged alone; the losers' labels stay.
-                    Isolation::Worktree | Isolation::Copy => {
+                    (Isolation::Worktree | Isolation::Copy, None) => {
                         self.reconcile_isolated(winner, tree, &checkout).await?
                     }
                 };
@@ -2008,6 +2331,51 @@ impl Isolator for GixIsolator {
 
             // F-Q: `prepare` made `<root>/<run>/<step>/` and no per-tree verb names it.
             let run_dir = self.config.scratch_root.join(run.to_string());
+
+            // MOD-133 M3 D3: the run's landing trees, one per repo a step landed onto its run
+            // branch, go through `git worktree remove` before their directory does; the run
+            // branch itself stays. A tree whose directory is already gone still has its entry
+            // removed (`worktree remove` tolerates the missing directory).
+            let landing = run_dir.join("landing");
+            for (repo, checkout) in &self.config.repos {
+                let path = landing.join(&checkout.name);
+                let present = if path.exists() {
+                    Ok(true)
+                } else {
+                    let (main, tree) = (checkout.local_path.clone(), path.clone());
+                    blocking(move || git::worktree_by_path(&main, &tree))
+                        .await
+                        .map(|entry| entry.is_some())
+                };
+                match present {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(err) => {
+                        failures.push(err);
+                        continue;
+                    }
+                }
+                if !worktree_repos.contains(repo) {
+                    worktree_repos.push(*repo);
+                }
+                let git = match self.cli() {
+                    Ok(git) => git.clone(),
+                    Err(err) => {
+                        failures.push(err);
+                        continue;
+                    }
+                };
+                let local = checkout.local_path.clone();
+                if let Err(err) = self
+                    .under_admin(*repo, || {
+                        git::with_retry("worktree remove", || git.remove_worktree(&local, &path))
+                    })
+                    .await
+                {
+                    failures.push(err);
+                }
+            }
+
             if let Err(err) = remove_directory(&run_dir).await {
                 failures.push(err);
             }
@@ -2166,23 +2534,39 @@ impl Isolator for GixIsolator {
             };
             let git = self.cli()?.clone();
             let tip = match self.landing_tip(request, checkout).await? {
-                Ok(tip) => tip,
+                Ok(LandingTip::Push(tip)) => tip,
+                Ok(LandingTip::Held(tip)) => return Ok(LandOutcome::Landed { hash: tip }),
                 Err(reason) => return Ok(refused(reason)),
             };
             let cwd = &checkout.local_path;
             let remote = request.remote.as_str();
-            let target = request.target_branch.as_str();
+            // MOD-133 M3 D5: a `pull_request` record pushes its run branch, never the target.
+            let target = request
+                .run_branch
+                .as_deref()
+                .unwrap_or(&request.target_branch);
+            let landed = |hash: String| {
+                if request.run_branch.is_some() {
+                    LandOutcome::Pushed { hash }
+                } else {
+                    LandOutcome::Landed { hash }
+                }
+            };
             if let Some(remote_tip) = git.ls_remote(cwd, remote, target).await?
                 && (remote_tip == tip
                     || self
                         .holds_past(request.repo, checkout, &tip, remote_tip)
                         .await?)
             {
-                return Ok(LandOutcome::Landed { hash: tip });
+                return Ok(landed(tip));
             }
             match git.push(cwd, remote, &tip, target).await? {
-                git::Pushed::Done => Ok(LandOutcome::Landed { hash: tip }),
-                git::Pushed::NonFastForward => Ok(refused(land::non_fast_forward(target))),
+                git::Pushed::Done => Ok(landed(tip)),
+                git::Pushed::NonFastForward => Ok(refused(if request.run_branch.is_some() {
+                    land::run_branch_non_fast_forward(target)
+                } else {
+                    land::non_fast_forward(target)
+                })),
                 git::Pushed::Failed(line) => {
                     Ok(refused(land::push_failed(&scrub_remote(&line, remote))))
                 }
@@ -2192,6 +2576,15 @@ impl Isolator for GixIsolator {
             }
         })
     }
+}
+
+/// What [`GixIsolator::landing_tip`] found to land.
+enum LandingTip {
+    /// The tip to push (or find on the remote).
+    Push(String),
+    /// MOD-133 M3 D5: a run branch the local target branch already holds (every committing step
+    /// lost a fan-out): `Landed` at it, with nothing pushed.
+    Held(String),
 }
 
 /// A [`LandOutcome::Refused`] with `reason`.
@@ -2219,25 +2612,46 @@ impl GixIsolator {
     /// MOD-133 D8's local half: the target branch's tip, or the refusal, read under the repo's
     /// admin lock (D70's "one child and nothing else": the guard is dropped on return, before any
     /// network verb). The `gix` reads run through `blocking`, as [`GixIsolator::head_of`]'s.
+    ///
+    /// MOD-133 M3 D5: with a run branch, the tip is the run branch's (`no_run_branch` when it is
+    /// missing), the commits must be its ancestors (`not_on_target` naming it), and a run branch
+    /// the local target branch already holds is [`LandingTip::Held`].
     async fn landing_tip(
         &self,
         request: &LandRequest,
         checkout: &RepoCheckout,
-    ) -> Result<Result<String, String>, IsolateError> {
+    ) -> Result<Result<LandingTip, String>, IsolateError> {
         let _admin = self.admin_guard(request.repo).await;
         let path = checkout.local_path.clone();
         let target = request.target_branch.clone();
         let commits = request.commits.clone();
+        let run_branch = request.run_branch.clone();
         blocking(move || {
-            let Some(tip) = git::branch_target(&path, &target)? else {
-                return Ok(Err(land::no_target_branch(&target)));
+            let Some(run_branch) = run_branch else {
+                let Some(tip) = git::branch_target(&path, &target)? else {
+                    return Ok(Err(land::no_target_branch(&target)));
+                };
+                for commit in &commits {
+                    if !git::is_ancestor(&path, commit, &tip)? {
+                        return Ok(Err(land::not_on_target(commit, &target)));
+                    }
+                }
+                return Ok(Ok(LandingTip::Push(tip)));
+            };
+            let Some(tip) = git::branch_target(&path, &run_branch)? else {
+                return Ok(Err(no_run_branch(&run_branch)));
             };
             for commit in &commits {
                 if !git::is_ancestor(&path, commit, &tip)? {
-                    return Ok(Err(land::not_on_target(commit, &target)));
+                    return Ok(Err(land::not_on_target(commit, &run_branch)));
                 }
             }
-            Ok(Ok(tip))
+            if let Some(held) = git::branch_target(&path, &target)?
+                && git::is_ancestor(&path, &tip, &held)?
+            {
+                return Ok(Ok(LandingTip::Held(tip)));
+            }
+            Ok(Ok(LandingTip::Push(tip)))
         })
         .await
     }

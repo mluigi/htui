@@ -4,5 +4,6 @@ mod gix_isolator;
 mod infer;
 mod landing;
 mod review_loop;
+mod run_branch;
 #[path = "../../../../tests/rust/write_executable.rs"]
 mod write_executable;

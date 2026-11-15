@@ -790,6 +790,11 @@ pub struct IntegrateSnapshot {
     pub remote: String,
     /// `repo.default_branch`.
     pub target_branch: String,
+    /// MOD-133 M3 D1: a `pull_request` entry's run branch,
+    /// [`run_branch_name`](crate::model::run_branch_name) of the item's key; `None` for `push`.
+    /// Absent from the JSON when `None`, so a `push` snapshot keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_branch: Option<String>,
 }
 
 /// MOD-164 D8: [`GraphSnapshot::capture`], what the run's capture step runs on.
@@ -2433,6 +2438,7 @@ mod tests {
                 mode: IntegrateMode::Push,
                 remote: "git@example.invalid:core.git".to_owned(),
                 target_branch: "main".to_owned(),
+                run_branch: None,
             },
         );
         let value = serde_json::to_value(&snapshot).expect("a snapshot serialises");
@@ -2449,6 +2455,50 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<super::GraphSnapshot>(value).expect("it decodes"),
             snapshot
+        );
+    }
+
+    /// MOD-133 M3 D1: an entry without a run branch writes exactly M1's bytes (no `run_branch`
+    /// key, so a `push` snapshot is unchanged), a blob without the key decodes to `None`, and a
+    /// `pull_request` entry's run branch round-trips.
+    #[test]
+    fn integrate_snapshot_run_branch_is_absent_when_none_and_round_trips() {
+        use crate::model::integration::IntegrateMode;
+
+        let push = super::IntegrateSnapshot {
+            mode: IntegrateMode::Push,
+            remote: "git@example.invalid:core.git".to_owned(),
+            target_branch: "main".to_owned(),
+            run_branch: None,
+        };
+        let text = serde_json::to_string(&push).expect("an entry serialises");
+        assert_eq!(
+            text,
+            r#"{"mode":"push","remote":"git@example.invalid:core.git","target_branch":"main"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<super::IntegrateSnapshot>(&text).expect("it decodes"),
+            push
+        );
+
+        let pull_request = super::IntegrateSnapshot {
+            mode: IntegrateMode::PullRequest,
+            run_branch: Some("htui/item/MOD-7".to_owned()),
+            ..push
+        };
+        let value = serde_json::to_value(&pull_request).expect("an entry serialises");
+        assert_eq!(
+            value,
+            json!({
+                "mode": "pull_request",
+                "remote": "git@example.invalid:core.git",
+                "target_branch": "main",
+                "run_branch": "htui/item/MOD-7",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<super::IntegrateSnapshot>(value).expect("it decodes"),
+            pull_request
         );
     }
 

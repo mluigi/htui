@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-133](docs/decisions/mod/mod-133.md)** - Integration records and modes (local, push, pull_request) (done, 2026-11-15)
 - **[MOD-159](docs/decisions/mod/mod-159.md)** - One knowledge indexer per collection: lease, freshness, coverage (done, 2026-11-15)
 - **[MOD-125](docs/decisions/mod/mod-125.md)** - Stopping and resuming runs (done, 2026-11-14)
 - **[ANA-42](docs/decisions/ana/ana-42.md)** - Execution targets: where an item runs (concluded, 2026-11-14)

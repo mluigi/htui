@@ -2228,7 +2228,9 @@ pub trait WriteStore: ReadStore {
     /// `lease_expires_at` = the store's clock plus `ttl` (the [`claim_run`](Self::claim_run)
     /// rule). Ordered by `(run_id, repo_id)` bytes; empty when nothing is takeable, an unknown box
     /// or run included. A record under another owner's live lease is left alone, so two sweeps of
-    /// one box never land one record twice.
+    /// one box never land one record twice. MOD-133 M3 D5: a `pull_request` record with a
+    /// `landed_hash` (its run branch pushed, [`LandOutcome::Pushed`]) is never taken, whatever its
+    /// lease: it waits for MOD-134 to open the pull request.
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` outside
@@ -2243,9 +2245,11 @@ pub trait WriteStore: ReadStore {
 
     /// MOD-133 D6: settles one record that is `pending` under `owner`'s lease:
     /// [`LandOutcome::Landed`] → `landed` with `landed_hash`, [`LandOutcome::Refused`] →
-    /// `refused` with `refusal`; the lease is cleared and `updated_at` moves. `Ok(false)`, writing
-    /// nothing, when the row is not this owner's `pending` row (a lost lease, an already-settled
-    /// record, an unknown pair): never an error, so a sweep that lost the race moves on.
+    /// `refused` with `refusal`, [`LandOutcome::Pushed`] (MOD-133 M3 D5) → still `pending`, with
+    /// `landed_hash`; the lease is cleared and `updated_at` moves. `Ok(false)`, writing nothing,
+    /// when the row is not this owner's `pending` row (a lost lease, an already-settled record, an
+    /// unknown pair), or for [`LandOutcome::Pushed`] on a record whose mode is not
+    /// `pull_request`: never an error, so a sweep that lost the race moves on.
     ///
     /// # Errors
     /// The backend's own failures only.
@@ -2261,7 +2265,8 @@ pub trait WriteStore: ReadStore {
     /// with `refusal` and the lease (`lease_box_id`, `lease_owner`, `lease_expires_at`) cleared
     /// and `updated_at` moved, so the executing box's next land pass (or sweep) takes it again.
     /// Answers how many moved: `0` when nothing of `run` is refused (a stale press, an unknown
-    /// run) is never an error. Records in any other state are left alone.
+    /// run) is never an error. Records in any other state are left alone, a pushed `pull_request`
+    /// record (`pending` with a `landed_hash`, MOD-133 M3 D5) included.
     ///
     /// # Errors
     /// The backend's own failures only.

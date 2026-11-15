@@ -499,6 +499,12 @@ pub const CASES: &[&str] = &[
     "the_latest_done_runs_landing_derives_the_item_state",
     "waiting_candidates_hold_an_open_item_over_a_refused_landing",
     "retry_landing_resets_only_refused_records",
+    // MOD-133 M3: a pushed `pull_request` record (plan D5)
+    "settle_pushed_keeps_a_pull_request_record_pending_with_its_hash",
+    "settle_pushed_answers_false_for_a_push_record",
+    "take_integrations_skips_a_pushed_pull_request_record",
+    "a_pushed_pull_request_record_holds_its_dependents",
+    "retry_landing_leaves_a_pushed_record_alone",
     // MOD-130 M1: execution targets (D1-D4, P2, P10)
     "the_local_target_is_seeded",
     // MOD-130 M1 T2: create, edit and bind targets (P4-P6, P9, blueprint B2-B4, B10)
@@ -1625,6 +1631,25 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "retry_landing_resets_only_refused_records" => {
             boxed(retry_landing_resets_only_refused_records, store).await;
+        }
+        "settle_pushed_keeps_a_pull_request_record_pending_with_its_hash" => {
+            boxed(
+                settle_pushed_keeps_a_pull_request_record_pending_with_its_hash,
+                store,
+            )
+            .await;
+        }
+        "settle_pushed_answers_false_for_a_push_record" => {
+            boxed(settle_pushed_answers_false_for_a_push_record, store).await;
+        }
+        "take_integrations_skips_a_pushed_pull_request_record" => {
+            boxed(take_integrations_skips_a_pushed_pull_request_record, store).await;
+        }
+        "a_pushed_pull_request_record_holds_its_dependents" => {
+            boxed(a_pushed_pull_request_record_holds_its_dependents, store).await;
+        }
+        "retry_landing_leaves_a_pushed_record_alone" => {
+            boxed(retry_landing_leaves_a_pushed_record_alone, store).await;
         }
         "the_local_target_is_seeded" => boxed(the_local_target_is_seeded, store).await,
         "create_target_round_trips_every_kind_but_local" => {
@@ -21359,6 +21384,7 @@ fn integrate_entry(repo: &Repo, mode: IntegrateMode) -> (RepoId, IntegrateSnapsh
                 .clone()
                 .expect("new_repo gives every repo a remote"),
             target_branch: repo.default_branch.clone(),
+            run_branch: None,
         },
     )
 }
@@ -22706,6 +22732,335 @@ async fn retry_landing_resets_only_refused_records<S: WriteStore>(store: &S) {
     assert!(
         !ready_ids(CASE, store).await.contains(&dependent),
         "{CASE}: a landing target still holds its dependent"
+    );
+}
+
+// ---- MOD-133 M3: a pushed `pull_request` record (plan D5) ----------------------------------
+//
+// After the executing box pushes a `pull_request` run's run branch, its record stays `pending`
+// with the pushed head in `landed_hash`: no sweep takes it again, it is not landed (so it holds
+// its dependents and the item reads `landing`), and Unblock's retry leaves it alone. MOD-134
+// widens the take to open the pull request.
+
+/// MOD-133 M3: a pushed outcome.
+fn landing_pushed() -> LandOutcome {
+    LandOutcome::Pushed {
+        hash: "5555555555555555555555555555555555555555".to_owned(),
+    }
+}
+
+/// MOD-133 M3: `run`'s record of `repo`.
+async fn integration_row<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    repo: RepoId,
+) -> Integration {
+    store
+        .integrations(run)
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|row| row.repo_id == repo)
+        .unwrap_or_else(|| panic!("{case}: the record of {repo} exists"))
+}
+
+/// MOD-133 M3 D5: [`LandOutcome::Pushed`] settles a `pull_request` record under its owner's lease
+/// by keeping it `pending` with `landed_hash` set and no refusal, and clearing the lease (so the
+/// same owner cannot settle it again); a stale owner settles nothing.
+async fn settle_pushed_keeps_a_pull_request_record_pending_with_its_hash<S: WriteStore>(store: &S) {
+    const CASE: &str = "settle_pushed_keeps_a_pull_request_record_pending_with_its_hash";
+    let owner = Uuid::now_v7();
+    let stale = Uuid::now_v7();
+    let repo = integration_repo(CASE, store, "reviewed").await;
+    let item = minted(CASE, store, "pushed run branch").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        item,
+        &[(&repo, IntegrateMode::PullRequest)],
+        &[repo.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, owner, LEASE, Some(run))
+                .await
+                .expect(CASE)
+        ),
+        vec![(run, repo.id)],
+        "{CASE}: an unpushed `pull_request` record is taken"
+    );
+    let before = integration_row(CASE, store, run, repo.id).await;
+    assert!(
+        !store
+            .settle_integration(run, repo.id, stale, &landing_pushed())
+            .await
+            .expect(CASE),
+        "{CASE}: a stale owner settles nothing"
+    );
+    assert_eq!(
+        integration_row(CASE, store, run, repo.id).await,
+        before,
+        "{CASE}: and writes nothing"
+    );
+    assert!(
+        store
+            .settle_integration(run, repo.id, owner, &landing_pushed())
+            .await
+            .expect(CASE),
+        "{CASE}: the owner settles the push"
+    );
+    let row = integration_row(CASE, store, run, repo.id).await;
+    assert_eq!(
+        (
+            row.mode,
+            row.state,
+            row.landed_hash.as_deref(),
+            row.refusal.as_deref(),
+            row.pr_ref.as_deref(),
+            row.pr_url.as_deref(),
+        ),
+        (
+            IntegrateMode::PullRequest,
+            IntegrationState::Pending,
+            Some("5555555555555555555555555555555555555555"),
+            None,
+            None,
+            None,
+        ),
+        "{CASE}: still pending, with the pushed head and no pull request yet"
+    );
+    assert!(
+        row.updated_at >= before.updated_at,
+        "{CASE}: updated_at never moves back"
+    );
+    assert!(
+        !store
+            .settle_integration(run, repo.id, owner, &landing_landed())
+            .await
+            .expect(CASE),
+        "{CASE}: the lease is cleared, so the owner settles nothing more"
+    );
+    assert_eq!(
+        integration_row(CASE, store, run, repo.id).await,
+        row,
+        "{CASE}: and the second settle wrote nothing"
+    );
+}
+
+/// MOD-133 M3 D5: [`LandOutcome::Pushed`] is a `pull_request` outcome only: on a `push` record it
+/// answers `false` and writes nothing, and the record stays its owner's to land.
+async fn settle_pushed_answers_false_for_a_push_record<S: WriteStore>(store: &S) {
+    const CASE: &str = "settle_pushed_answers_false_for_a_push_record";
+    let owner = Uuid::now_v7();
+    let repo = integration_repo(CASE, store, "pushed").await;
+    let item = minted(CASE, store, "pushed straight").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        item,
+        &[(&repo, IntegrateMode::Push)],
+        &[repo.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    store
+        .take_integrations(ids::BOX, owner, LEASE, Some(run))
+        .await
+        .expect(CASE);
+    let before = integration_row(CASE, store, run, repo.id).await;
+    assert!(
+        !store
+            .settle_integration(run, repo.id, owner, &landing_pushed())
+            .await
+            .expect(CASE),
+        "{CASE}: a `push` record is never settled as pushed"
+    );
+    assert_eq!(
+        integration_row(CASE, store, run, repo.id).await,
+        before,
+        "{CASE}: and nothing is written, the lease included"
+    );
+    assert!(
+        store
+            .settle_integration(run, repo.id, owner, &landing_landed())
+            .await
+            .expect(CASE),
+        "{CASE}: the owner still holds it, and lands it"
+    );
+    assert_eq!(
+        integration_row(CASE, store, run, repo.id).await.state,
+        IntegrationState::Landed,
+        "{CASE}: landed"
+    );
+}
+
+/// MOD-133 M3 D5: `take_integrations` skips a `pull_request` record with a `landed_hash` (pushed,
+/// waiting for MOD-134) even when its lease is free, and still takes an unpushed one beside it.
+async fn take_integrations_skips_a_pushed_pull_request_record<S: WriteStore>(store: &S) {
+    const CASE: &str = "take_integrations_skips_a_pushed_pull_request_record";
+    let first = Uuid::now_v7();
+    let second = Uuid::now_v7();
+    let pushed = integration_repo(CASE, store, "pr-pushed").await;
+    let unpushed = integration_repo(CASE, store, "pr-unpushed").await;
+    let item = minted(CASE, store, "half pushed").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        item,
+        &[
+            (&pushed, IntegrateMode::PullRequest),
+            (&unpushed, IntegrateMode::PullRequest),
+        ],
+        &[pushed.id, unpushed.id],
+        &[],
+        first,
+        RunStatus::Done,
+    )
+    .await;
+    let mut both = vec![(run, pushed.id), (run, unpushed.id)];
+    both.sort_unstable();
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, first, TimeDelta::zero(), Some(run))
+                .await
+                .expect(CASE)
+        ),
+        both,
+        "{CASE}: both unpushed records are taken, under a lease that expires at once"
+    );
+    assert!(
+        store
+            .settle_integration(run, pushed.id, first, &landing_pushed())
+            .await
+            .expect(CASE),
+        "{CASE}: one is pushed"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, second, LEASE, None)
+                .await
+                .expect(CASE)
+        ),
+        vec![(run, unpushed.id)],
+        "{CASE}: another owner takes the unpushed record's expired lease, and never the pushed one"
+    );
+    assert_eq!(
+        taken_keys(
+            &store
+                .take_integrations(ids::BOX, first, LEASE, Some(run))
+                .await
+                .expect(CASE)
+        ),
+        Vec::new(),
+        "{CASE}: the pushed record's free lease does not make it takeable"
+    );
+    assert_eq!(
+        integration_row(CASE, store, run, pushed.id).await.state,
+        IntegrationState::Pending,
+        "{CASE}: the skipped record is still pending"
+    );
+}
+
+/// MOD-133 M3 D5: a pushed `pull_request` record is not landed, so a `done` blocker holding one
+/// keeps its dependent waiting; its item reads `landing` (`RunLanding::Pending`), and it makes no
+/// waiting row (only a refusal does).
+async fn a_pushed_pull_request_record_holds_its_dependents<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_pushed_pull_request_record_holds_its_dependents";
+    let owner = Uuid::now_v7();
+    let target = minted(CASE, store, "pushed blocker").await;
+    let dependent = minted(CASE, store, "its dependent").await;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_HTUI, dependent, None).await;
+    propose_unleased(store, dependent, LinkKind::BlockedBy, target, step)
+        .await
+        .expect(CASE);
+    store
+        .finish_run(run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    let repo = integration_repo(CASE, store, "reviewed").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        target,
+        &[(&repo, IntegrateMode::PullRequest)],
+        &[repo.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    settle_landing(CASE, store, run, repo.id, owner, &landing_pushed()).await;
+    assert_eq!(
+        integration_states(CASE, store, run).await,
+        vec![(repo.id, IntegrationState::Pending)],
+        "{CASE}: the pushed record is pending"
+    );
+    assert!(
+        !ready_ids(CASE, store).await.contains(&dependent),
+        "{CASE}: a pushed but unmerged run branch holds the dependent"
+    );
+    let summary = store
+        .items(&platform_scope(), &ItemFilter::default())
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == target)
+        .unwrap_or_else(|| panic!("{CASE}: the target is listed"));
+    assert_eq!(
+        (summary.state(), summary.latest_run_landing),
+        (ItemState::Landing, Some(RunLanding::Pending)),
+        "{CASE}: the item reads `landing`"
+    );
+    assert!(
+        !store
+            .waiting_candidates(&platform_scope())
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.item.id == target),
+        "{CASE}: nothing is refused, so it waits on no one"
+    );
+}
+
+/// MOD-133 M3 D5: `retry_landing` moves only `refused` records, so a pushed `pull_request` record
+/// keeps its state, hash and timestamps, and the press answers `0`.
+async fn retry_landing_leaves_a_pushed_record_alone<S: WriteStore>(store: &S) {
+    const CASE: &str = "retry_landing_leaves_a_pushed_record_alone";
+    let owner = Uuid::now_v7();
+    let repo = integration_repo(CASE, store, "reviewed").await;
+    let item = minted(CASE, store, "pushed, then retried").await;
+    let run = integrated_run(
+        CASE,
+        store,
+        item,
+        &[(&repo, IntegrateMode::PullRequest)],
+        &[repo.id],
+        &[],
+        owner,
+        RunStatus::Done,
+    )
+    .await;
+    settle_landing(CASE, store, run, repo.id, owner, &landing_pushed()).await;
+    let before = integration_row(CASE, store, run, repo.id).await;
+    assert_eq!(
+        store.retry_landing(run).await.expect(CASE),
+        0,
+        "{CASE}: nothing of the run is refused"
+    );
+    assert_eq!(
+        integration_row(CASE, store, run, repo.id).await,
+        before,
+        "{CASE}: the pushed record is left alone"
     );
 }
 

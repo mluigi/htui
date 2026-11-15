@@ -12,7 +12,11 @@
 //! commits. A predicate that is too narrow only checks less (the target's tip is what is pushed),
 //! and one too wide is a visible `not_on_target` refusal, never a lost push.
 
-use htui_core::model::{RepoId, RunStep, RunStepCommit, StepId, StepRole, StepStatus};
+use std::collections::BTreeMap;
+
+use htui_core::model::{
+    GraphSnapshot, RepoId, RunStep, RunStepCommit, StepId, StepRole, StepStatus,
+};
 
 /// How many hex digits a hash is shown with in a reason or a note.
 pub const SHORT_HASH: usize = 7;
@@ -53,6 +57,18 @@ pub fn landed_commits(
     landed
 }
 
+/// MOD-133 M3 D2, D5: the run branch of each `pull_request` repo of the run, as frozen in its
+/// snapshot (`IntegrateSnapshot::run_branch`); empty for a `local` or `push` run, which then makes
+/// no run-branch call at all.
+#[must_use]
+pub fn run_branches(snapshot: &GraphSnapshot) -> BTreeMap<RepoId, String> {
+    snapshot
+        .integrate
+        .iter()
+        .filter_map(|(repo, entry)| Some((*repo, entry.run_branch.clone()?)))
+        .collect()
+}
+
 /// Whether `reconcile` merged `step` into the primary (the module's predicate).
 fn merged_into_primary(step: &RunStep) -> bool {
     step.status == StepStatus::Done
@@ -86,6 +102,16 @@ pub fn non_fast_forward(target: &str) -> String {
     format!("non_fast_forward: {target} on the remote has moved; merge it locally, then retry")
 }
 
+/// MOD-133 M3 D5: the remote's run branch is not an ancestor of the local one: `git push`
+/// refused the fast-forward, so the remote holds commits of the pull request this box lacks.
+#[must_use]
+pub fn run_branch_non_fast_forward(branch: &str) -> String {
+    format!(
+        "non_fast_forward: `{branch}` on the remote has commits this box lacks; merge them into \
+         the local branch, then retry"
+    )
+}
+
 /// Any other non-zero `git push`, with its scrubbed stderr line.
 #[must_use]
 pub fn push_failed(tail: &str) -> String {
@@ -99,7 +125,7 @@ mod tests {
     use htui_core::model::{RepoId, RunStep, RunStepCommit, StepId, StepRole, StepStatus};
     use uuid::Uuid;
 
-    use super::{landed_commits, not_on_target, short_hash};
+    use super::{landed_commits, not_on_target, run_branches, short_hash};
 
     fn repo(n: u128) -> RepoId {
         RepoId::from_uuid(Uuid::from_u128(0x200 + n))
@@ -228,6 +254,44 @@ mod tests {
         assert_eq!(
             landed_commits(&steps, &rows, repo(1)),
             ["plan", "integrate"]
+        );
+    }
+
+    /// MOD-133 M3 D2: only `integrate` entries with a run branch are run branches; a run with
+    /// none (`local`, `push`) answers an empty map.
+    #[test]
+    fn run_branches_are_the_pull_request_entries() {
+        use htui_core::fixtures::demo_data;
+        use htui_core::model::{GraphSnapshot, IntegrateMode, IntegrateSnapshot};
+
+        let run = demo_data()
+            .runs
+            .into_iter()
+            .find(|row| row.id == ids::RUN_1)
+            .expect("the fixture holds RUN_1");
+        let mut snapshot: GraphSnapshot =
+            serde_json::from_value(run.graph_snapshot.expect("RUN_1 carries a snapshot"))
+                .expect("the fixture snapshot is a `GraphSnapshot`");
+        assert!(run_branches(&snapshot).is_empty());
+
+        let entry = |mode, run_branch: Option<&str>| IntegrateSnapshot {
+            mode,
+            remote: "git@example.com:o/r.git".to_owned(),
+            target_branch: "main".to_owned(),
+            run_branch: run_branch.map(str::to_owned),
+        };
+        snapshot
+            .integrate
+            .insert(repo(1), entry(IntegrateMode::Push, None));
+        snapshot.integrate.insert(
+            repo(2),
+            entry(IntegrateMode::PullRequest, Some("htui/item/FEAT-3")),
+        );
+        assert_eq!(
+            run_branches(&snapshot),
+            [(repo(2), "htui/item/FEAT-3".to_owned())]
+                .into_iter()
+                .collect()
         );
     }
 

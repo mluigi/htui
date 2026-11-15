@@ -68,7 +68,7 @@ use crate::engine::{ControlFor, DeadWalks, PolicyFor, SessionKey, Tails};
 use crate::graph::GraphSource;
 use crate::isolate::{
     ChangedPaths, Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, IsolatorFuture, LandRequest,
-    PartTip, Prepared, PreparedTree, ResetReport,
+    PartTip, Prepared, PreparedTree, ResetReport, RunBranches,
 };
 use crate::tools::{ToolHost, ToolHostError, ToolLease, ToolScope};
 use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
@@ -204,6 +204,19 @@ pub struct FakeIsolator {
     land_answers: Mutex<VecDeque<std::result::Result<LandOutcome, IsolateError>>>,
     /// MOD-133 D8: every [`land`](Isolator::land) request, in call order.
     land_requests: Mutex<Vec<LandRequest>>,
+    /// MOD-133 M3 D3: every [`reconcile_onto`](Isolator::reconcile_onto) call's winner and run
+    /// branches (`None` for a plain `reconcile`), in call order; kept apart from
+    /// [`reconciles`](Self::reconciles) and the call log so their shapes do not change.
+    reconcile_onto_log: Mutex<Vec<ReconcileOnto>>,
+}
+
+/// One [`reconcile_onto`](Isolator::reconcile_onto) call as [`FakeIsolator`] saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileOnto {
+    /// The winner.
+    pub winner: StepId,
+    /// `onto`, owned: the run and its run branch per repo; `None` for a plain `reconcile`.
+    pub onto: Option<(RunId, BTreeMap<RepoId, String>)>,
 }
 
 /// One scripted `premerge` answer (by part key, blueprint P-15: part step ids are minted at
@@ -249,6 +262,8 @@ pub enum IsolatorCall {
     Reacquire(StepId),
     /// MOD-133 D8: `land` of one integration record, by its repo.
     Land(RepoId),
+    /// MOD-133 M3 D1: `run_branches`, the ensure of a `pull_request` run's run branches.
+    RunBranches,
 }
 
 /// Which of a step's two isolator windows is open (MOD-138 M3 T3).
@@ -810,6 +825,16 @@ impl FakeIsolator {
             .push_back(Err(err));
     }
 
+    /// MOD-133 M3 D3: every [`reconcile_onto`](Isolator::reconcile_onto) call so far, plain
+    /// `reconcile`s included (with `onto: None`), in call order.
+    #[must_use]
+    pub fn reconcile_onto_log(&self) -> Vec<ReconcileOnto> {
+        self.reconcile_onto_log
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
+    }
+
     /// MOD-133 D8: every [`land`](Isolator::land) request so far, in call order.
     #[must_use]
     pub fn land_requests(&self) -> Vec<LandRequest> {
@@ -1046,14 +1071,26 @@ impl Isolator for FakeIsolator {
     /// popped the queue would eat criterion 7's *second* scripted hash on the first step's advance
     /// and the loop would stop making sense. A step `capture` never ran for reports nothing, and
     /// `record_commits` over an empty batch writes nothing.
-    fn reconcile<'a>(
+    ///
+    /// MOD-133 M3 D3: `onto` is recorded for
+    /// [`reconcile_onto_log`](FakeIsolator::reconcile_onto_log) and changes nothing else: the
+    /// fake merges nothing, onto a run branch or anywhere.
+    fn reconcile_onto<'a>(
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
         siblings: &'a [StepId],
+        onto: Option<RunBranches<'a>>,
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
             self.log(IsolatorCall::Reconcile(winner));
+            self.reconcile_onto_log
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push(ReconcileOnto {
+                    winner,
+                    onto: onto.map(|onto| (onto.run, onto.branches.clone())),
+                });
             let call = {
                 let mut reconciles = self
                     .reconciles
@@ -1195,6 +1232,23 @@ impl Isolator for FakeIsolator {
             Ok(scope
                 .iter()
                 .map(|repo| (*repo, format!("fake:group-base:{repo}")))
+                .collect())
+        })
+    }
+
+    /// MOD-133 M3 D1: logged, then `fake:run-branch:<repo>` per repo: stable, and apart from
+    /// [`base`](Isolator::base)'s `fake:group-base:<repo>`, so a case can tell a step that
+    /// started from the run branch (D2) from one that started from `HEAD`. Only a
+    /// `pull_request` run calls it.
+    fn run_branches<'a>(
+        &'a self,
+        branches: &'a BTreeMap<RepoId, String>,
+    ) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
+        Box::pin(async move {
+            self.log(IsolatorCall::RunBranches);
+            Ok(branches
+                .keys()
+                .map(|repo| (*repo, format!("fake:run-branch:{repo}")))
                 .collect())
         })
     }
@@ -5025,5 +5079,61 @@ mod tests {
             .await
             .expect("the fake prepares");
         assert_eq!(isolator.in_place_overlaps(), 1, "alone, no overlap");
+    }
+
+    /// MOD-133 M3 D1, D3: `run_branches` is logged and answers its own synthetic tips; a plain
+    /// `reconcile` and a `reconcile_onto` both log `Reconcile`, and only the onto log tells them
+    /// apart.
+    #[tokio::test]
+    async fn run_branches_and_reconcile_onto_are_recorded() {
+        use crate::isolate::{Isolator as _, RunBranches};
+
+        let isolator = FakeIsolator::new();
+        let (repo, run, step) = (RepoId::new(), htui_core::model::RunId::new(), StepId::new());
+        let branches = BTreeMap::from([(repo, "htui/item/FEAT-3".to_owned())]);
+        assert_eq!(
+            isolator
+                .run_branches(&branches)
+                .await
+                .expect("the fake ensures"),
+            BTreeMap::from([(repo, format!("fake:run-branch:{repo}"))])
+        );
+        isolator
+            .reconcile(step, &[], &[])
+            .await
+            .expect("the fake reconciles");
+        isolator
+            .reconcile_onto(
+                step,
+                &[],
+                &[],
+                Some(RunBranches {
+                    run,
+                    branches: &branches,
+                }),
+            )
+            .await
+            .expect("the fake reconciles onto the run branch");
+        assert_eq!(
+            isolator.call_log(),
+            [
+                IsolatorCall::RunBranches,
+                IsolatorCall::Reconcile(step),
+                IsolatorCall::Reconcile(step)
+            ]
+        );
+        assert_eq!(
+            isolator.reconcile_onto_log(),
+            [
+                super::ReconcileOnto {
+                    winner: step,
+                    onto: None
+                },
+                super::ReconcileOnto {
+                    winner: step,
+                    onto: Some((run, branches.clone()))
+                },
+            ]
+        );
     }
 }

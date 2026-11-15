@@ -15,7 +15,15 @@
   Also refresh "Parallel runs" below: drop the closed ID and promote what it unblocked.
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-15):** **MOD-159 is done** (`docs/decisions/mod/mod-159.md`; M1 and M2 merged on main, M3
+**Current status (2026-11-15):** **MOD-133 is done** (`docs/decisions/mod/mod-133.md`; M1 and M2 merged on main, M3 on
+`hr/MOD-133`, to collect): each repo integrates `local` (default, unchanged), `push` (fast-forward of the remote's
+target branch by the executing box, never forced) or `pull_request` (steps land on a run branch `htui/item/<key>` in a
+detached landing worktree, which is pushed after `done`; the record waits for MOD-134 to open the PR; Settings keeps
+`pull_request` unselectable until then). Dependents wait for landed work; refused landings are waiting rows that
+`Unblock` retries. M3 adds no migration. Owed on the host: `scripts/hr collect MOD-133`, the merged-tree Postgres gate,
+and a real-network push (ssh and https) for both modes. MOD-135 and MOD-143 no longer wait on it; MOD-134 still waits
+on MOD-108.
+**MOD-159 is done** (`docs/decisions/mod/mod-159.md`; M1 and M2 merged on main, M3
 on `hr/MOD-159`, to collect): each Qdrant collection has one indexer, the holder of its `indexer_lease` row (worker or
 TUI); one collection per workspace (`htui_ws_<uuid>`) plus `htui_global` replace `htui_concepts_v2`; a 60 s
 incremental cycle runs between full reconciles; `Ctrl+R` and `--index-items` take a free lease, or ask the live holder
@@ -26,12 +34,7 @@ on it. Owed on the host: `scripts/hr collect MOD-159`, the merged-tree Postgres 
 `cache/` code).
 **ANA-42 is concluded** (`docs/decisions/ana/ana-42.md`): the maintainer accepted
 all six §8 decisions; MOD-130, MOD-131 and MOD-132 are no longer pending it, and MOD-43's queued-until-claimed rule
-now covers the enrolled kind only. **MOD-125 is done** (`docs/decisions/mod/mod-125.md`; merged on
-main): `htui stop [--force] <workspace>` and `htui resume <workspace>` stop every run of a workspace (graceful at
-the turn boundary, forced mid-turn) and resume each on its box through its saved session, confirmed by a prompt
-(`--yes`), with a report of how each run resumes. Migration `0037_stopped_run_index` (`0036` on the branch, renumbered behind MOD-122 M3's at the merge). Owed on the host: after the
-merge reinstall the MCP relay and `htui claude emit --force` on each box; the Postgres gate, the
-live-Qdrant suites and M3's live probes (`cli_live` 12-13, `isolation_live` `reopen`).
+now covers the enrolled kind only.
 Gate notes (TOOL-17, `docs/decisions/tool/tool-17.md`): `cargo-nextest` 0.9.151 is required (host:
 `~/.cargo/bin`; sandboxes: `scripts/hr build`, owed); a sandbox run on the old test layout that adds a
 `tests/<name>.rs` moves it under `tests/it/` at collect (TOOL-15); many Postgres cases failing `57P03` means the dev
@@ -42,15 +45,15 @@ MOD-152 (`docs/decisions/mod/mod-152.md`) is on `hr/MOD-152`, to collect.
 MOD-141 (`docs/decisions/mod/mod-141.md`): M3 is on `hr/MOD-141`, to collect. MOD-139
 (`docs/decisions/mod/mod-139.md`) still owes the host Qdrant suites and Postgres gate; its migration is
 `0029_divided_fanout` (MOD-97 took `0028`).
-MOD-143 waits on MOD-133.
-Earlier completions, MOD-149, MOD-122, TOOL-17, MOD-164, MOD-152, TOOL-16, TOOL-15, MOD-141, MOD-170, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
+Earlier completions, MOD-125, MOD-149, MOD-122, TOOL-17, MOD-164, MOD-152, TOOL-16, TOOL-15, MOD-141, MOD-170, MOD-139, MOD-97 and MOD-163 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
 text and others; `R-ENT-8`'s, §10.11 and, with MOD-133, §10.2 `R-ORCH-14` and §10.9 `R-ORCH-11` already applied) and ANA-40's (`R-TUI-7` and others). Open
 from ANA-29: **MOD-94** behind a maintainer decision. **MOD-99** (hard-coded Sentry DSN in a public
 repo) owes key rotation and a history rewrite, after the live `hr` branches merge. Owed on the host: the
-Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-17's `gate.ps1` test step and `-SelfTest`, TOOL-14's `gate.ps1
+Postgres gates on the merged tree (TOOL-8's included); MOD-125's MCP relay reinstall and `htui claude emit --force` on
+each box, with its live probes (`cli_live` 12-13, `isolation_live` `reopen`); the Windows runs (TOOL-17's `gate.ps1` test step and `-SelfTest`, TOOL-14's `gate.ps1
 -SelfTest`, TOOL-8's `claude -p "/gate fmt"` and `.ps1` commands, TOOL-9's `.ps1` gate files);
 TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-dev.md`); MOD-93's live
 install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; MOD-97's live `cli_live` case 11 (an inherited key, `apiKeySource` stays `none`) and Windows build of its
@@ -64,7 +67,7 @@ MOD-152's, MOD-158's, MOD-160's and MOD-163's live-Qdrant suites (`qdrant_live`,
 `htui provision` with a key; MOD-160's `gate.ps1` run and a real TUI launch against a down or keyless Qdrant; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), MOD-133 M1, MOD-130 M1, MOD-130 M2 and MOD-133 M2 (merged on main 2026-11-15), and MOD-159 (done 2026-11-15, `docs/decisions/mod/mod-159.md`; M1 and M2 on main, M3 on `hr/MOD-159`): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 349 after MOD-130 M2 and MOD-133 M2, neither with a migration), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection,
+Live coordinates after MOD-125, MOD-122, MOD-149, MOD-150, MOD-164 and MOD-152 (2026-11-14), MOD-133 M1, MOD-130 M1, MOD-130 M2 and MOD-133 M2 (merged on main 2026-11-15), and MOD-159 (done 2026-11-15, `docs/decisions/mod/mod-159.md`; M1 and M2 on main, M3 on `hr/MOD-159`): migrations run through `0040_execution_targets` (MOD-130 M1: `target` with the seeded local row, `box.kind`/`parent_box_id`, `target_id` on project/step_graph/item/run, `run.target_source`; mirrored by cache `0014_execution_targets`; `0037`/cache `0013` on its branch; `TABLES` 60, mirrored tables 25, store conformance `CASES` 354 after MOD-130 M2 and MOD-133 M2 and M3 (354 on `hr/MOD-133`, 349 on main until it is collected), none with a migration), before it `0039_integration` (MOD-133 M1: `integration`, one record per (run, repo), and nullable `repo.integrate`; mirrored by cache `0013_integration`), before it `0038_indexer_lease` (MOD-159 M1: `indexer_lease`, one lease row per Qdrant collection,
 `pass_requested_at` written since M3; not mirrored; `0036` on its branch; collections `htui_ws_<uuid>` per workspace and
 `htui_global`; the API MOD-112 (4), MOD-161 and MOD-167 plug into is `IndexerLeaseStore` (take, renew, release,
 `request_indexer_pass`, `claim_indexer_pass`), `take_or_request_pass` → `LeaseTurn::{Ours, Requested, Held}`,
@@ -115,19 +118,21 @@ items it follows are done.
 **Wave 1 (together)**
 
 - MOD-130: opus
-- MOD-133: opus
 - MOD-116: sonnet
 - MOD-127: sonnet
 - ANA-39: none (analysis)
 - MOD-43: opus
 - MOD-166: opus
 - MOD-112: opus
+- MOD-135: sonnet
+- MOD-143: opus
+- MOD-44: opus
 
 **Wave 2**
 
 - MOD-132: opus
-- MOD-135: sonnet
-- MOD-143: opus
+- MOD-136: opus
+- MOD-154: sonnet
 - MOD-117: sonnet
 - MOD-128: sonnet
 - MOD-161: sonnet
@@ -137,8 +142,6 @@ items it follows are done.
 **Wave 3**
 
 - MOD-118: sonnet
-- MOD-136: opus
-- MOD-154: sonnet
 - MOD-155: opus
 - MOD-129: opus
 
@@ -483,52 +486,15 @@ items it follows are done.
   positions -2 and -1 (`node_key` `prepare`, `collect`). MOD-139 is done (`docs/decisions/mod/mod-139.md`): the
   `stage` role and positions -3..-1 with these keys are reserved in `0029`; writing the rows is this item's.
   Blocked on MOD-130.
-- [ ] **MOD-133 - Integration records and modes (local, push, pull_request)** (from ANA-34,
-  `docs/ANA-34.md` §7.2-§7.4). `R-ORCH-14`, `R-ORCH-11`, `R-TUI-9`, `R-ENT-4`. Per-repo `integrate`
-  setting (`local`, the default and today's behaviour; `push`, fast-forward only, never forced;
-  `pull_request`) with a project default and a Settings form, snapshotted at run start; a run branch
-  `htui/item/<key>` for `pull_request` (`worktree` and `copy` isolation only); an `integration` record
-  per (run, repo) written by `finish_run(Done)`; an integrate arm of `sweep_once` on the executing box
-  with a lease, idempotence and park-with-refusal; an integration section in the close-out summary.
-  From ANA-35 (`docs/ANA-35.md` §7.1, §7.2): a `folder` repo (`repo.vcs`, MOD-145) integrates `local`
-  only, and the integration records extend the readiness "released" rule with the landed check at every
-  site (Pg, MemStore, and the cache, which mirrors the records). Not blocked (`pull_request` completes
-  with MOD-134).
-  **Phase 1 landed (`bfb2fd17..b8a4968f` on `hr/MOD-133`, 2026-11-15, merged on main 2026-11-15):** M1 records, `push` and the landed
-  check (PRD `.claude/prds/mod-133-integration-modes.prd.md`, plan
-  `.claude/plans/mod-133-m1-records-push-landed.plan.md`). `IntegrateMode`/`IntegrationState`, nullable
-  `repo.integrate` with a strict project default (`settings.integrate`), snapshotted at run start
-  (`GraphSnapshot.integrate`, absent for `local`, so local snapshots keep their bytes); a `pending`
-  `integration` record per non-`local` repo the run changed, written in `finish_run(Done)`; the
-  executing box lands it (walk right after `done`, sweep arm after the claims as recovery) under a lease:
-  `ls-remote` idempotence, fast-forward `git push` with the box's own credentials (never forced, batch
-  ssh, bounded network verbs), refusals `not_on_target`/`non_fast_forward`/`push_failed` with an item
-  note, transport failures retried; the landed check at all six readiness sites; an `## Integration`
-  close-out table. Requirement edits ANA-34 §10.2 and §10.9 applied. Migration `0039_integration`, cache
-  `0013_integration` (live coordinates above). Owed on the host: a real-network push over ssh and https
-  with the box's credentials (tests use local bare remotes only), and the merged-tree Postgres gate.
-  **Phase 2 landed (`56c0e5cb..4665aba2` on `hr/MOD-133`, 2026-11-15, merged on main 2026-11-15):** M2 Settings, visibility and
-  retry (plan `.claude/plans/mod-133-m2-settings-visibility-retry.plan.md`). The project default is the
-  project-only registry key `integrate` (`SettingKey::Integrate`, Settings > Prompt; cycles not set,
-  `local`, `push`); the repo mode is an `integrate` choice row of the Hierarchy repo editor; both refuse
-  `pull_request` (MOD-134) and a non-`local` mode without a remote URL (`IntegrateMode::selectable_refusal`).
-  Derived display states `landing` (`⇡`) and `landing refused` (`↯`) from the latest graph run's records
-  (`RunLanding`, `ItemState::of_landing`; `is_finished` is `done | landing | landing refused`, close-out
-  law unchanged for MOD-135), on Pg, Mem and the cache. A refused record is a `landing` waiting row, and
-  `Unblock` retries it (`UnblockCase::RetryLanding`, `WriteStore::retry_landing`; the executing process
-  lands at once under a walk token, other boxes by their sweep). No migration; conformance `CASES` 346
-  (349 on main with MOD-130 M2's three).
-  No demo item reads the landing states (the demo has no repos). Review fix round R1 (sweep/Unblock
-  double push, `Q` on a landing item, three lows). Commit `a4a22aa3` alone does not compile `htui`
-  (the next commit does; a squash at collect is the maintainer's call).
-  Remaining: M3 the `pull_request` run branch.
 - [ ] **MOD-134 - Forge adapter and push/forge credentials** (from ANA-34, `docs/ANA-34.md` §7.4,
   §7.5). `R-ORCH-14`, `R-BOX-4`, `R-STO-1`, `R-SEC-2`, `R-SEC-3`, `R-SEC-4`. A forge adapter with four
   verbs (push a branch, open or update a PR, set auto-merge, read PR state); OneDev REST first
   (`git.mluigi.it` runs OneDev), GitHub REST second; an htui credential helper for git children,
   reusing MOD-108's; forge tokens as keyring entries per base URL, scrubber masks, no fallback; the
   systemd-credential exception for headless workers; PR state polling. Credentials never reach an agent
-  environment. Blocked on MOD-108 and MOD-133.
+  environment. Blocked on MOD-108; MOD-133 is done (`docs/decisions/mod/mod-133.md`: a `pull_request` record
+  is `pending` with the pushed run branch head in `landed_hash`, skipped by `take_integrations` until this adapter widens
+  the filter and settles it `pr_open`).
 - [ ] **MOD-135 - Close-out checklist** (from ANA-34, `docs/ANA-34.md` §7.6). `R-TUI-9`, `R-ENT-8`,
   `R-ENT-15`, `R-ID-6`, `R-MCP-2`. A `CloseOut` waiting reason; a deterministic checklist (each run's
   integration outcome, the proposed resolution, suspect citations through `reconfirm`, follow-up drafts);
@@ -537,8 +503,8 @@ items it follows are done.
   re-confirmations; `done` requires landed work; auto mode never closes an item. Builds on MOD-144's
   close-out law (done, `docs/decisions/mod/mod-144.md`: `Resolution::closes_from(status, finished)`,
   `default_for` from the finished run's `graph_snapshot`) and adds finished-not-closed items as `CloseOut`
-  candidates; a parent closed with open children is flagged on the checklist (MOD-150's `parent`, done). Blocked on
-  MOD-133.
+  candidates; a parent closed with open children is flagged on the checklist (MOD-150's `parent`, done). MOD-133 is
+  done (`docs/decisions/mod/mod-133.md`).
   ANA-36 §7.2 adds design input: MOD-154's typed status request is the checklist's proposed resolution;
   follow-ups come from `item_create` drafts.
   MOD-161 (from ANA-37) shows related items beside its follow-up drafts, a later consumer of the draft store.
@@ -1126,8 +1092,8 @@ items it follows are done.
   item_id)`. The `subgraph` node with a frozen child snapshot and an item source (planner-named existing items, or
   ANA-35's `parent` children); one ordinary child run per item through the normal claim, capped by `max_child_runs`;
   done when every child is done, a failed child fails the node; the parent releases its per-box slot while it waits;
-  idempotent recovery; depth 1. MOD-138 is done (`docs/decisions/mod/mod-138.md`). Blocked on MOD-133
-  (child integration, from ANA-34); MOD-150's `parent` link is done (`docs/decisions/mod/mod-150.md`). ANA-35's status change shipped with MOD-144 (waiting is read from runs);
+  idempotent recovery; depth 1. MOD-138 is done (`docs/decisions/mod/mod-138.md`). MOD-133 is done
+  (`docs/decisions/mod/mod-133.md`, child integration from ANA-34); MOD-150's `parent` link is done (`docs/decisions/mod/mod-150.md`). ANA-35's status change shipped with MOD-144 (waiting is read from runs);
   whether a parent run waiting on its children needs a state beyond that is the plan's to check (`docs/ANA-33.md` §7.9).
 - [ ] **MOD-171 - Per-graph run bounds and the `runtime_changes` override** (from MOD-141's M2 plan,
   `.claude/plans/mod-141-m2-splits-palette-header.plan.md` M-1; ANA-33 §7.6, §7.8, §7.10). `R-ORCH-1`, `R-TUI-8`.
@@ -1259,6 +1225,6 @@ items it follows are done.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 5 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows) |
-| MOD-N   | 74 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-176 worktree resume without reflogs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 73 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-176 worktree resume without reflogs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-18 dev Postgres crash) |
