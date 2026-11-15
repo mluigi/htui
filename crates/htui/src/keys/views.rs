@@ -723,10 +723,13 @@ pub const MIGRATION: Stack<'static> = Stack::new(&[
 pub const ABORT_CONFIRM: Stack<'static> =
     Stack::new(&[Layer::only(Context::Editor, &[Act::EditorAbort]), QUIT]);
 
-/// The leave dialog (MOD-115 M2 D6): its own two answers, then `global ∩ {help}`. No quit layer:
-/// its `ctrl-c` is `leave.confirm`.
+/// The leave dialog (MOD-115 M2 D6): its own answers (MOD-116 M2 D9 added `leave.stop`), then
+/// `global ∩ {help}`. No quit layer: its `ctrl-c` is `leave.confirm`.
 pub const LEAVE: Stack<'static> = Stack::new(&[
-    Layer::view(Context::Leave, &[Act::LeaveConfirm, Act::LeaveStay]),
+    Layer::view(
+        Context::Leave,
+        &[Act::LeaveConfirm, Act::LeaveStay, Act::LeaveStop],
+    ),
     HELP,
 ]);
 
@@ -1768,6 +1771,9 @@ mod tests {
         assert_eq!(resolve(LEAVE, "n"), [Act::LeaveStay]);
         assert_eq!(resolve(LEAVE, "?"), [Act::Help]);
         assert_eq!(resolve(LEAVE, "f1"), [Act::Help]);
+        // MOD-116 M2 D9: `S` stops every live workspace gracefully first; `s` is nothing.
+        assert_eq!(resolve(LEAVE, "S"), [Act::LeaveStop]);
+        assert_eq!(resolve(LEAVE, "s"), []);
         for spec in ["q", "y", "Y"] {
             assert_eq!(resolve(LEAVE, spec), [], "{spec}");
         }

@@ -832,6 +832,9 @@ pub enum Act {
     LeaveConfirm,
     /// `leave.stay`: close the leave dialog and stay.
     LeaveStay,
+    /// `leave.stop`: stop every live workspace gracefully, wait for them, then leave (MOD-116 M2
+    /// D9).
+    LeaveStop,
     /// `field.submit`: a text field's submit (its canonical `Enter`, MOD-115 M2 D7).
     FieldSubmit,
     /// `field.cancel`: a text field's cancel (its canonical `Esc`).
@@ -2516,6 +2519,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     )
     .since(2),
     row(Act::LeaveStay, Leave, "stay", &["esc", "n"], "stay").since(2),
+    // MOD-116 M2 D9: stop every live workspace gracefully first, then leave.
+    row(Act::LeaveStop, Leave, "stop", &["S"], "stop gracefully first"),
     // [field]: MOD-115 M2 D7, a text field's editing keys: the `TextField`, `TextArea` and
     // `Composer` literals (text_field.rs, text_area.rs:236-239). All named keys, so in capture.
     capture_row(Act::FieldSubmit, Field, "submit", &["enter"], "submit").since(2),
@@ -3108,6 +3113,7 @@ mod tests {
         Act::ActivityFilter,
         Act::WorkspacesStop,
         Act::WorkspacesResume,
+        Act::LeaveStop,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -3368,6 +3374,7 @@ mod tests {
             Act::ActivityFilter => 251,
             Act::WorkspacesStop => 252,
             Act::WorkspacesResume => 253,
+            Act::LeaveStop => 254,
         }
     }
 
@@ -3405,8 +3412,8 @@ mod tests {
         // MOD-147 M3 D9: `settings.hierarchy.documents` and the documents pane's two, 250.
         // MOD-122 M3 D10: `activity.open` and `activity.filter`, 252.
         // MOD-116 M1 D10: `workspaces.open` took the retired `switcher.switch`'s row, still 252.
-        // MOD-116 M2 D10: `workspaces.stop` and `workspaces.resume`, 254.
-        assert_eq!(CATALOGUE.len(), 254);
+        // MOD-116 M2 D10: `workspaces.stop` and `workspaces.resume`, 254; `leave.stop`, 255.
+        assert_eq!(CATALOGUE.len(), 255);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
