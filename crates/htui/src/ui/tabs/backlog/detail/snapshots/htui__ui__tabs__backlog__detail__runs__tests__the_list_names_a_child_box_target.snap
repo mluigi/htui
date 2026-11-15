@@ -1,0 +1,17 @@
+---
+source: crates/htui/src/ui/tabs/backlog/detail/runs.rs
+expression: "drawn_at(&pane, &shell, PANE_WIDTH, 16).join(\"\\n\")"
+---
+kind   status      box          started
+mode                            finished
+graph  ● done      DESKTOP-HTUI 09-02 08:00
+manual                          09-02 12:00
+runs on docker-here · from item
+▸ prd             ● done            —  1h00
+    approved   claude/sonnet
+  plan            ● done          14k  1h00
+    approved   claude/sonnet
+  implement       ● done            —  1h00
+    approved   ~36k ! claude/opus
+  review          ● done            —  1h00
+    approved   agy/default
