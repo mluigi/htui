@@ -440,6 +440,19 @@ pub enum EngineError {
         /// The missing tags: byte order, deduplicated, never empty.
         missing: Vec<String>,
     },
+    /// MOD-130 M2 P10 (D1, D10): the target the cascade chose cannot run a run started here (a
+    /// kind this build does not run, a retired target, a box elsewhere, a target not `ready`).
+    /// Raised at enqueue, after resolution: no run row was written and the item is `blocked`
+    /// with the refusal's sentence as a note (`Engine::refuse_target`). Permanent until the
+    /// cascade or the target changes, so it is **not** [`EngineError::ClaimRefused`] and nothing
+    /// re-queues it.
+    #[error("item {item}: {refusal}")]
+    TargetRefused {
+        /// The item refused.
+        item: ItemId,
+        /// Why the run cannot start on the target.
+        refusal: htui_core::model::TargetRefusal,
+    },
     /// Plan D86: a heartbeat's refresh touched zero rows, so another orchestrator took the lease
     /// and the walk was dropped where it stood, writing nothing further (ANA-2 `:1280-1282`).
     ///
@@ -2118,6 +2131,23 @@ mod tests {
                 ids::WORKSPACE_PLATFORM
             ),
             "MOD-125 D5"
+        );
+        assert_eq!(
+            EngineError::TargetRefused {
+                item: ids::HTUI_FEAT_3,
+                refusal: htui_core::model::TargetRefusal::NotRunnable {
+                    name: "dev docker".to_owned(),
+                    kind: htui_core::model::TargetKind::Docker,
+                    owner: "MOD-44",
+                },
+            }
+            .to_string(),
+            format!(
+                "item {}: target dev docker is docker, which this build cannot run yet; \
+                 MOD-44 brings it",
+                ids::HTUI_FEAT_3
+            ),
+            "MOD-130 M2 P10: the enqueue refusal names the item and the target"
         );
         assert_eq!(
             EngineError::MissingTags {

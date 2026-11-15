@@ -8739,13 +8739,13 @@ async fn finish_chat_run_takes_the_step_first() {
     .await;
     answer.expect("the close lands");
     assert_eq!(
-        db.store
-            .run(run)
-            .await
-            .expect("read the run")
-            .map(|r| r.status),
-        Some(RunStatus::Done),
-        "the chat run is closed"
+        db.store.run(run).await.expect("read the run").map(|r| (
+            r.status,
+            r.target_id,
+            r.target_source
+        )),
+        Some((RunStatus::Done, None, None)),
+        "the chat run is closed, and records no target (MOD-130 M2 D17)"
     );
 
     db.drop_db().await;
