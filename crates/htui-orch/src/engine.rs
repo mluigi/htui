@@ -3916,11 +3916,18 @@ where
             let Some(reads) = read.as_ref() else {
                 continue;
             };
+            let run_branch = reads.run_branches.get(&record.repo_id).cloned();
+            if record.mode == htui_core::model::IntegrateMode::PullRequest && run_branch.is_none() {
+                // MOD-133 M3 D5: never M1's push of the target branch for a pull request.
+                tracing::warn!(run = %record.run_id, repo = %record.repo_id, "the run's snapshot names no run branch for this pull_request record; it stays pending");
+                continue;
+            }
             let request = LandRequest {
                 repo: record.repo_id,
                 remote: record.remote.clone(),
                 target_branch: record.target_branch.clone(),
                 commits: land::landed_commits(&reads.steps, &reads.commits, record.repo_id),
+                run_branch,
             };
             let outcome = match self.parts.isolator.land(&request).await {
                 Ok(outcome) => outcome,
@@ -3958,8 +3965,9 @@ where
                     land::short_hash(hash)
                 ),
                 LandOutcome::Pushed { hash } => format!(
-                    "integration pushed: repo `{repo}` run branch `the run branch` at {}; its \
-                     pull request against {target} waits for MOD-134",
+                    "integration pushed: repo `{repo}` run branch {} at {}; its pull request \
+                     against {target} waits for MOD-134",
+                    request.run_branch.as_deref().unwrap_or_default(),
                     land::short_hash(hash)
                 ),
                 LandOutcome::Refused { reason } => format!(
@@ -3974,9 +3982,18 @@ where
     }
 
     /// MOD-133 D9: what landing reads of one run: its item, its steps and their commit rows (as
-    /// [`Self::close_out_reads`] reads them).
+    /// [`Self::close_out_reads`] reads them), and (M3 D5) its snapshot's run branches. A snapshot
+    /// that does not decode is warned and read as naming none, which leaves the run's
+    /// `pull_request` records `pending` rather than failing the pass.
     async fn land_reads(&self, run: RunId) -> Result<LandReads, EngineError> {
         let row = self.run(run).await?;
+        let run_branches = match Self::snapshot_of(&row) {
+            Ok(snapshot) => land::run_branches(&snapshot),
+            Err(err) => {
+                tracing::warn!(%run, %err, "landing could not read the run's snapshot; it names no run branch");
+                BTreeMap::new()
+            }
+        };
         let steps = self.parts.store.run_steps(run).await?;
         let mut commits = Vec::with_capacity(steps.len());
         for step in &steps {
@@ -3987,6 +4004,7 @@ where
             item: row.item_id,
             steps,
             commits,
+            run_branches,
         })
     }
 
@@ -11104,6 +11122,8 @@ struct LandReads {
     steps: Vec<RunStep>,
     /// Every step's `run_step_commit` rows.
     commits: Vec<(StepId, Vec<RunStepCommit>)>,
+    /// MOD-133 M3 D5: the run branch of each `pull_request` repo ([`land::run_branches`]).
+    run_branches: BTreeMap<RepoId, String>,
 }
 
 /// Stage 3's two outcomes that are the run's own rather than an engine fault (blueprint D195).

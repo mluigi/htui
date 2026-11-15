@@ -37,7 +37,8 @@ use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteSto
 use htui_orch::Isolator;
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::isolate::{
-    ChangedPaths, EnvFiles, FanoutSlot, IsolatorFuture, LandRequest, PartTip, Prepared, ResetReport,
+    ChangedPaths, EnvFiles, FanoutSlot, IsolatorFuture, LandRequest, PartTip, Prepared,
+    ResetReport, RunBranches,
 };
 use htui_orch::{Command, CommandOutcome, UnblockCase};
 use htui_store::Backend;
@@ -603,13 +604,21 @@ impl<B: BeforeLand> Isolator for Watched<B> {
         self.inner.env_files(cwd, extra_dirs)
     }
 
-    fn reconcile<'a>(
+    fn run_branches<'a>(
+        &'a self,
+        branches: &'a BTreeMap<RepoId, String>,
+    ) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
+        self.inner.run_branches(branches)
+    }
+
+    fn reconcile_onto<'a>(
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
         siblings: &'a [StepId],
+        onto: Option<RunBranches<'a>>,
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
-        self.inner.reconcile(winner, trees, siblings)
+        self.inner.reconcile_onto(winner, trees, siblings, onto)
     }
 
     fn premerge<'a>(

@@ -108,7 +108,22 @@ pub struct FanoutSlot<'a> {
     /// The phase's `fan_out`: how many candidates the group holds.
     pub width: i32,
     /// The group's base per repo of the scope.
+    ///
+    /// MOD-133 M3 D2: a `pull_request` step's width-1 slot holds the run branches' tips
+    /// ([`Isolator::run_branches`]), so its trees start from the run branch, not from `HEAD`.
     pub base: &'a BTreeMap<RepoId, String>,
+}
+
+/// MOD-133 M3 D3: where [`Isolator::reconcile_onto`] lands a `pull_request` run's steps: the run,
+/// whose landing trees live under its scratch directory, and the run branch per repo
+/// (`IntegrateSnapshot::run_branch`). A repo not in `branches` reconciles into its primary as
+/// [`Isolator::reconcile`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunBranches<'a> {
+    /// The run the step belongs to.
+    pub run: RunId,
+    /// `refs/heads/<branch>` per repo, the branch name without `refs/heads/`.
+    pub branches: &'a BTreeMap<RepoId, String>,
 }
 
 /// Plan D92/D99: what [`Isolator::reset`] did. **`refused` non-empty ⇒ nothing was reset.**
@@ -162,12 +177,17 @@ pub struct LandRequest {
     /// The run's landed commits in the repo ([`crate::land::landed_commits`]), each of which must
     /// be an ancestor of the local target branch; empty pushes the target branch as it is.
     pub commits: Vec<String>,
+    /// MOD-133 M3 D5: a `pull_request` record's run branch (`IntegrateSnapshot::run_branch`).
+    /// `Some` pushes `refs/heads/<run branch>` instead of the target branch, whose commits must be
+    /// its ancestors; `None` is M1's `push` landing.
+    pub run_branch: Option<String>,
 }
 
 /// ANA-2 §4.6's four verbs plus four reads (milestone 4's two, `changed_paths`, MOD-9 D119, and
 /// `env_files`, MOD-89), milestone 5's two recovery verbs, MOD-139 M3's pre-merge verb and
-/// post-check read, MOD-125 M3's `reacquire` and MOD-133's `land`; the four are named there
-/// verbatim (`docs/ANA-2.md:1769`), and all fourteen sit behind plan D6's seam.
+/// post-check read, MOD-125 M3's `reacquire`, MOD-133's `land` and MOD-133 M3's `run_branches`
+/// and `reconcile_onto`; the four are named there verbatim (`docs/ANA-2.md:1769`), and all sit
+/// behind plan D6's seam.
 ///
 /// **An isolator touches no store.** The engine persists what these return —
 /// `upsert_step_tree` after [`prepare`](Isolator::prepare), `record_commits` after
@@ -220,6 +240,19 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// come from candidate 0's own `prepare`.
     fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>>;
 
+    /// MOD-133 M3 D1: makes sure each `refs/heads/<branch>` of `branches` exists in its repo's
+    /// checkout, and answers its tip, keyed by repo. Per repo, under that repo's admin lock: a
+    /// branch checked out in any worktree, the primary included, is refused
+    /// (`real::run_branch_checked_out`); an absent one is created at the checkout's `HEAD`; one
+    /// that is an ancestor of `HEAD` is fast-forwarded to it by compare-and-swap; a diverged one
+    /// is kept as it is (a re-run continues the same pull request). The checkout's `HEAD`, index
+    /// and files are never touched. All the state is in git, so a crash or an adoption simply
+    /// ensures again.
+    fn run_branches<'a>(
+        &'a self,
+        branches: &'a BTreeMap<RepoId, String>,
+    ) -> IsolatorFuture<'a, BTreeMap<RepoId, String>>;
+
     /// MOD-4 milestone 4 D54(c), D55: the step's work as a [`DiffBlock`], over its `run_step_tree`
     /// rows and the `run_step_commit` rows recorded for them.
     ///
@@ -265,11 +298,30 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// the winner alone and leave the losers' `htui/<step>` labels where they are;
     /// `shared_serialized` moves the checked-out branch to the winner's label, which is safe only
     /// when the checkout is clean and sits at the group's base or at a sibling's label (D56).
+    ///
+    /// [`reconcile_onto`](Isolator::reconcile_onto) with no run branches.
     fn reconcile<'a>(
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
         siblings: &'a [StepId],
+    ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
+        self.reconcile_onto(winner, trees, siblings, None)
+    }
+
+    /// [`reconcile`](Isolator::reconcile), with MOD-133 M3 D3's run branches: a `worktree` or
+    /// `copy` tree whose repo is in `onto` is merged `--no-ff` onto that repo's run branch in a
+    /// detached landing worktree of the run (`<scratch root>/<run>/landing/<repo name>`), and the
+    /// branch moves to the merge by compare-and-swap; the primary's `HEAD`, index and files are
+    /// never touched. A merge the run branch already holds is answered, not repeated (D136). An
+    /// in-place tree of such a repo is refused (`real::run_branch_in_place`). Every other tree
+    /// reconciles as `reconcile` does.
+    fn reconcile_onto<'a>(
+        &'a self,
+        winner: StepId,
+        trees: &'a [RunStepTree],
+        siblings: &'a [StepId],
+        onto: Option<RunBranches<'a>>,
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>>;
 
     /// MOD-139 M3 D2, D3: integrate's pre-merge. Per tree row (repo), in plan order: a part with
@@ -365,6 +417,13 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// exit 0, `Refused("non_fast_forward: …")` when the remote moved, and
     /// `Refused("push_failed: …")` for any other failure. Remote URLs in a reason carry no
     /// userinfo.
+    ///
+    /// MOD-133 M3 D5: with `request.run_branch` set, the run branch is what lands: no local
+    /// `refs/heads/<run branch>` is `Refused("no_run_branch: …")`, a commit not on it is
+    /// `not_on_target` naming it, a run branch the local target branch already holds is `Landed`
+    /// at its tip with nothing pushed, a remote that already holds it is `Pushed` with nothing
+    /// pushed, and otherwise it is pushed (created, never forced) and answered `Pushed { tip }`;
+    /// a remote run branch with commits this box lacks is `Refused("non_fast_forward: …")`.
     ///
     /// An `Err` (no usable `git`, a verb past its budget) is not a refusal: the engine leaves the
     /// record `pending` for the next sweep.

@@ -643,6 +643,46 @@ impl Cli {
         worktree_post_condition(repo, path, base).await
     }
 
+    /// MOD-133 M3 D3: `git worktree add --lock --reason "htui run <run>" --detach <path> <at>`,
+    /// run in the managed checkout: a run's landing tree, detached at its run branch's tip so the
+    /// branch is never checked out anywhere and moves only by compare-and-swap.
+    ///
+    /// The post-conditions are [`add_worktree`](Cli::add_worktree)'s: the new tree's `HEAD` is
+    /// `at`, and the main repository lists a locked entry at `path`.
+    ///
+    /// # Errors
+    /// As [`add_worktree`](Cli::add_worktree).
+    pub async fn add_detached_worktree(
+        &self,
+        repo: &Path,
+        path: &Path,
+        run: RunId,
+        at: &str,
+    ) -> Result<(), IsolateError> {
+        let reason = format!("htui run {run}");
+        let exited = self
+            .run(
+                "worktree add",
+                repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("--lock"),
+                    OsStr::new("--reason"),
+                    OsStr::new(&reason),
+                    OsStr::new("--detach"),
+                    path.as_os_str(),
+                    OsStr::new(at),
+                ],
+                &[],
+            )
+            .await?;
+        if !exited.ok() {
+            return Err(exited.failure("worktree add"));
+        }
+        worktree_post_condition(repo, path, at).await
+    }
+
     /// D23 and D46: `git worktree remove --force --force <path>`, run in the managed checkout.
     ///
     /// One `--force` for a dirty tree and the second for a locked one — ours are always both. A
@@ -2195,6 +2235,64 @@ pub fn create_branch(path: &Path, name: &str, target: &str) -> Result<(), Isolat
     )
     .map(|_| ())
     .map_err(|err| IsolateError::Git(format!("cannot create refs/heads/{name}: {err}")))
+}
+
+/// MOD-133 M3 D1, D3: moves `refs/heads/<name>` from `from` to `to` by compare-and-swap
+/// (`PreviousValue::MustExistAndMatch`): a branch that is absent, or no longer at `from`, is
+/// refused and left where it is. Called through [`with_retry`], as [`create_branch`] is.
+///
+/// # Errors
+/// [`IsolateError::Git`] when a hash is not a hash, the repository cannot be opened, or the
+/// compare-and-swap fails.
+pub fn move_branch(path: &Path, name: &str, from: &str, to: &str) -> Result<(), IsolateError> {
+    let (from, to) = (parse_oid(from)?, parse_oid(to)?);
+    let repo = open(path)?;
+    repo.reference(
+        format!("refs/heads/{name}"),
+        to,
+        gix::refs::transaction::PreviousValue::MustExistAndMatch(gix::refs::Target::Object(from)),
+        "htui: run branch",
+    )
+    .map(|_| ())
+    .map_err(|err| IsolateError::Git(format!("cannot move refs/heads/{name} from {from}: {err}")))
+}
+
+/// MOD-133 M3 D1: where `full_ref` (`refs/heads/<name>`) is checked out: `main` itself when its
+/// `HEAD` names it, else the base of the first linked worktree whose `HEAD` file names it, else
+/// `None`. A run branch checked out anywhere must not be moved by `update-ref` (probe C12): that
+/// tree's index and files would be left behind its `HEAD`.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the repository cannot be opened, its `HEAD` read, or its
+/// `worktrees/` directory listed.
+pub fn checked_out_at(main: &Path, full_ref: &str) -> Result<Option<PathBuf>, IsolateError> {
+    let repo = open(main)?;
+    let head = repo.head_name().map_err(|err| {
+        IsolateError::Git(format!("cannot read HEAD of {}: {err}", main.display()))
+    })?;
+    if head.is_some_and(|name| name.as_bstr() == full_ref) {
+        return Ok(Some(main.to_path_buf()));
+    }
+    let proxies = repo.worktrees().map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot list the worktrees of {}: {err}",
+            main.display()
+        ))
+    })?;
+    for proxy in proxies {
+        // A worktree's `HEAD` is a file in its administrative entry: `ref: <name>` when it is on
+        // a branch, a hash when detached. An entry whose file cannot be read checks nothing out.
+        let Ok(text) = std::fs::read_to_string(proxy.git_dir().join("HEAD")) else {
+            continue;
+        };
+        if text.trim().strip_prefix("ref:").map(str::trim) == Some(full_ref) {
+            let base = proxy
+                .base()
+                .unwrap_or_else(|_| proxy.git_dir().to_path_buf());
+            return Ok(Some(canonical(&base)));
+        }
+    }
+    Ok(None)
 }
 
 /// What `refs/heads/<name>` points at, or `None` when it does not exist
