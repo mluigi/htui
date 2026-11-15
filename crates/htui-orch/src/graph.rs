@@ -1483,7 +1483,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
     // (a stale `<repo>:` glob, a negative position, a pin naming no version) refuses the clone
     // whole and leaves no orphan graph.
     let sources: Vec<PhaseId> = rows.iter().map(|node| node.phase.id).collect();
-    let copies: Vec<Binding> = store
+    let phase_rows: Vec<Binding> = store
         .skill_bindings(BindingHome::Project(item.project_id))
         .await?
         .into_iter()
@@ -1493,6 +1493,33 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                 .is_some_and(|phase| sources.contains(&phase))
         })
         .collect();
+    // MOD-127 M2: `skill_bindings` lists both kinds and a row's `skill_id` holds its `ref_id`
+    // whichever it is, so each row is told apart by the table its id is found in. A server
+    // attachment is copied like a skill's, under its own kind; an id found in neither is the
+    // `NotFound` the writer would answer.
+    let mut copies: Vec<(Binding, BindingRef)> = Vec::new();
+    let mut skills = Vec::new();
+    if !phase_rows.is_empty() {
+        skills = store.skills().await?;
+        let servers = store.mcp_servers().await?;
+        for binding in phase_rows {
+            let target = if skills.iter().any(|skill| skill.id == binding.skill_id) {
+                BindingRef::Skill(binding.skill_id)
+            } else if let Some(server) = servers
+                .iter()
+                .find(|server| server.id.as_uuid() == binding.skill_id.as_uuid())
+            {
+                BindingRef::McpServer(server.id)
+            } else {
+                return Err(StoreError::NotFound {
+                    entity: "skill",
+                    id: binding.skill_id.to_string(),
+                }
+                .into());
+            };
+            copies.push((binding, target));
+        }
+    }
     if !copies.is_empty() {
         let repos: Vec<String> = store
             .repos(item.project_id)
@@ -1504,22 +1531,24 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
             .project(item.project_id)
             .await?
             .map_or_else(|| item.project_id.to_string(), |project| project.slug);
-        let skills = store.skills().await?;
-        for binding in &copies {
-            let skill_name = skills
-                .iter()
-                .find(|skill| skill.id == binding.skill_id)
-                .map(|skill| skill.name.as_str())
-                .ok_or_else(|| StoreError::NotFound {
-                    entity: "skill",
-                    id: binding.skill_id.to_string(),
-                })?;
-            let versions: Vec<i32> = store
-                .skill_versions(binding.skill_id)
-                .await?
-                .into_iter()
-                .map(|version| version.version)
-                .collect();
+        for (binding, target) in &copies {
+            // A server has no name to quote in a pin sentence and no versions: its chain
+            // refuses a pin whole, whatever this says.
+            let (skill_name, versions): (&str, Vec<i32>) = match *target {
+                BindingRef::Skill(skill_id) => (
+                    skills
+                        .iter()
+                        .find(|skill| skill.id == skill_id)
+                        .map_or("", |skill| skill.name.as_str()),
+                    store
+                        .skill_versions(skill_id)
+                        .await?
+                        .into_iter()
+                        .map(|version| version.version)
+                        .collect(),
+                ),
+                BindingRef::McpServer(_) => ("", Vec::new()),
+            };
             // The copy's key names the cloned phase, which is minted only once the clone is
             // written. The key here names the source phase instead, and `phase_project` is the
             // project the writer will find for the cloned phase: the clone is a graph of
@@ -1528,7 +1557,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
             check_attachment(
                 &BindingFacts {
                     key: BindingKey {
-                        target: BindingRef::Skill(binding.skill_id),
+                        target: *target,
                         workspace: None,
                         project: Some(item.project_id),
                         item_kind: None,
@@ -1706,14 +1735,14 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
 
     // Every phase-level attachment of a source phase, onto its clone (D80). Project and global
     // rows apply to the clone already; a copy of them would be a second row at the same level.
-    for binding in &copies {
+    for (binding, target) in &copies {
         let Some(source) = binding.phase_id else {
             continue;
         };
         let Some(&(_, phase)) = cloned.iter().find(|(old, _)| *old == source) else {
             continue;
         };
-        let key = BindingKey::phase(binding.skill_id, item.project_id, phase);
+        let key = BindingKey::phase(*target, item.project_id, phase);
         let copy = BindingChange::Attach(Attachment::of(binding));
         if let CasOutcome::Stale(_) = store.set_skill_binding(key, None, copy).await? {
             // A fresh phase id has no row; a `Stale` here is a store bug, said rather than hidden.
@@ -3554,6 +3583,92 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 .count(),
             1,
             "the item-kind row is not copied"
+        );
+    }
+
+    /// MOD-127 M2: `skill_bindings` lists both kinds, so the clone must tell a server row from a
+    /// skill row. A phase-level `mcp_server` attachment no longer refuses the clone with `NotFound
+    /// skill`; it is copied onto the cloned phase beside the skill's, as a server row.
+    #[tokio::test]
+    async fn override_clone_copies_a_phase_level_mcp_attachment() {
+        use htui_core::model::{
+            Activation, Attachment, BindingChange, BindingKey, McpServerId, McpTransport,
+            NewMcpServer,
+        };
+
+        let store = MemStore::demo();
+        let item = feat_1(&store).await;
+        let source = TestSource::claude(&store);
+        let server = store
+            .create_mcp_server(NewMcpServer {
+                id: McpServerId::new(),
+                name: "docs".to_owned(),
+                description: String::new(),
+                transport: McpTransport::Stdio,
+                command: "mcp-docs".to_owned(),
+                args: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                env: Vec::new(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("create a server");
+        store
+            .set_skill_binding(
+                BindingKey::phase(server.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
+                None,
+                BindingChange::Attach(Attachment {
+                    pinned_version: None,
+                    position: 3,
+                    activation: Activation::Always,
+                    globs: Vec::new(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("the attach is legal");
+
+        let clone = override_graph(&store, &source, &item)
+            .await
+            .expect("a server attachment does not refuse the clone");
+
+        let cloned = store
+            .phases(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        let implement = cloned
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        let scope = ResolveScope::project(ids::PROJECT_HTUI, Some(implement.id));
+        let bound = GraphSource::bound_mcp_servers(&store, scope)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            bound.len(),
+            1,
+            "the cloned implement phase binds the server too: {bound:?}"
+        );
+        let copies: Vec<Binding> = store
+            .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .filter(|row| row.phase_id == Some(implement.id))
+            .collect();
+        assert_eq!(
+            copies.len(),
+            2,
+            "one skill copy and one server copy on the clone: {copies:?}"
+        );
+        assert!(
+            copies
+                .iter()
+                .any(|row| row.skill_id.as_uuid() == server.id.as_uuid() && row.position == 3),
+            "the server's copy keeps its position: {copies:?}"
         );
     }
 
