@@ -13,20 +13,25 @@ use crate::ui::tabs::backlog::{BacklogTab, QueueIntent};
 pub(super) const NO_ITEM_TO_QUEUE: &str = "select an item to queue";
 
 impl BacklogTab {
-    /// MOD-12 D9: `Q`. A finished item (MOD-144: state `done` or `closed`) is refused here and
-    /// nothing is sent; any other reads the queue first, and the reply decides between queue and
-    /// dequeue.
+    /// MOD-12 D9: `Q`. A finished item (MOD-144: its latest graph run is `done`, landed or not,
+    /// MOD-133 M2 R1) or a `closed` one is refused here and nothing is sent: queued, it would
+    /// never be ready again. Any other reads the queue first, and the reply decides between queue
+    /// and dequeue.
     pub(super) fn toggle_queued(&mut self, ctx: &Ctx<'_>) {
         let Some(item) = self.item() else {
             ctx.emit(Action::Error(NO_ITEM_TO_QUEUE.to_owned()));
             return;
         };
         let state = item.state();
-        if matches!(state, ItemState::Done | ItemState::Closed) {
+        if state.is_finished() || state == ItemState::Closed {
+            // `landing` and `landing refused` are a done run still landing: said as done.
+            let is = match state {
+                ItemState::Landing | ItemState::LandRefused => format!("done ({})", state.word()),
+                other => other.word().to_owned(),
+            };
             ctx.emit(Action::Error(format!(
-                "{} is {}: nothing to queue",
-                item.key,
-                state.word()
+                "{} is {is}: nothing to queue",
+                item.key
             )));
             return;
         }

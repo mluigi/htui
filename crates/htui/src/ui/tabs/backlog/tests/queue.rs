@@ -224,3 +224,61 @@ async fn a_queue_write_names_its_item_after_the_list_dropped_it() {
         "named by its key, not its id: {actions:?}"
     );
 }
+
+/// MOD-133 M2 R1 (F2): an item whose latest graph run is done but not landed (`landing`,
+/// `landing refused`) is finished, so `Q` refuses it as it refuses a `done` one, and reads
+/// nothing: queued, it would never be ready again.
+#[tokio::test]
+async fn q_on_a_landing_item_queues_nothing() {
+    use htui_core::model::{ItemState, RunLanding};
+
+    let bench = Bench::new().await;
+    for (landing, state, refusal) in [
+        (
+            RunLanding::Pending,
+            ItemState::Landing,
+            "ANA-1 is done (landing): nothing to queue",
+        ),
+        (
+            RunLanding::Refused,
+            ItemState::LandRefused,
+            "ANA-1 is done (landing refused): nothing to queue",
+        ),
+    ] {
+        let items: Vec<ItemSummary> = bench
+            .items
+            .iter()
+            .cloned()
+            .map(|mut item| {
+                if item.key == "ANA-1" {
+                    item.latest_run_landing = Some(landing);
+                }
+                item
+            })
+            .collect();
+        let ana_1 = items
+            .iter()
+            .find(|item| item.key == "ANA-1")
+            .expect("the demo's Platform holds ANA-1");
+        assert_eq!(ana_1.state(), state, "ANA-1's run is done");
+        let mut tab = BacklogTab {
+            selected: Some(Selection::Item(ana_1.id)),
+            items: items.clone(),
+            ..bench.tab()
+        };
+
+        press(&mut tab, &bench, KeyCode::Char('Q'));
+        let actions = bench.actions();
+        assert_eq!(
+            queue_requests(&actions),
+            Vec::<String>::new(),
+            "{actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Error(status) if status == refusal)),
+            "{actions:?}"
+        );
+    }
+}
