@@ -85,7 +85,7 @@ pub(super) enum FormOutcome {
     /// The form took it; nothing for the tab to do.
     Stay,
     /// Send this; the form is busy until its reply.
-    Submit(StoreRequest),
+    Submit(Box<StoreRequest>),
     /// The form refused to submit; it says why itself, under the fields.
     Refused,
     /// `Esc`: close the form.
@@ -220,12 +220,12 @@ impl WorkspaceForm {
         };
         self.error = None;
         self.busy = Some(0);
-        FormOutcome::Submit(StoreRequest::NewWorkspace {
+        FormOutcome::Submit(Box::new(StoreRequest::NewWorkspace {
             slug: text(&self.slug).trim().to_owned(),
             name: text(&self.name).trim().to_owned(),
             description: text(&self.description).to_owned(),
             folder: folder.display().to_string(),
-        })
+        }))
     }
 
     /// Says `why` under the form.
@@ -586,13 +586,13 @@ impl ProjectForm {
         };
         self.error = None;
         self.busy = Some(0);
-        FormOutcome::Submit(StoreRequest::NewProject {
+        FormOutcome::Submit(Box::new(StoreRequest::NewProject {
             workspace: self.workspace,
             slug: self.slug().to_owned(),
             name: text(&self.name).trim().to_owned(),
             description: text(&self.description).to_owned(),
             source,
-        })
+        }))
     }
 
     /// Says `why` under the form.
@@ -957,11 +957,14 @@ mod tests {
         // The default folder is sent absolute, under the tab's home.
         let mut form = WorkspaceForm::new(Some(home));
         type_into_workspace(&mut form, "Mobile App");
-        let FormOutcome::Submit(StoreRequest::NewWorkspace {
-            slug, name, folder, ..
-        }) = workspace_key(&mut form, "enter")
-        else {
+        let FormOutcome::Submit(request) = workspace_key(&mut form, "enter") else {
             panic!("the form submits");
+        };
+        let StoreRequest::NewWorkspace {
+            slug, name, folder, ..
+        } = *request
+        else {
+            panic!("a new workspace");
         };
         assert_eq!(
             (slug.as_str(), name.as_str(), folder.as_str()),
@@ -1048,10 +1051,11 @@ mod tests {
               MOD-145"
             ]
         );
-        let FormOutcome::Submit(StoreRequest::NewProject { source, slug, .. }) =
-            project_key(&mut form, "enter")
-        else {
+        let FormOutcome::Submit(request) = project_key(&mut form, "enter") else {
             panic!("the form submits");
+        };
+        let StoreRequest::NewProject { source, slug, .. } = *request else {
+            panic!("a new project");
         };
         assert_eq!(slug, "app");
         assert_eq!(
@@ -1080,10 +1084,13 @@ mod tests {
         form.on_paste("https://me:secret@example.com/app.git");
         assert!(matches!(
             project_key(&mut form, "enter"),
-            FormOutcome::Submit(StoreRequest::NewProject {
-                source: ProjectSource::Clone { .. },
-                ..
-            })
+            FormOutcome::Submit(request) if matches!(
+                *request,
+                StoreRequest::NewProject {
+                    source: ProjectSource::Clone { .. },
+                    ..
+                }
+            )
         ));
         form.tick();
         form.tick();

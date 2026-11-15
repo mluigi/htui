@@ -180,13 +180,13 @@ and says why on the status line; update `htui` to connect.
 
 Everything happens in a **workspace**. Press `w` for the **Workspaces** tab, select one and press
 `o` to open it; htui reopens the last one you opened when it starts. If the database has none yet,
-create one in **Settings › Hierarchy** with `N`.
+press `N` on the Workspaces tab to create one.
 
 `htui` has seven tabs. Switch with `Ctrl+PgDn` / `Ctrl+PgUp` or the number keys `1` to `7`.
 
 | Tab | What it is for |
 |---|---|
-| **1 Workspaces** | Every workspace with its state (open, in the background, stopping, stopped) and an overview of each, its runs and its projects; `o` opens one, `s` stops its runs, `r` resumes them. |
+| **1 Workspaces** | Every workspace with its state (open, in the background, stopping, stopped) and an overview of each, its runs and its projects; `o` opens one, `s` stops its runs, `r` resumes them, `N` creates a workspace or a project (an existing git folder, a git URL it clones, or a new repo). |
 | **2 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
 | **3 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
 | **4 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |

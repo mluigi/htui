@@ -1110,10 +1110,10 @@ impl WorkspacesTab {
         match outcome {
             FormOutcome::Stay | FormOutcome::Refused => {}
             FormOutcome::Submit(request) => {
-                if let StoreRequest::NewProject { slug, .. } = &request {
+                if let StoreRequest::NewProject { slug, .. } = request.as_ref() {
                     self.creating = Some(slug.clone());
                 }
-                ctx.request(request);
+                ctx.request(*request);
             }
             FormOutcome::Cancel => {
                 let out = matches!(&self.mode, Mode::Project(form) if form.is_busy());
@@ -1131,7 +1131,7 @@ impl WorkspacesTab {
     /// cursor lands on its group. It is not opened, unless the shell's scope names no workspace
     /// the tab lists (a first start), so the shell is never left without one.
     fn workspace_created(&mut self, workspace: &WorkspaceSummary, ctx: &Ctx<'_>) {
-        if self.mode.has_form() && matches!(self.mode, Mode::Workspace(_)) {
+        if matches!(self.mode, Mode::Workspace(_)) {
             self.mode = Mode::Browse;
         }
         self.land_on = Some(Entry::Workspace(workspace.workspace_id));

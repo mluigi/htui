@@ -18,7 +18,7 @@ no workspace   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  
 │                                                ││                                                │
 │                                                ││                                                │
 │               No workspaces yet.               ││               No workspaces yet.               │
-│     `N` in Settings › Hierarchy creates one    ││     `N` in Settings › Hierarchy creates one    │
+│                 `N` creates one                ││                 `N` creates one                │
 │                                                ││                                                │
 │                                                ││                                                │
 │                                                ││                                                │
@@ -31,4 +31,4 @@ no workspace   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  
 │                                                ││                                                │
 │                                                ││                                                │
 │                                                ││                                                │
-╰─o open · j/k move · Enter fold─────────────────╯╰────────────────────────────────────────────────╯
+╰─o open · N new · j/k move · Enter fold─────────╯╰────────────────────────────────────────────────╯
