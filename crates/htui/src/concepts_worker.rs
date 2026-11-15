@@ -74,7 +74,9 @@ pub enum IndexOutcome {
     /// no pass request could be recorded (it let go and was taken again at every attempt).
     HeldBy(IndexerLease),
     /// Another process holds the lease live and was asked for a pass (MOD-159 M3 plan D4, D6):
-    /// its next beat reconciles the collection in full; nothing was synced here.
+    /// the holder's index job, or the next job to take the lease (a `Ctrl+R` press or
+    /// `--index-items` never claims it), reconciles the collection in full at its next beat;
+    /// nothing was synced here.
     Requested(IndexerLease),
 }
 
@@ -1684,22 +1686,31 @@ impl ConceptsRuntime {
     }
 
     /// MOD-159 M1 plan D8, M3 plan D7: at the TUI's exit, side by side, lets go of the `Ctrl+R`
-    /// presses' leases over `backend` (after the tasks [`Self::shutdown`] aborted are gone, all
-    /// within [`TUI_RELEASE_WAIT`]; a failure, a timeout or an offline backend leaves them to
-    /// lapse) and stops the TUI's index job, if one runs, letting go of its leases (waited for at
-    /// most [`TUI_RELEASE_WAIT`]), then waits as long again at most for an earlier job's stop
+    /// presses' leases over `backend` (after the tasks [`Self::shutdown`] aborted are gone or half
+    /// of [`TUI_RELEASE_WAIT`] has passed, all within it; a failure, a timeout or an offline
+    /// backend leaves them to lapse) and stops the TUI's index job, if one runs, letting go of its
+    /// leases (waited for at most [`TUI_RELEASE_WAIT`]), then waits as long again at most for an earlier job's stop
     /// still in flight. The two tokens differ, so the two legs touch different rows. The store
     /// loop calls it once, when the UI is gone, after [`Self::shutdown`].
     pub async fn stop_index_job(&mut self, backend: &Backend) {
         let (aborted, press_owner) = (std::mem::take(&mut self.aborted), self.press_owner);
         let presses = async move {
-            let release = async {
+            // MOD-159 M3 R1: the aborted tasks have half the wait, so one that does not end still
+            // leaves the release the rest; the leg as a whole stays within the wait.
+            let deadline = tokio::time::Instant::now() + TUI_RELEASE_WAIT;
+            let gone = async {
                 for task in aborted {
                     let _ = task.await;
                 }
-                backend.release_indexer_leases(press_owner).await
             };
-            match tokio::time::timeout(TUI_RELEASE_WAIT, release).await {
+            if tokio::time::timeout(TUI_RELEASE_WAIT / 2, gone)
+                .await
+                .is_err()
+            {
+                tracing::debug!("an aborted concepts task did not end in time");
+            }
+            let release = backend.release_indexer_leases(press_owner);
+            match tokio::time::timeout_at(deadline, release).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) => {
                     tracing::debug!(%err, "the Ctrl+R leases were not let go; they lapse");
@@ -1821,7 +1832,17 @@ impl ConceptsRuntime {
                     self.owner,
                     self.press_owner,
                 );
+                // MOD-159 M3 R1: every press shares one token, so the press this one supersedes
+                // must be gone before this one takes: its release, still in flight, would let go
+                // of the lease this press has just taken. Aborted before the spawn, awaited first.
+                let superseded = self.tasks.remove(&key);
+                if let Some(superseded) = &superseded {
+                    superseded.abort();
+                }
                 tokio::spawn(async move {
+                    if let Some(superseded) = superseded {
+                        let _ = superseded.await;
+                    }
                     // MOD-147 M4 D8: the scope row joins off the loop, as a search's does.
                     let scope = match scope_row_of {
                         Some(workspace_id) => {
@@ -4241,6 +4262,13 @@ mod tests {
             .expect("the memory store reads it")
             .expect("the press took it");
         assert!(lease.live, "held mid-sync: {lease:?}");
+        assert!(
+            backend
+                .renew_indexer_lease(&collection, runtime.press_owner(), TimeDelta::seconds(120))
+                .await
+                .expect("the memory store answers"),
+            "the press token holds it"
+        );
 
         runtime.shutdown();
         runtime.stop_index_job(&backend).await;
@@ -4260,6 +4288,42 @@ mod tests {
             .await
             .expect("the memory store takes it");
         assert_eq!(other, LeaseTake::Taken);
+    }
+
+    /// MOD-159 M3 R1: an aborted task that never ends costs the presses' release only its share
+    /// of the wait: their lease is still let go at the exit, within `TUI_RELEASE_WAIT`.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_aborted_task_still_leaves_the_release_its_share() {
+        let (backend, scope) = platform().await;
+        let collection = IndexedCollection::Workspace(scope.workspace_id);
+        let mut runtime = ConceptsRuntime::new(Arc::new(MemIndex::new()));
+        let taken = backend
+            .take_indexer_lease(
+                &collection,
+                BoxId::new(),
+                runtime.press_owner(),
+                TimeDelta::seconds(120),
+            )
+            .await
+            .expect("the memory store takes it");
+        assert_eq!(taken, LeaseTake::Taken);
+        runtime
+            .aborted
+            .push(tokio::spawn(std::future::pending::<()>()));
+
+        let started = tokio::time::Instant::now();
+        runtime.stop_index_job(&backend).await;
+        assert!(
+            started.elapsed() <= TUI_RELEASE_WAIT,
+            "{:?}",
+            started.elapsed()
+        );
+        let lease = backend
+            .indexer_lease(&collection)
+            .await
+            .expect("the memory store reads it")
+            .expect("taken once");
+        assert!(!lease.live, "let go despite the stuck task: {lease:?}");
     }
 
     /// MOD-159 M3 D7: a press superseded half-way leaves its lease under the runtime's one press

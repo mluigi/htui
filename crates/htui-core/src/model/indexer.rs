@@ -118,8 +118,8 @@ pub enum LeaseTurn {
     /// Another owner holds it live and its row now carries a pass request; the holder as
     /// `indexer_lease` shows it.
     Requested(IndexerLease),
-    /// Another owner held it live at the last attempt and nothing was recorded (each request
-    /// found it let go, and each take found it held again).
+    /// The holder the last take saw (possibly lapsed, so `live` may be `false`), and nothing was
+    /// recorded (each request found it let go, and each take found it held again).
     Held(IndexerLease),
 }
 

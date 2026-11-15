@@ -934,7 +934,7 @@ where
 }
 
 /// Claims `collection`'s pass request for `owner` (MOD-159 M3 D5): `true` is one `info` line and
-/// a full reconcile now. A claim that fails is a `warn` line and no request.
+/// a full reconcile this beat. A claim that fails is a `warn` line and no request.
 async fn claim_pass<L: IndexerLeaseStore>(
     leases: &L,
     collection: &IndexedCollection,
@@ -942,7 +942,7 @@ async fn claim_pass<L: IndexerLeaseStore>(
 ) -> bool {
     match leases.claim_indexer_pass(collection, owner).await {
         Ok(true) => {
-            tracing::info!(%collection, "concepts index pass requested; reconciling now");
+            tracing::info!(%collection, "concepts index pass requested; reconciling this beat");
             true
         }
         Ok(false) => false,
@@ -3920,30 +3920,23 @@ mod tests {
             );
         }
 
-        /// MOD-159 M3 D5: a beat claims only what it holds: a request on a collection another
-        /// owner holds stays for that holder's claim, and the job opens nothing for it.
+        /// MOD-159 M3 D5: the global collection has no scope to reconcile, so a beat never claims
+        /// its pass request, even one the job holds: the request stays pending.
         #[tokio::test(start_paused = true)]
-        async fn a_beat_claims_no_request_for_a_collection_it_does_not_hold() {
+        async fn a_beat_never_claims_the_global_collections_request() {
             let read = indexable().await;
-            let other = Uuid::now_v7();
-            read.take_indexer_lease(&GRAPHICS, ids::BOX, other, TimeDelta::seconds(120))
-                .await
-                .expect("the memory store never fails");
-            read.request_indexer_pass(&GRAPHICS)
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            tokio::time::advance(BEAT).await;
+            read.request_indexer_pass(&IndexedCollection::Global)
                 .await
                 .expect("the memory store never fails")
-                .expect("other holds Graphics live");
-            let settings = settings_over(&read);
-            let index = Fakes::default();
-            let mut state = JobState::default();
-            index_beat(&read, &settings, &index, Uuid::now_v7(), &mut state).await;
-            assert!(!state.held().contains(&GRAPHICS), "other's lease");
-            assert!(!index.opened().contains(&GRAPHICS), "nothing opened for it");
+                .expect("the job holds the global collection live");
+            index_beat(&read, &settings, &index, owner, &mut state).await;
             assert!(
-                read.claim_indexer_pass(&GRAPHICS, other)
+                read.claim_indexer_pass(&IndexedCollection::Global, owner)
                     .await
                     .expect("the memory store never fails"),
-                "the request stays for its holder"
+                "the request is still pending"
             );
         }
 

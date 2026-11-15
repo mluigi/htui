@@ -1023,9 +1023,8 @@ fn orchestration_offline() -> StoreError {
 }
 
 /// MOD-159 M1 plan D12: the indexer lease goes to the arm's store, `MemStore` for `--demo` and
-/// the overlay tests, Postgres online, and so do MOD-159 M3's pass request and claim. Offline every
-/// verb is refused with
-/// [`DATABASE_UNREACHABLE`]: the lease is live coordination state the mirror does not hold
+/// the overlay tests, Postgres online, and so do MOD-159 M3's pass request and claim. Offline
+/// every verb is refused with [`DATABASE_UNREACHABLE`]: the lease is live coordination state the mirror does not hold
 /// (`0038_indexer_lease.sql`), so there is nothing to take, renew, release or read.
 impl IndexerLeaseStore for Backend {
     async fn take_indexer_lease(
