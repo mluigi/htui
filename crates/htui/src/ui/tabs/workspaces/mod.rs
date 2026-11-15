@@ -1064,11 +1064,23 @@ impl Tab for WorkspacesTab {
                 if self.in_flight == Some(*workspace) {
                     self.in_flight = None;
                 }
-                // D6: the pending ask's fresh overview raises its question.
+                // D6: the pending ask's fresh overview raises its question; R1 F6: a workspace
+                // gone meanwhile is told as gone.
                 if let Some((_, asked)) = self.pending.take_if(|(pending, _)| pending == workspace)
-                    && let Some(read) = overview
                 {
-                    self.question = Some(Self::question_of(asked, *workspace, read, ctx));
+                    match overview {
+                        Some(read) => {
+                            self.question = Some(Self::question_of(asked, *workspace, read, ctx));
+                        }
+                        None => {
+                            let title = match asked {
+                                Asked::Stop => question::STOP_TOLD_TITLE,
+                                Asked::Resume => question::RESUME_TOLD_TITLE,
+                            };
+                            let text = format!("{} no longer exists", self.name_of(*workspace));
+                            self.tell(title, text);
+                        }
+                    }
                 }
                 let held = overview
                     .as_ref()
@@ -1085,6 +1097,10 @@ impl Tab for WorkspacesTab {
                             self.tell(question::STOP_TOLD_TITLE, text);
                         }
                         StopWrite::Changed => self.changed(*workspace, true, ctx),
+                        StopWrite::Failed(message) => self.tell(
+                            question::STOP_TOLD_TITLE,
+                            question::needs_the_database(true, message),
+                        ),
                     }
                 }
             }

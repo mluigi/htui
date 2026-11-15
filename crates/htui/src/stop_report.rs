@@ -75,7 +75,7 @@ pub struct RunLine {
     /// How it will resume, or why it waits.
     pub resume: RunResume,
     /// MOD-116 M2 D2: for a `running` run, its `running` steps in row order; empty for every
-    /// other status. The CLI never prints it.
+    /// other status, and for a report read without names (R1 F4: the CLI never prints it).
     pub steps: Vec<LiveStep>,
 }
 
@@ -251,14 +251,16 @@ impl core::fmt::Display for Report {
 
 /// D4's read: the stop row, the runs that are not finished (`workspace_live_runs`), their items'
 /// keys, the boxes' hostnames, each stopped step's forecast ([`stopped_step_resume`] over its
-/// row, its agent's caps and its log) and, MOD-116 M2 D2, each running run's running steps.
+/// row, its agent's caps and its log) and, MOD-116 M2 D2, each running run's running steps,
+/// their agents named from `names`. `None` reads no step (R1 F4: `htui stop`, which prints none,
+/// gains no failure mode from them): every [`RunLine::steps`] is then empty.
 ///
 /// # Errors
 /// Whatever the store reports.
 pub async fn report<S: ReadStore + WriteStore>(
     store: &S,
     caps: &HashMap<AgentId, DriverCaps>,
-    names: &HashMap<AgentId, String>,
+    names: Option<&HashMap<AgentId, String>>,
     workspace: WorkspaceId,
     slug: &str,
 ) -> Result<Report, StoreError> {
@@ -295,10 +297,12 @@ pub async fn report<S: ReadStore + WriteStore>(
             _ if run.executing_box_id.is_none() => RunResume::NoBox,
             _ => stopped_resume(store, caps, run.id).await?,
         };
-        let steps = if run.status == RunStatus::Running {
-            live_steps(store, caps, names, run.id).await?
-        } else {
-            Vec::new()
+        // R1 F4: no names (the CLI, which prints no step) reads no step.
+        let steps = match names {
+            Some(names) if run.status == RunStatus::Running => {
+                live_steps(store, caps, names, run.id).await?
+            }
+            _ => Vec::new(),
         };
         lines.push(RunLine {
             item,
@@ -390,7 +394,7 @@ pub struct StopTarget {
 }
 
 /// MOD-116 M2 D3: what [`write_stop`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopWrite {
     /// The stop was written (inserted, or a graceful stop escalated to forced).
     Written,
@@ -399,6 +403,10 @@ pub enum StopWrite {
     Already(StopMode),
     /// The row changed since the question was decided on: nothing was written.
     Changed,
+    /// MOD-116 M2 R1 F1: the store refused this target's write (its message); never returned by
+    /// [`write_stop`], whose refusal is an `Err`: a batch (`StopWorkspaces`) records it here and
+    /// goes on with the next target, so its answer tells every target.
+    Failed(String),
 }
 
 /// MOD-116 M2 D3: what [`write_resume`] did.
@@ -703,7 +711,7 @@ mod tests {
         running_step(&store, running, 1, "checks", None).await;
         let held = queued(&store, ws, 2).await;
 
-        let read = report(&store, &caps, &names, ws, "graphics")
+        let read = report(&store, &caps, Some(&names), ws, "graphics")
             .await
             .expect("report");
         let line = |run| {
@@ -733,7 +741,7 @@ mod tests {
         assert_eq!(line(ids::RUN_8).steps, []);
 
         // Without the names map the agent is unnamed, and its caps still decide `pauses`.
-        let unnamed = report(&store, &caps, &Default::default(), ws, "graphics")
+        let unnamed = report(&store, &caps, Some(&Default::default()), ws, "graphics")
             .await
             .expect("report");
         let steps = &unnamed
@@ -744,6 +752,21 @@ mod tests {
             .steps;
         assert_eq!(steps[0].agent, None);
         assert_eq!(steps[0].pauses, caps_for(&claude).resume);
+
+        // R1 F4: no names asked for (the CLI), no step is read: the running line lists none.
+        let stepless = report(&store, &caps, None, ws, "graphics")
+            .await
+            .expect("report");
+        let line = stepless
+            .lines
+            .iter()
+            .find(|line| line.run == running)
+            .expect("the running line");
+        assert_eq!(line.steps, []);
+        assert_eq!(
+            line.under(StopMode::Graceful),
+            ["stops before its next step"]
+        );
     }
 
     /// D3: written once, never downgraded, and nothing written over a stop that changed.

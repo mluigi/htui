@@ -14,7 +14,8 @@
 //! [`StoreRequest::ResumeWorkspace`], through the writer as this user at the worker's clock, each
 //! target re-read against the stop row its question was decided on
 //! ([`stop_report::write_stop`], [`stop_report::write_resume`]); offline they are refused before
-//! any write.
+//! any write. A stop target whose write fails is told as [`StopWrite::Failed`] and the next one
+//! is still written (R1 F1).
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ use htui_core::store::{ReadStore, Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::hierarchy::{self, HierarchySnapshot};
-use crate::stop_report::{self, Report};
+use crate::stop_report::{self, Report, StopWrite};
 use crate::store_worker::{StoreReply, StoreRequest, serve_waiting};
 
 /// One workspace as the Workspaces tab's detail pane shows it (D7).
@@ -135,6 +136,8 @@ pub async fn serve_with_home(
             // Taken when the request is served: after the question was answered (M4 R1).
             let at = Utc::now();
             let mut outcomes = Vec::with_capacity(targets.len());
+            // R1 F1: a target whose write fails is its outcome, and the next target is still
+            // written, so the answer tells every target: the ones written before it stand.
             for target in targets {
                 let outcome = stop_report::write_stop(
                     &writer,
@@ -144,7 +147,8 @@ pub async fn serve_with_home(
                     user,
                     at,
                 )
-                .await?;
+                .await
+                .unwrap_or_else(|err| StopWrite::Failed(err.to_string()));
                 outcomes.push((target.workspace, outcome));
             }
             Ok(StoreReply::StopsWritten {
@@ -197,7 +201,7 @@ async fn overview(
     let names = stop_report::agent_names(&agents);
     let caps = stop_report::caps_map(agents);
     let report =
-        stop_report::report(writer, &caps, &names, workspace, &tree.workspace.slug).await?;
+        stop_report::report(writer, &caps, Some(&names), workspace, &tree.workspace.slug).await?;
 
     let scope = Scope {
         workspace_id: workspace,
@@ -639,6 +643,44 @@ mod tests {
             let row = stop_of(&backend, workspace).await.expect("stopped");
             assert_eq!((row.mode, row.requested_by), (StopMode::Graceful, user));
             assert!(row.requested_at >= before, "{row:?}");
+        }
+    }
+
+    /// MOD-116 M2 R1 F1: a target whose write fails (a workspace deleted meanwhile) is an
+    /// outcome, and the targets after it are still written, so the reply tells every one.
+    #[tokio::test]
+    async fn a_failing_target_is_told_and_the_others_are_still_written() {
+        let backend = Backend::memory(MemStore::demo());
+        let gone = htui_core::model::WorkspaceId::new();
+        let request = StoreRequest::StopWorkspaces {
+            mode: StopMode::Graceful,
+            targets: [ids::WORKSPACE_PLATFORM, gone, ids::WORKSPACE_GRAPHICS]
+                .into_iter()
+                .map(|workspace| StopTarget {
+                    workspace,
+                    decided_on: None,
+                })
+                .collect(),
+        };
+        let reply = crate::store_worker::serve(&backend, &request).await;
+        let StoreReply::StopsWritten { outcomes, .. } = reply else {
+            panic!("expected the stops written, got {reply:?}");
+        };
+        let refusal = StoreError::NotFound {
+            entity: "workspace",
+            id: gone.to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            outcomes,
+            [
+                (ids::WORKSPACE_PLATFORM, StopWrite::Written),
+                (gone, StopWrite::Failed(refusal)),
+                (ids::WORKSPACE_GRAPHICS, StopWrite::Written),
+            ]
+        );
+        for workspace in [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS] {
+            assert!(stop_of(&backend, workspace).await.is_some(), "{workspace}");
         }
     }
 

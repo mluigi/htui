@@ -22,8 +22,8 @@ use htui::ui::state_file::UiStore;
 use htui::ui::tabs::{Tab as _, WorkspacesTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    DocumentId, NewOwnerDocument, NewProject, NewRepo, ProjectId, RepoBoxPath, RepoId, RunStatus,
-    StopMode, WorkspaceBoxPath, WorkspaceProject,
+    DocumentId, NewOwnerDocument, NewProject, NewRepo, NewWorkspace, ProjectId, RepoBoxPath,
+    RepoId, RunStatus, StopMode, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
 };
 use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
 use htui_store::{Backend, CacheStore, PgStore};
@@ -459,10 +459,7 @@ async fn location_and_restore_return_to_the_entry() {
     );
 
     let mut gone = loc.clone();
-    gone.cursor = Some(format!(
-        "workspace:{}",
-        htui_core::model::WorkspaceId::new()
-    ));
+    gone.cursor = Some(format!("workspace:{}", WorkspaceId::new()));
     assert!(!tab.restore(&gone, &mut bench.ctx()), "not listed");
     assert!(!tab.restore(&htui::ui::shell::TabLoc::default(), &mut bench.ctx()));
 
@@ -761,7 +758,7 @@ fn boxed(frame: &str, title: &str) -> String {
 }
 
 /// `workspace`'s stop row's mode, if any.
-async fn stop_of(store: &MemStore, workspace: htui_core::model::WorkspaceId) -> Option<StopMode> {
+async fn stop_of(store: &MemStore, workspace: WorkspaceId) -> Option<StopMode> {
     store
         .workspace_stop(workspace)
         .await
@@ -770,7 +767,7 @@ async fn stop_of(store: &MemStore, workspace: htui_core::model::WorkspaceId) -> 
 }
 
 /// A stop of `mode` written on `workspace` straight into the store.
-async fn stop_directly(store: &MemStore, workspace: htui_core::model::WorkspaceId, mode: StopMode) {
+async fn stop_directly(store: &MemStore, workspace: WorkspaceId, mode: StopMode) {
     store
         .stop_workspace(workspace, mode, ids::USER, Utc::now())
         .await
@@ -803,10 +800,15 @@ async fn s_asks_to_stop_the_runs_listing_each() {
     let agents = store.agents().await.expect("the agents are read");
     let names = htui::stop_report::agent_names(&agents);
     let caps = htui::stop_report::caps_map(agents);
-    let report =
-        htui::stop_report::report(&store, &caps, &names, ids::WORKSPACE_PLATFORM, "platform")
-            .await
-            .expect("the report is read");
+    let report = htui::stop_report::report(
+        &store,
+        &caps,
+        Some(&names),
+        ids::WORKSPACE_PLATFORM,
+        "platform",
+    )
+    .await
+    .expect("the report is read");
     let live: Vec<_> = report
         .lines
         .iter()
@@ -1030,6 +1032,53 @@ async fn a_stop_changed_while_asking_is_refused_and_said() {
         Some(StopMode::Forced)
     );
     assert_eq!(harness.app().status, None);
+}
+
+/// MOD-116 M2 R1 F6: a workspace deleted between `s` and its fresh overview is told as gone, in
+/// the box; `r` the same; nothing is written and the status line stays clear.
+#[tokio::test]
+async fn s_or_r_on_a_workspace_deleted_meanwhile_says_it_no_longer_exists() {
+    for (key, title) in [("s", "Stop runs"), ("r", "Resume runs")] {
+        let store = demo().await;
+        store
+            .create_workspace(NewWorkspace {
+                id: WorkspaceId::new(),
+                slug: "scratch".to_owned(),
+                name: "Scratch".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("a workspace is created");
+        let mut harness = open_over(store.clone(), 100, 30).await;
+        harness.key("G");
+        harness.settle().await;
+        let frame = harness.render();
+        assert!(
+            selected(&frame).contains("overview") && frame.contains("\u{256d}\u{2500} Scratch "),
+            "{key}: the cursor is on Scratch's overview: {frame}"
+        );
+        let scratch = store
+            .workspaces()
+            .await
+            .expect("the workspaces are read")
+            .into_iter()
+            .find(|summary| summary.slug == "scratch")
+            .expect("Scratch is listed")
+            .workspace_id;
+        harness.key(key);
+        store
+            .delete_workspace(scratch)
+            .await
+            .expect("Scratch is deleted");
+        harness.settle().await;
+        assert_eq!(
+            boxed(&harness.render(), title),
+            "Scratch no longer exists",
+            "{key}"
+        );
+        assert_eq!(harness.app().status, None, "{key}");
+    }
 }
 
 /// D6: a stop whose overview read is refused (offline) says it needs the database, in the box,

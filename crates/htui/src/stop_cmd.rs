@@ -305,7 +305,8 @@ pub async fn resume_on<S: ReadStore + WriteStore>(
 }
 
 /// D4's read, before and after the write: [`stop_report::report`] with this verb's caps and no
-/// agent names (the CLI prints no step), its store failure mapped to a [`StateExit`].
+/// agent names, so no step is read (the CLI prints none, MOD-116 M2 R1 F4), its store failure
+/// mapped to a [`StateExit`].
 ///
 /// # Errors
 /// [`StateExit`]: 3 Postgres did not answer, 1 any other failure.
@@ -317,7 +318,7 @@ pub async fn report<S: ReadStore + WriteStore>(
     stop_report::report(
         store,
         ctx.caps,
-        &HashMap::new(),
+        None,
         workspace.workspace_id,
         &workspace.slug,
     )
@@ -485,8 +486,8 @@ fn say(question: &mut dyn Write, text: &str) -> Result<(), StateExit> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ask, Context, RunResume, STOP_POLL, STOP_WAIT, StateExit, caps_map, report, resume_on,
-        stop_on, store_exit,
+        Ask, Context, Report, RunResume, STOP_POLL, STOP_WAIT, StateExit, caps_map, report,
+        resume_on, stop_on, store_exit,
     };
     use chrono::{DateTime, TimeDelta, Utc};
     use htui_agent::driver::DriverCaps;
@@ -1471,40 +1472,36 @@ mod tests {
         );
     }
 
-    /// MOD-116 M2 D1: the CLI's report is the shared one, read with no agent names, so its text is
-    /// the shared `Display` over the same store.
+    /// MOD-116 M2 R1 F4: the CLI asks the shared report for no steps, so it reads none: its
+    /// running run lists no step where the tab's read, with the agents' names, lists one. Not the
+    /// CLI's parity evidence (its `Display` prints no step either way): `report_stopping.snap`
+    /// and the tests above are.
     #[tokio::test(start_paused = true)]
-    async fn the_cli_report_text_is_the_shared_display() {
+    async fn the_cli_report_reads_no_steps() {
         let fx = Fixture::demo().await;
         let ws = ids::WORKSPACE_GRAPHICS;
         let owner = Uuid::now_v7();
-        let reopen = fx.claimed(ws, 1, owner).await;
-        fx.running_step(reopen, owner, 0, "implement", &banner())
-            .await;
-        fx.stop_run(reopen, owner).await;
         let running = fx.claimed(ws, 2, owner).await;
         fx.running_step(running, owner, 0, "review", &no_banner())
             .await;
-        fx.queued(ws, 3).await;
-        fx.store
-            .stop_workspace(ws, StopMode::Graceful, ids::USER, now())
-            .await
-            .expect("stop");
+        let steps = |read: &Report| {
+            read.lines
+                .iter()
+                .find(|line| line.run == running)
+                .map(|line| line.steps.len())
+                .expect("the running line")
+        };
 
         let cli = report(&fx.store, &fx.ctx(), fx.graphics())
             .await
             .expect("report");
-        let shared = crate::stop_report::report(
-            &fx.store,
-            &fx.caps,
-            &HashMap::new(),
-            ws,
-            &fx.graphics().slug,
-        )
-        .await
-        .expect("report");
-        assert_eq!(cli, shared);
-        assert_eq!(cli.to_string(), shared.to_string());
-        assert_eq!(cli.lines.len(), 4, "{cli}");
+        assert_eq!(steps(&cli), 0, "{cli:?}");
+        let names = crate::stop_report::agent_names(&fx.store.agents().await.expect("agents"));
+        let tab =
+            crate::stop_report::report(&fx.store, &fx.caps, Some(&names), ws, &fx.graphics().slug)
+                .await
+                .expect("report");
+        assert_eq!(steps(&tab), 1, "{tab:?}");
+        assert_eq!(cli.to_string(), tab.to_string(), "the text prints no step");
     }
 }
