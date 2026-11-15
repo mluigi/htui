@@ -1375,6 +1375,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -1650,6 +1651,15 @@ mod tests {
         }
         async fn project(&self, id: ProjectId) -> StoreResult<Option<Project>> {
             self.inner.project(id).await
+        }
+        async fn targets(&self) -> StoreResult<Vec<htui_core::model::Target>> {
+            self.inner.targets().await
+        }
+        async fn target(
+            &self,
+            id: htui_core::model::TargetId,
+        ) -> StoreResult<htui_core::model::Target> {
+            self.inner.target(id).await
         }
         async fn run(&self, id: RunId) -> StoreResult<Option<Run>> {
             self.inner.run(id).await
@@ -1962,6 +1972,7 @@ mod tests {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })

@@ -231,6 +231,7 @@ mod tests {
                 description: tag.to_owned(),
                 is_override: false,
                 revision,
+                target_id: None,
                 created_at: DateTime::UNIX_EPOCH,
                 updated_at: DateTime::UNIX_EPOCH,
             },

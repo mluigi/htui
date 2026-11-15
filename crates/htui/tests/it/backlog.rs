@@ -239,6 +239,7 @@ async fn mint_ws_1(store: &MemStore) -> ItemId {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -2074,6 +2075,7 @@ async fn ready_here_lists_what_this_box_can_start() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })

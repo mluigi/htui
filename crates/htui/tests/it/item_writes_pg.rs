@@ -104,6 +104,7 @@ fn spec(title: &str) -> ItemSpec {
         required_tags: Vec::new(),
         touched_paths: Vec::new(),
         step_graph_id: None,
+        target_id: None,
     }
 }
 

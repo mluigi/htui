@@ -916,6 +916,8 @@ impl ItemForm {
                 |text| Ok(item_spec::parse_paths(text)),
             )?,
             step_graph_id: self.graph,
+            // MOD-130 M1 D11, D16: no target widget yet, so an edit keeps the stored target.
+            target_id: base.and_then(|base| base.target_id),
         })
     }
 
@@ -1217,7 +1219,10 @@ mod tests {
     use crate::ui::tabs::backlog::panes;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
-    use htui_core::model::{GraphScope, ItemPatch, NewItemKind, NewStepGraph, WorkspaceProject};
+    use htui_core::model::{
+        GraphScope, ItemPatch, NewItemKind, NewStepGraph, NewTarget, TargetId, TargetKind,
+        WorkspaceProject,
+    };
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
     use ratatui::buffer::Buffer;
@@ -3082,6 +3087,48 @@ mod tests {
         }
         assert!(form.resolving().is_some(), "still open");
         assert_eq!(form.external, None);
+    }
+
+    /// MOD-130 M1 D11, D16: the form has no target widget, so an edit keeps the item's stored
+    /// target: a title edit sends no `target_id` change.
+    #[tokio::test]
+    async fn an_edit_keeps_the_items_target() {
+        let store = MemStore::demo();
+        let target = store
+            .create_target(NewTarget {
+                id: TargetId::new(),
+                name: "builder".to_owned(),
+                kind: TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("a target");
+        store
+            .update_item(
+                ids::HTUI_ANA_1,
+                1,
+                ItemPatch {
+                    target_id: Some(Some(target.id)),
+                    ..patch()
+                },
+            )
+            .await
+            .expect("the item takes the target");
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        focus_on(&mut form, Field::Title);
+        type_text(&mut form, " too");
+        let (version, changes, _) = edit_sent(&mut form);
+        assert_eq!(version, 2, "the edit is at the head's version");
+        assert!(changes.title.is_some(), "the title moved");
+        assert_eq!(changes.target_id, None, "the stored target is kept");
+        assert_eq!(
+            changes,
+            SpecChanges {
+                title: changes.title.clone(),
+                ..SpecChanges::default()
+            },
+            "the title alone"
+        );
     }
 
     /// D4: only the body moves; the token, reason and other fields stay, so the save is the

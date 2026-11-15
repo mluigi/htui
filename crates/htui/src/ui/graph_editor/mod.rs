@@ -1806,6 +1806,7 @@ mod tests {
                 description: String::new(),
                 is_override: false,
                 revision,
+                target_id: None,
                 created_at: now(),
                 updated_at: now(),
             },

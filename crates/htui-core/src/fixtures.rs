@@ -22,15 +22,16 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Activation, Agent, AppUser, BoxRow, BoxTool, CitationKind, Document, EdgeId, EventKind,
-    EventRole, GateOutcome, GraphSnapshot, Isolation, Item, ItemKind, ItemKindId, ItemLink,
-    ItemRequirement, ItemRevision, LinkKind, NodeRole, Note, NoteId, OsFamily, Persona, PhaseId,
-    Priority, Project, ProjectId, PromptTemplate, PromptTemplateId, Requirement, RequirementArea,
-    RequirementAreaId, RequirementId, RequirementRevision, RequirementSpec, RequirementState,
-    Resolution, Run, RunKind, RunMode, RunStatus, RunStep, RuntimeChanges, SessionEvent, Skill,
-    SkillBinding, SkillVersion, SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings,
-    SnapshotTemplate, Status, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
-    StepRole, StepStatus, Workspace, WorkspaceId, WorkspaceProject,
+    Activation, Agent, AppUser, BoxKind, BoxRow, BoxTool, CitationKind, Document, EdgeId,
+    EventKind, EventRole, GateOutcome, GraphSnapshot, Isolation, Item, ItemKind, ItemKindId,
+    ItemLink, ItemRequirement, ItemRevision, LinkKind, NodeRole, Note, NoteId, OsFamily, Persona,
+    PhaseId, Priority, Project, ProjectId, PromptTemplate, PromptTemplateId, Requirement,
+    RequirementArea, RequirementAreaId, RequirementId, RequirementRevision, RequirementSpec,
+    RequirementState, Resolution, Run, RunKind, RunMode, RunStatus, RunStep, RuntimeChanges,
+    SessionEvent, Skill, SkillBinding, SkillVersion, SnapshotCandidate, SnapshotGraph,
+    SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status, StepGraph, StepGraphEdge,
+    StepGraphId, StepGraphPhase, StepId, StepRole, StepStatus, Workspace, WorkspaceId,
+    WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -509,7 +510,7 @@ fn boxes() -> Vec<BoxRow> {
         id: ids::BOX,
         user_id: ids::USER,
         hostname: "DESKTOP-HTUI".to_owned(),
-        os_family: OsFamily::Windows,
+        os_family: Some(OsFamily::Windows),
         os_version: "10.0.26200".to_owned(),
         arch: "x86_64".to_owned(),
         cpu: "AMD Ryzen 9 7950X".to_owned(),
@@ -526,6 +527,8 @@ fn boxes() -> Vec<BoxRow> {
         last_probed_at: Some(epoch()),
         updated_at: demo_at(2, 8),
         edit_version: 0,
+        kind: BoxKind::Machine,
+        parent_box_id: None,
     }]
 }
 
@@ -799,6 +802,7 @@ fn projects() -> Vec<Project> {
             secret_provider: None,
             secret_scope: None,
             settings: json!({}),
+            target_id: None,
             created_by: ids::USER,
             created_at: epoch(),
             updated_at: epoch(),
@@ -819,6 +823,7 @@ fn projects() -> Vec<Project> {
                 "retention_days": null,
                 "keep_raw_events": false,
             }),
+            target_id: None,
             created_by: ids::USER,
             created_at: epoch(),
             updated_at: epoch(),
@@ -1272,6 +1277,7 @@ fn items() -> Vec<Item> {
             required_tags: strings(spec.tags),
             touched_paths: Vec::new(),
             step_graph_id: None,
+            target_id: None,
             version: 1,
             created_by: ids::USER,
             created_at: demo_at(0, i64::from(spec.n)),

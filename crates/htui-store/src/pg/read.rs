@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use htui_core::model::IntegrateMode;
 use htui_core::model::OwnerDocument;
 use htui_core::model::StepRole;
+use htui_core::model::TargetId;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
@@ -212,6 +213,7 @@ impl ReadStore for PgStore {
                    required_tags,
                    touched_paths,
                    step_graph_id AS "step_graph_id: htui_core::model::StepGraphId",
+                   target_id     AS "target_id: htui_core::model::TargetId",
                    version,
                    created_by    AS "created_by: htui_core::model::UserId",
                    created_at,
@@ -746,6 +748,7 @@ impl ReadStore for PgStore {
                    secret_provider,
                    secret_scope,
                    settings,
+                   target_id       AS "target_id: TargetId",
                    created_by      AS "created_by: htui_core::model::UserId",
                    created_at,
                    updated_at
@@ -1298,6 +1301,58 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-130 M1 P10: name byte order (`COLLATE "C"`), then id; retired rows included.
+    async fn targets(&self) -> Result<Vec<htui_core::model::Target>> {
+        sqlx::query_as!(
+            htui_core::model::Target,
+            r#"
+            SELECT id          AS "id: htui_core::model::TargetId",
+                   name,
+                   kind        AS "kind: htui_core::model::TargetKind",
+                   locator,
+                   box_id      AS "box_id: BoxId",
+                   probed_at,
+                   probe_error,
+                   retired_at,
+                   created_at,
+                   updated_at
+              FROM target
+             ORDER BY name COLLATE "C", id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    async fn target(&self, id: TargetId) -> Result<htui_core::model::Target> {
+        sqlx::query_as!(
+            htui_core::model::Target,
+            r#"
+            SELECT id          AS "id: htui_core::model::TargetId",
+                   name,
+                   kind        AS "kind: htui_core::model::TargetKind",
+                   locator,
+                   box_id      AS "box_id: BoxId",
+                   probed_at,
+                   probe_error,
+                   retired_at,
+                   created_at,
+                   updated_at
+              FROM target
+             WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "target",
+            id: id.to_string(),
+        })
+    }
+
     /// The item's live citations, each joined to the requirement as it is now, in the
     /// requirement's list order ([`requirements`](ReadStore::requirements)), then `kind`.
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
@@ -1531,6 +1586,7 @@ impl ReadStore for PgStore {
                    i.required_tags,
                    i.touched_paths,
                    i.step_graph_id AS "step_graph_id: htui_core::model::StepGraphId",
+                   i.target_id     AS "target_id: htui_core::model::TargetId",
                    i.version,
                    i.created_by    AS "created_by: htui_core::model::UserId",
                    i.created_at,
@@ -1708,6 +1764,9 @@ impl PgStore {
 
     /// This box's row, projected for the top bar.
     ///
+    /// This box is always a machine, and `chk_box_os_family` holds a machine's `os_family` non-NULL
+    /// (MOD-130 M1, D13), hence the `!` on the nullable column.
+    ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
@@ -1721,7 +1780,7 @@ impl PgStore {
             -- seeds two *different* sets and names which is which (blueprint §3.5, T1 audit A-5).
             SELECT id            AS "box_id: htui_core::model::BoxId",
                    hostname,
-                   os_family     AS "os_family: htui_core::model::OsFamily",
+                   os_family     AS "os_family!: htui_core::model::OsFamily",
                    probed_tags,
                    declared_tags,
                    settings
@@ -2051,7 +2110,9 @@ impl PgStore {
                    last_seen_at,
                    last_probed_at,
                    updated_at,
-                   edit_version
+                   edit_version,
+                   kind           AS "kind: htui_core::model::BoxKind",
+                   parent_box_id  AS "parent_box_id: BoxId"
               FROM box WHERE id = $1
             "#,
             id.as_uuid(),
@@ -2321,7 +2382,9 @@ impl PgStore {
                    last_seen_at,
                    last_probed_at,
                    updated_at,
-                   edit_version
+                   edit_version,
+                   kind           AS "kind: htui_core::model::BoxKind",
+                   parent_box_id  AS "parent_box_id: BoxId"
               FROM box WHERE id = $1
             "#,
             id.as_uuid(),
@@ -3327,6 +3390,7 @@ impl PgStore {
                    -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
                    is_override,
                    revision,
+                   target_id    AS "target_id: TargetId",
                    created_at,
                    updated_at
               FROM step_graph
@@ -3363,6 +3427,7 @@ impl PgStore {
                    -- `StepGraphRow`'s order: `query_as!` binds positionally (T1 audit A-4).
                    g.is_override,
                    g.revision,
+                   g.target_id    AS "target_id: TargetId",
                    g.created_at,
                    g.updated_at
               FROM step_graph g
@@ -3700,6 +3765,7 @@ pub(crate) async fn step_graph_row_on<'e, E: PgExecutor<'e>>(
                    -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
                    is_override,
                    revision,
+                   target_id    AS "target_id: TargetId",
                    created_at,
                    updated_at
               FROM step_graph WHERE id = $1
@@ -4076,6 +4142,7 @@ pub(crate) struct StepGraphRow {
     pub(crate) description: String,
     pub(crate) is_override: bool,
     pub(crate) revision: i64,
+    pub(crate) target_id: Option<TargetId>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
@@ -4098,6 +4165,7 @@ impl TryFrom<StepGraphRow> for StepGraph {
             description: row.description,
             is_override: row.is_override,
             revision: row.revision,
+            target_id: row.target_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })

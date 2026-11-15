@@ -68,15 +68,20 @@ use htui_store::testkit as common;
 /// and MOD-150 M3's five document link cases (plan D1-D8) make it 317,
 /// and MOD-149's seven key, nesting, refinement and coverage cases (plan D2-D9) make it 324,
 /// and MOD-125 M4's `workspace_live_runs` case (plan D4) makes it 325,
-/// and MOD-133 M1's seven integration cases (plan D2, D4, D6, D7) make it 332.
-const EXPECTED_CASES: usize = 332;
+/// and MOD-133 M1's seven integration cases (plan D2, D4, D6, D7) make it 332,
+/// and MOD-130 M1 T1's seeded local target case (D2, P2) makes it 333,
+/// and MOD-130 M1 T2's four create, edit and bind target cases (P4-P6, P9) make it 337,
+/// and MOD-130 M1 T3's item target spec field case (D11) makes it 338,
+/// and MOD-130 M1 T4's five level, default, retire and delete cases (D3, D5, D11, D14) make it
+/// 343.
+const EXPECTED_CASES: usize = 343;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (332 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (343 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -94,7 +99,9 @@ fn case_list_matches_mem_store() {
          case, and MOD-152 T1's three command-log cases, and MOD-125 M3's five resume and \
          stopped-run cancel cases, and MOD-164's six capture-write and two usage-tally cases and its F2 person-amended and evidence cases, and MOD-150 M2's four close-out link cases, and MOD-150 M3's five document link cases, and MOD-149's seven key, nesting, \
              refinement and coverage cases, and MOD-125 M4's `workspace_live_runs` case, and MOD-133 M1's seven integration \
-             cases)"
+             cases, and MOD-130 M1 T1's seeded local target case, and MOD-130 \
+             M1 T2's four target cases, and MOD-130 M1 T3's item target case, and MOD-130 M1 \
+             T4's five level, default, retire and delete cases)"
     );
 }
 

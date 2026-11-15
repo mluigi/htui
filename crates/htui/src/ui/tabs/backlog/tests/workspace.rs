@@ -21,6 +21,7 @@ async fn mint_ws_1(store: &MemStore) -> ItemId {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: USER,
             box_id: Some(htui_core::fixtures::ids::BOX),
         })

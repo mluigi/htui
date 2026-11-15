@@ -111,6 +111,7 @@ pub mod skill_glob;
 pub mod skill_import;
 pub mod skill_language;
 pub mod stop;
+pub mod target;
 pub mod usage;
 pub mod user;
 pub mod waiting;
@@ -122,9 +123,9 @@ pub use activity::{
 };
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
 pub use box_::{
-    BOX_PROBE_SPEC_KEY, BoxEdit, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings,
-    BoxTool, DECLARED_TAG_MAX, DEFAULT_MAX_CONCURRENT_ITEMS, Executor, OsFamily, ProbedTool,
-    canonical_declared_tags, declared_tags_from_text, is_declared_tag,
+    BOX_PROBE_SPEC_KEY, BoxEdit, BoxInfo, BoxKind, BoxProbe, BoxProfile, BoxRecord, BoxRow,
+    BoxSettings, BoxTool, DECLARED_TAG_MAX, DEFAULT_MAX_CONCURRENT_ITEMS, Executor, OsFamily,
+    ProbedTool, canonical_declared_tags, declared_tags_from_text, is_declared_tag,
 };
 pub use document::{
     Document, DocumentHead, NewDocument, NewOwnerDocument, OwnerDocument, ResolvedInput,
@@ -140,7 +141,7 @@ pub use ids::{
     AgentId, ArtifactLinkId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId,
     MemoryEntryId, NoteId, PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId,
     RelaySessionId, RepoId, RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId,
-    SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
+    SkillBindingId, SkillId, StepGraphId, StepId, TargetId, UserId, WorkspaceId,
 };
 pub use indexer::{
     IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, ProjectChanges,
@@ -231,6 +232,10 @@ pub use skill::{
 pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
 pub use stop::{PendingStop, StopMode, WorkspaceStop, WorkspaceStopState};
+pub use target::{
+    AttachedBox, DEFAULT_TARGET_KEY, DefaultTarget, NewChildBox, NewTarget, RUNNABLE_KINDS, Target,
+    TargetEdit, TargetKind, TargetStatus, locator_refusal, target_name_refusal,
+};
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 pub use waiting::{WaitingCandidate, WaitingPermission};

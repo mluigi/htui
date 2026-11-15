@@ -267,13 +267,15 @@ pub const fn command_queue(queue: CommandQueue) -> &'static str {
     }
 }
 
-/// A box's operating system, spelled as its vendor does.
+/// A box's operating system, spelled as its vendor does; `not probed` for a container box whose
+/// first probe has not run (MOD-130 M1, P5, blueprint B12).
 #[must_use]
-pub const fn os_family(os: OsFamily) -> &'static str {
+pub const fn os_family(os: Option<OsFamily>) -> &'static str {
     match os {
-        OsFamily::Windows => "Windows",
-        OsFamily::Linux => "Linux",
-        OsFamily::Macos => "macOS",
+        Some(OsFamily::Windows) => "Windows",
+        Some(OsFamily::Linux) => "Linux",
+        Some(OsFamily::Macos) => "macOS",
+        None => "not probed",
     }
 }
 
@@ -461,7 +463,7 @@ mod tests {
             ),
             (
                 "OsFamily",
-                words(OsFamily::ALL, OsFamily::as_str, os_family),
+                words(OsFamily::ALL, OsFamily::as_str, |os| os_family(Some(os))),
             ),
             (
                 "LinkKind",
@@ -776,9 +778,13 @@ mod tests {
     #[test]
     fn an_os_family_is_spelled_as_its_vendor_does() {
         assert_eq!(
-            labels(&words(OsFamily::ALL, OsFamily::as_str, os_family)),
+            labels(&words(OsFamily::ALL, OsFamily::as_str, |os| os_family(
+                Some(os)
+            ))),
             ["Windows", "Linux", "macOS"]
         );
+        // MOD-130 M1 (blueprint B12): a container box before its first probe.
+        assert_eq!(os_family(None), "not probed");
     }
 
     /// MOD-115 M4 D-1, MOD-150 D1: the Graph's edges read as words, `blocked by` for

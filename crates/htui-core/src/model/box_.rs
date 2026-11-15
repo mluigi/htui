@@ -22,6 +22,16 @@ str_enum!(
     }
 );
 
+str_enum!(
+    /// `box.kind` (MOD-130 M1, D12): a machine, or a container that is a child of a machine.
+    BoxKind {
+        /// A machine: a development box or a remote host.
+        Machine => "machine",
+        /// A container on a machine (`box.parent_box_id`).
+        Container => "container",
+    }
+);
+
 /// A row of `box` (§5.2): one development machine, identified by a UUID kept in `box.toml` so the
 /// identity survives a hostname change (`R-BOX-4`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,8 +42,8 @@ pub struct BoxRow {
     pub user_id: UserId,
     /// `box.hostname`.
     pub hostname: String,
-    /// `box.os_family`.
-    pub os_family: OsFamily,
+    /// `box.os_family`: `None` only on a container box not yet probed (MOD-130 M1, D13, P5).
+    pub os_family: Option<OsFamily>,
     /// `box.os_version`.
     pub os_version: String,
     /// `box.arch`.
@@ -68,6 +78,11 @@ pub struct BoxRow {
     /// (MOD-7 milestone 2, D39). Bumped by `WriteStore::edit_box` and by nothing else:
     /// registration and the box probe never write it, so a reconnect cannot stale an open editor.
     pub edit_version: i32,
+    /// `box.kind` (MOD-130 M1, D12).
+    pub kind: BoxKind,
+    /// `box.parent_box_id`: the machine a container box runs on; `None` exactly on a machine
+    /// (MOD-130 M1, D12).
+    pub parent_box_id: Option<BoxId>,
 }
 
 /// A row of `box_tool` (§5.2): one compiler, build tool, shell or container runtime found by the
@@ -367,8 +382,9 @@ pub const DEFAULT_MAX_CONCURRENT_ITEMS: u32 = 2;
 pub struct BoxProfile {
     /// `box.hostname`.
     pub hostname: String,
-    /// `box.os_family`.
-    pub os_family: OsFamily,
+    /// `box.os_family`; `None` (a container box not yet probed, MOD-130 M1 P5) omits the `os`
+    /// line.
+    pub os_family: Option<OsFamily>,
     /// `box.os_version`.
     pub os_version: String,
     /// `box.arch`.
@@ -446,7 +462,7 @@ mod tests {
             id: BoxId::new(),
             user_id: UserId::new(),
             hostname: "dev-win-01".to_owned(),
-            os_family: OsFamily::Windows,
+            os_family: Some(OsFamily::Windows),
             os_version: "10.0.26200".to_owned(),
             arch: "x86_64".to_owned(),
             cpu: "AMD Ryzen 9 7950X, 32 threads".to_owned(),
@@ -463,6 +479,8 @@ mod tests {
             last_probed_at: Some(at()),
             updated_at: at(),
             edit_version: 0,
+            kind: BoxKind::Machine,
+            parent_box_id: None,
         }
     }
 
@@ -887,6 +905,23 @@ mod tests {
                 serde_json::to_value(&decoded).expect("settings serialise")[Executor::KEY],
                 json!(text),
                 "{blob}"
+            );
+        }
+    }
+
+    /// `box.kind`'s spellings are `0040_execution_targets.sql`'s `chk_box_kind` list, in order
+    /// (MOD-130 M1, D12).
+    #[test]
+    fn box_kind_matches_the_check_list() {
+        assert_eq!(
+            BoxKind::ALL.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+            ["machine", "container"]
+        );
+        for kind in BoxKind::ALL {
+            assert_eq!(kind.as_str().parse::<BoxKind>(), Ok(*kind));
+            assert_eq!(
+                serde_json::to_value(kind).expect("a box kind serialises"),
+                json!(kind.as_str())
             );
         }
     }

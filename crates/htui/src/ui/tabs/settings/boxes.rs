@@ -1122,12 +1122,18 @@ impl BoxesSection {
             ),
             read(
                 "os",
-                format!(
-                    "{} {} \u{b7} {}",
-                    label::os_family(row.os_family),
-                    row.os_version,
-                    row.arch
-                ),
+                // MOD-130 M1 (blueprint B12): a container box not yet probed has no version or
+                // arch either, so its row reads `not probed` alone.
+                if row.os_family.is_some() {
+                    format!(
+                        "{} {} \u{b7} {}",
+                        label::os_family(row.os_family),
+                        row.os_version,
+                        row.arch
+                    )
+                } else {
+                    label::os_family(None).to_owned()
+                },
             ),
             read("cpu", row.cpu.clone()),
             read(
@@ -1415,7 +1421,7 @@ fn spec_lines(spec: &SpecView, width: usize, theme: &Theme) -> Vec<Line<'static>
 mod tests {
     use super::*;
 
-    use htui_core::model::{BoxRow, OsFamily, UserId};
+    use htui_core::model::{BoxKind, BoxRow, OsFamily, UserId};
 
     /// MOD-67 M6 D4: the stale notices name the retry key, and say a save (or nothing) unbound.
     /// The save-key editors' sentence is the shared one (MOD-115 M3 D-5).
@@ -1482,7 +1488,7 @@ mod tests {
                 id: BoxId::new(),
                 user_id: UserId::from_uuid(uuid::Uuid::nil()),
                 hostname: hostname.to_owned(),
-                os_family: OsFamily::Linux,
+                os_family: Some(OsFamily::Linux),
                 os_version: "6.8".to_owned(),
                 arch: "x86_64".to_owned(),
                 cpu: String::new(),
@@ -1499,6 +1505,8 @@ mod tests {
                 last_probed_at: None,
                 updated_at: at,
                 edit_version: 0,
+                kind: BoxKind::Machine,
+                parent_box_id: None,
             },
             tools: Vec::new(),
             probe_spec_digest: None,

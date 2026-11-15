@@ -63,6 +63,11 @@ impl PgStore {
         }
 
         for row in &data.boxes {
+            // The demo holds machines only (MOD-130 M1, blueprint B12): a box without an OS family
+            // here is a fixture bug, not a value to invent.
+            let os_family = row
+                .os_family
+                .ok_or_else(|| StoreError::Backend(format!("box {} has no os_family", row.id)))?;
             sqlx::query!(
                 "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, cpu, ram_mb, \
                  gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags, quirks, \
@@ -72,7 +77,7 @@ impl PgStore {
                 row.id.as_uuid(),
                 row.user_id.as_uuid(),
                 row.hostname,
-                row.os_family.as_str(),
+                os_family.as_str(),
                 row.os_version,
                 row.arch,
                 row.cpu,

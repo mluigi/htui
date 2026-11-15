@@ -173,7 +173,7 @@ pub fn seen_against(records: &[BoxRecord], id: BoxId, baseline: &Baseline) -> bo
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone as _;
-    use htui_core::model::{BoxRow, OsFamily, UserId};
+    use htui_core::model::{BoxKind, BoxRow, OsFamily, UserId};
 
     use super::*;
 
@@ -189,7 +189,7 @@ mod tests {
                 id,
                 user_id: UserId::from_uuid(uuid::Uuid::nil()),
                 hostname: "box1".to_owned(),
-                os_family: OsFamily::Linux,
+                os_family: Some(OsFamily::Linux),
                 os_version: "6.8".to_owned(),
                 arch: "x86_64".to_owned(),
                 cpu: String::new(),
@@ -206,6 +206,8 @@ mod tests {
                 last_probed_at: None,
                 updated_at: at(0),
                 edit_version: 0,
+                kind: BoxKind::Machine,
+                parent_box_id: None,
             },
             tools: Vec::new(),
             probe_spec_digest: None,

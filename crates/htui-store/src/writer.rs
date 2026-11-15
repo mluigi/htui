@@ -380,6 +380,20 @@ impl ReadStore for Writer {
             Self::Online(pg) => pg.run_plans(run).await,
         }
     }
+
+    async fn targets(&self) -> Result<Vec<htui_core::model::Target>> {
+        match self {
+            Self::Memory(store) => store.targets().await,
+            Self::Online(pg) => pg.targets().await,
+        }
+    }
+
+    async fn target(&self, id: htui_core::model::TargetId) -> Result<htui_core::model::Target> {
+        match self {
+            Self::Memory(store) => store.target(id).await,
+            Self::Online(pg) => pg.target(id).await,
+        }
+    }
 }
 
 impl WriteStore for Writer {
@@ -531,6 +545,98 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.set_box_probe_spec(overlay, expected).await,
             Self::Online(pg) => pg.set_box_probe_spec(overlay, expected).await,
+        }
+    }
+
+    async fn create_target(
+        &self,
+        new: htui_core::model::NewTarget,
+    ) -> Result<htui_core::model::Target> {
+        match self {
+            Self::Memory(store) => store.create_target(new).await,
+            Self::Online(pg) => pg.create_target(new).await,
+        }
+    }
+
+    async fn edit_target(
+        &self,
+        id: htui_core::model::TargetId,
+        expected: DateTime<Utc>,
+        edit: htui_core::model::TargetEdit,
+    ) -> Result<CasOutcome<htui_core::model::Target>> {
+        match self {
+            Self::Memory(store) => store.edit_target(id, expected, edit).await,
+            Self::Online(pg) => pg.edit_target(id, expected, edit).await,
+        }
+    }
+
+    async fn attach_child_box(
+        &self,
+        new: htui_core::model::NewChildBox,
+    ) -> Result<htui_core::model::AttachedBox> {
+        match self {
+            Self::Memory(store) => store.attach_child_box(new).await,
+            Self::Online(pg) => pg.attach_child_box(new).await,
+        }
+    }
+
+    async fn set_project_target(
+        &self,
+        project: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<htui_core::model::TargetId>,
+    ) -> Result<CasOutcome<Project>> {
+        match self {
+            Self::Memory(store) => store.set_project_target(project, expected, target).await,
+            Self::Online(pg) => pg.set_project_target(project, expected, target).await,
+        }
+    }
+
+    async fn set_graph_target(
+        &self,
+        graph: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<htui_core::model::TargetId>,
+    ) -> Result<CasOutcome<StepGraph>> {
+        match self {
+            Self::Memory(store) => store.set_graph_target(graph, expected, target).await,
+            Self::Online(pg) => pg.set_graph_target(graph, expected, target).await,
+        }
+    }
+
+    async fn default_target(&self) -> Result<Option<htui_core::model::DefaultTarget>> {
+        match self {
+            Self::Memory(store) => store.default_target().await,
+            Self::Online(pg) => pg.default_target().await,
+        }
+    }
+
+    async fn set_default_target(
+        &self,
+        target: Option<htui_core::model::TargetId>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<htui_core::model::DefaultTarget>>> {
+        match self {
+            Self::Memory(store) => store.set_default_target(target, expected).await,
+            Self::Online(pg) => pg.set_default_target(target, expected).await,
+        }
+    }
+
+    async fn retire_target(
+        &self,
+        id: htui_core::model::TargetId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<htui_core::model::Target>> {
+        match self {
+            Self::Memory(store) => store.retire_target(id, expected).await,
+            Self::Online(pg) => pg.retire_target(id, expected).await,
+        }
+    }
+
+    async fn delete_target(&self, id: htui_core::model::TargetId) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.delete_target(id).await,
+            Self::Online(pg) => pg.delete_target(id).await,
         }
     }
 

@@ -95,6 +95,7 @@ async fn stopped_on_the_box(db: &testkit::TestDb) -> RunId {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })

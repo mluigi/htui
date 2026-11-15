@@ -44,6 +44,7 @@ use htui_core::model::{
 };
 use htui_core::model::{ArtifactLinkKind, LinkedDocument};
 use htui_core::model::{PlanScope, PlanStatus, RunPlan, RunPlanId};
+use htui_core::model::{Target, TargetId, TargetKind};
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
@@ -178,12 +179,37 @@ fn item_of(row: &SqliteRow) -> Result<Item> {
             "item.step_graph_id",
             opt_text(row, "step_graph_id")?.as_deref(),
         )?,
+        target_id: opt_uuid_col::<TargetId>(
+            "item.target_id",
+            opt_text(row, "target_id")?.as_deref(),
+        )?,
         version: get(row, "version")?,
         created_by: uuid_col::<UserId>("item.created_by", &text(row, "created_by")?)?,
         created_at: ts_col("item.created_at", get(row, "created_at")?)?,
         updated_at: ts_col("item.updated_at", get(row, "updated_at")?)?,
         closed_at: opt_ts_col("item.closed_at", get(row, "closed_at")?)?,
         resolution: get::<Option<Resolution>>(row, "resolution")?,
+    })
+}
+
+/// Every `target` column, in [`target_of`]'s names (MOD-130 M1, D15).
+const TARGET_SELECT: &str = "id, name, kind, locator, box_id, probed_at, probe_error, retired_at, \
+     created_at, updated_at";
+
+/// One `target` row, every column of `cache_migrations/0014_execution_targets.sql` (MOD-130 M1,
+/// D15).
+fn target_of(row: &SqliteRow) -> Result<Target> {
+    Ok(Target {
+        id: uuid_col("target.id", &text(row, "id")?)?,
+        name: text(row, "name")?,
+        kind: get::<TargetKind>(row, "kind")?,
+        locator: json_col("target.locator", &text(row, "locator")?)?,
+        box_id: opt_uuid_col::<BoxId>("target.box_id", opt_text(row, "box_id")?.as_deref())?,
+        probed_at: opt_ts_col("target.probed_at", get(row, "probed_at")?)?,
+        probe_error: opt_text(row, "probe_error")?,
+        retired_at: opt_ts_col("target.retired_at", get(row, "retired_at")?)?,
+        created_at: ts_col("target.created_at", get(row, "created_at")?)?,
+        updated_at: ts_col("target.updated_at", get(row, "updated_at")?)?,
     })
 }
 
@@ -228,7 +254,7 @@ fn document_of(row: &SqliteRow) -> Result<Document> {
 /// as `id`).
 const ITEM_SELECT: &str = "i.id, i.project_id, i.kind_id, i.key_prefix, i.key_number, i.key, \
      i.title, i.body, i.status, i.priority, i.required_tags, i.touched_paths, i.step_graph_id, \
-     i.version, i.created_by, i.created_at, i.updated_at, i.closed_at, i.resolution";
+     i.version, i.created_by, i.created_at, i.updated_at, i.closed_at, i.resolution, i.target_id";
 
 /// MOD-144: the latest graph run's status of the item aliased `i`, `cancelled` skipped, `NULL`
 /// when none: `pg/read.rs`' `lr` LATERAL as a correlated subquery (SQLite has no LATERAL). The
@@ -545,7 +571,7 @@ impl ReadStore for CacheStore {
         let row = sqlx::query(
             "SELECT id, project_id, kind_id, key_prefix, key_number, key, title, body, status, \
              priority, required_tags, touched_paths, step_graph_id, version, created_by, \
-             created_at, updated_at, closed_at, resolution FROM item WHERE id = ?",
+             created_at, updated_at, closed_at, resolution, target_id FROM item WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -1047,7 +1073,8 @@ impl ReadStore for CacheStore {
     async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
         let row = sqlx::query(
             "SELECT id, slug, name, description, type, owner_workspace_id, secret_provider, \
-             secret_scope, settings, created_by, created_at, updated_at FROM project WHERE id = ?",
+             secret_scope, settings, target_id, created_by, created_at, updated_at FROM project \
+             WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -1067,6 +1094,10 @@ impl ReadStore for CacheStore {
             secret_provider: opt_text(&row, "secret_provider")?,
             secret_scope: opt_text(&row, "secret_scope")?,
             settings: json_col("project.settings", &text(&row, "settings")?)?,
+            target_id: opt_uuid_col::<TargetId>(
+                "project.target_id",
+                opt_text(&row, "target_id")?.as_deref(),
+            )?,
             created_by: uuid_col::<UserId>("project.created_by", &text(&row, "created_by")?)?,
             created_at: ts_col("project.created_at", get(&row, "created_at")?)?,
             updated_at: ts_col("project.updated_at", get(&row, "updated_at")?)?,
@@ -1476,6 +1507,36 @@ impl ReadStore for CacheStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(run_plan_of).collect()
+    }
+
+    /// MOD-130 M1 (D15, P10): the mirrored targets in name byte order (SQLite's `BINARY`
+    /// collation is Postgres's `COLLATE "C"`), then id; retired rows included.
+    async fn targets(&self) -> Result<Vec<Target>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {TARGET_SELECT} FROM target ORDER BY name, id"
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(target_of).collect()
+    }
+
+    /// MOD-130 M1 (D15): one mirrored target, retired or not.
+    async fn target(&self, id: TargetId) -> Result<Target> {
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {TARGET_SELECT} FROM target WHERE id = ?"
+        )))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound {
+                entity: "target",
+                id: id.to_string(),
+            });
+        };
+        target_of(&row)
     }
 
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {

@@ -63,10 +63,15 @@ use crate::model::{
     moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::model::{
+    AttachedBox, BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind,
+    locator_refusal, target_name_refusal,
+};
+use crate::model::{
     CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemorySource, MemoryUsage, NewRunMemory, RunMemoryWrite,
     RunProvenance,
 };
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
+use crate::model::{DEFAULT_TARGET_KEY, DefaultTarget};
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::model::{IndexChanges, IndexedCollection, IndexerLease, LeaseTake};
 use crate::model::{IntegrateMode, IntegrateSnapshot, Integration, IntegrationState, LandOutcome};
@@ -112,7 +117,16 @@ use crate::store::traits::{
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use crate::store::traits::{
+    DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN, TARGET_USER_DEFAULT, target_in_use, target_user_graph,
+    target_user_item, target_user_project,
+};
+use crate::store::traits::{
     MEMORY_EVIDENCE_OUTSIDE_THE_RUN, MEMORY_NEEDS_A_CAPTURE_STEP, run_memory_held_by_a_person,
+};
+use crate::store::traits::{
+    box_bound_to_other_target, box_hostname_is_blank, box_not_a_child_of,
+    child_box_needs_a_machine, has_nul, target_bound_elsewhere, target_built_in, target_name_taken,
+    target_retired, target_takes_no_container,
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
@@ -266,6 +280,9 @@ struct State {
     users: HashMap<UserId, AppUser>,
     /// `box`.
     boxes: HashMap<BoxId, BoxRow>,
+    /// `target` (MOD-130 M1), created targets only: the built-in `local` row is answered by the
+    /// readers (blueprint B8).
+    targets: BTreeMap<TargetId, Target>,
     /// The box this process runs on (`box.toml`), for the top bar.
     this_box: Option<BoxId>,
     /// `workspace`.
@@ -526,6 +543,7 @@ impl MemStore {
         let state = State {
             users: data.users.into_iter().map(|row| (row.id, row)).collect(),
             boxes: data.boxes.into_iter().map(|row| (row.id, row)).collect(),
+            targets: BTreeMap::new(),
             this_box: data.this_box,
             workspaces: data
                 .workspaces
@@ -638,19 +656,26 @@ impl MemStore {
     }
 
     /// This box's row, projected for the top bar.
+    ///
+    /// This box is always a machine, so a row without an OS family is a store bug (MOD-130 M1,
+    /// blueprint B12), answered as a backend error rather than an invented family.
     pub async fn box_info(&self) -> Result<Option<BoxInfo>> {
-        Ok(self.read(|state| {
-            let id = state.this_box?;
-            let row = state.boxes.get(&id)?;
-            Some(BoxInfo {
+        self.read(|state| {
+            let Some(row) = state.this_box.and_then(|id| state.boxes.get(&id)) else {
+                return Ok(None);
+            };
+            let os_family = row
+                .os_family
+                .ok_or_else(|| StoreError::Backend(format!("box {} has no os_family", row.id)))?;
+            Ok(Some(BoxInfo {
                 box_id: row.id,
                 hostname: row.hostname.clone(),
-                os_family: row.os_family,
+                os_family,
                 probed_tags: row.probed_tags.clone(),
                 declared_tags: row.declared_tags.clone(),
                 settings: row.settings.clone(),
-            })
-        }))
+            }))
+        })
     }
 
     /// How many runs of the scope are on the top bar (`RunStatus::on_top_bar`, MOD-125 D2).
@@ -2479,6 +2504,9 @@ impl State {
                 kind.prefix, kind.project_id, new.project_id
             )));
         }
+        // MOD-130 M1 D11: after the kind, before the id and the author, as `PgStore`'s guard
+        // (folded into the counter CTE) refuses before its insert can.
+        item_target_refusal(&self.targets, new.target_id)?;
         if self.items.contains_key(&new.id) {
             return Err(StoreError::Constraint(format!(
                 "item `{}` already exists",
@@ -2510,6 +2538,7 @@ impl State {
             required_tags: new.required_tags,
             touched_paths: new.touched_paths,
             step_graph_id: new.step_graph_id,
+            target_id: new.target_id,
             version: 1,
             created_by: new.created_by,
             created_at: now,
@@ -2579,9 +2608,15 @@ impl State {
                     kind.prefix, kind.project_id, item.project_id
                 )));
             }
-            item.kind_id = kind_id;
+        }
+        // MOD-130 M1 D11: after the kind check, before the first write.
+        if let Some(target_id) = patch.target_id {
+            item_target_refusal(&self.targets, target_id)?;
         }
 
+        if let Some(kind_id) = patch.kind_id {
+            item.kind_id = kind_id;
+        }
         if let Some(title) = patch.title {
             item.title = title;
         }
@@ -2599,6 +2634,9 @@ impl State {
         }
         if let Some(step_graph_id) = patch.step_graph_id {
             item.step_graph_id = step_graph_id;
+        }
+        if let Some(target_id) = patch.target_id {
+            item.target_id = target_id;
         }
         item.version += 1;
         item.updated_at = now;
@@ -3293,6 +3331,7 @@ impl State {
             secret_provider: None,
             secret_scope: None,
             settings: Value::Object(serde_json::Map::new()),
+            target_id: None,
             created_by: new.created_by,
             created_at: now,
             updated_at: now,
@@ -3532,6 +3571,7 @@ impl State {
             secret_provider: None,
             secret_scope: None,
             settings: Value::Object(serde_json::Map::new()),
+            target_id: None,
             created_by,
             created_at: now,
             updated_at: now,
@@ -4061,6 +4101,7 @@ impl State {
             description: new.description,
             is_override: new.is_override,
             revision: 0,
+            target_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -10549,6 +10590,29 @@ fn require_author(id: UserId, column: &str) -> Result<()> {
     Ok(())
 }
 
+/// MOD-130 M1 D11 (blueprint B3): an item's target is inherit (`None`), the built-in local target
+/// (never in `targets`, blueprint B8, and never retired), or a target that is not retired. A free
+/// function over `targets`, so `update` can call it while it holds the item.
+fn item_target_refusal(
+    targets: &BTreeMap<TargetId, Target>,
+    target_id: Option<TargetId>,
+) -> Result<()> {
+    let Some(id) = target_id.filter(|id| *id != seed::LOCAL_TARGET_ID) else {
+        return Ok(());
+    };
+    match targets.get(&id) {
+        None => Err(StoreError::Constraint(references_no_row(
+            "item.target_id",
+            id,
+            "target",
+        ))),
+        Some(row) if row.retired_at.is_some() => {
+            Err(StoreError::Constraint(target_retired(&row.name)))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 /// MOD-42 (plan D1-D5, D12-D14; blueprint §2.11): the relay's reference semantics. Every time is
 /// the handle's clock, passed in as `now` (I-4); every status move is a compare-and-set (I-3).
 impl State {
@@ -11259,6 +11323,422 @@ impl State {
     }
 }
 
+/// MOD-130 M1 T2: the target writers (P4-P6, P9, blueprint B2-B4, B10). The built-in `local`
+/// row is not in `targets` (blueprint B8), so each writer names it by id or name itself.
+impl State {
+    /// A stored target, the built-in one included, or `NotFound`.
+    fn target_row(&self, id: TargetId) -> Result<Target> {
+        if id == seed::LOCAL_TARGET_ID {
+            return Ok(seed::local_target(DateTime::UNIX_EPOCH));
+        }
+        self.targets
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "target",
+                id: id.to_string(),
+            })
+    }
+
+    /// Whether a target other than `except` holds `name`, the local target's name included.
+    fn target_name_held(&self, name: &str, except: Option<TargetId>) -> bool {
+        name == seed::LOCAL_TARGET_NAME
+            || self
+                .targets
+                .values()
+                .any(|row| Some(row.id) != except && row.name == name)
+    }
+
+    /// [`WriteStore::create_target`]'s order: local kind, name, locator, taken id, taken name.
+    fn create_target(&mut self, new: NewTarget, now: DateTime<Utc>) -> Result<Target> {
+        if new.kind == TargetKind::Local {
+            return Err(StoreError::Constraint(target_built_in()));
+        }
+        if let Some(refusal) =
+            target_name_refusal(&new.name).or_else(|| locator_refusal(&new.locator))
+        {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if new.id == seed::LOCAL_TARGET_ID || self.targets.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("target", new.id)));
+        }
+        if self.target_name_held(&new.name, None) {
+            return Err(StoreError::Constraint(target_name_taken(&new.name)));
+        }
+        let row = Target {
+            id: new.id,
+            name: new.name,
+            kind: new.kind,
+            locator: new.locator,
+            box_id: None,
+            probed_at: None,
+            probe_error: None,
+            retired_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.targets.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// [`WriteStore::edit_target`]'s order: unknown, local, name and locator, `Stale`, taken name.
+    fn edit_target(
+        &mut self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+        edit: TargetEdit,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Target>> {
+        let current = self.target_row(id)?;
+        if current.kind == TargetKind::Local {
+            return Err(StoreError::Constraint(target_built_in()));
+        }
+        if let Some(refusal) = edit
+            .name
+            .as_deref()
+            .and_then(target_name_refusal)
+            .or_else(|| edit.locator.as_ref().and_then(locator_refusal))
+        {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(name) = &edit.name
+            && self.target_name_held(name, Some(id))
+        {
+            return Err(StoreError::Constraint(target_name_taken(name)));
+        }
+        let row = self
+            .targets
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(name) = edit.name {
+            row.name = name;
+        }
+        if let Some(locator) = edit.locator {
+            row.locator = locator;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// [`WriteStore::attach_child_box`]'s order, then the insert and the binding, each only when
+    /// it is not already so: a repeat writes nothing.
+    fn attach_child_box(&mut self, new: NewChildBox, now: DateTime<Utc>) -> Result<AttachedBox> {
+        if new.hostname.trim().is_empty() {
+            return Err(StoreError::Constraint(box_hostname_is_blank()));
+        }
+        if new.hostname.contains('\0') {
+            return Err(StoreError::Constraint(has_nul("box.hostname")));
+        }
+        let target = self.target_row(new.target)?;
+        if target.retired_at.is_some() {
+            return Err(StoreError::Constraint(target_retired(&target.name)));
+        }
+        if !matches!(target.kind, TargetKind::Docker | TargetKind::SshDocker) {
+            return Err(StoreError::Constraint(target_takes_no_container(
+                &target.name,
+                target.kind,
+            )));
+        }
+        let Some(parent) = self.boxes.get(&new.parent) else {
+            return Err(StoreError::Constraint(references_no_row(
+                "box.parent_box_id",
+                new.parent,
+                "box",
+            )));
+        };
+        if parent.kind == BoxKind::Container {
+            return Err(StoreError::Constraint(child_box_needs_a_machine(
+                new.parent,
+            )));
+        }
+        let user_id = parent.user_id;
+        if let Some(child) = self.boxes.get(&new.id)
+            && (child.kind != BoxKind::Container || child.parent_box_id != Some(new.parent))
+        {
+            return Err(StoreError::Constraint(box_not_a_child_of(
+                new.id, new.parent,
+            )));
+        }
+        if let Some(other) = self
+            .targets
+            .values()
+            .find(|row| row.id != target.id && row.box_id == Some(new.id))
+        {
+            return Err(StoreError::Constraint(box_bound_to_other_target(
+                new.id,
+                &other.name,
+            )));
+        }
+        if let Some(other) = target.box_id.filter(|other| *other != new.id) {
+            return Err(StoreError::Constraint(target_bound_elsewhere(
+                &target.name,
+                other,
+            )));
+        }
+        let child = self
+            .boxes
+            .entry(new.id)
+            .or_insert_with(|| BoxRow {
+                id: new.id,
+                user_id,
+                hostname: new.hostname,
+                os_family: None,
+                os_version: String::new(),
+                arch: String::new(),
+                cpu: String::new(),
+                ram_mb: None,
+                gpu_present: false,
+                gpu_vendor: None,
+                htui_version: String::new(),
+                probed_tags: Vec::new(),
+                declared_tags: Vec::new(),
+                quirks: String::new(),
+                settings: Value::Object(serde_json::Map::new()),
+                registered_at: now,
+                last_seen_at: now,
+                last_probed_at: None,
+                updated_at: now,
+                edit_version: 0,
+                kind: BoxKind::Container,
+                parent_box_id: Some(new.parent),
+            })
+            .clone();
+        let target = if target.box_id == Some(new.id) {
+            target
+        } else {
+            let row = self
+                .targets
+                .get_mut(&target.id)
+                .expect("a docker target is a stored one, read under the same lock");
+            row.box_id = Some(new.id);
+            row.updated_at = now;
+            row.clone()
+        };
+        Ok(AttachedBox { child, target })
+    }
+
+    /// MOD-130 M1 T4 (D14, blueprint B3): a target named as a level's value is the local one,
+    /// or a stored one that is not retired; one naming no row is `references_no_row(column)`.
+    fn level_target_refusal(&self, column: &str, target: Option<TargetId>) -> Result<()> {
+        let Some(id) = target else {
+            return Ok(());
+        };
+        if id == seed::LOCAL_TARGET_ID {
+            return Ok(());
+        }
+        match self.targets.get(&id) {
+            None => Err(StoreError::Constraint(references_no_row(
+                column, id, "target",
+            ))),
+            Some(row) if row.retired_at.is_some() => {
+                Err(StoreError::Constraint(target_retired(&row.name)))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// [`WriteStore::set_project_target`]'s order: unknown project, the target, `Stale`.
+    fn set_project_target(
+        &mut self,
+        id: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Project>> {
+        let current = self
+            .projects
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "project",
+                id: id.to_string(),
+            })?;
+        self.level_target_refusal("project.target_id", target)?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        let row = self
+            .projects
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        row.target_id = target;
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// [`WriteStore::set_graph_target`]'s order, then the write and one bump (D11).
+    fn set_graph_target(
+        &mut self,
+        id: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<StepGraph>> {
+        let current = self
+            .graphs
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "step_graph",
+                id: id.to_string(),
+            })?;
+        self.level_target_refusal("step_graph.target_id", target)?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        self.graphs
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock")
+            .target_id = target;
+        self.bump_graph(id, now);
+        Ok(CasOutcome::Applied(self.graphs[&id].clone()))
+    }
+
+    /// The Settings default row, parsed (blueprint B11).
+    fn default_target(&self) -> Result<Option<DefaultTarget>> {
+        self.app_settings
+            .get(DEFAULT_TARGET_KEY)
+            .map(|(value, updated_at)| DefaultTarget::parse(value, *updated_at))
+            .transpose()
+    }
+
+    /// [`WriteStore::set_default_target`]: the clear refusal, the target, then
+    /// [`set_box_probe_spec`](State::set_box_probe_spec)'s token rule.
+    fn set_default_target(
+        &mut self,
+        target: Option<TargetId>,
+        expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Option<DefaultTarget>>> {
+        if target.is_none() && expected.is_none() {
+            return Err(StoreError::Constraint(
+                DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN.to_owned(),
+            ));
+        }
+        self.level_target_refusal("app_setting.default_target", target)?;
+        let stored = self.default_target()?;
+        let current = match (&stored, expected) {
+            (None, None) => true,
+            (Some(row), Some(want)) => row.updated_at == want,
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !current {
+            return Ok(CasOutcome::Stale(stored));
+        }
+        Ok(CasOutcome::Applied(match target {
+            Some(target) => {
+                self.app_settings.insert(
+                    DEFAULT_TARGET_KEY.to_owned(),
+                    (DefaultTarget::value(target), now),
+                );
+                Some(DefaultTarget {
+                    target,
+                    updated_at: now,
+                })
+            }
+            None => {
+                self.app_settings.remove(DEFAULT_TARGET_KEY);
+                None
+            }
+        }))
+    }
+
+    /// The P9 labels (blueprint B5) of every level and the Settings default naming `id`.
+    fn target_users(&self, id: TargetId) -> Result<Vec<String>> {
+        let slug = |project: ProjectId| {
+            self.projects
+                .get(&project)
+                .map_or_else(|| project.to_string(), |row| row.slug.clone())
+        };
+        let mut users: Vec<String> = self
+            .projects
+            .values()
+            .filter(|row| row.target_id == Some(id))
+            .map(|row| target_user_project(&row.slug))
+            .collect();
+        users.extend(
+            self.graphs
+                .values()
+                .filter(|row| row.target_id == Some(id))
+                .map(|row| match row.scope {
+                    GraphScope::Project(project) => {
+                        target_user_graph(&row.name, Some(&slug(project)), None)
+                    }
+                    GraphScope::Workspace(workspace) => {
+                        let owner = self
+                            .workspaces
+                            .get(&workspace)
+                            .map_or_else(|| workspace.to_string(), |row| row.slug.clone());
+                        target_user_graph(&row.name, None, Some(&owner))
+                    }
+                    GraphScope::Library => target_user_graph(&row.name, None, None),
+                }),
+        );
+        users.extend(
+            self.items
+                .values()
+                .filter(|row| row.target_id == Some(id))
+                .map(|row| target_user_item(&row.key, &slug(row.project_id))),
+        );
+        if self
+            .default_target()?
+            .is_some_and(|default| default.target == id)
+        {
+            users.push(TARGET_USER_DEFAULT.to_owned());
+        }
+        Ok(users)
+    }
+
+    /// The refusals [`WriteStore::retire_target`] and [`WriteStore::delete_target`] share:
+    /// unknown, local, in use.
+    fn target_free(&self, id: TargetId) -> Result<Target> {
+        let current = self.target_row(id)?;
+        if current.kind == TargetKind::Local {
+            return Err(StoreError::Constraint(target_built_in()));
+        }
+        let users = self.target_users(id)?;
+        if !users.is_empty() {
+            return Err(StoreError::Constraint(target_in_use(&current.name, &users)));
+        }
+        Ok(current)
+    }
+
+    /// [`WriteStore::retire_target`]: the shared refusals, `Stale`, then `retired_at` unless it
+    /// is set already.
+    fn retire_target(
+        &mut self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Target>> {
+        let current = self.target_free(id)?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if current.retired_at.is_some() {
+            return Ok(CasOutcome::Applied(current));
+        }
+        let row = self
+            .targets
+            .get_mut(&id)
+            .expect("a target that is not local is a stored one, read under the same lock");
+        row.retired_at = Some(now);
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// [`WriteStore::delete_target`]: the shared refusals, then the delete. Run history waits
+    /// for M2's `Run.target_id` here (P8).
+    fn delete_target(&mut self, id: TargetId) -> Result<()> {
+        self.target_free(id)?;
+        self.targets.remove(&id);
+        Ok(())
+    }
+}
+
 impl ReadStore for MemStore {
     async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
         Ok(self.read(|state| state.item_summaries(scope, filter)))
@@ -11420,6 +11900,39 @@ impl ReadStore for MemStore {
 
     async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>> {
         Ok(self.read(|state| state.run_plan_rows(run)))
+    }
+
+    async fn targets(&self) -> Result<Vec<Target>> {
+        // MOD-130 M1 blueprint B8: the built-in row is answered here, at the epoch, rather than
+        // stored in `State`, so no constructor can lose it.
+        Ok(self.read(|state| {
+            let mut rows: Vec<Target> = std::iter::once(seed::local_target(DateTime::UNIX_EPOCH))
+                .chain(state.targets.values().cloned())
+                .collect();
+            rows.sort_by(|a, b| {
+                a.name
+                    .as_bytes()
+                    .cmp(b.name.as_bytes())
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            rows
+        }))
+    }
+
+    async fn target(&self, id: TargetId) -> Result<Target> {
+        if id == seed::LOCAL_TARGET_ID {
+            return Ok(seed::local_target(DateTime::UNIX_EPOCH));
+        }
+        self.read(|state| {
+            state
+                .targets
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "target",
+                    id: id.to_string(),
+                })
+        })
     }
 }
 
@@ -12657,6 +13170,72 @@ impl WriteStore for MemStore {
     async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
         let now = self.now();
         Ok(self.write(|state| state.close_dropped_follow_ups(run, owner, reason, now)))
+    }
+
+    async fn create_target(&self, new: NewTarget) -> Result<Target> {
+        let now = self.now();
+        self.write(|state| state.create_target(new, now))
+    }
+
+    async fn edit_target(
+        &self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+        edit: TargetEdit,
+    ) -> Result<CasOutcome<Target>> {
+        let now = self.now();
+        self.write(|state| state.edit_target(id, expected, edit, now))
+    }
+
+    async fn attach_child_box(&self, new: NewChildBox) -> Result<AttachedBox> {
+        let now = self.now();
+        self.write(|state| state.attach_child_box(new, now))
+    }
+
+    async fn set_project_target(
+        &self,
+        project: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+    ) -> Result<CasOutcome<Project>> {
+        let now = self.now();
+        self.write(|state| state.set_project_target(project, expected, target, now))
+    }
+
+    async fn set_graph_target(
+        &self,
+        graph: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<TargetId>,
+    ) -> Result<CasOutcome<StepGraph>> {
+        let now = self.now();
+        self.write(|state| state.set_graph_target(graph, expected, target, now))
+    }
+
+    async fn default_target(&self) -> Result<Option<DefaultTarget>> {
+        self.read(State::default_target)
+    }
+
+    async fn set_default_target(
+        &self,
+        target: Option<TargetId>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<DefaultTarget>>> {
+        let now = self.now();
+        self.write(|state| state.set_default_target(target, expected, now))
+    }
+
+    async fn retire_target(
+        &self,
+        id: TargetId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<Target>> {
+        let now = self.now();
+        self.write(|state| state.retire_target(id, expected, now))
+    }
+
+    async fn delete_target(&self, id: TargetId) -> Result<()> {
+        self.write(|state| state.delete_target(id))
     }
 }
 
@@ -15729,6 +16308,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -16965,6 +17545,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -17041,6 +17622,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -17665,6 +18247,7 @@ mod tests {
                         touched_paths: Vec::new(),
                         priority: 0,
                         step_graph_id: None,
+                        target_id: None,
                         created_by: ids::USER,
                         box_id: Some(ids::BOX),
                     })
@@ -17762,6 +18345,7 @@ mod tests {
                     touched_paths: Vec::new(),
                     priority: 0,
                     step_graph_id: None,
+                    target_id: None,
                     created_by: ids::USER,
                     box_id: Some(ids::BOX),
                 })
@@ -17993,6 +18577,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -18119,6 +18704,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -19562,6 +20148,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -19672,6 +20259,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -20158,6 +20746,7 @@ mod tests {
                 touched_paths: Vec::new(),
                 priority: 0,
                 step_graph_id: None,
+                target_id: None,
                 created_by: ids::USER,
                 box_id: Some(ids::BOX),
             })
@@ -21637,6 +22226,7 @@ mod tests {
                     touched_paths: Vec::new(),
                     priority: 0,
                     step_graph_id: None,
+                    target_id: None,
                     created_by: ids::USER,
                     box_id: Some(ids::BOX),
                 })
@@ -21728,6 +22318,75 @@ mod tests {
                 .expect("the read answers"),
             None,
             "another box has none"
+        );
+    }
+
+    // ---- MOD-130 M1 R1: a container under another machine (refusal 6) -------------------------
+
+    /// MOD-130 M1 R1 (blueprint B3, refusal 6): a stored container attached again under a second
+    /// machine is `box_not_a_child_of`, and writes nothing. The conformance case cannot reach this
+    /// arm: no `WriteStore` verb creates a machine, so the second one is planted.
+    #[tokio::test]
+    async fn a_container_attached_under_another_machine_is_refused() {
+        use crate::model::{NewChildBox, NewTarget, TargetId, TargetKind};
+        use crate::store::traits::box_not_a_child_of;
+
+        let store = MemStore::demo();
+        let second = BoxId::new();
+        let mut machine = store
+            .box_row(ids::BOX)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture box");
+        machine.id = second;
+        machine.hostname = "second".to_owned();
+        store.write(|state| {
+            state.boxes.insert(second, machine);
+        });
+        let target = |name: &str| NewTarget {
+            id: TargetId::new(),
+            name: name.to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        };
+        let docker = store
+            .create_target(target("dev docker"))
+            .await
+            .expect("create");
+        let spare = store
+            .create_target(target("spare docker"))
+            .await
+            .expect("create");
+        let child = BoxId::new();
+        let attach = |parent: BoxId, target: TargetId| NewChildBox {
+            id: child,
+            parent,
+            hostname: "dev-rust".to_owned(),
+            target,
+        };
+        store
+            .attach_child_box(attach(ids::BOX, docker.id))
+            .await
+            .expect("attach under the fixture machine");
+        let before = store.boxes().await.expect("boxes");
+
+        for target in [docker.id, spare.id] {
+            let refused = store.attach_child_box(attach(second, target)).await;
+            assert!(
+                matches!(&refused, Err(StoreError::Constraint(m))
+                    if *m == box_not_a_child_of(child, second)),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            store.boxes().await.expect("boxes"),
+            before,
+            "nothing written"
+        );
+        assert_eq!(
+            store.target(spare.id).await.expect("read"),
+            spare,
+            "the spare target stays unbound"
         );
     }
 }

@@ -410,6 +410,22 @@ pub trait ReadStore: Send + Sync {
     /// # Errors
     /// The backend's own failures only.
     async fn run_plans(&self, run: RunId) -> Result<Vec<RunPlan>>;
+
+    // ---- MOD-130 M1: execution targets (D1-D4, D15, P10) ----------------------------------------
+
+    /// Every target, the built-in `local` one included and retired ones too, ordered by `name`
+    /// byte order, then `id` (MOD-130 M1, P10). Pickers filter retired targets themselves.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn targets(&self) -> Result<Vec<crate::model::Target>>;
+
+    /// One target (MOD-130 M1).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with entity `"target"` when
+    /// no row has that id.
+    async fn target(&self, id: crate::model::TargetId) -> Result<crate::model::Target>;
 }
 
 /// Everything a write path needs.
@@ -1124,7 +1140,9 @@ pub trait WriteStore: ReadStore {
 
     /// Replaces a graph's editable content in one write (MOD-137 D10). From `body.graph` only
     /// `name` and `description` are written; its `id` must be `graph`, and `scope`,
-    /// `is_override`, `revision` and the timestamps are ignored. Nodes are diffed **by phase
+    /// `is_override`, `revision` and the timestamps are ignored. `target_id` is never written;
+    /// [`set_graph_target`](Self::set_graph_target) is its writer (MOD-130 M1, blueprint B9).
+    /// Nodes are diffed **by phase
     /// id**: a kept id is updated in place and keeps its `skill_binding` rows; a new id is
     /// inserted; a stored id missing from `body` is deleted with its candidates, parts, edges and
     /// phase bindings. Every node's candidates and parts, and the graph's edges, are replaced
@@ -2971,6 +2989,167 @@ pub trait WriteStore: ReadStore {
         step: StepId,
         new: NewRunMemory,
     ) -> Result<RunMemoryWrite>;
+
+    // ---- MOD-130 M1: execution targets (P4, P6, P9, blueprint B2, B10) -------------------------
+
+    /// Creates a target, unbound (MOD-130 M1, P4), with both stamps equal. Decided in this order,
+    /// before anything is written:
+    ///
+    /// 1. a `local` kind is [`target_built_in`] (D2);
+    /// 2. [`target_name_refusal`](crate::model::target_name_refusal);
+    /// 3. [`locator_refusal`](crate::model::locator_refusal);
+    /// 4. a stored `id`, the local target's included, is [`already_exists`] (blueprint B2);
+    /// 5. a stored name is [`target_name_taken`].
+    ///
+    /// # Errors
+    /// The refusals above as [`StoreError::Constraint`](crate::store::StoreError::Constraint),
+    /// and the backend's own failures.
+    async fn create_target(&self, new: crate::model::NewTarget) -> Result<crate::model::Target>;
+
+    /// Renames a target or replaces its locator under compare-and-set on `updated_at` (MOD-130
+    /// M1, P6). A retired target can be edited. Decided in this order:
+    ///
+    /// 1. an unknown id is `NotFound { entity: "target" }`;
+    /// 2. the local target is [`target_built_in`] (D2);
+    /// 3. the name and locator refusals of [`create_target`](Self::create_target);
+    /// 4. `expected` other than the row's `updated_at` is `Stale(current)`;
+    /// 5. a name another target holds is [`target_name_taken`].
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn edit_target(
+        &self,
+        id: crate::model::TargetId,
+        expected: DateTime<Utc>,
+        edit: crate::model::TargetEdit,
+    ) -> Result<CasOutcome<crate::model::Target>>;
+
+    /// Registers a container box under a machine and binds it to a `docker` or `ssh_docker`
+    /// target (MOD-130 M1, P4, P5, blueprint B10). The child is inserted with the parent's user,
+    /// `new.hostname`, no `os_family`, empty `os_version`, `arch` and `htui_version`, no tags and
+    /// `edit_version` 0, unless it exists; the target's `box_id` is set unless it already is the
+    /// child. A repeat answers the same pair and writes nothing. Decided in this order:
+    ///
+    /// 0. a blank hostname is [`box_hostname_is_blank`], a NUL in it [`has_nul`]`("box.hostname")`;
+    /// 1. an unknown target is `NotFound { entity: "target" }`;
+    /// 2. a retired target is [`target_retired`];
+    /// 3. a kind other than `docker` and `ssh_docker` is [`target_takes_no_container`];
+    /// 4. an unknown parent is [`references_no_row`]`("box.parent_box_id", parent, "box")`;
+    /// 5. a container parent is [`child_box_needs_a_machine`];
+    /// 6. a stored `id` that is not a container of `parent` is [`box_not_a_child_of`];
+    /// 7. a child another target is bound to is [`box_bound_to_other_target`];
+    /// 8. a target bound to another box is [`target_bound_elsewhere`].
+    ///
+    /// Postgres runs it in one transaction that locks the target row `FOR UPDATE` before step 2
+    /// and the child row before step 7.
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn attach_child_box(
+        &self,
+        new: crate::model::NewChildBox,
+    ) -> Result<crate::model::AttachedBox>;
+
+    // ---- MOD-130 M1 T4: the levels, the Settings default, retire and delete (D3, D5, D11, D14)
+
+    /// Sets or clears a project's target under compare-and-set on `updated_at` (MOD-130 M1, P6).
+    /// On a workspace's scope row this is the workspace level (D5). `revision` of no graph moves.
+    /// Decided in this order, before anything is written:
+    ///
+    /// 1. an unknown project is `NotFound { entity: "project" }`;
+    /// 2. a `Some(t)` naming no row is
+    ///    [`references_no_row`]`("project.target_id", t, "target")` (blueprint B3);
+    /// 3. a retired `t` is [`target_retired`];
+    /// 4. `expected` other than the row's `updated_at` is `Stale(current)`.
+    ///
+    /// The built-in local target is a valid `Some`. Postgres reads the target `FOR SHARE` in the
+    /// write's transaction before step 2 (blueprint B7).
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn set_project_target(
+        &self,
+        project: ProjectId,
+        expected: DateTime<Utc>,
+        target: Option<crate::model::TargetId>,
+    ) -> Result<CasOutcome<Project>>;
+
+    /// Sets or clears a workflow's target under compare-and-set on `updated_at` (MOD-130 M1, P6),
+    /// bumping `revision` by one (D11). The order of
+    /// [`set_project_target`](Self::set_project_target), with `NotFound { entity: "step_graph" }`
+    /// and the column `step_graph.target_id`. A miss bumps nothing.
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn set_graph_target(
+        &self,
+        graph: StepGraphId,
+        expected: DateTime<Utc>,
+        target: Option<crate::model::TargetId>,
+    ) -> Result<CasOutcome<StepGraph>>;
+
+    /// The Settings default target (MOD-130 M1, D3, blueprint B11): the `app_setting` row
+    /// [`DEFAULT_TARGET_KEY`](crate::model::DEFAULT_TARGET_KEY), parsed. `None` when there is no
+    /// row, which means the local target.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`](crate::store::StoreError::Backend) naming the key when the stored
+    /// value is not a JSON string holding a target id, and the backend's own failures.
+    async fn default_target(&self) -> Result<Option<crate::model::DefaultTarget>>;
+
+    /// Sets, replaces or clears the Settings default target, a compare-and-set on the row's
+    /// `updated_at` (MOD-130 M1, D3, P6), with
+    /// [`set_box_probe_spec`](Self::set_box_probe_spec)'s token rules: `expected: None` means "I
+    /// expect no row", a miss is `Stale` with the row as it is now (`Stale(None)` when it is
+    /// gone), and `target: None` deletes the row (`Applied(None)`). Decided in this order:
+    ///
+    /// 0. `target: None` with `expected: None` is [`DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN`], before
+    ///    any read;
+    /// 1. a `Some(t)` naming no row is
+    ///    [`references_no_row`]`("app_setting.default_target", t, "target")`;
+    /// 2. a retired `t` is [`target_retired`];
+    /// 3. the token compare.
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn set_default_target(
+        &self,
+        target: Option<crate::model::TargetId>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<crate::model::DefaultTarget>>>;
+
+    /// Retires a target under compare-and-set on `updated_at` (MOD-130 M1, D14): `retired_at` is
+    /// set, the row and its history stay, and pickers hide it. A retired target answers
+    /// `Applied` unchanged. Decided in this order:
+    ///
+    /// 1. an unknown id is `NotFound { entity: "target" }`;
+    /// 2. the local target is [`target_built_in`] (D2);
+    /// 3. a target a level or the Settings default names is [`target_in_use`], listing them;
+    /// 4. `expected` other than the row's `updated_at` is `Stale(current)`.
+    ///
+    /// Postgres locks the target row `FOR UPDATE` before step 3 (blueprint B7).
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn retire_target(
+        &self,
+        id: crate::model::TargetId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<crate::model::Target>>;
+
+    /// Deletes a target that nothing names (MOD-130 M1, D14). Decided in this order:
+    ///
+    /// 1. an unknown id is `NotFound { entity: "target" }`;
+    /// 2. the local target is [`target_built_in`] (D2);
+    /// 3. a target a level or the Settings default names is [`target_in_use`];
+    /// 4. a target a run references is [`target_has_runs`] (Postgres only until M2 gives the
+    ///    in-memory run a target, P8).
+    ///
+    /// Postgres locks the target row `FOR UPDATE` before step 3 (blueprint B7).
+    ///
+    /// # Errors
+    /// The refusals above, and the backend's own failures.
+    async fn delete_target(&self, id: crate::model::TargetId) -> Result<()>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -3242,7 +3421,7 @@ pub fn run_plan_refusal(plan: &NewRunPlan) -> Option<String> {
 }
 
 /// Whether any string or object key inside `value` holds U+0000.
-fn json_has_nul(value: &Value) -> bool {
+pub(crate) fn json_has_nul(value: &Value) -> bool {
     match value {
         Value::String(text) => text.contains('\0'),
         Value::Array(items) => items.iter().any(json_has_nul),
@@ -4300,6 +4479,145 @@ pub fn self_link(item: ItemId) -> String {
 #[must_use]
 pub fn link_outside_reach(to: ItemId) -> String {
     format!("item {to} is not in this project or its workspaces")
+}
+
+/// MOD-130 M1 P9 (blueprint B4): a target name both stores refuse, stored as given and never
+/// trimmed. [`crate::model::target_name_refusal`] decides it.
+#[must_use]
+pub fn target_name_refused(name: &str) -> String {
+    format!(
+        "target.name is 1-64 characters with no control character and no leading or trailing \
+         space; {name:?} is not"
+    )
+}
+
+/// MOD-130 M1 P9 (blueprint B6): a locator that is not an object or looks like it holds a
+/// secret. `why` names the key path or the value. [`crate::model::locator_refusal`] decides it.
+#[must_use]
+pub fn target_locator_refused(why: &str) -> String {
+    format!("a target locator holds names and addresses, never secrets: {why}")
+}
+
+/// MOD-130 M1 P9 (D2): the seeded `local` target, or a `local` kind, refused by every writer.
+#[must_use]
+pub fn target_built_in() -> String {
+    "the local target is built in; it cannot be created, edited, retired or deleted".to_owned()
+}
+
+/// MOD-130 M1 P9 (blueprint B4): `uq_target_name`, in the house form of a unique name, decided
+/// in code before the statement on both stores.
+#[must_use]
+pub fn target_name_taken(name: &str) -> String {
+    format!("target.name `{name}` is taken")
+}
+
+/// MOD-130 M1 P9 (D14): a retired target takes no new binding or level.
+#[must_use]
+pub fn target_retired(name: &str) -> String {
+    format!("target {name} is retired")
+}
+
+/// MOD-130 M1 P9 (blueprint B10): only a `docker` or `ssh_docker` target runs in a container,
+/// so only one of them takes a child box.
+#[must_use]
+pub fn target_takes_no_container(name: &str, kind: crate::model::TargetKind) -> String {
+    format!("only a docker or ssh_docker target takes a container box; {name} is {kind}")
+}
+
+/// MOD-130 M1 P9: a target is bound to one box; a second box is refused, never swapped in.
+#[must_use]
+pub fn target_bound_elsewhere(name: &str, other: BoxId) -> String {
+    format!("target {name} is bound to box {other}")
+}
+
+/// MOD-130 M1 (blueprint B10): one target per container box, so two targets never share and
+/// overwrite one probe.
+#[must_use]
+pub fn box_bound_to_other_target(child: BoxId, other_name: &str) -> String {
+    format!("box {child} is bound to target {other_name}")
+}
+
+/// MOD-130 M1 P9 (D12): a container is a child of a machine, never of another container.
+#[must_use]
+pub fn child_box_needs_a_machine(parent: BoxId) -> String {
+    format!("box {parent} is a container; a child box needs a machine parent")
+}
+
+/// MOD-130 M1 P9 (D12): a child box id that is stored as something else than a container of
+/// this parent.
+#[must_use]
+pub fn box_not_a_child_of(child: BoxId, parent: BoxId) -> String {
+    format!("box {child} exists and is not a container of box {parent}")
+}
+
+/// MOD-130 M1 (blueprint B4): a child box needs a hostname, decided before any read.
+#[must_use]
+pub fn box_hostname_is_blank() -> String {
+    "box.hostname must not be blank".to_owned()
+}
+
+/// MOD-130 M1 P9 (D14): a target a level or the Settings default names cannot be retired or
+/// deleted. `users` are the labels of [`target_user_project`], [`target_user_graph`],
+/// [`target_user_item`] and [`TARGET_USER_DEFAULT`]; they are deduplicated and sorted by bytes
+/// here (blueprint B5), so both stores answer the same sentence.
+#[must_use]
+pub fn target_in_use(name: &str, users: &[String]) -> String {
+    let mut users: Vec<&str> = users.iter().map(String::as_str).collect();
+    users.sort_unstable();
+    users.dedup();
+    format!(
+        "target {name} is used by {}; set them to inherit or another target first",
+        users.join(", ")
+    )
+}
+
+/// MOD-130 M1 P9 (D14): a target with run history is never deleted; it is retired.
+#[must_use]
+pub fn target_has_runs(name: &str, runs: u64) -> String {
+    format!("target {name} has {runs} run(s); retire it instead")
+}
+
+/// MOD-130 M1 (blueprint B11): [`WriteStore::set_default_target`]'s refusal of a clear with no
+/// token, decided before any read.
+pub const DEFAULT_TARGET_CLEAR_NEEDS_A_TOKEN: &str =
+    "clearing the default target needs the row's updated_at";
+
+/// MOD-130 M1 P9 (blueprint B5): the in-use label of the Settings default.
+pub const TARGET_USER_DEFAULT: &str = "Settings default";
+
+/// MOD-130 M1 P9 (blueprint B5): the in-use label of a project row, `project <slug>`, or of a
+/// workspace's scope row, `workspace <slug without @>` (D5).
+#[must_use]
+pub fn target_user_project(slug: &str) -> String {
+    match slug.strip_prefix('@') {
+        Some(workspace) => format!("workspace {workspace}"),
+        None => format!("project {slug}"),
+    }
+}
+
+/// MOD-130 M1 P9 (blueprint B5): the in-use label of a workflow, `workflow <name> of project
+/// <slug>`, `of workspace <slug>` or `in the library`. `project` is the owning project's slug
+/// (a scope row's reads as its workspace); `workspace` the owning workspace's slug.
+#[must_use]
+pub fn target_user_graph(name: &str, project: Option<&str>, workspace: Option<&str>) -> String {
+    match (workspace, project) {
+        (Some(workspace), _) => format!("workflow {name} of workspace {workspace}"),
+        (None, Some(slug)) => match slug.strip_prefix('@') {
+            Some(workspace) => format!("workflow {name} of workspace {workspace}"),
+            None => format!("workflow {name} of project {slug}"),
+        },
+        (None, None) => format!("workflow {name} in the library"),
+    }
+}
+
+/// MOD-130 M1 P9 (blueprint B5): the in-use label of an item, `item <key> of project <slug>`;
+/// a workspace-owned item's slug is its scope row's without the `@`.
+#[must_use]
+pub fn target_user_item(key: &str, project: &str) -> String {
+    format!(
+        "item {key} of project {}",
+        project.strip_prefix('@').unwrap_or(project)
+    )
 }
 
 /// MOD-150 M3 D3: how a [`DocumentRef`] is named in a refusal: `"{owner} {kind}"`, plus

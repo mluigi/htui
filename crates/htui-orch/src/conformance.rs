@@ -5222,6 +5222,7 @@ async fn mint_feat<O: Orchestrate>(orch: &O, title: &str, paths: &[&str]) -> Ite
             touched_paths: paths.iter().map(|path| (*path).to_owned()).collect(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: user,
             box_id: Some(ids::BOX),
         })
@@ -10146,6 +10147,7 @@ async fn mint_ana<O: Orchestrate>(orch: &O, title: &str) -> ItemId {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: user,
             box_id: Some(ids::BOX),
         })

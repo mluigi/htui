@@ -31,10 +31,12 @@ use htui_core::model::{
     SnapshotSettings, Status, StepId, StepOutcome, StepRole, StopMode, TIMESTAMPTZ_DIGITS,
     Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
+use htui_core::model::{NewChildBox, NewTarget, TargetId, TargetKind};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::conformance::assert_leased_for;
+use htui_core::store::traits::{box_not_a_child_of, target_has_runs, target_retired};
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken, workspace_gone,
@@ -82,6 +84,7 @@ fn race_item(kind_id: ItemKindId, title: &str) -> NewItem {
         touched_paths: Vec::new(),
         priority: 0,
         step_graph_id: None,
+        target_id: None,
         created_by: ids::USER,
         box_id: Some(ids::BOX),
     }
@@ -11674,6 +11677,7 @@ async fn queue_feat<S: htui_core::store::WriteStore>(store: &S, id: ItemId, prio
             touched_paths: Vec::new(),
             priority,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -13715,6 +13719,7 @@ async fn missing_tags_of_answers_missing_tags_per_item_on_both_stores() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         };
@@ -14013,6 +14018,7 @@ async fn queue_item_fills_a_scope_rows_workspace_on_both_stores() {
         touched_paths: Vec::new(),
         priority: 0,
         step_graph_id: None,
+        target_id: None,
         created_by: ids::USER,
         box_id: Some(ids::BOX),
     };
@@ -15339,5 +15345,315 @@ async fn workspace_rename_restores_a_missing_scope_row() {
         "with its `WS` seed"
     );
 
+    db.drop_db().await;
+}
+
+/// MOD-130 M1 T4 (D14, P8): a target a run references is never deleted. The run is planted with
+/// `target_id` and `target_source = 'item'` through SQL (M2 writes them); `delete_target` answers
+/// `target_has_runs` before the statement, so no `23503`/`23001` reaches the caller, and the row
+/// stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_target_refuses_one_with_run_history() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "history docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create a target");
+    let run = db
+        .store
+        .create_run(race_run(ids::HTUI_ANA_2))
+        .await
+        .expect("queue a graph run");
+    sqlx::query("UPDATE run SET target_id = $1, target_source = 'item' WHERE id = $2")
+        .bind(target.id.as_uuid())
+        .bind(run.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("plant the run's target");
+
+    match db.store.delete_target(target.id).await {
+        Err(htui_core::store::StoreError::Constraint(sentence)) => {
+            assert_eq!(sentence, target_has_runs("history docker", 1));
+        }
+        other => panic!("a target with run history is refused, got {other:?}"),
+    }
+    assert_eq!(
+        db.store.target(target.id).await.expect("the row stays"),
+        target,
+        "the refusal deleted nothing"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-130 M1 T4 (blueprint B7): a level setter that waits behind a retire holding the target's
+/// row lock sees the retire, and answers `target_retired` rather than naming a retired target.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_level_set_behind_a_retire_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = db
+        .store
+        .create_target(NewTarget {
+            id: TargetId::new(),
+            name: "racing docker".to_owned(),
+            kind: TargetKind::Docker,
+            locator: serde_json::json!({}),
+        })
+        .await
+        .expect("create a target");
+    let project = db
+        .store
+        .project(ids::PROJECT_HTUI)
+        .await
+        .expect("project")
+        .expect("the fixture holds htui");
+
+    // The retire's transaction, held open with the row locked as `retire_target` locks it.
+    let mut retire = PgConnection::connect(&db.url)
+        .await
+        .expect("the retiring connection");
+    sqlx::query("BEGIN")
+        .execute(&mut retire)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM target WHERE id = $1 FOR UPDATE")
+        .bind(target.id.as_uuid())
+        .execute(&mut retire)
+        .await
+        .expect("lock the target");
+    sqlx::query("UPDATE target SET retired_at = now() WHERE id = $1")
+        .bind(target.id.as_uuid())
+        .execute(&mut retire)
+        .await
+        .expect("retire it");
+
+    let setter = {
+        let store = db.store.clone();
+        tokio::spawn(async move {
+            store
+                .set_project_target(project.id, project.updated_at, Some(target.id))
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !setter.is_finished(),
+        "the setter waits on the retire's row lock"
+    );
+    sqlx::query("COMMIT")
+        .execute(&mut retire)
+        .await
+        .expect("commit the retire");
+
+    match setter.await.expect("the setter task") {
+        Err(htui_core::store::StoreError::Constraint(sentence)) => {
+            assert_eq!(sentence, target_retired("racing docker"));
+        }
+        other => panic!("a set behind a retire is refused, got {other:?}"),
+    }
+    assert_eq!(
+        db.store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("project")
+            .expect("htui"),
+        project,
+        "the refused set wrote nothing"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-130 M1 R1 (blueprint B7): an item writer naming a target reads it `FOR SHARE`, so an
+/// `update_item` or a `mint_item` that waits behind a retire holding the target's row lock sees
+/// the retire and answers `target_retired`, never storing a retired target.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_write_behind_a_retire_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let kind = race_kind(&db.pool).await;
+    let before = db
+        .store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("read must not fail")
+        .expect("the fixture item exists");
+    let (edited, version) = (before.id, before.version);
+
+    for writer in ["update_item", "mint_item"] {
+        let name = format!("racing {writer}");
+        let target = db
+            .store
+            .create_target(NewTarget {
+                id: TargetId::new(),
+                name: name.clone(),
+                kind: TargetKind::Docker,
+                locator: serde_json::json!({}),
+            })
+            .await
+            .expect("create a target");
+
+        // The retire's transaction, held open with the row locked as `retire_target` locks it.
+        let mut retire = PgConnection::connect(&db.url)
+            .await
+            .expect("the retiring connection");
+        sqlx::query("BEGIN")
+            .execute(&mut retire)
+            .await
+            .expect("begin");
+        sqlx::query("SELECT 1 FROM target WHERE id = $1 FOR UPDATE")
+            .bind(target.id.as_uuid())
+            .execute(&mut retire)
+            .await
+            .expect("lock the target");
+        sqlx::query("UPDATE target SET retired_at = now() WHERE id = $1")
+            .bind(target.id.as_uuid())
+            .execute(&mut retire)
+            .await
+            .expect("retire it");
+
+        let store = db.store.clone();
+        let item = ItemId::new();
+        let write = tokio::spawn(async move {
+            if writer == "update_item" {
+                store
+                    .update_item(
+                        edited,
+                        version,
+                        ItemPatch {
+                            target_id: Some(Some(target.id)),
+                            author_id: ids::USER,
+                            box_id: Some(ids::BOX),
+                            reason: "pinned".to_owned(),
+                            ..ItemPatch::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                store
+                    .mint_item(NewItem {
+                        id: item,
+                        target_id: Some(target.id),
+                        ..race_item(kind, "racing mint")
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !write.is_finished(),
+            "the {writer} waits on the retire's row lock"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut retire)
+            .await
+            .expect("commit the retire");
+
+        match write.await.expect("the writer task") {
+            Err(htui_core::store::StoreError::Constraint(sentence)) => {
+                assert_eq!(sentence, target_retired(&name), "{writer}");
+            }
+            other => panic!("an {writer} behind a retire is refused, got {other:?}"),
+        }
+        let pinned: i64 = sqlx::query_scalar("SELECT count(*) FROM item WHERE target_id = $1")
+            .bind(target.id.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count the target's items");
+        assert_eq!(pinned, 0, "the refused {writer} stored no retired target");
+    }
+    assert_eq!(
+        db.store
+            .item(ids::HTUI_ANA_2)
+            .await
+            .expect("read must not fail")
+            .expect("the fixture item exists"),
+        before,
+        "the refused edit wrote nothing"
+    );
+    assert_eq!(
+        counter(&db.pool, ids::PROJECT_HTUI, RACE_PREFIX).await,
+        None,
+        "the refused mint spent no key number"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-130 M1 R1 (blueprint B3, refusal 6): a stored container attached again under a second
+/// machine is `box_not_a_child_of`, and writes nothing. The conformance case cannot reach this
+/// arm: no `WriteStore` verb creates a machine, so the second one is planted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_container_attached_under_another_machine_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let second = BoxId::new();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, $2, 'second', 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(second.as_uuid())
+    .bind(db.store.this_user().as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant a second machine");
+    let target = |name: &str| NewTarget {
+        id: TargetId::new(),
+        name: name.to_owned(),
+        kind: TargetKind::Docker,
+        locator: serde_json::json!({}),
+    };
+    let docker = db
+        .store
+        .create_target(target("dev docker"))
+        .await
+        .expect("create");
+    let spare = db
+        .store
+        .create_target(target("spare docker"))
+        .await
+        .expect("create");
+    let child = BoxId::new();
+    let attach = |parent: BoxId, target: TargetId| NewChildBox {
+        id: child,
+        parent,
+        hostname: "dev-rust".to_owned(),
+        target,
+    };
+    db.store
+        .attach_child_box(attach(ids::BOX, docker.id))
+        .await
+        .expect("attach under the fixture machine");
+    let before = db.store.boxes().await.expect("boxes");
+
+    for target in [docker.id, spare.id] {
+        match db.store.attach_child_box(attach(second, target)).await {
+            Err(htui_core::store::StoreError::Constraint(sentence)) => {
+                assert_eq!(sentence, box_not_a_child_of(child, second));
+            }
+            other => panic!("a container under another machine is refused, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        db.store.boxes().await.expect("boxes"),
+        before,
+        "nothing written"
+    );
+    assert_eq!(
+        db.store.target(spare.id).await.expect("read"),
+        spare,
+        "the spare target stays unbound"
+    );
     db.drop_db().await;
 }

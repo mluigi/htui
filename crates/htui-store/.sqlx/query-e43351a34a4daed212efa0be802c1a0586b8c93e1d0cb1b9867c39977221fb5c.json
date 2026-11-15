@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version,\n                                     kind, parent_box_id)\n                    VALUES ($1, $2, $3, NULL, '', '', '', 'container', $4)\n                    ON CONFLICT (id) DO NOTHING\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e43351a34a4daed212efa0be802c1a0586b8c93e1d0cb1b9867c39977221fb5c"
+}

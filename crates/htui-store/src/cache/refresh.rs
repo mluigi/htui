@@ -213,13 +213,17 @@ const REQUIREMENT_AREA: &str = "requirement_area";
 const REQUIREMENT: &str = "requirement";
 const ITEM_REQUIREMENT: &str = "item_requirement";
 
+/// MOD-130 M1 (D15, plan P7): the unscoped `target` table, a full replace like `workspace`.
+const TARGET: &str = "target";
+
 /// One pass, as a free function so `tests/cache.rs` can run it without a task.
 ///
 /// In order (§6.2 verbatim, with the two gaps of blueprint H.3 and H.4 closed):
 ///
-/// 1. unscoped full replace of `app_user`, `agent`, `workspace` and `workspace_project` - small
-///    tables, and `workspace_project` has no timestamp at all to put a cursor on (H.4). `agent`
-///    joined them in MOD-2 milestone 4 (plan D31, D32) and rides no cursor either;
+/// 1. unscoped full replace of `app_user`, `agent`, `workspace`, `target` and
+///    `workspace_project` - small tables, and `workspace_project` has no timestamp at all to put a
+///    cursor on (H.4). `agent` joined them in MOD-2 milestone 4 (plan D31, D32) and rides no cursor
+///    either; `target` joined in MOD-130 M1 (D15, plan P7), so a deleted target leaves the mirror;
 /// 2. the own `box` row, unscoped, upserted on its primary key;
 /// 3. per project, per table in foreign-key order, `ts_col > high_water - overlap`, primary-key
 ///    upsert, cursor set to `max(ts_col)` of the fetched rows - server time, so clock skew between
@@ -248,6 +252,7 @@ pub async fn run_pass(
     replace_app_user(pool, sqlite, &mut report).await?;
     replace_agent(pool, sqlite, &mut report).await?;
     replace_workspace(pool, sqlite, &mut report).await?;
+    replace_target(pool, sqlite, &mut report).await?;
     replace_workspace_project(pool, sqlite, &mut report).await?;
     refresh_box(pool, sqlite, settings.this_box, &mut report).await?;
 
@@ -574,6 +579,57 @@ async fn replace_workspace(
     Ok(())
 }
 
+const TARGET_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "kind",
+    "locator",
+    "box_id",
+    "probed_at",
+    "probe_error",
+    "retired_at",
+    "created_at",
+    "updated_at",
+];
+
+/// MOD-130 M1 (D15, plan P7): every `target` row, retired ones included, as a full replace.
+async fn replace_target(pool: &PgPool, sqlite: &SqlitePool, report: &mut PassReport) -> Result<()> {
+    let rows = sqlx::query!(
+        "SELECT id, name, kind, locator, box_id, probed_at, probe_error, retired_at, created_at, \
+                updated_at \
+           FROM target"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(TARGET, TARGET_COLUMNS, 1);
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    sqlx::query("DELETE FROM target")
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    for row in &rows {
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.id.to_string())
+            .bind(&row.name)
+            .bind(&row.kind)
+            .bind(json_text(&row.locator)?)
+            .bind(row.box_id.map(|id| id.to_string()))
+            .bind(row.probed_at.map(ts_bind))
+            .bind(row.probe_error.as_deref())
+            .bind(row.retired_at.map(ts_bind))
+            .bind(ts_bind(row.created_at))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    tx.commit().await.map_err(map_sqlx)?;
+    report.add(TARGET, rows.len() as u64);
+    Ok(())
+}
+
 const WORKSPACE_PROJECT_COLUMNS: &[&str] = &["workspace_id", "project_id", "position"];
 
 async fn replace_workspace_project(
@@ -642,7 +698,7 @@ async fn refresh_box(
         "SELECT id, user_id, hostname, os_family, os_version, arch, cpu, ram_mb, gpu_present, \
                 gpu_vendor, htui_version, probed_tags, declared_tags, quirks, settings, \
                 registered_at, last_seen_at, last_probed_at, updated_at \
-           FROM box WHERE id = $1",
+           FROM box WHERE id = $1 AND kind = 'machine'",
         this_box.as_uuid(),
     )
     .fetch_all(pool)
@@ -652,11 +708,17 @@ async fn refresh_box(
     let sql = upsert_sql("box", BOX_COLUMNS, 1);
     let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
     for row in &rows {
+        // This box is a machine, and `chk_box_os_family` holds a machine's family non-NULL
+        // (MOD-130 M1, D13): a NULL here is a store bug, not a value to invent (blueprint B12).
+        let os_family = row
+            .os_family
+            .as_deref()
+            .ok_or_else(|| StoreError::Backend(format!("box {} has no os_family", row.id)))?;
         sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
             .bind(row.id.to_string())
             .bind(row.user_id.to_string())
             .bind(&row.hostname)
-            .bind(&row.os_family)
+            .bind(os_family)
             .bind(&row.os_version)
             .bind(&row.arch)
             .bind(&row.cpu)
@@ -707,6 +769,7 @@ const PROJECT_COLUMNS: &[&str] = &[
     "updated_at",
     "type",
     "owner_workspace_id",
+    "target_id",
 ];
 
 async fn refresh_project(
@@ -718,7 +781,7 @@ async fn refresh_project(
 ) -> Result<Batch> {
     let rows = sqlx::query!(
         "SELECT id, slug, name, description, secret_provider, secret_scope, settings, created_by, \
-                created_at, updated_at, type AS project_type, owner_workspace_id \
+                created_at, updated_at, type AS project_type, owner_workspace_id, target_id \
            FROM project WHERE id = $1 AND updated_at > $2 ORDER BY updated_at",
         project.as_uuid(),
         since,
@@ -743,6 +806,7 @@ async fn refresh_project(
             .bind(ts_bind(row.updated_at))
             .bind(&row.project_type)
             .bind(row.owner_workspace_id.map(|id| id.to_string()))
+            .bind(row.target_id.map(|id| id.to_string()))
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
@@ -880,6 +944,7 @@ const ITEM_COLUMNS: &[&str] = &[
     "updated_at",
     "closed_at",
     "resolution",
+    "target_id",
 ];
 
 async fn refresh_item(
@@ -892,7 +957,7 @@ async fn refresh_item(
     let rows = sqlx::query!(
         r#"SELECT id, project_id, kind_id, key_prefix, key_number, key as "key!", title, body,
                   status, priority, required_tags, touched_paths, step_graph_id, version,
-                  created_by, created_at, updated_at, closed_at, resolution
+                  created_by, created_at, updated_at, closed_at, resolution, target_id
              FROM item WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at"#,
         project.as_uuid(),
         since,
@@ -924,6 +989,7 @@ async fn refresh_item(
             .bind(ts_bind(row.updated_at))
             .bind(row.closed_at.map(ts_bind))
             .bind(&row.resolution)
+            .bind(row.target_id.map(|id| id.to_string()))
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
@@ -1211,6 +1277,8 @@ const RUN_COLUMNS: &[&str] = &[
     "lease_expires_at",
     "updated_at",
     "workspace_id",
+    "target_id",
+    "target_source",
 ];
 
 async fn refresh_run(
@@ -1225,7 +1293,8 @@ async fn refresh_run(
         // by definition not running while the mirror is read.
         "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, \
                 graph_snapshot, started_by, queued_at, started_at, finished_at, failure, \
-                repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id \
+                repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id, target_id, \
+                target_source \
            FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
         project.as_uuid(),
         since,
@@ -1257,6 +1326,8 @@ async fn refresh_run(
             .bind(row.lease_expires_at.map(ts_bind))
             .bind(ts_bind(row.updated_at))
             .bind(row.workspace_id.map(|id| id.to_string()))
+            .bind(row.target_id.map(|id| id.to_string()))
+            .bind(row.target_source.as_deref())
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;

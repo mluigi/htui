@@ -623,6 +623,7 @@ mod tests {
             description: String::new(),
             is_override: true,
             revision: 0,
+            target_id: None,
             created_at: DateTime::UNIX_EPOCH,
             updated_at: DateTime::UNIX_EPOCH,
         });

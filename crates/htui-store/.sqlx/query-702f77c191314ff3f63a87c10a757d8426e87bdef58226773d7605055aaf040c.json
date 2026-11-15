@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT user_id AS \"user_id: UserId\", kind AS \"kind: BoxKind\"\n              FROM box WHERE id = $1\n               FOR KEY SHARE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "kind: BoxKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "kind"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "702f77c191314ff3f63a87c10a757d8426e87bdef58226773d7605055aaf040c"
+}

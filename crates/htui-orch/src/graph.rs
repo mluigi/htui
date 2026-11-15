@@ -1344,6 +1344,8 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
         .await?
         .ok_or(ResolveError::NoGraph(item.id))?;
     let source_name = source_row.name;
+    // MOD-130 M1 T4 (blueprint B9): the workflow's target, which the clone keeps.
+    let source_target = source_row.target_id;
 
     // D96 (F-H): every source phase attachment must pass `set_skill_binding`'s whole rule chain
     // (D78's `check_attachment`) before the clone writes anything, so a row the writer would refuse
@@ -1489,6 +1491,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                 description: description.clone(),
                 is_override: true,
                 revision: 0,
+                target_id: None,
                 created_at: now,
                 updated_at: now,
             }
@@ -1539,6 +1542,29 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
             return Err(ResolveError::Store(StoreError::Constraint(format!(
                 "override graph `{name}` moved while it was being {verb}; override again"
             ))));
+        }
+    };
+
+    // MOD-130 M1 T4 (blueprint B9): `replace_graph` never writes `target_id`, so the clone takes
+    // the source's target here; without it an override would move the item from the workflow's
+    // pinned target to inherit. The clone mirrors the source exactly (R1): a re-clone of a
+    // workflow set back to inherit clears the old pin. A refusal (the target was retired
+    // meanwhile) leaves the orphan, as every other mid-clone failure does, and the next call
+    // adopts it.
+    let clone = if clone.target_id == source_target {
+        clone
+    } else {
+        match store
+            .set_graph_target(clone.id, clone.updated_at, source_target)
+            .await?
+        {
+            CasOutcome::Applied(row) => row,
+            CasOutcome::Stale(_) => {
+                return Err(ResolveError::Store(StoreError::Constraint(format!(
+                    "override graph `{name}` moved while its target was being copied; \
+                     override again"
+                ))));
+            }
         }
     };
 
@@ -3671,6 +3697,126 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .into_iter()
             .filter(|graph| graph.is_override)
             .collect()
+    }
+
+    /// MOD-130 M1 T4 (blueprint B9): `replace_graph` never writes `target_id`, so the clone takes
+    /// the workflow's pinned target itself; overriding an item's workflow never moves the item
+    /// back to inherit, and a re-clone keeps the target too.
+    #[tokio::test]
+    async fn an_override_keeps_the_workflows_target() {
+        let store = MemStore::demo();
+        let pinned = store
+            .create_target(htui_core::model::NewTarget {
+                id: htui_core::model::TargetId::new(),
+                name: "pinned docker".to_owned(),
+                kind: htui_core::model::TargetKind::Docker,
+                locator: json!({}),
+            })
+            .await
+            .expect("create a target");
+        let feat = store
+            .graph_body(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the seeded feature graph")
+            .graph;
+        let CasOutcome::Applied(_) = store
+            .set_graph_target(feat.id, feat.updated_at, Some(pinned.id))
+            .await
+            .expect("pin the workflow's target")
+        else {
+            panic!("the pin applies")
+        };
+
+        let source = TestSource::claude(&store);
+        let clone = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes an override");
+        assert_eq!(
+            clone.target_id,
+            Some(pinned.id),
+            "the clone keeps the workflow's target"
+        );
+        assert_eq!(
+            store
+                .graph_body(clone.id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the clone is stored")
+                .graph,
+            clone,
+            "override_graph answers the clone as stored"
+        );
+
+        let again = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("a re-override re-clones");
+        assert_eq!(
+            (again.id, again.target_id),
+            (clone.id, Some(pinned.id)),
+            "the re-clone keeps the target"
+        );
+    }
+
+    /// MOD-130 M1 R1 (blueprint B9): a re-clone mirrors the source's target exactly, so a workflow
+    /// set back to inherit after its item was first overridden clears the clone's old pin.
+    #[tokio::test]
+    async fn a_re_override_mirrors_a_workflow_set_back_to_inherit() {
+        let store = MemStore::demo();
+        let pinned = store
+            .create_target(htui_core::model::NewTarget {
+                id: htui_core::model::TargetId::new(),
+                name: "pinned docker".to_owned(),
+                kind: htui_core::model::TargetKind::Docker,
+                locator: json!({}),
+            })
+            .await
+            .expect("create a target");
+        let feat = store
+            .graph_body(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the seeded feature graph")
+            .graph;
+        let CasOutcome::Applied(feat) = store
+            .set_graph_target(feat.id, feat.updated_at, Some(pinned.id))
+            .await
+            .expect("pin the workflow's target")
+        else {
+            panic!("the pin applies")
+        };
+
+        let source = TestSource::claude(&store);
+        let clone = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes an override");
+        assert_eq!(clone.target_id, Some(pinned.id), "the clone takes the pin");
+
+        let CasOutcome::Applied(_) = store
+            .set_graph_target(feat.id, feat.updated_at, None)
+            .await
+            .expect("set the workflow back to inherit")
+        else {
+            panic!("the clear applies")
+        };
+        let again = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("a re-override re-clones");
+        assert_eq!(
+            (again.id, again.target_id),
+            (clone.id, None),
+            "the re-clone mirrors the source's inherit"
+        );
+        assert_eq!(
+            store
+                .graph_body(again.id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the clone is stored")
+                .graph,
+            again,
+            "override_graph answers the clone as stored"
+        );
     }
 
     /// MOD-137 D13: the first override copies the kind default's edges too, remapped onto the

@@ -48,7 +48,7 @@ fn demo_budget() -> Budget {
 fn demo_box() -> BoxProfile {
     BoxProfile {
         hostname: "dev-win-01".to_owned(),
-        os_family: OsFamily::Windows,
+        os_family: Some(OsFamily::Windows),
         os_version: "10.0.26200".to_owned(),
         arch: "x86_64".to_owned(),
         cpu: "AMD Ryzen 9 7950X, 32 threads".to_owned(),
@@ -291,7 +291,7 @@ pub fn phase_all_empty() -> PromptSpec {
         upstream: Vec::new(),
         box_profile: BoxProfile {
             hostname: "ci-linux-01".to_owned(),
-            os_family: OsFamily::Linux,
+            os_family: Some(OsFamily::Linux),
             os_version: "6.8.0".to_owned(),
             arch: "x86_64".to_owned(),
             cpu: String::new(),

@@ -783,6 +783,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -831,6 +832,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -2592,6 +2594,7 @@ async fn the_mirror_counts_the_scope_row_in_upstream_scope() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -3278,9 +3281,9 @@ async fn a_refused_integration_holds_its_dependent_offline() {
 async fn a_closed_item_mirrors_its_resolution() {
     assert_eq!(
         htui_store::cache::MIRRORED_TABLES.len(),
-        24,
+        25,
         "MOD-38 adds requirement_spec, requirement_area, requirement and item_requirement; \
-         MOD-139 adds run_plan; MOD-150 M3 adds item_artifact_link; MOD-133 adds integration",
+         MOD-139 adds run_plan; MOD-150 M3 adds item_artifact_link; MOD-133 adds integration; MOD-130 M1 adds target",
     );
     let Some(db) = common::demo_db().await else {
         return;
@@ -4106,6 +4109,7 @@ async fn a_scope_row_mirrors_its_kinds_items_and_owner_documents() {
             touched_paths: Vec::new(),
             priority: 0,
             step_graph_id: None,
+            target_id: None,
             created_by: ids::USER,
             box_id: Some(ids::BOX),
         })
@@ -4331,6 +4335,244 @@ async fn the_0012_requirement_refinements_reach_the_mirror() {
         vec![("R-ENT-3", Some(3), None), ("W-ORCH-1.1", None, Some(1))],
         "both refinements, in list order; the nested row has no number"
     );
+
+    teardown(db, &[&cache]).await;
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-130 M1 T5: the mirror holds `target` and the level columns (D15, plan P7)
+// ------------------------------------------------------------------------------------------------
+
+/// A docker target named `name`, unbound, with a small locator (MOD-130 M1 T5).
+fn docker_target(name: &str) -> htui_core::model::NewTarget {
+    htui_core::model::NewTarget {
+        id: htui_core::model::TargetId::new(),
+        name: name.to_owned(),
+        kind: htui_core::model::TargetKind::Docker,
+        locator: json!({ "context": "default", "image": "htui/agent" }),
+    }
+}
+
+/// The value inside a `CasOutcome` that must have applied.
+fn applied<T: std::fmt::Debug>(what: &str, outcome: htui_core::store::CasOutcome<T>) -> T {
+    match outcome {
+        htui_core::store::CasOutcome::Applied(row) => row,
+        htui_core::store::CasOutcome::Stale(row) => panic!("{what}: stale, now {row:?}"),
+    }
+}
+
+/// MOD-130 M1 T5 (D15, P7): a docker target set on a project, an item and a scope row reaches the
+/// mirror, and every offline read equals the Postgres one: `targets()`, `target()`, both
+/// `project()` rows and `item()`. The scope row rides the pass because the pass names it.
+#[tokio::test]
+async fn a_refresh_mirrors_targets_and_the_level_columns() {
+    use htui_core::model::{EditReason, ItemPatch};
+    use htui_core::store::UpdateOutcome;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let docker = db
+        .store
+        .create_target(docker_target("mirror docker"))
+        .await
+        .expect("create the docker target");
+    for project in [ids::PROJECT_AGY, ids::PROJECT_SCOPE_PLATFORM] {
+        let row = db
+            .store
+            .project(project)
+            .await
+            .expect("pg project")
+            .expect("the project exists");
+        applied(
+            "set_project_target",
+            db.store
+                .set_project_target(project, row.updated_at, Some(docker.id))
+                .await
+                .expect("set the project's target"),
+        );
+    }
+    let item = db
+        .store
+        .item(ids::HTUI_FEAT_1)
+        .await
+        .expect("pg item")
+        .expect("FEAT-1 exists");
+    let UpdateOutcome::Updated(item) = db
+        .store
+        .update_item(
+            item.id,
+            item.version,
+            ItemPatch {
+                target_id: Some(Some(docker.id)),
+                author_id: ids::USER,
+                box_id: Some(ids::BOX),
+                reason: EditReason::Edited.as_str().to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("set the item's target")
+    else {
+        panic!("an edit at the current version lands");
+    };
+    assert_eq!(item.target_id, Some(docker.id));
+
+    let cache = open_cache(&db).await;
+    let mut projects = all_projects();
+    projects.push(ids::PROJECT_SCOPE_PLATFORM);
+    run_pass(&db.pool, &cache, &projects, &settings(&db, 20))
+        .await
+        .expect("the pass");
+
+    let pg_targets = db.store.targets().await.expect("pg targets");
+    assert_eq!(
+        cache.targets().await.expect("cache targets"),
+        pg_targets,
+        "the mirror lists the targets as Postgres does, local included"
+    );
+    assert_eq!(pg_targets.len(), 2, "the local target and the docker one");
+    assert_eq!(
+        cache.target(docker.id).await.expect("cache target"),
+        docker,
+        "target() reads the docker target, locator included"
+    );
+    for project in [ids::PROJECT_AGY, ids::PROJECT_SCOPE_PLATFORM] {
+        let mirrored = cache
+            .project(project)
+            .await
+            .expect("cache project")
+            .expect("the project is mirrored");
+        assert_eq!(mirrored.target_id, Some(docker.id), "{project}'s level");
+        assert_eq!(
+            Some(mirrored),
+            db.store.project(project).await.expect("pg project"),
+            "the two backends read {project} alike"
+        );
+    }
+    assert_eq!(
+        cache
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("cache project")
+            .map(|p| p.target_id),
+        Some(None),
+        "a project without a level inherits"
+    );
+    assert_eq!(
+        cache.item(item.id).await.expect("cache item"),
+        Some(item.clone()),
+        "item() reads the item's target off the mirror"
+    );
+
+    let run_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('run') ORDER BY cid")
+            .fetch_all(cache.pool())
+            .await
+            .expect("list run's columns");
+    assert!(
+        run_columns.ends_with(&["target_id".to_owned(), "target_source".to_owned()]),
+        "run carries target_id and target_source, got {run_columns:?}"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-130 M1 T5 (D14, D15): retiring a target hides it from pickers, never from the mirror: the
+/// next pass keeps the row with its `retired_at`, as Postgres keeps it.
+#[tokio::test]
+async fn a_retired_target_stays_in_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let docker = db
+        .store
+        .create_target(docker_target("to retire"))
+        .await
+        .expect("create the docker target");
+    let cache = open_cache(&db).await;
+    let settings = settings(&db, 20);
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the first pass");
+    assert_eq!(
+        cache.target(docker.id).await.expect("mirrored").retired_at,
+        None
+    );
+
+    let retired = applied(
+        "retire_target",
+        db.store
+            .retire_target(docker.id, docker.updated_at)
+            .await
+            .expect("retire the target"),
+    );
+    assert!(retired.retired_at.is_some(), "Postgres stamps retired_at");
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the pass after the retire");
+
+    assert_eq!(
+        cache.target(docker.id).await.expect("still mirrored"),
+        retired,
+        "the retired target stays, retired_at and updated_at included"
+    );
+    assert_eq!(
+        cache.targets().await.expect("cache targets"),
+        db.store.targets().await.expect("pg targets"),
+        "targets() still lists it, as Postgres does"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-130 M1 T5 (D14, D15): a target deleted on Postgres leaves the mirror on the next pass, since
+/// `target` is a full replace: `target()` answers not found and `targets()` equals Postgres's.
+#[tokio::test]
+async fn a_deleted_target_leaves_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let docker = db
+        .store
+        .create_target(docker_target("to delete"))
+        .await
+        .expect("create the docker target");
+    let cache = open_cache(&db).await;
+    let settings = settings(&db, 20);
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the first pass");
+    assert_eq!(
+        cache.target(docker.id).await.expect("mirrored"),
+        docker,
+        "the target is mirrored first"
+    );
+
+    db.store
+        .delete_target(docker.id)
+        .await
+        .expect("delete the unused target");
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the pass after the delete");
+
+    assert!(
+        matches!(
+            cache.target(docker.id).await,
+            Err(StoreError::NotFound {
+                entity: "target",
+                ..
+            })
+        ),
+        "the deleted target is gone from the mirror"
+    );
+    assert_eq!(
+        cache.targets().await.expect("cache targets"),
+        db.store.targets().await.expect("pg targets"),
+        "targets() equals Postgres's: the local target alone"
+    );
+    assert_eq!(mirror_count(cache.pool(), "target").await, 1);
 
     teardown(db, &[&cache]).await;
 }

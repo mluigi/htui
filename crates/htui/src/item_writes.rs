@@ -437,6 +437,7 @@ mod tests {
             required_tags: Vec::new(),
             touched_paths: Vec::new(),
             step_graph_id: None,
+            target_id: None,
         }
     }
 
@@ -495,6 +496,7 @@ mod tests {
             priority: None,
             touched_paths: None,
             step_graph_id: None,
+            target_id: None,
             author_id: ids::USER,
             box_id: None,
             reason: "elsewhere".to_owned(),
@@ -865,6 +867,7 @@ mod tests {
             priority: None,
             touched_paths: None,
             step_graph_id: None,
+            target_id: None,
             author_id: ids::USER,
             box_id: None,
             reason: "elsewhere".to_owned(),

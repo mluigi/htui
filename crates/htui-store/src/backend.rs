@@ -1333,6 +1333,22 @@ impl ReadStore for Backend {
         }
     }
 
+    async fn targets(&self) -> Result<Vec<htui_core::model::Target>> {
+        match self {
+            Self::Memory(store) => store.targets().await,
+            Self::Online { pg, .. } => pg.targets().await,
+            Self::Offline { cache, .. } => cache.targets().await,
+        }
+    }
+
+    async fn target(&self, id: htui_core::model::TargetId) -> Result<htui_core::model::Target> {
+        match self {
+            Self::Memory(store) => store.target(id).await,
+            Self::Online { pg, .. } => pg.target(id).await,
+            Self::Offline { cache, .. } => cache.target(id).await,
+        }
+    }
+
     async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
         match self {
             Self::Memory(store) => store.item_requirements(item).await,

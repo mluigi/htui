@@ -170,6 +170,7 @@ fn catalogue_requests() -> Vec<StoreRequest> {
                     description: String::new(),
                     is_override: false,
                     revision: 0,
+                    target_id: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
@@ -1631,6 +1632,7 @@ async fn an_unreferenced_graph_is_listed_after_the_kinds() {
             description: String::new(),
             is_override: false,
             revision: 0,
+            target_id: None,
             created_at: now,
             updated_at: now,
         },
@@ -3780,6 +3782,7 @@ async fn enter_on_a_kind_opens_its_project_graph_and_refuses_a_shared_one() {
         description: String::new(),
         is_override: false,
         revision: 0,
+        target_id: None,
         created_at: now,
         updated_at: now,
     };

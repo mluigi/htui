@@ -52,10 +52,15 @@ pub const CACHE_FILE: &str = "cache.sqlite";
 /// `integration` joined in MOD-133 M1 (plan D5, D7): the readiness read (`ready_case`) releases a
 /// `done` blocker run only when every record of it is landed, so an offline `items(ready)` agrees
 /// with Postgres. The lease columns and `repo.integrate` are not mirrored.
-pub const MIRRORED_TABLES: [&str; 24] = [
+///
+/// `target` joined in MOD-130 M1 (D15, plan P7): an offline reader answers `targets` and `target`
+/// off it, retired rows included. Like `workspace` it is a full replace on every pass, so a target
+/// deleted on Postgres leaves the mirror; `project`, `item` and `run` carry its level columns.
+pub const MIRRORED_TABLES: [&str; 25] = [
     "app_user",
     "agent",
     "box",
+    "target",
     "workspace",
     "workspace_project",
     "project",
