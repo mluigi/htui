@@ -2253,6 +2253,16 @@ pub trait WriteStore: ReadStore {
         outcome: &LandOutcome,
     ) -> Result<bool>;
 
+    /// MOD-133 M2 E5: Unblock's retry. Every `refused` record of `run` goes back to `pending`
+    /// with `refusal` and the lease (`lease_box_id`, `lease_owner`, `lease_expires_at`) cleared
+    /// and `updated_at` moved, so the executing box's next land pass (or sweep) takes it again.
+    /// Answers how many moved: `0` when nothing of `run` is refused (a stale press, an unknown
+    /// run) is never an error. Records in any other state are left alone.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn retry_landing(&self, run: RunId) -> Result<usize>;
+
     /// `R-TUI-9`'s three effects, one transaction (plan D6): the summary document at its next
     /// version, the commits upserted, and the item set to `closed` with `resolution` and
     /// `closed_at`. Close-out is the **only** way into `closed` and the only writer of

@@ -86,6 +86,7 @@ fn upstream_entry(
         in_scope,
         summary: summary.map(str::to_owned),
         latest_run_status: latest,
+        latest_run_landing: None,
     }
 }
 

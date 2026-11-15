@@ -79,6 +79,7 @@ use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{LogShipLevel, NewWorkerLog, WorkerLogLine};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
 use crate::model::{PlanAdmission, PlanToAdmit};
+use crate::model::{RefusedLanding, RunLanding};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
@@ -1352,6 +1353,7 @@ impl MemStore {
                             .map(|note| note.body.clone()),
                         open_blockers: state.open_blocker_keys(item.id),
                         latest_run_status: state.latest_run_status(item.id),
+                        latest_run_landing: state.latest_run_landing(item.id),
                         entry,
                     })
                 })
@@ -1919,9 +1921,11 @@ impl State {
         {
             return false;
         }
-        if filter.states.as_ref().is_some_and(|states| {
-            !states.contains(&ItemState::of(item.status, self.latest_run_status(item.id)))
-        }) {
+        if filter
+            .states
+            .as_ref()
+            .is_some_and(|states| !states.contains(&self.item_state(item)))
+        {
             return false;
         }
         if filter
@@ -1981,6 +1985,7 @@ impl State {
             status: item.status,
             depth,
             latest_run_status: self.latest_run_status(item.id),
+            latest_run_landing: self.latest_run_landing(item.id),
         }
     }
 
@@ -2252,6 +2257,7 @@ impl State {
                 })
                 .flatten(),
             latest_run_status: self.latest_run_status(item.id),
+            latest_run_landing: self.latest_run_landing(item.id),
         }
     }
 
@@ -2460,7 +2466,9 @@ impl State {
     }
 
     /// MOD-69 plan D2: the scope's candidates, grouped and sorted by `WaitingCandidate::assemble`:
-    /// an item that is `blocked`, or that owns a run at `awaiting_approval` (MOD-144).
+    /// an item that is `blocked`, or that owns a run at `awaiting_approval` (MOD-144), or that is
+    /// `open` over a `done` latest graph run holding a `refused` record (MOD-133 M2 E4), whose
+    /// refused records ride along.
     fn waiting_candidates(&self, scope: &Scope) -> Vec<WaitingCandidate> {
         let parked: BTreeSet<ItemId> = self
             .runs
@@ -2468,11 +2476,49 @@ impl State {
             .filter(|run| run.status == RunStatus::AwaitingApproval)
             .filter_map(|run| run.item_id)
             .collect();
+        let mut refused: Vec<(ItemId, RefusedLanding)> = Vec::new();
+        for item in self.items.values() {
+            if !scope.contains(item.project_id) || item.status != Status::Open {
+                continue;
+            }
+            let Some(run) = self
+                .latest_graph_run_of(item.id)
+                .filter(|run| run.status == RunStatus::Done)
+            else {
+                continue;
+            };
+            refused.extend(
+                self.integrations
+                    .range((run.id, RepoId(Uuid::nil()))..=(run.id, RepoId(Uuid::max())))
+                    .filter(|(_, record)| record.row.state == IntegrationState::Refused)
+                    .filter_map(|(_, record)| {
+                        let repo = self.repos.get(&record.row.repo_id)?;
+                        Some((
+                            item.id,
+                            RefusedLanding {
+                                run: run.id,
+                                repo: repo.id,
+                                repo_name: repo.name.clone(),
+                                mode: record.row.mode,
+                                target_branch: record.row.target_branch.clone(),
+                                refusal: record.row.refusal.clone().unwrap_or_default(),
+                                since: record.row.updated_at,
+                                run_queued_at: run.queued_at,
+                            },
+                        ))
+                    }),
+            );
+        }
+        let landing: BTreeSet<ItemId> = refused.iter().map(|(item, _)| *item).collect();
         let items: Vec<Item> = self
             .items
             .values()
             .filter(|item| scope.contains(item.project_id))
-            .filter(|item| item.status == Status::Blocked || parked.contains(&item.id))
+            .filter(|item| {
+                item.status == Status::Blocked
+                    || parked.contains(&item.id)
+                    || landing.contains(&item.id)
+            })
             .cloned()
             .collect();
         let wanted: BTreeSet<ItemId> = items.iter().map(|item| item.id).collect();
@@ -2490,7 +2536,7 @@ impl State {
             .filter(|step| owners.contains(&step.run_id))
             .cloned()
             .collect();
-        WaitingCandidate::assemble(scope, items, runs, steps)
+        WaitingCandidate::assemble(scope, items, runs, steps, refused)
     }
 
     /// Mints an item: counter upsert, key assembly and revision 1, all in one lock (§7.1, §4.1).
@@ -6584,10 +6630,33 @@ impl State {
             .all(|(_, record)| record.row.state.is_landed())
     }
 
-    /// The list projection of `item` with its latest graph run's status filled (MOD-144).
+    /// MOD-133 M2 E3: the [`RunLanding`] of the records of `item`'s latest graph run (the run
+    /// [`State::latest_run_status`] reads), whatever that run's status.
+    fn latest_run_landing(&self, item: ItemId) -> Option<RunLanding> {
+        let run = self.latest_graph_run_of(item)?;
+        RunLanding::of(
+            self.integrations
+                .range((run.id, RepoId(Uuid::nil()))..=(run.id, RepoId(Uuid::max())))
+                .map(|(_, record)| record.row.state),
+        )
+    }
+
+    /// The derived display state of `item` (MOD-144, MOD-133 M2): its status over its latest
+    /// graph run and that run's landing, as every projection's `state()` reads it.
+    fn item_state(&self, item: &Item) -> ItemState {
+        ItemState::of_landing(
+            item.status,
+            self.latest_run_status(item.id),
+            self.latest_run_landing(item.id),
+        )
+    }
+
+    /// The list projection of `item` with its latest graph run's status and landing filled
+    /// (MOD-144, MOD-133 M2).
     fn summary_of(&self, item: &Item) -> ItemSummary {
         ItemSummary {
             latest_run_status: self.latest_run_status(item.id),
+            latest_run_landing: self.latest_run_landing(item.id),
             ..item.summary()
         }
     }
@@ -8839,6 +8908,26 @@ impl State {
         record.lease_expires_at = None;
         record.row.updated_at = now;
         true
+    }
+
+    /// MOD-133 M2 E5: every `refused` record of `run` back to `pending`, refusal and lease
+    /// cleared; answers how many moved.
+    fn retry_landing(&mut self, run: RunId, now: DateTime<Utc>) -> usize {
+        let mut moved = 0;
+        for (_, record) in self
+            .integrations
+            .range_mut((run, RepoId(Uuid::nil()))..=(run, RepoId(Uuid::max())))
+            .filter(|(_, record)| record.row.state == IntegrationState::Refused)
+        {
+            record.row.state = IntegrationState::Pending;
+            record.row.refusal = None;
+            record.row.updated_at = now;
+            record.lease_box_id = None;
+            record.lease_owner = None;
+            record.lease_expires_at = None;
+            moved += 1;
+        }
+        moved
     }
 
     /// `R-TUI-9`'s three effects, one closure: everything refusable is decided first.
@@ -12762,6 +12851,11 @@ impl WriteStore for MemStore {
     ) -> Result<bool> {
         let now = self.now();
         Ok(self.write(|state| state.settle_integration(run, repo, owner, outcome, now)))
+    }
+
+    async fn retry_landing(&self, run: RunId) -> Result<usize> {
+        let now = self.now();
+        Ok(self.write(|state| state.retry_landing(run, now)))
     }
 
     async fn close_out(
@@ -21401,6 +21495,80 @@ mod tests {
             "RUN_6 is the latest non-cancelled"
         );
         assert_eq!(row.state(), crate::model::ItemState::Failed);
+    }
+
+    /// MOD-133 M2 E3: a queue row carries its latest graph run's landing: `refused` wins over
+    /// `pending`, and the row reads `landing refused`; with every record landed it reads `done`.
+    #[tokio::test]
+    async fn queue_rows_carry_the_latest_runs_landing() {
+        use super::IntegrationRow;
+        use crate::model::{IntegrateMode, Integration, IntegrationState, ItemState, RunLanding};
+        let store = MemStore::demo();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let run = store
+            .read(|state| state.latest_graph_run_of(ids::HTUI_ANA_1).map(|run| run.id))
+            .expect("ANA-1 has a done run");
+        let plant = |states: &[IntegrationState]| {
+            store.write(|state| {
+                state.integrations.clear();
+                for &record in states {
+                    let repo = RepoId::new();
+                    state.integrations.insert(
+                        (run, repo),
+                        IntegrationRow {
+                            row: Integration {
+                                run_id: run,
+                                repo_id: repo,
+                                project_id: ids::PROJECT_HTUI,
+                                mode: IntegrateMode::Push,
+                                remote: "git@example.test:htui.git".to_owned(),
+                                target_branch: "main".to_owned(),
+                                state: record,
+                                refusal: (record == IntegrationState::Refused)
+                                    .then(|| "non_fast_forward: main moved".to_owned()),
+                                landed_hash: None,
+                                pr_ref: None,
+                                pr_url: None,
+                                created_at: at,
+                                updated_at: at,
+                            },
+                            lease_box_id: None,
+                            lease_owner: None,
+                            lease_expires_at: None,
+                        },
+                    );
+                }
+            });
+        };
+        store
+            .queue_item(ids::HTUI_ANA_1, ids::BOX, None, ids::USER, at)
+            .await
+            .expect("queue");
+        for (states, landing, item_state) in [
+            (
+                vec![IntegrationState::Pending, IntegrationState::Refused],
+                Some(RunLanding::Refused),
+                ItemState::LandRefused,
+            ),
+            (
+                vec![IntegrationState::Pending],
+                Some(RunLanding::Pending),
+                ItemState::Landing,
+            ),
+            (vec![IntegrationState::Landed], None, ItemState::Done),
+        ] {
+            plant(&states);
+            let rows = store.queue_rows(ids::BOX).await.expect("read");
+            let row = rows
+                .iter()
+                .find(|row| row.entry.item_id == ids::HTUI_ANA_1)
+                .expect("ANA-1 is queued");
+            assert_eq!(
+                (row.latest_run_landing, row.state()),
+                (landing, item_state),
+                "{states:?}"
+            );
+        }
     }
 
     /// MOD-144 (PD5): a `blocked_by` target is released when it is closed **or** its latest

@@ -2564,6 +2564,12 @@ mod tests {
 
     /// MOD-144 (PD11): every derived [`ItemState`](crate::model::ItemState) appears somewhere in
     /// the demo, each item's state read from its status and its latest graph run.
+    ///
+    /// MOD-133 M2 E9: but `landing` and `landing refused`. The demo holds no repo, integration or
+    /// `run_step_commit` (plan D110), and both `done` demo items have live `blocked_by`
+    /// dependents, so planting a record would move rows the TUI snapshots pin. The conformance
+    /// cases and the cache's case cover those two states instead, seeding records through the
+    /// store.
     #[test]
     fn every_item_state_appears_in_the_demo() {
         use crate::model::{ItemState, latest_graph_run};
@@ -2572,7 +2578,10 @@ mod tests {
             let runs = data.runs.iter().filter(|run| run.item_id == Some(item.id));
             ItemState::of(item.status, latest_graph_run(runs).map(|run| run.status))
         };
-        for state in ItemState::ALL {
+        for state in ItemState::ALL
+            .iter()
+            .filter(|state| !matches!(state, ItemState::Landing | ItemState::LandRefused))
+        {
             assert!(
                 data.items.iter().any(|item| state_of(item) == *state),
                 "the backlog renders every item state: {state} is missing"

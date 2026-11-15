@@ -51,6 +51,25 @@ impl IntegrateMode {
             Some(other) => Err(other.to_string()),
         }
     }
+
+    /// MOD-133 M2 E8: why a Settings form refuses to set this mode, or `None` when it may.
+    /// [`IntegrateMode::PullRequest`] waits for the forge adapter (MOD-134), whatever the remote;
+    /// [`IntegrateMode::Push`] needs a remote URL (`has_remote`); [`IntegrateMode::Local`] is
+    /// always selectable. The form is the guard: the stores keep no such check, and a run refuses
+    /// at start (M1 D3).
+    #[must_use]
+    pub fn selectable_refusal(self, has_remote: bool) -> Option<String> {
+        match self {
+            Self::PullRequest => Some(
+                "`pull_request` needs the forge adapter (MOD-134): choose `local` or `push`"
+                    .to_owned(),
+            ),
+            Self::Push if !has_remote => {
+                Some("`push` needs a remote URL: set one, or choose `local`".to_owned())
+            }
+            Self::Local | Self::Push => None,
+        }
+    }
 }
 
 str_enum!(
@@ -68,7 +87,9 @@ str_enum!(
         /// The pull request closed unmerged (MOD-134).
         PrClosed => "pr_closed",
         /// Landing was refused for a typed reason ([`Integration::refusal`]); not retried by a
-        /// sweep (Unblock retry is MOD-133 milestone 2).
+        /// sweep. Unblock retries it (MOD-133 M2):
+        /// [`WriteStore::retry_landing`](crate::store::WriteStore::retry_landing) puts it back to
+        /// `pending` for its box to land again.
         Refused => "refused",
     }
 );
@@ -193,6 +214,28 @@ mod tests {
                 IntegrateMode::project_default(&settings),
                 Ok(IntegrateMode::Local),
                 "{settings}"
+            );
+        }
+    }
+
+    /// MOD-133 M2 E8: `pull_request` waits for the forge adapter whatever the remote; `push` needs
+    /// a remote URL; `local` is always selectable.
+    #[test]
+    fn selectable_refusal_refuses_pull_request_and_push_without_a_remote() {
+        let forge = "`pull_request` needs the forge adapter (MOD-134): choose `local` or `push`";
+        let remote = "`push` needs a remote URL: set one, or choose `local`";
+        for (mode, has_remote, expected) in [
+            (IntegrateMode::Local, true, None),
+            (IntegrateMode::Local, false, None),
+            (IntegrateMode::Push, true, None),
+            (IntegrateMode::Push, false, Some(remote)),
+            (IntegrateMode::PullRequest, true, Some(forge)),
+            (IntegrateMode::PullRequest, false, Some(forge)),
+        ] {
+            assert_eq!(
+                mode.selectable_refusal(has_remote).as_deref(),
+                expected,
+                "{mode}, has_remote {has_remote}"
             );
         }
     }

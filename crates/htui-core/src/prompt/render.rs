@@ -1289,6 +1289,7 @@ mod tests {
             in_scope,
             summary: summary.map(str::to_owned),
             latest_run_status: None,
+            latest_run_landing: None,
         }
     }
 

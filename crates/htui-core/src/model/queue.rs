@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::model::box_::{BoxSettings, DEFAULT_MAX_CONCURRENT_ITEMS};
 use crate::model::ids::{BatchId, BoxId, ItemId, ProjectId, RunId, StepId, UserId, WorkspaceId};
-use crate::model::item::{ItemState, ItemSummary, Status};
+use crate::model::item::{ItemState, ItemSummary, RunLanding, Status};
 use crate::model::quota::CapError;
 use crate::model::run::{RunMode, RunStatus};
 
@@ -252,13 +252,15 @@ pub struct QueueRow {
     /// MOD-144: the status of the item's latest **non-cancelled** graph run, the one
     /// [`QueueRow::state`] derives from.
     pub latest_run_status: Option<RunStatus>,
+    /// MOD-133 M2 E3: the landing of that same run's integration records.
+    pub latest_run_landing: Option<RunLanding>,
 }
 
 impl QueueRow {
     /// The item's derived display state (MOD-144).
     #[must_use]
     pub const fn state(&self) -> ItemState {
-        ItemState::of(self.status, self.latest_run_status)
+        ItemState::of_landing(self.status, self.latest_run_status, self.latest_run_landing)
     }
 }
 
@@ -660,6 +662,7 @@ mod tests {
             updated_at: DateTime::UNIX_EPOCH,
             touched_paths: Vec::new(),
             latest_run_status: None,
+            latest_run_landing: None,
         }
     }
 
@@ -834,6 +837,7 @@ mod tests {
             latest_note: None,
             open_blockers: Vec::new(),
             latest_run_status,
+            latest_run_landing: None,
         }
     }
 

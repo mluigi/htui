@@ -12,7 +12,7 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 78 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
+//! `WorkerStore` is 79 methods: 16 [`ReadStore`] reads (MOD-163 D12 adds `memory_entries`,
 //! MOD-139 M1 `run_plans`), 9 [`WriteStore`] reads, 31 writes (MOD-139 M1 adds `insert_run_plan`,
 //! MOD-139 M2 `admit_plan` and `abandon_plans`),
 //! `write_document`, MOD-42's three command methods, MOD-11's
@@ -22,7 +22,8 @@
 //! `pending_stops`; MOD-144 R1 adds the write
 //! `block_if_idle`; MOD-125 M3 the read `pending_resumes` and the writes `resume_run`,
 //! `cancel_stopped_run` and `record_opening`; MOD-133 the read `integrations` and the writes
-//! `take_integrations` and `settle_integration`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
+//! `take_integrations` and `settle_integration`, MOD-133 M2 the write `retry_landing`;
+//! [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`;
 //! MOD-12 M2 adds two (`batch_spend`, `project_settings`), 31.
@@ -461,6 +462,8 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         owner: Uuid,
         outcome: &LandOutcome,
     ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::retry_landing`] (MOD-133 M2 E5): Unblock's retry of a refused landing.
+    fn retry_landing(&self, run: RunId) -> impl Future<Output = Result<usize>> + Send;
     /// [`WriteStore::close_out`].
     fn close_out(
         &self,
@@ -1101,6 +1104,9 @@ impl WorkerStore for MemStore {
         outcome: &LandOutcome,
     ) -> Result<bool> {
         WriteStore::settle_integration(self, run, repo, owner, outcome).await
+    }
+    async fn retry_landing(&self, run: RunId) -> Result<usize> {
+        WriteStore::retry_landing(self, run).await
     }
     async fn close_out(
         &self,

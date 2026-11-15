@@ -1524,6 +1524,9 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
             .settle_integration(run, repo, owner, outcome)
             .await
     }
+    async fn retry_landing(&self, run: RunId) -> StoreResult<usize> {
+        self.inner.retry_landing(run).await
+    }
     async fn close_out(
         &self,
         item: ItemId,
