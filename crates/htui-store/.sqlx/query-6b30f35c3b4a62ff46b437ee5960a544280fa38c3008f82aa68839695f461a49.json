@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT i.id                   AS \"id!: ItemId\",\n                   i.project_id           AS \"project_id!: ProjectId\",\n                   i.kind_id              AS \"kind_id!: ItemKindId\",\n                   i.key                  AS \"key!\",\n                   i.key_prefix           AS \"key_prefix!\",\n                   i.key_number           AS \"key_number!\",\n                   i.title                AS \"title!\",\n                   i.status               AS \"status!: Status\",\n                   i.priority             AS \"priority!\",\n                   i.required_tags        AS \"required_tags!\",\n                   i.updated_at           AS \"updated_at!\",\n                   i.touched_paths        AS \"touched_paths!\",\n                   i.resolution           AS \"resolution?: Resolution\",\n                   ir.kind                AS \"kind!: CitationKind\",\n                   ir.requirement_version AS \"requirement_version!\",\n                   r.version > ir.requirement_version AS \"suspect!\",\n                   lr.status              AS \"latest_run_status?: RunStatus\"\n              FROM item_requirement ir\n              JOIN requirement r ON r.id = ir.requirement_id\n              JOIN item i        ON i.id = ir.item_id\n              LEFT JOIN LATERAL (\n                    SELECT gr.status FROM run gr\n                     WHERE gr.item_id = i.id AND gr.kind = 'graph' AND gr.status <> 'cancelled'\n                     ORDER BY gr.queued_at DESC, gr.id DESC\n                     LIMIT 1\n                   ) lr ON true\n             WHERE ir.requirement_id = $1 AND ir.deleted_at IS NULL\n             ORDER BY i.key_prefix COLLATE \"C\", i.key_number, i.id, ir.kind COLLATE \"C\"\n            ",
+  "query": "\n            SELECT i.id                   AS \"id!: ItemId\",\n                   i.project_id           AS \"project_id!: ProjectId\",\n                   i.kind_id              AS \"kind_id!: ItemKindId\",\n                   i.key                  AS \"key!\",\n                   i.key_prefix           AS \"key_prefix!\",\n                   i.key_number           AS \"key_number!\",\n                   i.title                AS \"title!\",\n                   i.status               AS \"status!: Status\",\n                   i.priority             AS \"priority!\",\n                   i.required_tags        AS \"required_tags!\",\n                   i.updated_at           AS \"updated_at!\",\n                   i.touched_paths        AS \"touched_paths!\",\n                   i.resolution           AS \"resolution?: Resolution\",\n                   ir.kind                AS \"kind!: CitationKind\",\n                   ir.requirement_version AS \"requirement_version!\",\n                   r.version > ir.requirement_version AS \"suspect!\",\n                   lr.status              AS \"latest_run_status?: RunStatus\",\n                   CASE WHEN EXISTS (SELECT 1 FROM integration g\n                                        WHERE g.run_id = lr.id AND g.state = 'refused')\n                             THEN 'refused'\n                        WHEN EXISTS (SELECT 1 FROM integration g\n                                      WHERE g.run_id = lr.id\n                                        AND g.state NOT IN ('landed', 'pr_merged'))\n                             THEN 'pending' END\n                                          AS \"latest_run_landing?: RunLanding\"\n              FROM item_requirement ir\n              JOIN requirement r ON r.id = ir.requirement_id\n              JOIN item i        ON i.id = ir.item_id\n              LEFT JOIN LATERAL (\n                    SELECT gr.id, gr.status FROM run gr\n                     WHERE gr.item_id = i.id AND gr.kind = 'graph' AND gr.status <> 'cancelled'\n                     ORDER BY gr.queued_at DESC, gr.id DESC\n                     LIMIT 1\n                   ) lr ON true\n             WHERE ir.requirement_id = $1 AND ir.deleted_at IS NULL\n             ORDER BY i.key_prefix COLLATE \"C\", i.key_number, i.id, ir.kind COLLATE \"C\"\n            ",
   "describe": {
     "columns": [
       {
@@ -184,6 +184,12 @@
             "name": "status"
           }
         }
+      },
+      {
+        "ordinal": 17,
+        "name": "latest_run_landing?: RunLanding",
+        "type_info": "Text",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -208,8 +214,9 @@
       false,
       false,
       null,
-      false
+      false,
+      null
     ]
   },
-  "hash": "058261c4deba5958cb414b8f9c231d10570d27cf1f9abaac938b42767e308e09"
+  "hash": "6b30f35c3b4a62ff46b437ee5960a544280fa38c3008f82aa68839695f461a49"
 }

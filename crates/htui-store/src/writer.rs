@@ -1570,6 +1570,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn retry_landing(&self, run: RunId) -> Result<usize> {
+        match self {
+            Self::Memory(store) => store.retry_landing(run).await,
+            Self::Online(pg) => pg.retry_landing(run).await,
+        }
+    }
+
     async fn close_out(
         &self,
         item: ItemId,

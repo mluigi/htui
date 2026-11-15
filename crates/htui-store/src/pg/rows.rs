@@ -32,9 +32,9 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     Activation, AgentId, BoxId, GateOutcome, ItemId, LinkNode, MemoryEntry, MemoryEntryId,
     MemoryEvidence, MemoryKind, MemorySource, MemoryState, MemoryUsage, Persona, PersonaId,
-    PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunMode, RunProvenance,
-    RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId, Status, StepId,
-    StepOpening, StepStatus, UpstreamEntry, UserId, VerifyOutcome,
+    PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunLanding, RunMode,
+    RunProvenance, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId,
+    Status, StepId, StepOpening, StepStatus, UpstreamEntry, UserId, VerifyOutcome,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -198,6 +198,8 @@ pub(crate) struct LinkNodeRow {
     pub(crate) depth: i32,
     /// MOD-144: the latest graph run's status, `cancelled` skipped (the `lr` LATERAL).
     pub(crate) latest_run_status: Option<RunStatus>,
+    /// MOD-133 M2 E3: the landing of that same run's `integration` records.
+    pub(crate) latest_run_landing: Option<RunLanding>,
 }
 
 impl LinkNodeRow {
@@ -216,6 +218,7 @@ impl LinkNodeRow {
             status: self.status,
             depth: u8::try_from(self.depth).unwrap_or(u8::MAX),
             latest_run_status: self.latest_run_status,
+            latest_run_landing: self.latest_run_landing,
         }
     }
 }
@@ -243,6 +246,8 @@ pub(crate) struct UpstreamRow {
     pub(crate) summary: Option<String>,
     /// MOD-144: the latest graph run's status, `cancelled` skipped (the `lr` LATERAL).
     pub(crate) latest_run_status: Option<RunStatus>,
+    /// MOD-133 M2 E3: the landing of that same run's `integration` records.
+    pub(crate) latest_run_landing: Option<RunLanding>,
 }
 
 impl UpstreamRow {
@@ -261,6 +266,7 @@ impl UpstreamRow {
             in_scope: self.in_scope,
             summary: self.summary,
             latest_run_status: self.latest_run_status,
+            latest_run_landing: self.latest_run_landing,
         }
     }
 }

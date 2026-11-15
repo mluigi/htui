@@ -73,15 +73,16 @@ use htui_store::testkit as common;
 /// and MOD-130 M1 T2's four create, edit and bind target cases (P4-P6, P9) make it 337,
 /// and MOD-130 M1 T3's item target spec field case (D11) makes it 338,
 /// and MOD-130 M1 T4's five level, default, retire and delete cases (D3, D5, D11, D14) make it
-/// 343.
-const EXPECTED_CASES: usize = 343;
+/// 343,
+/// and MOD-133 M2's three landing-state, refused-waiting-row and retry cases (E1-E5) make it 346.
+const EXPECTED_CASES: usize = 346;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (343 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (346 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -101,7 +102,8 @@ fn case_list_matches_mem_store() {
              refinement and coverage cases, and MOD-125 M4's `workspace_live_runs` case, and MOD-133 M1's seven integration \
              cases, and MOD-130 M1 T1's seeded local target case, and MOD-130 \
              M1 T2's four target cases, and MOD-130 M1 T3's item target case, and MOD-130 M1 \
-             T4's five level, default, retire and delete cases)"
+             T4's five level, default, retire and delete cases, and MOD-133 M2's three \
+             landing, refusal and retry cases)"
     );
 }
 
@@ -481,6 +483,119 @@ async fn pg_ready_items_and_queue_rows_wait_for_landed_integrations() {
             expected,
             "a `{state}` record {} its dependent",
             if released { "releases" } else { "holds" }
+        );
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-133 M2 E3, Postgres only: the two landing carriers the conformance suite does not reach,
+/// the inherent `queue_rows` and `upstream_summaries`, carry the landing of the item's latest
+/// graph run. The fixture's `agy` ANA-1 has a `done` latest graph run (`RUN_7`) and `agy` FIX-1
+/// is `blocked_by` it: no record reads `done`, a `pending` one `landing`, a `refused` one beside
+/// it `landing refused` (refused wins), every record landed `done` again.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_queue_rows_and_upstream_carry_the_latest_runs_landing() {
+    use chrono::{SubsecRound as _, Utc};
+    use htui_core::fixtures::ids;
+    use htui_core::model::{ItemState, PromptScope, RunLanding, TIMESTAMPTZ_DIGITS};
+    use htui_core::store::ReadStore as _;
+
+    let Some(db) = Box::pin(common::demo_db()).await else {
+        return; // `common` printed the skip line already (plan D13).
+    };
+    let pg = &db.store;
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    pg.queue_item(ids::AGY_ANA_1, ids::BOX, None, ids::USER, at)
+        .await
+        .expect("queue agy ANA-1");
+    let mut repos = Vec::new();
+    for name in ["landing-a", "landing-b"] {
+        let repo: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO repo (project_id, name, remote_url) \
+             VALUES ($1, $2, 'git@example.invalid:landing.git') RETURNING id",
+        )
+        .bind(ids::PROJECT_AGY.as_uuid())
+        .bind(name)
+        .fetch_one(&db.pool)
+        .await
+        .expect("plant a repo");
+        repos.push(repo);
+    }
+    let scope = PromptScope {
+        workspace: Some(ids::WORKSPACE_PLATFORM),
+        project: ids::PROJECT_AGY,
+    };
+
+    let observe = async |case: &str| -> [(Option<RunLanding>, ItemState); 2] {
+        let row = pg
+            .queue_rows(ids::BOX)
+            .await
+            .expect(case)
+            .into_iter()
+            .find(|row| row.entry.item_id == ids::AGY_ANA_1)
+            .unwrap_or_else(|| panic!("{case}: agy ANA-1 is on the box's queue"));
+        let entry = pg
+            .upstream_summaries(ids::AGY_FIX_1, 1, &scope)
+            .await
+            .expect(case)
+            .into_iter()
+            .find(|entry| entry.item_id == ids::AGY_ANA_1)
+            .unwrap_or_else(|| panic!("{case}: agy ANA-1 is upstream of agy FIX-1"));
+        [
+            (row.latest_run_landing, row.state()),
+            (entry.latest_run_landing, entry.state()),
+        ]
+    };
+
+    assert_eq!(
+        observe("no record").await,
+        [(None, ItemState::Done); 2],
+        "a `done` run with no record (`local`) reads `done`"
+    );
+    for (states, landing, state) in [
+        (
+            ["pending", "pending"],
+            Some(RunLanding::Pending),
+            ItemState::Landing,
+        ),
+        (
+            ["pending", "refused"],
+            Some(RunLanding::Refused),
+            ItemState::LandRefused,
+        ),
+        (
+            ["landed", "refused"],
+            Some(RunLanding::Refused),
+            ItemState::LandRefused,
+        ),
+        (["landed", "pr_merged"], None, ItemState::Done),
+    ] {
+        sqlx::query("DELETE FROM integration WHERE run_id = $1")
+            .bind(ids::RUN_7.as_uuid())
+            .execute(&db.pool)
+            .await
+            .expect("clear RUN_7's records");
+        for (repo, record) in repos.iter().zip(states) {
+            sqlx::query(
+                "INSERT INTO integration \
+                     (run_id, repo_id, project_id, mode, remote, target_branch, state, refusal) \
+                 VALUES ($1, $2, $3, 'push', 'git@example.invalid:landing.git', 'main', $4, \
+                         CASE WHEN $4 = 'refused' THEN 'non_fast_forward: main moved' END)",
+            )
+            .bind(ids::RUN_7.as_uuid())
+            .bind(repo)
+            .bind(ids::PROJECT_AGY.as_uuid())
+            .bind(record)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(|err| panic!("a {record} record of RUN_7: {err}"));
+        }
+        assert_eq!(
+            observe(&format!("{states:?}")).await,
+            [(landing, state); 2],
+            "records {states:?}"
         );
     }
 

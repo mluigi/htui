@@ -40,6 +40,7 @@ use htui_core::model::{
     StepGraphEdge,
 };
 use htui_core::model::{PlanStatus, RunPlan, RunPlanId};
+use htui_core::model::{RefusedLanding, RunLanding};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::qdrant::{QDRANT_URL_KEY, StoredQdrantUrl};
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -100,10 +101,14 @@ impl ReadStore for PgStore {
     /// non-cancelled graph run (`lr.status IS NULL`) and every live `blocked_by` target released
     /// (`closed`, or its own latest graph run `done`), compared against the wanted boolean so
     /// `ready: Some(false)` selects the *not*-ready items; every term is non-null, so the
-    /// comparison stays two-valued. `states` matches [`ItemState::of`] spelled as one `CASE`
-    /// (`ItemState::as_str` equals `RunStatus::as_str` where they share a word).
+    /// comparison stays two-valued. `states` matches [`ItemState::of_landing`] spelled as one
+    /// `CASE` (`ItemState::as_str` equals `RunStatus::as_str` where they share a word).
     ///
-    /// [`ItemState::of`]: htui_core::model::ItemState::of
+    /// MOD-133 M2 E3: `ll` is the [`RunLanding`] of `lr`'s own `integration` records (`refused`
+    /// wins over any record not `landed | pr_merged`; none, or all landed, is `NULL`), projected
+    /// as `latest_run_landing` and read by the `states` `CASE` over a `done` run.
+    ///
+    /// [`ItemState::of_landing`]: htui_core::model::ItemState::of_landing
     async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
         if scope.is_empty() {
             return Ok(Vec::new()); // `= ANY('{}')` is false for every row; skip the round trip.
@@ -136,14 +141,25 @@ impl ReadStore for PgStore {
                    i.required_tags,
                    i.updated_at,
                    i.touched_paths,
-                   lr.status       AS "latest_run_status?: htui_core::model::RunStatus"
+                   lr.status       AS "latest_run_status?: htui_core::model::RunStatus",
+                   ll.landing      AS "latest_run_landing?: htui_core::model::RunLanding"
               FROM item i
               LEFT JOIN LATERAL (
-                    SELECT r.status FROM run r
+                    SELECT r.id, r.status FROM run r
                      WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
                      ORDER BY r.queued_at DESC, r.id DESC
                      LIMIT 1
                    ) lr ON true
+              -- MOD-133 M2 E3: the landing of the records of that same run.
+              LEFT JOIN LATERAL (
+                    SELECT CASE WHEN EXISTS (SELECT 1 FROM integration g
+                                              WHERE g.run_id = lr.id AND g.state = 'refused')
+                                THEN 'refused'
+                                WHEN EXISTS (SELECT 1 FROM integration g
+                                              WHERE g.run_id = lr.id
+                                                AND g.state NOT IN ('landed', 'pr_merged'))
+                                THEN 'pending' END AS landing
+                   ) ll ON true
              WHERE i.project_id = ANY($1)
                AND ($2::uuid[] IS NULL OR i.project_id = ANY($2))
                AND ($3::text[] IS NULL OR i.status = ANY($3))
@@ -179,6 +195,8 @@ impl ReadStore for PgStore {
                         WHEN i.status = 'blocked' THEN 'blocked'
                         WHEN lr.status IS NULL    THEN 'open'
                         WHEN lr.status = 'awaiting_approval' THEN 'needs_you'
+                        WHEN lr.status = 'done' AND ll.landing = 'refused' THEN 'land_refused'
+                        WHEN lr.status = 'done' AND ll.landing = 'pending' THEN 'landing'
                         ELSE lr.status END) = ANY($7))
              ORDER BY array_position($1, i.project_id), i.key_prefix, i.key_number
             "#,
@@ -260,12 +278,20 @@ impl ReadStore for PgStore {
                    i.title       AS "title!",
                    i.status      AS "status!: htui_core::model::Status",
                    n.depth       AS "depth!",
-                   lr.status     AS "latest_run_status?: htui_core::model::RunStatus"
+                   lr.status     AS "latest_run_status?: htui_core::model::RunStatus",
+                   CASE WHEN EXISTS (SELECT 1 FROM integration g
+                                        WHERE g.run_id = lr.id AND g.state = 'refused')
+                             THEN 'refused'
+                        WHEN EXISTS (SELECT 1 FROM integration g
+                                      WHERE g.run_id = lr.id
+                                        AND g.state NOT IN ('landed', 'pr_merged'))
+                             THEN 'pending' END
+                                 AS "latest_run_landing?: htui_core::model::RunLanding"
               FROM node n
               JOIN item i    ON i.id = n.item_id
               JOIN project p ON p.id = i.project_id
               LEFT JOIN LATERAL (
-                    SELECT r.status FROM run r
+                    SELECT r.id, r.status FROM run r
                      WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
                      ORDER BY r.queued_at DESC, r.id DESC
                      LIMIT 1
@@ -649,7 +675,8 @@ impl ReadStore for PgStore {
     /// [`links`](ReadStore::links) keeps its whole set — the inference is the macro's, not the
     /// schema's, and a `!` on a column that is already non-null costs nothing.
     /// `latest_run_status` (MOD-144, the `lr` LATERAL) carries a `?` instead: a `LEFT JOIN`
-    /// column is `NULL` for an item with no non-cancelled graph run.
+    /// column is `NULL` for an item with no non-cancelled graph run; so does
+    /// `latest_run_landing` (MOD-133 M2 E3), the `CASE` over that run's `integration` records.
     async fn upstream_summaries(
         &self,
         id: ItemId,
@@ -693,7 +720,15 @@ impl ReadStore for PgStore {
                    best.depth                 AS "depth!",
                    (s.project_id IS NOT NULL) AS "in_scope!",
                    CASE WHEN s.project_id IS NOT NULL THEN d.body END AS "summary?",
-                   lr.status                  AS "latest_run_status?: htui_core::model::RunStatus"
+                   lr.status                  AS "latest_run_status?: htui_core::model::RunStatus",
+                   CASE WHEN EXISTS (SELECT 1 FROM integration g
+                                        WHERE g.run_id = lr.id AND g.state = 'refused')
+                             THEN 'refused'
+                        WHEN EXISTS (SELECT 1 FROM integration g
+                                      WHERE g.run_id = lr.id
+                                        AND g.state NOT IN ('landed', 'pr_merged'))
+                             THEN 'pending' END
+                                              AS "latest_run_landing?: htui_core::model::RunLanding"
               FROM best
               JOIN item i    ON i.id = best.item_id
               JOIN project p ON p.id = i.project_id
@@ -702,7 +737,7 @@ impl ReadStore for PgStore {
                                   WHERE item_id = i.id AND kind = 'summary'
                                   ORDER BY version DESC LIMIT 1) d ON TRUE
               LEFT JOIN LATERAL (
-                    SELECT r.status FROM run r
+                    SELECT r.id, r.status FROM run r
                      WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
                      ORDER BY r.queued_at DESC, r.id DESC
                      LIMIT 1
@@ -1444,12 +1479,20 @@ impl ReadStore for PgStore {
                    ir.kind                AS "kind!: CitationKind",
                    ir.requirement_version AS "requirement_version!",
                    r.version > ir.requirement_version AS "suspect!",
-                   lr.status              AS "latest_run_status?: RunStatus"
+                   lr.status              AS "latest_run_status?: RunStatus",
+                   CASE WHEN EXISTS (SELECT 1 FROM integration g
+                                        WHERE g.run_id = lr.id AND g.state = 'refused')
+                             THEN 'refused'
+                        WHEN EXISTS (SELECT 1 FROM integration g
+                                      WHERE g.run_id = lr.id
+                                        AND g.state NOT IN ('landed', 'pr_merged'))
+                             THEN 'pending' END
+                                          AS "latest_run_landing?: RunLanding"
               FROM item_requirement ir
               JOIN requirement r ON r.id = ir.requirement_id
               JOIN item i        ON i.id = ir.item_id
               LEFT JOIN LATERAL (
-                    SELECT gr.status FROM run gr
+                    SELECT gr.id, gr.status FROM run gr
                      WHERE gr.item_id = i.id AND gr.kind = 'graph' AND gr.status <> 'cancelled'
                      ORDER BY gr.queued_at DESC, gr.id DESC
                      LIMIT 1
@@ -1480,6 +1523,7 @@ impl ReadStore for PgStore {
                     updated_at: row.updated_at,
                     touched_paths: row.touched_paths,
                     latest_run_status: row.latest_run_status,
+                    latest_run_landing: row.latest_run_landing,
                 },
                 kind: row.kind,
                 resolution: row.resolution,
@@ -1561,10 +1605,13 @@ impl ReadStore for PgStore {
         Ok(counts)
     }
 
-    /// MOD-69 plan D1, D2: three reads — the candidate items, their active runs, those runs' steps —
-    /// grouped and ordered by `WaitingCandidate::assemble`. A display read: the statements need not
-    /// share a snapshot (blueprint H-7). The run read's `status IN (...)` is `LIVE_RUN_STATUSES`'
-    /// literal (blueprint H-24).
+    /// MOD-69 plan D1, D2: four reads — the candidate items, their active runs, those runs' steps,
+    /// their latest graph run's refused records (MOD-133 M2 E4) — grouped and ordered by
+    /// `WaitingCandidate::assemble`. A display read: the statements need not share a snapshot
+    /// (blueprint H-7). The run read's `status IN (...)` is `LIVE_RUN_STATUSES`' literal
+    /// (blueprint H-24). A candidate is `blocked`, owns a run at `awaiting_approval` (MOD-144), or
+    /// is `open` over a latest graph run (`kind = 'graph'`, `cancelled` skipped, by
+    /// `(queued_at, id)`) that is `done` and holds a `refused` record (MOD-133 M2 E4).
     async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
         if scope.is_empty() {
             return Ok(Vec::new());
@@ -1597,7 +1644,16 @@ impl ReadStore for PgStore {
              WHERE i.project_id = ANY($1)
                AND (i.status = 'blocked'
                     OR EXISTS (SELECT 1 FROM run r
-                                WHERE r.item_id = i.id AND r.status = 'awaiting_approval'))
+                                WHERE r.item_id = i.id AND r.status = 'awaiting_approval')
+                    OR (i.status = 'open'
+                        AND EXISTS (
+                            SELECT 1 FROM (SELECT r.id, r.status FROM run r
+                                            WHERE r.item_id = i.id AND r.kind = 'graph'
+                                              AND r.status <> 'cancelled'
+                                            ORDER BY r.queued_at DESC, r.id DESC
+                                            LIMIT 1) lr
+                              JOIN integration g ON g.run_id = lr.id
+                             WHERE lr.status = 'done' AND g.state = 'refused')))
             "#,
             &projects[..],
         )
@@ -1684,7 +1740,57 @@ impl ReadStore for PgStore {
             .await
             .map_err(map_sqlx)?
         };
-        Ok(WaitingCandidate::assemble(scope, items, runs, steps))
+
+        // MOD-133 M2 E4: the refused records of each open candidate's latest graph run, when that
+        // run is `done` (the item filter's third arm, record by record). `refusal` is non-null
+        // on a `refused` record (`chk_integration_refusal`).
+        let refused = sqlx::query!(
+            r#"
+            SELECT i.id            AS "item_id!: ItemId",
+                   lr.id           AS "run!: RunId",
+                   g.repo_id       AS "repo!: RepoId",
+                   rp.name         AS "repo_name!",
+                   g.mode          AS "mode!: IntegrateMode",
+                   g.target_branch AS "target_branch!",
+                   g.refusal       AS "refusal!",
+                   g.updated_at    AS "since!",
+                   lr.queued_at    AS "run_queued_at!"
+              FROM item i
+              JOIN LATERAL (
+                    SELECT r.id, r.status, r.queued_at FROM run r
+                     WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
+                     ORDER BY r.queued_at DESC, r.id DESC
+                     LIMIT 1
+                   ) lr ON true
+              JOIN integration g ON g.run_id = lr.id AND g.state = 'refused'
+              JOIN repo rp       ON rp.id = g.repo_id
+             WHERE i.id = ANY($1) AND i.status = 'open' AND lr.status = 'done'
+            "#,
+            &item_ids[..],
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .into_iter()
+        .map(|row| {
+            (
+                row.item_id,
+                RefusedLanding {
+                    run: row.run,
+                    repo: row.repo,
+                    repo_name: row.repo_name,
+                    mode: row.mode,
+                    target_branch: row.target_branch,
+                    refusal: row.refusal,
+                    since: row.since,
+                    run_queued_at: row.run_queued_at,
+                },
+            )
+        })
+        .collect();
+        Ok(WaitingCandidate::assemble(
+            scope, items, runs, steps, refused,
+        ))
     }
 }
 
@@ -2465,7 +2571,9 @@ impl PgStore {
                    i.required_tags,
                    i.updated_at,
                    i.touched_paths,
-                   lr.status       AS "latest_run_status?: htui_core::model::RunStatus"
+                   lr.status       AS "latest_run_status?: htui_core::model::RunStatus",
+                   -- A ready item has no non-cancelled graph run, so no landing (MOD-133 M2 E3).
+                   NULL::text      AS "latest_run_landing?: htui_core::model::RunLanding"
               FROM item i LEFT JOIN box b ON b.id = $2
               LEFT JOIN LATERAL (
                     SELECT r.status FROM run r
@@ -2710,7 +2818,8 @@ impl PgStore {
     /// `(queued_at, id)` **cancelled included**, feeds [`QueueRunFact`] (what the queue overlay
     /// shows of the last run, a cancel included); its parked step is its first
     /// `awaiting_approval` step by `(position, attempt, fanout_index)`. `ls`, the same with
-    /// `cancelled` skipped, is `latest_run_status`, the run the item's state derives from. The
+    /// `cancelled` skipped, is `latest_run_status`, the run the item's state derives from, and
+    /// its `integration` records' `CASE` is `latest_run_landing` (MOD-133 M2 E3). The
     /// blocker clause is [`ready_items`](PgStore::ready_items)' release rule verbatim (a target
     /// not `closed` whose latest graph run is not `done`), so "open blocker" and "not ready for a
     /// blocker" are one rule; `COLLATE "C"` is `MemStore`'s byte order. Keys are unique only
@@ -2744,7 +2853,15 @@ impl PgStore {
                    lr.parked_step    AS "run_parked_step?: StepId",
                    ln.body           AS "note?",
                    COALESCE(ob.keys, '{}'::text[]) AS "blockers!",
-                   ls.status         AS "latest_run_status?: RunStatus"
+                   ls.status         AS "latest_run_status?: RunStatus",
+                   CASE WHEN EXISTS (SELECT 1 FROM integration g
+                                        WHERE g.run_id = ls.id AND g.state = 'refused')
+                             THEN 'refused'
+                        WHEN EXISTS (SELECT 1 FROM integration g
+                                      WHERE g.run_id = ls.id
+                                        AND g.state NOT IN ('landed', 'pr_merged'))
+                             THEN 'pending' END
+                                     AS "latest_run_landing?: RunLanding"
               FROM queue_entry e
               JOIN item i ON i.id = e.item_id
               LEFT JOIN LATERAL (
@@ -2760,7 +2877,7 @@ impl PgStore {
                      LIMIT 1
                    ) lr ON true
               LEFT JOIN LATERAL (
-                    SELECT r.status FROM run r
+                    SELECT r.id, r.status FROM run r
                      WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
                      ORDER BY r.queued_at DESC, r.id DESC
                      LIMIT 1
@@ -2834,6 +2951,7 @@ impl PgStore {
                     latest_note: row.note,
                     open_blockers: row.blockers,
                     latest_run_status: row.latest_run_status,
+                    latest_run_landing: row.latest_run_landing,
                 }
             })
             .collect())
@@ -4255,22 +4373,26 @@ mod tests {
         );
     }
 
-    /// `items`' `states` `CASE` (MOD-144, B1), transcribed arm by arm: the stored status's text,
-    /// then the latest graph run's text (`NULL` → `open`, `awaiting_approval` → `needs_you`).
-    fn item_state_case(status: &str, latest: Option<&str>) -> String {
-        match (status, latest) {
-            ("closed", _) => "closed",
-            ("blocked", _) => "blocked",
-            (_, None) => "open",
-            (_, Some("awaiting_approval")) => "needs_you",
-            (_, Some(run)) => run,
+    /// `items`' `states` `CASE` (MOD-144, B1; MOD-133 M2 E2), transcribed arm by arm: the stored
+    /// status's text, then the latest graph run's text (`NULL` → `open`, `awaiting_approval` →
+    /// `needs_you`, `done` over a `refused` landing → `land_refused`, over a `pending` one →
+    /// `landing`).
+    fn item_state_case(status: &str, latest: Option<&str>, landing: Option<&str>) -> String {
+        match (status, latest, landing) {
+            ("closed", _, _) => "closed",
+            ("blocked", _, _) => "blocked",
+            (_, None, _) => "open",
+            (_, Some("awaiting_approval"), _) => "needs_you",
+            (_, Some("done"), Some("refused")) => "land_refused",
+            (_, Some("done"), Some("pending")) => "landing",
+            (_, Some(run), _) => run,
         }
         .to_owned()
     }
 
     #[test]
     fn item_state_case_matches_item_state_of() {
-        use htui_core::model::{ItemState, Status};
+        use htui_core::model::{ItemState, RunLanding, Status};
 
         let latest = core::iter::once(None).chain(
             RunStatus::ALL
@@ -4281,19 +4403,27 @@ mod tests {
         );
         let mut rows = 0;
         for latest in latest {
-            for status in Status::ALL {
-                assert_eq!(
-                    item_state_case(status.as_str(), latest.map(RunStatus::as_str)),
-                    ItemState::of(*status, latest).as_str(),
-                    "the SQL state of a `{status}` item over a {latest:?} latest graph run"
-                );
-                rows += 1;
+            for landing in core::iter::once(None).chain(RunLanding::ALL.iter().copied().map(Some)) {
+                for status in Status::ALL {
+                    assert_eq!(
+                        item_state_case(
+                            status.as_str(),
+                            latest.map(RunStatus::as_str),
+                            landing.map(RunLanding::as_str),
+                        ),
+                        ItemState::of_landing(*status, latest, landing).as_str(),
+                        "the SQL state of a `{status}` item over a {latest:?} latest graph run \
+                         landing {landing:?}"
+                    );
+                    rows += 1;
+                }
             }
         }
         assert_eq!(
             rows,
-            3 * 7,
-            "every status over no run and the six non-cancelled ones"
+            3 * 7 * 3,
+            "every status over no run and the six non-cancelled ones, each over no landing, \
+             `pending` and `refused`"
         );
     }
 }

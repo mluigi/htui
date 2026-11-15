@@ -229,6 +229,7 @@ fn item_summary_of(row: &SqliteRow) -> Result<ItemSummary> {
         updated_at: ts_col("item.updated_at", get(row, "updated_at")?)?,
         touched_paths: strings_col("item.touched_paths", &text(row, "touched_paths")?)?,
         latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
+        latest_run_landing: None,
     })
 }
 
@@ -630,6 +631,7 @@ impl ReadStore for CacheStore {
                 status: get::<Status>(row, "status")?,
                 depth: u8::try_from(get::<i64>(row, "depth")?).unwrap_or(u8::MAX),
                 latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
+                latest_run_landing: None,
             });
         }
 
@@ -1062,6 +1064,7 @@ impl ReadStore for CacheStore {
                 in_scope: bool_col(get::<i64>(row, "in_scope")?),
                 summary: opt_text(row, "summary")?,
                 latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
+                latest_run_landing: None,
             });
         }
         // The mirror's `ORDER BY` is byte order and Postgres's is collation order, so neither is
@@ -1704,7 +1707,13 @@ impl ReadStore for CacheStore {
                 .map(run_step_of)
                 .collect::<Result<Vec<_>>>()?
         };
-        Ok(WaitingCandidate::assemble(scope, items, runs, steps))
+        Ok(WaitingCandidate::assemble(
+            scope,
+            items,
+            runs,
+            steps,
+            Vec::new(),
+        ))
     }
 }
 
