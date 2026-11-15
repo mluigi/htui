@@ -19,16 +19,21 @@ services:
       - {type: volume, source: cargo-src, target: "${HR_HOME:?}/.cargo/registry/src"}
 
   postgres:
-    # The test server's version, as the host's htui-postgres-test (compose.yaml). The 18 image keeps
-    # its cluster under /var/lib/postgresql/18/docker, so the volume is mounted one level up; it is
-    # pgdata18, not pgdata, so a run created under 16 never offers its old cluster to an 18 server.
+    # The host's htui-postgres-test (compose.yaml), setting for setting: Postgres 18, durability off,
+    # 300 connections, the data dir a tmpfs. Not a named volume: those live in /var/lib/docker on the
+    # system disk, beside the run builds' writes. The 18 image keeps its cluster under
+    # /var/lib/postgresql/18/docker, so the tmpfs is mounted one level up. A restart empties it,
+    # which costs nothing: the suites mint a fresh database per test and rebuild the template, and
+    # nothing else a run keeps here (an htui_sqlx scratch database) outlives a session. 8g is a
+    # bound for a crashed run's leftovers, as on the host; it is RAM only while used.
     image: postgres:18
-    command: ["postgres", "-p", "5439", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+    command: ["postgres", "-p", "5439", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off",
+              "-c", "max_connections=300"]
     environment:
       POSTGRES_HOST_AUTH_METHOD: trust
     shm_size: 1gb
-    volumes:
-      - {type: volume, source: pgdata18, target: /var/lib/postgresql}
+    tmpfs:
+      - /var/lib/postgresql:size=8g
     healthcheck:   # -h localhost: the entrypoint's init-time temp server is socket-only, so this goes green only on the real server
       test: ["CMD-SHELL", "pg_isready -h localhost -p 5439 -U postgres"]
       interval: 2s
@@ -190,6 +195,8 @@ services:
       - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/credentials.toml", read_only: true, bind: {create_host_path: false}}
 
 volumes:
+  # No service mounts it since Postgres moved to a tmpfs (2026-11-16). Still declared so that
+  # `down -v` (scripts/hr purge) removes the volume a run made before then; a new run never creates it.
   pgdata18:
   gortex:
   cargo-src:       # per run, so `down -v` removes it

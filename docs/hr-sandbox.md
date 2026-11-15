@@ -431,7 +431,8 @@ scripts/hr gc [--yes]
 | Run directory: clone, `target/`, `claude.json`, `cargo-empty`, `claude-mask/`, `tmp/` (the container's `/tmp`) | `/media/projects/htui-hr/<ITEM>/` | `HR_ROOT`; `--ssd` → `HR_SSD_ROOT` (`~/htui-hr`) |
 | ID leases: `id-leases.tsv`, `id-leases.lock` | `/media/projects/htui-hr/.state/` (`/hr-state` inside, shared read-write) | `HR_STATE` — every run and the host must agree |
 | Run registry, its `.lock`, `.leases-initialized`, `.migrated` | `/media/projects/htui-hr/.runs/` (host only, never mounted) | `HR_RUNS` — never inside `HR_STATE` (exit `2`) |
-| Postgres, Gortex store, extracted crate sources (`~/.cargo/registry/src`) | per-run Docker volumes, under `/var/lib/docker` | — |
+| Gortex store, extracted crate sources (`~/.cargo/registry/src`) | per-run Docker volumes, under `/var/lib/docker` | — |
+| Postgres data | a tmpfs in the run's `postgres` container (RAM, up to 8 GB; emptied when the container restarts) | — |
 | Qdrant storage | a tmpfs in the run's `qdrant` container (RAM, up to 2 GB; emptied when the container restarts) | — |
 | Cargo download cache, index and git cache | `htui-hr-cargo` Docker volume, shared by all runs | — |
 | Host repo the runs clone and collect into | the main worktree of this repo | `HR_HOST_REPO` |
@@ -458,9 +459,13 @@ df -h /media /
 docker system df
 ```
 
-`/` holds the Docker volumes, and a full `/` takes the runs' Postgres down with it. `/tmp` is a
-bind mount into the run directory, so agent-made target dirs stay off `/`. Qdrant keeps its storage
-on a tmpfs, off both disks: on disk every Qdrant write waits on an fsync, and creates there took
+`/` holds the Docker volumes. `/tmp` is a bind mount into the run directory, so agent-made target
+dirs stay off `/`. Postgres keeps its data on a tmpfs, off both disks, with the host's
+`htui-postgres-test` settings (durability off, 300 connections): the suites mint and drop a
+database per test, and nothing in a run needs it across a restart. A run made before the tmpfs
+(2026-11-16) keeps its `pgdata18` volume, now unused, until it is purged; its Postgres picks up
+the tmpfs the next time `scripts/hr up` or `attach` recreates the containers, and the old
+databases are not carried over. Qdrant keeps its storage on a tmpfs too: on disk every Qdrant write waits on an fsync, and creates there took
 3.5-19 s against the client's 5 s deadline, failing the live Qdrant suites. A restart empties it,
 and htui's indexer rebuilds the run's collections. A run made before the tmpfs keeps its
 `qdrant/` directory, now unused, until it is purged; its Qdrant container picks up the tmpfs the
@@ -718,8 +723,11 @@ keeps happening, the fallback is a long-lived token from `claude setup-token`, u
 process ids inside a container mean nothing on the host and vice versa. When a host save and a run
 save collide, an entry can land interleaved. This is a known, accepted limitation.
 
-**Postgres in a run restarts or reports recovery mode.** Check `df -h /` first: the run databases
-live under `/var/lib/docker`. (`/tmp` does not: it is in the run directory. Qdrant is on a tmpfs.)
+**Postgres in a run restarts or reports recovery mode.** Its data is on an 8 GB tmpfs: check
+`df -h /var/lib/postgresql` in the run's `postgres` container for leaked `htui_test_*` databases
+(the testkit's sweep drops them after an hour), and the host's free memory. A run made before
+2026-11-16 that has not been recreated still keeps them in its `pgdata18` volume under
+`/var/lib/docker`: check `df -h /` for it.
 
 ## Tests
 
