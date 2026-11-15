@@ -900,7 +900,7 @@ items it follows are done.
   tab** (amended by the UI redesign review, 2026-10-17: not a Templates tab of its own; the Toolbox
   is MOD-124). (2) Skill attachments gain **workspace** and
   **item-kind** levels (phase > kind > project > workspace > global), extending MOD-9's resolution
-  (ANA-22). (3) Skills carry **resources** (scripts, references, files), and the prompt and session
+  (ANA-22). **Delivered by MOD-127 M1** (`hr/MOD-127`: levels, resolver and Skills-tab rows). (3) Skills carry **resources** (scripts, references, files), and the prompt and session
   learn to deliver them. (4) **Import** whole skill folders and Claude Code plugins, resources
   included. Not blocked.
   ANA-36 §7.2 adds design input: part (3) delivers resources through a read tool over the bound skills
@@ -1056,6 +1056,17 @@ items it follows are done.
   command and env-preset kinds: tables, neutral records, Claude CLI and ACP renderers (other agents marked
   unsupported), secrets by reference, Toolbox forms. A run receives an exact frozen set; a kind the agent cannot
   use is skipped and the skip recorded. MOD-115 (and its snapshot rewrite) is done (`docs/decisions/mod/mod-115.md`).
+  PRD `.claude/prds/mod-127-toolbox-binding.prd.md` (three milestones: 1 typed binding and resolver, 2 MCP server kind,
+  3 command and env-preset kinds). **Phase M1 landed (`b5568a7d`..`ce895975`, 2026-11-15, on `hr/MOD-127`):** plan
+  `.claude/plans/mod-127-toolbox-binding-m1.plan.md` (fact-checked). Migration `0041_toolbox_binding` renames
+  `skill_binding` to `toolbox_binding` (`kind`, `ref_id`, `workspace_id`, `item_kind_id`; one forward migration, rows
+  keep their meaning, no dual read); `SkillLevel` is `Global < Workspace < Project < ItemKind < Phase`; one resolver
+  (`bound_skills(ResolveScope)`) on both stores with the run's workspace (`Run.workspace_id`, none for a chat run) and
+  the item's kind; the Skills tab attaches at the two new levels. Deliberately left for M2: the Rust `BindingKind` type
+  (the schema has `kind`, only `skill` exists) and the run's frozen tool set (skills stay live-resolved at each step).
+  The migration number renumbers at `scripts/hr collect` if a sibling lands first, which moves the count pins.
+  Owed on the host: the merged-tree Postgres gate. Open: M2 (MCP server kind, renderers, secrets by reference, frozen
+  set) and M3 (command and env-preset kinds).
 - [ ] **MOD-128 - Toolbox bundle entries with linked parts and probe status** (from ANA-40, §8 P4). `R-LATER-7`,
   `R-AGT-10`, `R-BOX-2`, `R-TUI-7`. A bundle record (Gortex, Headroom, Serena, Graphify) is one `tools` entry with
   linked parts, each toggleable alone, default-on for coding projects and switchable off per project; the box
