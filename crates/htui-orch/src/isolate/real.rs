@@ -2045,7 +2045,7 @@ impl Isolator for GixIsolator {
         })
     }
 
-    /// MOD-133 M3 D1: [`GixIsolator::ensure_run_branch`] per repo, in `RepoId` order. `gix`
+    /// MOD-133 M3 D1: `GixIsolator::ensure_run_branch` per repo, in `RepoId` order. `gix`
     /// reads and ref edits only: no `git` child, no tree touched.
     fn run_branches<'a>(
         &'a self,
@@ -2172,7 +2172,7 @@ impl Isolator for GixIsolator {
 
     /// MOD-133 M3 D3: an in-place tree of a repo with a run branch refuses before any tree is
     /// read or merged; then per tree, a `worktree`/`copy` tree with a run branch lands onto it
-    /// ([`GixIsolator::reconcile_onto_branch`]) and every other tree as before.
+    /// (`GixIsolator::reconcile_onto_branch`) and every other tree as before.
     fn reconcile_onto<'a>(
         &'a self,
         winner: StepId,
