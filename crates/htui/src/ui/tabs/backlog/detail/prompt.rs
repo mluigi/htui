@@ -498,7 +498,7 @@ impl DetailTab for PromptTab {
 mod tests {
     use super::*;
     use crate::ui::cells::cell_width;
-    use htui_core::model::{Activation, SkillLevel};
+    use htui_core::model::{Activation, BindingLevel};
     use htui_core::prompt::{SectionName, TrimStrategy};
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget as _;
@@ -646,7 +646,7 @@ mod tests {
             skill: htui_core::fixtures::ids::SKILL_TESTS,
             name: "legacy\nstyle".to_owned(),
             version: None,
-            level: SkillLevel::Global,
+            level: BindingLevel::Global,
             activation: Activation::Off,
             active: false,
             reason: ChoiceReason::Off,
@@ -726,7 +726,7 @@ mod tests {
             skill: htui_core::fixtures::ids::SKILL_TESTS,
             name: "rust-glob".to_owned(),
             version: Some(1),
-            level: SkillLevel::Project,
+            level: BindingLevel::Project,
             activation: Activation::Glob,
             active: true,
             reason: ChoiceReason::Matched,
@@ -750,7 +750,7 @@ mod tests {
             skill: htui_core::fixtures::ids::SKILL_TESTS,
             name: "rust-glob".to_owned(),
             version: Some(1),
-            level: SkillLevel::Project,
+            level: BindingLevel::Project,
             activation: Activation::Glob,
             active: false,
             reason: ChoiceReason::NoMatch,
@@ -791,7 +791,7 @@ mod tests {
             skill: htui_core::fixtures::ids::SKILL_TESTS,
             name: "rust-glob".to_owned(),
             version: Some(1),
-            level: SkillLevel::Phase,
+            level: BindingLevel::Phase,
             activation: Activation::Glob,
             active: true,
             reason: ChoiceReason::Matched,

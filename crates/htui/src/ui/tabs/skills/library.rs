@@ -25,7 +25,7 @@ use core::cell::Cell;
 use chrono::{DateTime, Utc};
 use htui_core::model::skill::validate_name;
 use htui_core::model::{
-    Activation, BindingChange, BoundSkill, SkillId, SkillLevel, SkillPatch, SkillVersion,
+    Activation, BindingChange, BindingLevel, BoundSkill, SkillId, SkillPatch, SkillVersion,
 };
 use htui_core::prompt::edit_help::HelpTarget;
 use htui_core::prompt::{TokenEstimator, render};
@@ -292,7 +292,7 @@ fn estimate(name: &str, version: i32, body: &str) -> i64 {
         version: Some(version),
         position: 0,
         body: body.to_owned(),
-        level: SkillLevel::Global,
+        level: BindingLevel::Global,
         activation: Activation::Always,
         globs: Vec::new(),
     }])
@@ -2182,7 +2182,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
-    use htui_core::model::{Attachment, ProjectRef, Scope, SkillBindingKey, StepId};
+    use htui_core::model::{Attachment, BindingKey, ProjectRef, Scope, StepId};
     use htui_core::store::{BLANK_SKILL_BODY, CasOutcome, MemStore, WriteStore as _};
     use htui_store::Backend;
 
@@ -2452,7 +2452,7 @@ mod tests {
         assert_eq!(
             (*written, *expected),
             (
-                SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN),
+                BindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN),
                 None
             )
         );
@@ -2510,7 +2510,7 @@ mod tests {
         let mut view = LibraryView::default();
         let untouched = serve(&backend, &StoreRequest::Skills(scope.clone())).await;
         view.on_reply(&untouched, &mut ctx);
-        let written = SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
+        let written = BindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
 
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`).
         view.on_key(key(KeyCode::Char('a')), &mut ctx);
@@ -2823,7 +2823,7 @@ mod tests {
         let mut view = LibraryView::default();
         let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
         view.on_reply(&read, &mut ctx);
-        let written = SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
+        let written = BindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
 
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`);
         // `Space` twice while the save is in flight: `always` becomes `off`.

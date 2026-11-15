@@ -9,7 +9,7 @@
 //! `command-queue` v1 at position 1 — and assembles.
 #![cfg(feature = "test-support")]
 
-use htui_core::model::{Activation, ChoiceReason, SkillChoice, SkillLevel, StepFiles};
+use htui_core::model::{Activation, BindingLevel, ChoiceReason, SkillChoice, StepFiles};
 use htui_core::prompt::{
     AssembleError, AssembledPrompt, PromptSpec, SectionName, assemble, fixtures,
 };
@@ -104,7 +104,7 @@ fn an_off_skill_is_not_rendered_and_is_recorded_off() {
             skill: spec.skills[1].skill_id,
             name: "command-queue".to_owned(),
             version: Some(1),
-            level: SkillLevel::Project,
+            level: BindingLevel::Project,
             activation: Activation::Off,
             active: false,
             reason: ChoiceReason::Off,

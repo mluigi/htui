@@ -15,13 +15,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, EdgeId, Gate,
-    GraphBody, GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, NodeBody,
-    PhaseAgent, PhaseId, PhasePart, Project, ProjectCaps, ProjectId, ProjectSettings,
-    PromptTemplate, RepoId, ResolveScope, ResolvedGraph, ResolvedPhase, RunMode, RuntimeChanges,
-    SkillBinding, SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge,
-    SnapshotPersona, SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge,
-    StepGraphId, StepGraphPhase,
+    Agent, AgentBox, AgentId, Attachment, Binding, BindingChange, BindingKey, BindingRef,
+    BoundSkill, BoxId, CapError, EdgeId, Gate, GraphBody, GraphSnapshot, Isolation, Item, ItemId,
+    ItemPatch, NewStepGraph, NodeBody, PhaseAgent, PhaseId, PhasePart, Project, ProjectCaps,
+    ProjectId, ProjectSettings, PromptTemplate, RepoId, ResolveScope, ResolvedGraph, ResolvedPhase,
+    RunMode, RuntimeChanges, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
+    SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId,
+    StepGraphPhase,
 };
 use htui_core::model::{
     EdgeKind, GraphScope, ItemFilter, NodeRole, PLAN_SUFFIX, Scope, SnapshotDivide, SnapshotEdge,
@@ -1475,7 +1475,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
     // (a stale `<repo>:` glob, a negative position, a pin naming no version) refuses the clone
     // whole and leaves no orphan graph.
     let sources: Vec<PhaseId> = rows.iter().map(|node| node.phase.id).collect();
-    let copies: Vec<SkillBinding> = store
+    let copies: Vec<Binding> = store
         .skill_bindings(BindingHome::Project(item.project_id))
         .await?
         .into_iter()
@@ -1519,8 +1519,8 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
             // from firing, exactly as it cannot fire for the copy.
             check_attachment(
                 &BindingFacts {
-                    key: SkillBindingKey {
-                        skill: binding.skill_id,
+                    key: BindingKey {
+                        target: BindingRef::Skill(binding.skill_id),
                         workspace: None,
                         project: Some(item.project_id),
                         item_kind: None,
@@ -1704,7 +1704,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
         let Some(&(_, phase)) = cloned.iter().find(|(old, _)| *old == source) else {
             continue;
         };
-        let key = SkillBindingKey::phase(binding.skill_id, item.project_id, phase);
+        let key = BindingKey::phase(binding.skill_id, item.project_id, phase);
         let copy = BindingChange::Attach(Attachment::of(binding));
         if let CasOutcome::Stale(_) = store.set_skill_binding(key, None, copy).await? {
             // A fresh phase id has no row; a `Stale` here is a store bug, said rather than hidden.
@@ -2227,10 +2227,10 @@ async fn agent_name<G: GraphSource>(
 mod tests {
     use htui_core::fixtures::{DemoData, demo_data, ids};
     use htui_core::model::{
-        Activation, EdgeId, EdgeKind, Gate, GraphBody, GraphScope, IntegrateMode,
+        Activation, Binding, EdgeId, EdgeKind, Gate, GraphBody, GraphScope, IntegrateMode,
         IntegrateSnapshot, ItemFilter, ItemPatch, NewRepo, NewStepGraph, NodeBody, PersonaId,
         PhasePatch, PromptTemplateId, RepoId, RepoPatch, RepoScope, ResolveScope, RunScope, Scope,
-        SkillBinding, SkillBindingId, SnapshotPersona, Split, StepGraphEdge,
+        SkillBindingId, SnapshotPersona, Split, StepGraphEdge,
     };
     use htui_core::model::{
         EdgePredicate, NodeRole, PlanScope, RuntimeChanges, SnapshotDivide, SnapshotEdge,
@@ -3487,14 +3487,14 @@ question and not a test fix. Decide the version bump first, then paste the new d
     /// row at the same level.
     #[tokio::test]
     async fn override_clone_copies_phase_level_attachments_only() {
-        use htui_core::model::{Activation, Attachment, BindingChange, SkillBindingKey};
+        use htui_core::model::{Activation, Attachment, BindingChange, BindingKey};
 
         let store = MemStore::demo();
         let item = feat_1(&store).await;
         let source = TestSource::claude(&store);
         for key in [
-            SkillBindingKey::workspace(ids::SKILL_RUST_STYLE, ids::WORKSPACE_PLATFORM),
-            SkillBindingKey::item_kind(
+            BindingKey::workspace(ids::SKILL_RUST_STYLE, ids::WORKSPACE_PLATFORM),
+            BindingKey::item_kind(
                 ids::SKILL_RUST_STYLE,
                 ids::PROJECT_HTUI,
                 ids::KIND_HTUI_FEAT,
@@ -3618,7 +3618,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read");
-        let copies: Vec<&SkillBinding> = after
+        let copies: Vec<&Binding> = after
             .iter()
             .filter(|row| {
                 row.phase_id
@@ -3670,7 +3670,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             bound_before,
             "and the original phase's bindings are untouched"
         );
-        let untouched: Vec<SkillBinding> = after
+        let untouched: Vec<Binding> = after
             .iter()
             .filter(|row| row.id != copy.id)
             .cloned()
@@ -3842,7 +3842,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 .find(|row| row.phase_id == Some(ids::PHASE_HTUI_IMPLEMENT))
                 .expect("the fixture's one phase-level binding")
                 .clone();
-            data.skill_bindings.push(SkillBinding {
+            data.skill_bindings.push(Binding {
                 id: SkillBindingId::new(),
                 skill_id: ids::SKILL_TESTS,
                 pinned_version: None,
@@ -4469,7 +4469,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 .is_some_and(|phase| first_phases.contains(&phase))),
             "the first clone's copies are gone: {rows:?}"
         );
-        let copies: Vec<&SkillBinding> = rows
+        let copies: Vec<&Binding> = rows
             .iter()
             .filter(|row| {
                 row.phase_id
@@ -4514,7 +4514,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 .find(|row| row.phase_id == Some(ids::PHASE_HTUI_IMPLEMENT))
                 .expect("the fixture's one phase-level binding")
                 .clone();
-            data.skill_bindings.push(SkillBinding {
+            data.skill_bindings.push(Binding {
                 id: SkillBindingId::new(),
                 skill_id: ids::SKILL_TESTS,
                 pinned_version: None,
@@ -4806,7 +4806,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 .all(|phase| !orphan_phases.contains(&phase.id)),
             "fresh phase ids"
         );
-        let copies: Vec<SkillBinding> = store
+        let copies: Vec<Binding> = store
             .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
             .await
             .expect("MemStore never fails a read")

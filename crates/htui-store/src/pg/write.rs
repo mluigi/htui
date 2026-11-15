@@ -30,28 +30,28 @@ use htui_core::model::link::{
 use htui_core::model::split_qualified;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchClose, BatchId,
-    BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
-    CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, FollowUpRequest, FollowUpSettle, GateOutcome,
-    Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
-    ItemRevision, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision,
-    MemoryState, MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument,
-    NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument,
-    PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
-    Project, ProjectId, ProjectPatch, ProjectType, PromptTemplate, PromptTemplateId, QueueBatch,
-    QueueEntry, QueueMove, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
-    canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
+    Binding, BindingChange, BindingKey, BindingRef, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
+    BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
+    CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor,
+    FollowUpRequest, FollowUpSettle, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, MemoryBody, MemoryEntry,
+    MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState, MemorySubject,
+    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
+    NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PersonaPermission,
+    PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch,
+    ProjectType, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueSetting,
+    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
+    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBindingId, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, UserId, VerifyOutcome,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop, canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{ArtifactLinkId, DocumentId};
 use htui_core::model::{
@@ -6619,7 +6619,7 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<Binding>> {
         self.skill_binding_rows(home).await
     }
 
@@ -6797,20 +6797,21 @@ impl WriteStore for PgStore {
     /// `23503`, a `Constraint`.
     async fn set_skill_binding(
         &self,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
-    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+    ) -> Result<CasOutcome<Option<Binding>>> {
+        let BindingRef::Skill(skill_id) = key.target;
         let current = self.skill_binding_row(key).await?;
         if current.as_ref().map(|row| row.updated_at) != expected {
             return Ok(CasOutcome::Stale(current));
         }
         let skill = self
-            .skill_row(key.skill)
+            .skill_row(skill_id)
             .await?
             .ok_or_else(|| StoreError::NotFound {
                 entity: "skill",
-                id: key.skill.to_string(),
+                id: skill_id.to_string(),
             })?;
         let project_slug = match key.project {
             Some(id) => {
@@ -6891,7 +6892,7 @@ impl WriteStore for PgStore {
             BindingChange::Attach(attachment) => attachment,
         };
         let versions: Vec<i32> = self
-            .skill_version_rows(key.skill)
+            .skill_version_rows(skill_id)
             .await?
             .iter()
             .map(|row| row.version)
@@ -6922,7 +6923,7 @@ impl WriteStore for PgStore {
 
         let written = match &current {
             None => sqlx::query_as!(
-                SkillBinding,
+                Binding,
                 r#"
                 INSERT INTO toolbox_binding
                        (id, kind, ref_id, workspace_id, project_id, item_kind_id, phase_id,
@@ -6944,7 +6945,7 @@ impl WriteStore for PgStore {
                           updated_at
                 "#,
                 SkillBindingId::new().as_uuid(),
-                key.skill.as_uuid(),
+                skill_id.as_uuid(),
                 key.workspace.map(WorkspaceId::as_uuid),
                 key.project.map(ProjectId::as_uuid),
                 key.item_kind.map(ItemKindId::as_uuid),
@@ -6959,7 +6960,7 @@ impl WriteStore for PgStore {
             .await
             .map_err(map_sqlx)?,
             Some(row) => sqlx::query_as!(
-                SkillBinding,
+                Binding,
                 r#"
                 UPDATE toolbox_binding SET
                     pinned_version = $3,

@@ -67,27 +67,27 @@ use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
 use crate::model::skill_language;
 use crate::model::{
-    Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, BindingChange, BoxEdit, BoxId,
-    BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandLog,
-    CommandRun, CommandRunId, CommandRunStatus, CoverageRow, CoverageState, Document, DocumentHead,
-    DocumentId, FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter,
-    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
-    ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource,
-    MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
-    NewItemKind, NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject,
-    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunMemory,
-    NewRunPlan, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note,
-    OpenPermission, OwnerDocument, PendingStop, PermissionChoice, PermissionId, PermissionStatus,
-    Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, ProjectType, PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp,
-    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedInput, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunMemoryWrite, RunPlan, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingKey, SkillId, SkillLevel, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, Binding, BindingChange,
+    BindingKey, BindingLevel, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, CancelRequest,
+    ChatRunSpec, CitationKind, Claim, CommandLog, CommandRun, CommandRunId, CommandRunStatus,
+    CoverageRow, CoverageState, Document, DocumentHead, DocumentId, FollowUpRequest,
+    FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph, MemoryEntry,
+    MemoryEntryId, MemoryPatch, MemoryRevision, MemorySource, MemoryState, MemorySupersede,
+    MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
+    NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunMemory, NewRunPlan, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate,
+    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunMemoryWrite, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
     WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop,
 };
@@ -1276,7 +1276,7 @@ pub trait WriteStore: ReadStore {
     ///
     /// # Errors
     /// The backend's own failures only.
-    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>>;
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<Binding>>;
 
     /// Inserts the skill and its version 1 together (D75, D77, OQ-16).
     ///
@@ -1325,10 +1325,10 @@ pub trait WriteStore: ReadStore {
     /// As above.
     async fn set_skill_binding(
         &self,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
-    ) -> Result<CasOutcome<Option<SkillBinding>>>;
+    ) -> Result<CasOutcome<Option<Binding>>>;
 
     // persona (MOD-26 milestone 1, plan D4; milestone 2, D14)
     //
@@ -3711,9 +3711,9 @@ pub enum BindingHome {
 impl BindingHome {
     /// Whether `row` is listed at this home.
     #[must_use]
-    pub fn lists(self, row: &SkillBinding) -> bool {
+    pub fn lists(self, row: &Binding) -> bool {
         match self {
-            Self::Global => SkillBindingKey::of(row).level() == SkillLevel::Global,
+            Self::Global => BindingKey::of(row).level() == BindingLevel::Global,
             Self::Workspace(id) => row.workspace_id == Some(id),
             Self::Project(id) => row.project_id == Some(id),
         }
@@ -3802,7 +3802,7 @@ pub const GLOB_NEEDS_GLOBS: &str =
 #[derive(Debug, Clone, Copy)]
 pub struct BindingFacts<'a> {
     /// The key being written.
-    pub key: SkillBindingKey,
+    pub key: BindingKey,
     /// The project owning `key.phase`'s graph (`None` when `key.phase` is `None`).
     pub phase_project: Option<ProjectId>,
     /// Whether `key.workspace` names a workspace (`true` when `key.workspace` is `None`). Defence

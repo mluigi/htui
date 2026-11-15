@@ -31,8 +31,8 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
-    Activation, Attachment, BindingChange, NewRepo, NewSkillVersion, RepoBoxPath, RepoId,
-    SkillBinding, SkillBindingKey, SkillVersion,
+    Activation, Attachment, Binding, BindingChange, BindingKey, NewRepo, NewSkillVersion,
+    RepoBoxPath, RepoId, SkillVersion,
 };
 use htui_core::model::{Agent, AgentBox, AgentId, Billing, EventKind, Scope, Transport};
 use htui_core::store::{
@@ -192,7 +192,7 @@ async fn versions(store: &MemStore, name: &str) -> Vec<SkillVersion> {
 }
 
 /// `htui`'s row for `skill` at the project level, straight from the store.
-async fn htui_row(store: &MemStore, skill: htui_core::model::SkillId) -> Option<SkillBinding> {
+async fn htui_row(store: &MemStore, skill: htui_core::model::SkillId) -> Option<Binding> {
     store
         .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
         .await
@@ -215,7 +215,7 @@ fn always() -> Attachment {
 /// Writes `change` at `key` straight into the shared store, as another session would.
 async fn set_binding(
     store: &MemStore,
-    key: SkillBindingKey,
+    key: BindingKey,
     expected: Option<DateTime<Utc>>,
     change: BindingChange,
 ) {
@@ -266,7 +266,7 @@ async fn tests_row_as_glob(store: &MemStore, globs: &[&str], languages: &[&str])
         .expect("the demo `tests` row");
     set_binding(
         store,
-        SkillBindingKey::of(&row),
+        BindingKey::of(&row),
         Some(row.updated_at),
         BindingChange::Attach(Attachment {
             activation: Activation::Glob,
@@ -367,7 +367,7 @@ async fn the_attachments_pane_lists_global_projects_and_phases() {
     let store = MemStore::demo();
     set_binding(
         &store,
-        SkillBindingKey::workspace(ids::SKILL_RUST_STYLE, ids::WORKSPACE_PLATFORM),
+        BindingKey::workspace(ids::SKILL_RUST_STYLE, ids::WORKSPACE_PLATFORM),
         None,
         BindingChange::Attach(Attachment {
             position: 3,
@@ -438,8 +438,8 @@ async fn attaching_on_the_workspace_row_writes_the_workspace_key() {
         .await
         .expect("the workspace rows");
     assert_eq!(
-        rows.iter().map(SkillBindingKey::of).collect::<Vec<_>>(),
-        vec![SkillBindingKey::workspace(
+        rows.iter().map(BindingKey::of).collect::<Vec<_>>(),
+        vec![BindingKey::workspace(
             ids::SKILL_RUST_STYLE,
             ids::WORKSPACE_PLATFORM
         )],
@@ -779,7 +779,7 @@ async fn the_winning_row_is_starred_per_project() {
 
     set_binding(
         &store,
-        SkillBindingKey::global(ids::SKILL_RUST_STYLE),
+        BindingKey::global(ids::SKILL_RUST_STYLE),
         None,
         BindingChange::Attach(always()),
     )
@@ -1021,7 +1021,7 @@ async fn an_attachment_changed_elsewhere_keeps_the_form_and_saves_over_it() {
         .expect("the demo `tests` row");
     set_binding(
         &store,
-        SkillBindingKey::of(&row),
+        BindingKey::of(&row),
         Some(row.updated_at),
         BindingChange::Attach(Attachment {
             position: 5,

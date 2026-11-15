@@ -20,8 +20,8 @@ use chrono::Utc;
 use htui_core::fixtures::{DemoData, demo_data, ids};
 use htui_core::model::skill::{StepFiles, select};
 use htui_core::model::{
-    Activation, ChoiceReason, ItemKindId, PhaseId, ProjectId, ResolveScope, Skill, SkillBinding,
-    SkillBindingId, SkillId, SkillLevel, SkillVersion, WorkspaceId,
+    Activation, Binding, BindingLevel, ChoiceReason, ItemKindId, PhaseId, ProjectId, ResolveScope,
+    Skill, SkillBindingId, SkillId, SkillVersion, WorkspaceId,
 };
 use htui_core::store::{MemStore, WriteStore as _};
 use htui_store::MIGRATOR;
@@ -161,7 +161,7 @@ fn mem_with(house: Option<SkillId>, attachments: &[Attachment]) -> MemStore {
         } else {
             demo_skill(&data, name)
         };
-        data.skill_bindings.push(SkillBinding {
+        data.skill_bindings.push(Binding {
             id: SkillBindingId::new(),
             skill_id,
             workspace_id: None,
@@ -260,15 +260,21 @@ async fn pg_and_mem_agree_on_global_project_and_phase() {
             ))
             .collect::<Vec<_>>(),
         vec![
-            ("tests", SkillLevel::Phase, Activation::Off, Some(1), 0),
+            ("tests", BindingLevel::Phase, Activation::Off, Some(1), 0),
             (
                 "rust-style",
-                SkillLevel::Phase,
+                BindingLevel::Phase,
                 Activation::Always,
                 Some(1),
                 2
             ),
-            ("house", SkillLevel::Global, Activation::Always, Some(1), 5),
+            (
+                "house",
+                BindingLevel::Global,
+                Activation::Always,
+                Some(1),
+                5
+            ),
         ],
         "the phase's off beats the project's and the global tests; the phase pin holds \
          rust-style at v1; house reaches the project from the global level"
@@ -284,9 +290,9 @@ async fn pg_and_mem_agree_on_global_project_and_phase() {
             .map(|s| (s.name.as_str(), s.level, s.activation, s.position))
             .collect::<Vec<_>>(),
         vec![
-            ("tests", SkillLevel::Global, Activation::Off, 3),
-            ("house", SkillLevel::Global, Activation::Always, 5),
-            ("rust-style", SkillLevel::Global, Activation::Always, 9),
+            ("tests", BindingLevel::Global, Activation::Off, 3),
+            ("house", BindingLevel::Global, Activation::Always, 5),
+            ("rust-style", BindingLevel::Global, Activation::Always, 9),
         ],
         "a project with no attachment of its own sees the three global ones, off included"
     );
@@ -328,7 +334,7 @@ async fn an_off_phase_attachment_hides_a_project_skill() {
         .expect("tests is still a candidate");
     assert_eq!(
         (tests.level, tests.activation),
-        (SkillLevel::Phase, Activation::Off),
+        (BindingLevel::Phase, Activation::Off),
         "the phase row wins over the project row"
     );
 
@@ -536,7 +542,7 @@ async fn plant_scoped(db: &common::TestDb, rows: &[Scoped]) -> MemStore {
         )
         .await
         .unwrap_or_else(|err| panic!("plant {name}: {err}"));
-        mem.skill_bindings.push(SkillBinding {
+        mem.skill_bindings.push(Binding {
             id: SkillBindingId::new(),
             skill_id: skill,
             workspace_id: *workspace,
@@ -578,7 +584,7 @@ async fn both(
 /// `(name, level, activation)` by name, the part of an answer these cases pin.
 fn by_name(
     answer: &[htui_core::model::BoundSkill],
-) -> std::collections::BTreeMap<&str, (SkillLevel, Activation)> {
+) -> std::collections::BTreeMap<&str, (BindingLevel, Activation)> {
     answer
         .iter()
         .map(|s| (s.name.as_str(), (s.level, s.activation)))
@@ -672,9 +678,9 @@ async fn pg_and_mem_agree_on_all_five_levels() {
     assert_eq!(
         by_name(&feat_implement),
         [
-            ("house", (SkillLevel::Global, Activation::Always)),
-            ("rust-style", (SkillLevel::Phase, Activation::Always)),
-            ("tests", (SkillLevel::ItemKind, Activation::Off)),
+            ("house", (BindingLevel::Global, Activation::Always)),
+            ("rust-style", (BindingLevel::Phase, Activation::Always)),
+            ("tests", (BindingLevel::ItemKind, Activation::Off)),
         ]
         .into_iter()
         .collect(),
@@ -694,9 +700,9 @@ async fn pg_and_mem_agree_on_all_five_levels() {
     assert_eq!(
         by_name(&fix),
         [
-            ("house", (SkillLevel::ItemKind, Activation::Always)),
-            ("rust-style", (SkillLevel::Project, Activation::Always)),
-            ("tests", (SkillLevel::Project, Activation::Always)),
+            ("house", (BindingLevel::ItemKind, Activation::Always)),
+            ("rust-style", (BindingLevel::Project, Activation::Always)),
+            ("tests", (BindingLevel::Project, Activation::Always)),
         ]
         .into_iter()
         .collect(),
@@ -716,9 +722,9 @@ async fn pg_and_mem_agree_on_all_five_levels() {
     assert_eq!(
         by_name(&agy),
         [
-            ("house", (SkillLevel::Global, Activation::Always)),
-            ("rust-style", (SkillLevel::Workspace, Activation::Off)),
-            ("tests", (SkillLevel::Workspace, Activation::Always)),
+            ("house", (BindingLevel::Global, Activation::Always)),
+            ("rust-style", (BindingLevel::Workspace, Activation::Off)),
+            ("tests", (BindingLevel::Workspace, Activation::Always)),
         ]
         .into_iter()
         .collect(),
@@ -765,7 +771,7 @@ async fn a_workspace_row_applies_only_when_the_scope_names_it() {
             },
         )
         .await;
-        let levels: Vec<SkillLevel> = answer
+        let levels: Vec<BindingLevel> = answer
             .iter()
             .filter(|s| s.name == "house")
             .map(|s| s.level)
@@ -773,7 +779,7 @@ async fn a_workspace_row_applies_only_when_the_scope_names_it() {
         assert_eq!(
             levels,
             if applies {
-                vec![SkillLevel::Workspace]
+                vec![BindingLevel::Workspace]
             } else {
                 Vec::new()
             },
@@ -822,7 +828,7 @@ async fn an_item_kind_row_applies_only_to_that_kind() {
             },
         )
         .await;
-        let levels: Vec<SkillLevel> = answer
+        let levels: Vec<BindingLevel> = answer
             .iter()
             .filter(|s| s.name == "house")
             .map(|s| s.level)
@@ -830,7 +836,7 @@ async fn an_item_kind_row_applies_only_to_that_kind() {
         assert_eq!(
             levels,
             if applies {
-                vec![SkillLevel::ItemKind]
+                vec![BindingLevel::ItemKind]
             } else {
                 Vec::new()
             },
@@ -928,8 +934,14 @@ async fn old_rows_resolve_as_before_the_migration() {
             ))
             .collect::<Vec<_>>(),
         vec![
-            ("style", SkillLevel::Project, Activation::Glob, Some(1), 2),
-            ("house", SkillLevel::Global, Activation::Always, Some(1), 5),
+            ("style", BindingLevel::Project, Activation::Glob, Some(1), 2),
+            (
+                "house",
+                BindingLevel::Global,
+                Activation::Always,
+                Some(1),
+                5
+            ),
         ],
         "the two old rows resolve as they did before the rename"
     );

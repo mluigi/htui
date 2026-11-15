@@ -22789,7 +22789,7 @@ mod tests {
         globs: &[&str],
     ) -> htui_core::model::SkillId {
         use htui_core::model::{
-            Activation, Attachment, BindingChange, NewSkill, SkillBindingKey, SkillId,
+            Activation, Attachment, BindingChange, BindingKey, NewSkill, SkillId,
         };
 
         let store = &harness.orch.store;
@@ -22806,7 +22806,7 @@ mod tests {
             .expect("a new skill");
         let outcome = store
             .set_skill_binding(
-                SkillBindingKey::project(skill.id, ids::PROJECT_HTUI),
+                BindingKey::project(skill.id, ids::PROJECT_HTUI),
                 None,
                 BindingChange::Attach(Attachment {
                     pinned_version: None,
@@ -23382,7 +23382,7 @@ mod tests {
         skills: &[htui_core::model::BoundSkill],
     ) -> Vec<(
         String,
-        htui_core::model::SkillLevel,
+        htui_core::model::BindingLevel,
         Option<i32>,
         i32,
         htui_core::model::Activation,
@@ -23475,7 +23475,7 @@ mod tests {
     /// one (v2), and `tests` comes from the project (`pg_criteria.rs`' phase answer).
     #[tokio::test]
     async fn a_phase_step_renders_its_phase_and_project_skills() {
-        use htui_core::model::{Activation, ChoiceReason, SkillLevel};
+        use htui_core::model::{Activation, BindingLevel, ChoiceReason};
 
         let harness = Harness::new().await;
         let (row, snapshot, prd) = skills_prologue(&harness).await;
@@ -23486,14 +23486,14 @@ mod tests {
             vec![
                 (
                     "tests".to_owned(),
-                    SkillLevel::Project,
+                    BindingLevel::Project,
                     Some(1),
                     0,
                     Activation::Always
                 ),
                 (
                     "rust-style".to_owned(),
-                    SkillLevel::Phase,
+                    BindingLevel::Phase,
                     Some(1),
                     2,
                     Activation::Always
@@ -23645,7 +23645,7 @@ mod tests {
     /// MOD-9 D44: a phase with no phase-level attachment sees the project's, with no note.
     #[tokio::test]
     async fn a_non_implement_phase_renders_project_skills_only() {
-        use htui_core::model::{Activation, SkillLevel};
+        use htui_core::model::{Activation, BindingLevel};
 
         let harness = Harness::new().await;
         let (row, snapshot, prd) = skills_prologue(&harness).await;
@@ -23669,14 +23669,14 @@ mod tests {
             vec![
                 (
                     "tests".to_owned(),
-                    SkillLevel::Project,
+                    BindingLevel::Project,
                     Some(1),
                     0,
                     Activation::Always
                 ),
                 (
                     "rust-style".to_owned(),
-                    SkillLevel::Project,
+                    BindingLevel::Project,
                     Some(2),
                     1,
                     Activation::Always
@@ -23697,7 +23697,7 @@ mod tests {
     #[tokio::test]
     async fn a_phase_off_attachment_turns_a_global_skill_off_for_that_phase_only() {
         use htui_core::model::{
-            Activation, Attachment, BindingChange, ChoiceReason, NewSkill, SkillBindingKey, SkillId,
+            Activation, Attachment, BindingChange, BindingKey, ChoiceReason, NewSkill, SkillId,
         };
         use htui_core::store::CasOutcome;
 
@@ -23726,7 +23726,7 @@ mod tests {
         };
         let global = store
             .set_skill_binding(
-                SkillBindingKey::global(skill.id),
+                BindingKey::global(skill.id),
                 None,
                 attach(Activation::Always),
             )
@@ -23735,7 +23735,7 @@ mod tests {
         assert!(matches!(global, CasOutcome::Applied(Some(_))), "{global:?}");
         let off = store
             .set_skill_binding(
-                SkillBindingKey::phase(skill.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
+                BindingKey::phase(skill.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
                 None,
                 attach(Activation::Off),
             )
@@ -23797,7 +23797,7 @@ mod tests {
     async fn attach_always(
         harness: &Harness,
         name: &str,
-        key: impl FnOnce(htui_core::model::SkillId) -> htui_core::model::SkillBindingKey,
+        key: impl FnOnce(htui_core::model::SkillId) -> htui_core::model::BindingKey,
     ) {
         use htui_core::model::{Activation, Attachment, BindingChange, NewSkill, SkillId};
         use htui_core::store::CasOutcome;
@@ -23841,7 +23841,7 @@ mod tests {
         snapshot: &GraphSnapshot,
         prd: &htui_core::model::RunStep,
         item: htui_core::model::ItemId,
-    ) -> Vec<(String, htui_core::model::SkillLevel)> {
+    ) -> Vec<(String, htui_core::model::BindingLevel)> {
         harness_engine!(harness.orch, engine);
         let implement = snapshot
             .phases
@@ -23863,13 +23863,13 @@ mod tests {
     /// level, and the judge of that run's phase reads the same candidates.
     #[tokio::test]
     async fn a_workspace_attachment_reaches_a_run_with_a_workspace() {
-        use htui_core::model::SkillBindingKey;
-        use htui_core::model::SkillLevel;
+        use htui_core::model::BindingKey;
+        use htui_core::model::BindingLevel;
 
         let harness = Harness::new().await;
         let (mut row, snapshot, prd) = skills_prologue(&harness).await;
         attach_always(&harness, "ws-style", |skill| {
-            SkillBindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
+            BindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
         })
         .await;
         row.workspace_id = Some(ids::WORKSPACE_PLATFORM);
@@ -23877,7 +23877,7 @@ mod tests {
 
         let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, item).await;
         assert!(
-            levels.contains(&("ws-style".to_owned(), SkillLevel::Workspace)),
+            levels.contains(&("ws-style".to_owned(), BindingLevel::Workspace)),
             "{levels:?}"
         );
 
@@ -23905,7 +23905,7 @@ mod tests {
 
         // Another workspace's attachment does not reach it.
         attach_always(&harness, "other-ws-style", |skill| {
-            SkillBindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
+            BindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
         })
         .await;
         let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, item).await;
@@ -23919,12 +23919,12 @@ mod tests {
     /// workspace-level candidate.
     #[tokio::test]
     async fn a_chat_run_without_a_workspace_gets_no_workspace_attachment() {
-        use htui_core::model::SkillBindingKey;
+        use htui_core::model::BindingKey;
 
         let harness = Harness::new().await;
         let (mut row, snapshot, prd) = skills_prologue(&harness).await;
         attach_always(&harness, "ws-style", |skill| {
-            SkillBindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
+            BindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
         })
         .await;
         row.workspace_id = None;
@@ -23940,12 +23940,12 @@ mod tests {
     /// MOD-127 D5: an item-kind attachment reaches the items of that kind and no others.
     #[tokio::test]
     async fn an_item_kind_attachment_reaches_only_items_of_that_kind() {
-        use htui_core::model::{SkillBindingKey, SkillLevel};
+        use htui_core::model::{BindingKey, BindingLevel};
 
         let harness = Harness::new().await;
         let (row, snapshot, prd) = skills_prologue(&harness).await;
         attach_always(&harness, "feat-style", |skill| {
-            SkillBindingKey::item_kind(skill, ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT)
+            BindingKey::item_kind(skill, ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT)
         })
         .await;
         let feat = row.item_id.expect("an item's run");
@@ -23953,7 +23953,7 @@ mod tests {
 
         let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, feat).await;
         assert!(
-            levels.contains(&("feat-style".to_owned(), SkillLevel::ItemKind)),
+            levels.contains(&("feat-style".to_owned(), BindingLevel::ItemKind)),
             "{levels:?}"
         );
 
@@ -23969,7 +23969,7 @@ mod tests {
     /// silently.
     #[tokio::test]
     async fn a_renamed_phase_falls_back_to_project_skills_with_a_note() {
-        use htui_core::model::SkillLevel;
+        use htui_core::model::BindingLevel;
         use htui_core::store::CasOutcome;
 
         let harness = Harness::new().await;
@@ -24006,7 +24006,7 @@ mod tests {
             .expect("the project still attaches `rust-style`");
         assert_eq!(
             (rust_style.level, rust_style.version),
-            (SkillLevel::Project, Some(2)),
+            (BindingLevel::Project, Some(2)),
             "the project's attachment, since the phase's cannot be found"
         );
         let expected = format!(

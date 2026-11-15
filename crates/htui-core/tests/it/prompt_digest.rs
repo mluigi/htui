@@ -1724,7 +1724,7 @@ fn the_record_graph_holds_no_map_that_could_break_the_null_argument() {
     // graph": `serde_json::to_value` fails on a map whose keys are not strings, and a `HashMap`
     // field is the one way to introduce that. `the_prompt_module_reads_no_clock` bans the type for
     // `crates/htui-core/src/prompt/`'s nine files, but the record graph reaches past them — into
-    // `model/skill.rs` for `SkillChoice`/`SkillLevel`/`Activation` and `model/ids.rs` for
+    // `model/skill.rs` for `SkillChoice`/`BindingLevel`/`Activation` and `model/ids.rs` for
     // `SkillId` — so that guard was narrower than the claim it was cited for. This is the guard
     // that covers the whole graph, and it is deliberately not folded into the clock test: "reads no
     // clock" and "serialises to an object" are different invariants with different blast radii.

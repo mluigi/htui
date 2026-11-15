@@ -33,34 +33,34 @@ use crate::model::{
 };
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
-    BOX_PROBE_SPEC_KEY, BatchClose, BatchId, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo,
-    BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, EventKind, Executor,
-    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
-    FollowUpSettle, FollowUpView, FollowUpWindow, GateOutcome, Item, ItemCitation, ItemFilter,
-    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryBody, MemoryEntry,
-    MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState, MemorySubject,
-    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
-    NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona,
-    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    ProjectRef, ProjectType, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry,
-    QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementState, RequirementUpdate, Resolution, ResolveScope, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillLevel, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode,
-    TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
-    WorkspaceSummary, canonical_declared_tags, memory_subject_key, missing_tags_failure,
-    moved_order, overlaps, prompt_summary, scope_of,
+    BOX_PROBE_SPEC_KEY, BatchClose, BatchId, Binding, BindingChange, BindingKey, BindingLevel,
+    BindingRef, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow,
+    BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
+    CommandRunId, CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document,
+    DocumentHead, DocumentId, EventKind, Executor, FOLLOW_UP_RUN_CANCELLED,
+    FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpView,
+    FollowUpWindow, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge,
+    LinkGraph, LinkKind, LinkNode, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch,
+    MemoryRevision, MemoryState, MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun,
+    NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewPersona,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, ProjectType, PromptScope,
+    PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueRow, QueueRunFact,
+    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, ResolveScope, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand,
+    RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
+    Skill, SkillBindingId, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop, WorkspaceSummary, canonical_declared_tags, memory_subject_key,
+    missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::model::{
     AttachedBox, BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind,
@@ -323,13 +323,13 @@ struct State {
     /// [`WriteStore::create_persona`] and [`WriteStore::update_persona`]; global, so
     /// `delete_project` leaves it.
     personas: HashMap<PersonaId, Persona>,
-    /// `skill_version`, resolved through [`SkillBinding::version_in_force`], read by
+    /// `skill_version`, resolved through [`Binding::version_in_force`], read by
     /// [`WriteStore::skill_versions`] and appended to by [`WriteStore::create_skill`] and
     /// [`WriteStore::add_skill_version`].
     skill_versions: Vec<SkillVersion>,
     /// `toolbox_binding`, resolved through `model::skill::resolve`, read by
     /// [`WriteStore::skill_bindings`] and written by [`WriteStore::set_skill_binding`].
-    skill_bindings: Vec<SkillBinding>,
+    skill_bindings: Vec<Binding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
     /// `box.probe_spec_digest`, which `BoxRow` does not carry (D14). Written by
@@ -998,7 +998,7 @@ impl MemStore {
 
     /// One `prompt_template` by `(project, name)`: the pinned `version` when there is one, else
     /// the highest. `None` when the pin cannot be honoured, which is
-    /// [`SkillBinding::version_in_force`]'s rule for the same shape of question.
+    /// [`Binding::version_in_force`]'s rule for the same shape of question.
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
@@ -4958,8 +4958,8 @@ impl State {
     /// D91, MOD-127 D6: the rows `home` lists, sorted by `(skill_id, item_kind_id, phase_id)`
     /// (`None < Some`, as `NULLS FIRST`; `Uuid`'s `Ord` is byte order, as Postgres's `uuid`
     /// comparison).
-    fn skill_binding_rows(&self, home: BindingHome) -> Vec<SkillBinding> {
-        let mut rows: Vec<SkillBinding> = self
+    fn skill_binding_rows(&self, home: BindingHome) -> Vec<Binding> {
+        let mut rows: Vec<Binding> = self
             .skill_bindings
             .iter()
             .filter(|row| home.lists(row))
@@ -4976,10 +4976,10 @@ impl State {
     }
 
     /// The row at a natural key, `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`.
-    fn skill_binding_at(&self, key: SkillBindingKey) -> Option<&SkillBinding> {
+    fn skill_binding_at(&self, key: BindingKey) -> Option<&Binding> {
         self.skill_bindings
             .iter()
-            .find(|row| SkillBindingKey::of(row) == key)
+            .find(|row| BindingKey::of(row) == key)
     }
 
     /// Order: `new_skill_refusal`; `require_user(created_by, "skill.created_by")`; a taken id →
@@ -5271,22 +5271,23 @@ impl State {
     /// editable columns in place and stamps `now` (the id is kept); a detach removes the row.
     fn set_skill_binding(
         &mut self,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
         now: DateTime<Utc>,
-    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+    ) -> Result<CasOutcome<Option<Binding>>> {
+        let BindingRef::Skill(skill) = key.target;
         let current = self.skill_binding_at(key).cloned();
         if current.as_ref().map(|row| row.updated_at) != expected {
             return Ok(CasOutcome::Stale(current));
         }
         let skill_name = self
             .skills
-            .get(&key.skill)
+            .get(&skill)
             .map(|row| row.name.clone())
             .ok_or_else(|| StoreError::NotFound {
                 entity: "skill",
-                id: key.skill.to_string(),
+                id: skill.to_string(),
             })?;
         let project_slug = match key.project {
             Some(id) => self
@@ -5346,7 +5347,7 @@ impl State {
             BindingChange::Attach(attachment) => attachment,
         };
         let versions: Vec<i32> = self
-            .skill_version_rows(key.skill)
+            .skill_version_rows(skill)
             .iter()
             .map(|row| row.version)
             .collect();
@@ -5372,9 +5373,9 @@ impl State {
         )
         .map_err(StoreError::Constraint)?;
 
-        let row = SkillBinding {
+        let row = Binding {
             id: current.map_or_else(SkillBindingId::new, |row| row.id),
-            skill_id: key.skill,
+            skill_id: skill,
             workspace_id: key.workspace,
             project_id: key.project,
             item_kind_id: key.item_kind,
@@ -10745,19 +10746,19 @@ impl State {
 /// `WHERE`. A row applies when its keys match the scope exactly at its level; a `None` in the
 /// scope (a workspace, item kind or phase it does not name) matches no row of that level, as
 /// `b.phase_id = NULL` matches none.
-fn binding_applies(binding: &SkillBinding, scope: ResolveScope) -> bool {
+fn binding_applies(binding: &Binding, scope: ResolveScope) -> bool {
     match binding.level() {
-        SkillLevel::Global => true,
-        SkillLevel::Workspace => {
+        BindingLevel::Global => true,
+        BindingLevel::Workspace => {
             binding.workspace_id.is_some() && binding.workspace_id == scope.workspace
         }
-        SkillLevel::Project => binding.project_id == Some(scope.project),
-        SkillLevel::ItemKind => {
+        BindingLevel::Project => binding.project_id == Some(scope.project),
+        BindingLevel::ItemKind => {
             binding.project_id == Some(scope.project)
                 && binding.item_kind_id.is_some()
                 && binding.item_kind_id == scope.item_kind
         }
-        SkillLevel::Phase => {
+        BindingLevel::Phase => {
             binding.project_id == Some(scope.project)
                 && binding.phase_id.is_some()
                 && binding.phase_id == scope.phase
@@ -12508,7 +12509,7 @@ impl WriteStore for MemStore {
         Ok(self.read(|state| state.skill_version_rows(skill)))
     }
 
-    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<Binding>> {
         Ok(self.read(|state| state.skill_binding_rows(home)))
     }
 
@@ -12539,10 +12540,10 @@ impl WriteStore for MemStore {
 
     async fn set_skill_binding(
         &self,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
-    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+    ) -> Result<CasOutcome<Option<Binding>>> {
         let now = self.now();
         self.write(|state| state.set_skill_binding(key, expected, change, now))
     }
@@ -14953,7 +14954,7 @@ mod tests {
             created_by: ids::USER,
             created_at: now,
         });
-        data.skill_bindings.push(crate::model::SkillBinding {
+        data.skill_bindings.push(crate::model::Binding {
             id: crate::model::SkillBindingId::new(),
             skill_id: house,
             workspace_id: None,
@@ -14974,7 +14975,7 @@ mod tests {
     /// with the project's and the phase's by `(position, name bytes)`.
     #[tokio::test]
     async fn a_global_attachment_reaches_every_project() {
-        use crate::model::SkillLevel;
+        use crate::model::BindingLevel;
         let (store, house) = demo_with_a_global_skill();
 
         let agy = store
@@ -14985,7 +14986,7 @@ mod tests {
             agy.iter()
                 .map(|s| (s.skill_id, s.level, s.version, s.position))
                 .collect::<Vec<_>>(),
-            vec![(house, SkillLevel::Global, Some(1), 5)],
+            vec![(house, BindingLevel::Global, Some(1), 5)],
             "a project with no attachment of its own still gets the global one"
         );
         assert_eq!(agy[0].body, "House rules.");
@@ -15003,9 +15004,9 @@ mod tests {
                 .map(|s| (s.name.as_str(), s.level, s.version, s.position))
                 .collect::<Vec<_>>(),
             vec![
-                ("tests", SkillLevel::Project, Some(1), 0),
-                ("rust-style", SkillLevel::Phase, Some(1), 2),
-                ("house", SkillLevel::Global, Some(1), 5),
+                ("tests", BindingLevel::Project, Some(1), 0),
+                ("rust-style", BindingLevel::Phase, Some(1), 2),
+                ("house", BindingLevel::Global, Some(1), 5),
             ],
             "the global attachment joins the project's and the phase's, in (position, name) order"
         );

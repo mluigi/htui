@@ -19,8 +19,8 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    ItemKind, NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillBinding,
-    SkillBindingKey, SkillId, SkillVersion, StepGraph, StepGraphPhase, WorkspaceId,
+    Binding, BindingKey, ItemKind, NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill,
+    SkillId, SkillVersion, StepGraph, StepGraphPhase, WorkspaceId,
 };
 use htui_core::store::{BindingHome, CasOutcome, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
@@ -38,7 +38,7 @@ pub struct SkillsSnapshot {
     /// The library in `name` byte order, each skill with every version.
     pub skills: Vec<SkillEntry>,
     /// The global attachments (`skill_bindings(BindingHome::Global)`), in D91 order.
-    pub global: Vec<SkillBinding>,
+    pub global: Vec<Binding>,
     /// One entry per workspace the view attaches at: the scope's workspace
     /// (`skill_bindings(BindingHome::Workspace(w))`, D91 order).
     pub workspaces: Vec<WorkspaceSkills>,
@@ -54,7 +54,7 @@ pub struct WorkspaceSkills {
     /// `workspace.name`, for the row's label; the id's first eight chars when the row is gone.
     pub name: String,
     /// Its attachments, in D91 order.
-    pub bindings: Vec<SkillBinding>,
+    pub bindings: Vec<Binding>,
 }
 
 /// One skill and its versions.
@@ -75,7 +75,7 @@ pub struct ProjectSkills {
     pub project: ProjectId,
     /// Its project, item-kind and phase attachments, `(skill_id, item_kind_id, phase_id)` byte
     /// order with the project row first (D91, MOD-127 D6).
-    pub bindings: Vec<SkillBinding>,
+    pub bindings: Vec<Binding>,
     /// Its item kinds, by `position` (the store's order): the rows an item-kind attachment sits
     /// under.
     pub item_kinds: Vec<ItemKind>,
@@ -140,13 +140,13 @@ impl SkillsSnapshot {
     /// `bindings`. `None` when no row sits there, which is also the `expected: None` a new
     /// attachment passes.
     #[must_use]
-    pub fn binding(&self, key: SkillBindingKey) -> Option<&SkillBinding> {
+    pub fn binding(&self, key: BindingKey) -> Option<&Binding> {
         let rows = match (key.workspace, key.project) {
             (Some(workspace), _) => &self.workspace(workspace)?.bindings,
             (None, None) => &self.global,
             (None, Some(project)) => &self.project(project)?.bindings,
         };
-        rows.iter().find(|row| SkillBindingKey::of(row) == key)
+        rows.iter().find(|row| BindingKey::of(row) == key)
     }
 }
 
@@ -160,7 +160,7 @@ pub enum StaleWhat {
     Version(SkillId),
     /// [`StoreRequest::SetSkillBinding`]: the row at the key changed, appeared or went, or its
     /// skill, workspace, project, item kind or phase is gone.
-    Binding(SkillBindingKey),
+    Binding(BindingKey),
 }
 
 /// One read (D81, D97), through the writer: `skill_bindings(BindingHome::Global)`; the scope
@@ -290,7 +290,7 @@ pub enum SkillWrite {
     /// [`StoreRequest::SetSkillBinding`] with an attach: the row at `key` is the one sent.
     Attached {
         /// The attachment's key.
-        key: SkillBindingKey,
+        key: BindingKey,
         /// The landed row's `updated_at`: the token a kept edit saves over (MOD-59 DV-1), not the
         /// re-read's row, which another session may already have written over.
         updated_at: DateTime<Utc>,
@@ -298,7 +298,7 @@ pub enum SkillWrite {
     /// [`StoreRequest::SetSkillBinding`] with a detach: no row at `key`.
     Detached {
         /// The attachment's key.
-        key: SkillBindingKey,
+        key: BindingKey,
     },
 }
 
@@ -532,8 +532,8 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use htui_core::fixtures::{self, ids};
     use htui_core::model::{
-        Activation, Attachment, BindingChange, NewRepo, PhaseId, RepoBoxPath, RepoId, Scope,
-        SkillBindingKey, SkillId, SkillPatch, StepGraph, StepGraphId,
+        Activation, Attachment, BindingChange, BindingKey, NewRepo, PhaseId, RepoBoxPath, RepoId,
+        Scope, SkillId, SkillPatch, StepGraph, StepGraphId,
     };
     use htui_core::store::{MemStore, StoreError, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY};
@@ -637,7 +637,7 @@ mod tests {
 
     fn bind(
         scope: &Scope,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
     ) -> StoreRequest {
@@ -650,8 +650,8 @@ mod tests {
     }
 
     /// The demo's phase-level attachment: `rust-style` on `htui`'s `implement` phase.
-    fn demo_phase_key() -> SkillBindingKey {
-        SkillBindingKey::phase(
+    fn demo_phase_key() -> BindingKey {
+        BindingKey::phase(
             ids::SKILL_RUST_STYLE,
             ids::PROJECT_HTUI,
             ids::PHASE_HTUI_IMPLEMENT,
@@ -787,7 +787,7 @@ mod tests {
             Some(ids::BINDING_HTUI_IMPLEMENT_RUST_STYLE)
         );
         assert_eq!(
-            snapshot.binding(SkillBindingKey {
+            snapshot.binding(BindingKey {
                 project: None,
                 phase: None,
                 ..demo_phase_key()
@@ -829,7 +829,7 @@ mod tests {
             "the project's kinds, the store's order"
         );
 
-        let ws_key = SkillBindingKey::workspace(ids::SKILL_TESTS, scope.workspace_id);
+        let ws_key = BindingKey::workspace(ids::SKILL_TESTS, scope.workspace_id);
         let (after, wrote) = applied(
             &backend,
             &bind(&scope, ws_key, None, BindingChange::Attach(always())),
@@ -843,7 +843,7 @@ mod tests {
         );
         assert!(after.global.is_empty(), "and is not a global row");
 
-        let kind_key = SkillBindingKey::item_kind(ids::SKILL_TESTS, ids::PROJECT_HTUI, kind.id);
+        let kind_key = BindingKey::item_kind(ids::SKILL_TESTS, ids::PROJECT_HTUI, kind.id);
         let (after, _) = applied(
             &backend,
             &bind(&scope, kind_key, None, BindingChange::Attach(always())),
@@ -856,24 +856,20 @@ mod tests {
         );
         assert_eq!(
             after
-                .binding(SkillBindingKey::project(
-                    ids::SKILL_TESTS,
-                    ids::PROJECT_HTUI
-                ))
+                .binding(BindingKey::project(ids::SKILL_TESTS, ids::PROJECT_HTUI))
                 .map(|row| (row.id, row.item_kind_id)),
             Some((ids::BINDING_HTUI_TESTS, None)),
             "the demo's project row is another key, untouched"
         );
 
-        let gone =
-            SkillBindingKey::workspace(ids::SKILL_TESTS, htui_core::model::WorkspaceId::new());
+        let gone = BindingKey::workspace(ids::SKILL_TESTS, htui_core::model::WorkspaceId::new());
         let (_, what) = stale(
             &backend,
             &bind(&scope, gone, None, BindingChange::Attach(always())),
         )
         .await;
         assert_eq!(what, StaleWhat::Binding(gone), "a vanished workspace");
-        let gone = SkillBindingKey::item_kind(
+        let gone = BindingKey::item_kind(
             ids::SKILL_TESTS,
             ids::PROJECT_HTUI,
             htui_core::model::ItemKindId::new(),
@@ -1005,7 +1001,7 @@ mod tests {
             }
         );
 
-        let key = SkillBindingKey::global(id);
+        let key = BindingKey::global(id);
         let (attached, outcome) = applied(
             &backend,
             &bind(&scope, key, None, BindingChange::Attach(always())),
@@ -1089,7 +1085,7 @@ mod tests {
         assert_eq!(what, StaleWhat::Version(gone));
         assert_eq!(fresh, before);
 
-        let no_phase = SkillBindingKey {
+        let no_phase = BindingKey {
             phase: Some(PhaseId::new()),
             ..key
         };

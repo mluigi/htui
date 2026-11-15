@@ -30,12 +30,11 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Activation, AgentId, BoxId, GateOutcome, ItemId, ItemKindId, LinkNode, MemoryEntry,
+    Activation, AgentId, Binding, BoxId, GateOutcome, ItemId, ItemKindId, LinkNode, MemoryEntry,
     MemoryEntryId, MemoryEvidence, MemoryKind, MemorySource, MemoryState, MemoryUsage, Persona,
     PersonaId, PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunLanding,
-    RunMode, RunProvenance, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId,
-    SkillId, Status, StepId, StepOpening, StepStatus, UpstreamEntry, UserId, VerifyOutcome,
-    WorkspaceId,
+    RunMode, RunProvenance, RunStatus, RunStepSummary, RunSummary, SkillBindingId, SkillId, Status,
+    StepId, StepOpening, StepStatus, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -277,7 +276,7 @@ impl UpstreamRow {
 /// `htui_core::model::skill::resolve`.
 ///
 /// Every `toolbox_binding` column is carried, so [`into_binding`](SkillBindingRow::into_binding)
-/// rebuilds the real [`SkillBinding`] and `resolve` applies the level and pin rules to it rather
+/// rebuilds the real [`Binding`] and `resolve` applies the level and pin rules to it rather
 /// than a second copy of them living here.
 #[derive(Debug, Clone)]
 pub(crate) struct SkillBindingRow {
@@ -310,11 +309,11 @@ pub(crate) struct SkillBindingRow {
 }
 
 impl SkillBindingRow {
-    /// The row as the model's [`SkillBinding`], paired with its joined `skill.name`: the shape
+    /// The row as the model's [`Binding`], paired with its joined `skill.name`: the shape
     /// `resolve` takes.
-    pub(crate) fn into_binding(self) -> (SkillBinding, String) {
+    pub(crate) fn into_binding(self) -> (Binding, String) {
         (
-            SkillBinding {
+            Binding {
                 id: self.id,
                 skill_id: self.skill_id,
                 workspace_id: self.workspace_id,

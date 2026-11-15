@@ -18,18 +18,18 @@ use htui_core::model::IntegrateMode;
 use htui_core::model::OwnerDocument;
 use htui_core::model::StepRole;
 use htui_core::model::{
-    Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
-    BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
-    DocumentHead, DocumentId, Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, MemoryEntry, MemoryEntryId,
-    MemoryKind, MemoryRevision, MemoryState, Note, Persona, PersonaId, PersonaPermission,
-    PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef, PromptScope,
-    PromptTemplate, QueueBatch, QueueEntry, QueueRow, QueueRunFact, Repo, RepoBoxPath, RepoId,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolveScope,
-    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Split, Status, StepGraph,
+    Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, Binding, BindingKey,
+    BindingRef, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind,
+    CommandQueue, CoverageRow, Document, DocumentHead, DocumentId, Gate, GateOutcome, Isolation,
+    Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph,
+    LinkKind, MemoryEntry, MemoryEntryId, MemoryKind, MemoryRevision, MemoryState, Note, Persona,
+    PersonaId, PersonaPermission, PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId,
+    ProjectRef, PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueueRow, QueueRunFact, Repo,
+    RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementRevision, RequirementSpec, RequirementState, Resolution,
+    ResolveScope, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBindingId, SkillId, SkillVersion, Split, Status, StepGraph,
     StepGraphId, StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId,
     VerifyOutcome, WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
     WorkspaceSummary,
@@ -2373,7 +2373,7 @@ impl PgStore {
     /// else the highest (`docs/ANA-5.md` §4.6).
     ///
     /// A pin that names no row is `None` rather than the highest version - the same rule
-    /// [`SkillBinding::version_in_force`](htui_core::model::SkillBinding::version_in_force) applies
+    /// [`Binding::version_in_force`](htui_core::model::Binding::version_in_force) applies
     /// to the same shape of question - which is why the pin is a `WHERE` conjunct and not an
     /// `ORDER BY` preference.
     ///
@@ -3677,7 +3677,7 @@ impl PgStore {
 
     // ---- MOD-9 milestone 3: the skill readers (plan D75, blueprint D91, D92) -----------------
     //
-    // `query_as!` builds the model rows directly: `Skill`, `SkillVersion` and `SkillBinding` carry
+    // `query_as!` builds the model rows directly: `Skill`, `SkillVersion` and `Binding` carry
     // exactly their table's columns, in field order (`rows.rs` needs no struct for them).
 
     /// Every skill, ordered by `name` bytes (D91).
@@ -3762,14 +3762,14 @@ impl PgStore {
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    pub(crate) async fn skill_binding_rows(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
+    pub(crate) async fn skill_binding_rows(&self, home: BindingHome) -> Result<Vec<Binding>> {
         let (workspace, project) = match home {
             BindingHome::Global => (None, None),
             BindingHome::Workspace(id) => (Some(id.as_uuid()), None),
             BindingHome::Project(id) => (None, Some(id.as_uuid())),
         };
         sqlx::query_as!(
-            SkillBinding,
+            Binding,
             r#"
             SELECT id             AS "id: SkillBindingId",
                    ref_id         AS "skill_id: SkillId",
@@ -3805,12 +3805,10 @@ impl PgStore {
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    pub(crate) async fn skill_binding_row(
-        &self,
-        key: SkillBindingKey,
-    ) -> Result<Option<SkillBinding>> {
+    pub(crate) async fn skill_binding_row(&self, key: BindingKey) -> Result<Option<Binding>> {
+        let BindingRef::Skill(skill) = key.target;
         sqlx::query_as!(
-            SkillBinding,
+            Binding,
             r#"
             SELECT id             AS "id: SkillBindingId",
                    ref_id         AS "skill_id: SkillId",
@@ -3832,7 +3830,7 @@ impl PgStore {
                AND item_kind_id IS NOT DISTINCT FROM $4
                AND phase_id IS NOT DISTINCT FROM $5
             "#,
-            key.skill.as_uuid(),
+            skill.as_uuid(),
             key.workspace.map(WorkspaceId::as_uuid),
             key.project.map(ProjectId::as_uuid),
             key.item_kind.map(ItemKindId::as_uuid),

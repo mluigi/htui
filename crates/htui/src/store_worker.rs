@@ -23,15 +23,15 @@ use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{ACTIVITY_PAGE, ActivityPage};
 use htui_core::model::{
-    AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BoxEdit, BoxId,
-    BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
+    AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BindingKey, BoxEdit,
+    BoxId, BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
     FollowUpText, GraphBody, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSpec,
     ItemSummary, KeyQualifier, LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona,
     PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, ProjectRef,
     ProjectType, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunCommandId,
-    RunStatus, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges,
-    StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission,
-    WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    RunStatus, RunSummary, Scope, SessionEvent, SkillId, SkillPatch, SpecChanges, StepGraphId,
+    StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId,
+    WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::model::{
     LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, OwnerDocument,
@@ -937,7 +937,7 @@ pub enum StoreRequest {
         /// The scope the reply re-reads.
         scope: Scope,
         /// The attachment's key.
-        key: SkillBindingKey,
+        key: BindingKey,
         /// The row's `updated_at` the form opened on; `None` for "no row at the key".
         expected: Option<DateTime<Utc>>,
         /// Attach or detach.

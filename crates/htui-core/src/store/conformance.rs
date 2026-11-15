@@ -21,33 +21,37 @@ use crate::model::{
 };
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
-    BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
-    Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow, CoverageState,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentId, EditReason, EventKind, EventRole, Executor,
-    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
-    FollowUpSettle, FollowUpText, FollowUpView, Gate, GateOutcome, GraphSnapshot, Isolation, Item,
-    ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind,
-    MEMORY_RUN_WRITE_CAP, MemoryBody, MemoryCitation, MemoryEntry, MemoryEntryId, MemoryEvidence,
-    MemoryKind, MemoryPatch, MemoryRevision, MemorySource, MemoryState, MemorySubject,
-    MemorySupersede, MemoryUpdate, MemoryUsage, NewCommandRun, NewDocument, NewFollowUp, NewItem,
-    NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule,
-    PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer,
-    PersonaId, PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools,
-    PhaseAgent, PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope,
-    PromptTemplate, PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind,
-    RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementState, RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind,
-    RunCommandStatus, RunId, RunKind, RunMemoryWrite, RunMode, RunProvenance, RunScope, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry, UserId,
-    VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
-    executor_scrub_refusal, missing_tags_failure,
+    BindingChange, BindingKey, BindingRef, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest,
+    ChatRunSpec, CitationKind, Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus,
+    CoverageRow, CoverageState, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentId, EditReason,
+    EventKind, EventRole, Executor, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED,
+    FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText, FollowUpView, Gate,
+    GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemSummary, LinkKind, MEMORY_RUN_WRITE_CAP, MemoryBody,
+    MemoryCitation, MemoryEntry, MemoryEntryId, MemoryEvidence, MemoryKind, MemoryPatch,
+    MemoryRevision, MemorySource, MemoryState, MemorySubject, MemorySupersede, MemoryUpdate,
+    MemoryUsage, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
+    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
+    NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PendingStop, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId, PersonaMatch, PersonaPatch,
+    PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
+    ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId,
+    QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RelayView,
+    RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
+    RunMemoryWrite, RunMode, RunProvenance, RunScope, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillId, SkillPatch, SkillVersion,
+    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
+    WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
+};
+use crate::model::{
+    Binding, EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart,
+    PlanScope, PredicateError, Split, StepGraphEdge,
 };
 use crate::model::{
     BoxKind, NewChildBox, NewTarget, ResolvedTarget, StepGraph, Target, TargetEdit, TargetId,
@@ -55,10 +59,6 @@ use crate::model::{
 };
 use crate::model::{CAPTURE_KEY, CAPTURE_POSITION, NewOwnerDocument, Project, StepRole};
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog};
-use crate::model::{
-    EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
-    PredicateError, SkillBinding, Split, StepGraphEdge,
-};
 use crate::model::{IndexChanges, ProjectChanges};
 use crate::model::{IndexedCollection, IndexerLease, LeaseTake, LeaseTurn};
 use crate::model::{
@@ -15242,9 +15242,9 @@ fn attachment(activation: Activation, position: i32) -> Attachment {
 }
 
 /// The natural key of one attachment.
-fn key(skill: SkillId, project: Option<ProjectId>, phase: Option<PhaseId>) -> SkillBindingKey {
-    SkillBindingKey {
-        skill,
+fn key(skill: SkillId, project: Option<ProjectId>, phase: Option<PhaseId>) -> BindingKey {
+    BindingKey {
+        target: BindingRef::Skill(skill),
         workspace: None,
         project,
         item_kind: None,
@@ -15259,9 +15259,9 @@ fn key_at(
     project: Option<ProjectId>,
     item_kind: Option<ItemKindId>,
     phase: Option<PhaseId>,
-) -> SkillBindingKey {
-    SkillBindingKey {
-        skill,
+) -> BindingKey {
+    BindingKey {
+        target: BindingRef::Skill(skill),
         workspace,
         project,
         item_kind,
@@ -15812,7 +15812,7 @@ async fn skill_binding_refuses_by_rule<S: WriteStore>(store: &S) {
         edit(&mut change);
         BindingChange::Attach(change)
     };
-    let refusals: [(SkillBindingKey, BindingChange, &str, &str); 15] = [
+    let refusals: [(BindingKey, BindingChange, &str, &str); 15] = [
         (
             key_at(
                 ids::SKILL_TESTS,
@@ -31361,7 +31361,7 @@ async fn replace_graph_keeps_bindings_of_kept_phases<S: WriteStore>(store: &S) {
                 .expect(CASE),
         );
     }
-    let bound = |rows: Vec<SkillBinding>| -> Vec<PhaseId> {
+    let bound = |rows: Vec<Binding>| -> Vec<PhaseId> {
         let mut phases: Vec<PhaseId> = rows
             .into_iter()
             .filter_map(|row| row.phase_id)

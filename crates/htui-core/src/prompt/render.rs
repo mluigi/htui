@@ -1269,7 +1269,7 @@ mod tests {
     use super::*;
     use crate::model::ids::{ItemId, StepId};
     use crate::model::item::Status;
-    use crate::model::{Activation, EventRole, OsFamily, SkillLevel};
+    use crate::model::{Activation, BindingLevel, EventRole, OsFamily};
     use crate::prompt::excerpt::{ExcerptReason, RootSource};
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -1717,7 +1717,7 @@ mod tests {
                 version: Some(3),
                 position: 0,
                 body: "Use `expect` over `unwrap`.\n".to_owned(),
-                level: SkillLevel::Project,
+                level: BindingLevel::Project,
                 activation: Activation::Always,
                 globs: Vec::new(),
             },
@@ -1727,7 +1727,7 @@ mod tests {
                 version: Some(1),
                 position: 1,
                 body: String::new(),
-                level: SkillLevel::Project,
+                level: BindingLevel::Project,
                 activation: Activation::Always,
                 globs: Vec::new(),
             },

@@ -24,8 +24,8 @@ use htui_core::model::skill_glob::{SkillGlobs, canonical_globs, split_list};
 use htui_core::model::skill_import::prefill_from_source;
 use htui_core::model::skill_language;
 use htui_core::model::{
-    Activation, Attachment, BindingChange, ItemKindId, PhaseId, ProjectId, SkillBinding,
-    SkillBindingKey, SkillGlob, SkillId, SkillLevel, WorkspaceId,
+    Activation, Attachment, Binding, BindingChange, BindingKey, BindingLevel, ItemKindId, PhaseId,
+    ProjectId, SkillGlob, SkillId, WorkspaceId,
 };
 use htui_core::store::{
     glob_names_unknown_repo, global_glob_names_a_repo, workspace_glob_names_a_repo,
@@ -154,7 +154,7 @@ enum AttachMode {
     /// `x` asked; `y` detaches (the kinds editor's modal question).
     ConfirmDetach {
         /// The row's key.
-        key: SkillBindingKey,
+        key: BindingKey,
         /// The row's `updated_at`: the detach's compare-and-set token.
         token: DateTime<Utc>,
         /// What the notice calls the row.
@@ -192,7 +192,7 @@ enum ARow {
 #[derive(Debug)]
 struct Form {
     /// The attachment's key.
-    key: SkillBindingKey,
+    key: BindingKey,
     /// What the title and the notices call the row.
     target: String,
     /// The row's `updated_at`; `None` when no row sat there (an attach).
@@ -374,7 +374,7 @@ impl AttachPane {
     /// detach.
     pub(super) fn on_landed(
         &mut self,
-        key: SkillBindingKey,
+        key: BindingKey,
         change: &BindingChange,
         token: Option<DateTime<Utc>>,
     ) -> bool {
@@ -696,7 +696,7 @@ impl AttachPane {
     fn on_confirm_key(
         &mut self,
         stack: Stack<'static>,
-        row: SkillBindingKey,
+        row: BindingKey,
         token: DateTime<Utc>,
         target: String,
         chord: KeyChord,
@@ -755,19 +755,19 @@ impl AttachPane {
     }
 
     /// The key a row writes under.
-    fn key_of(&self, row: ARow, snapshot: &SkillsSnapshot) -> SkillBindingKey {
-        let global = SkillBindingKey::global(self.skill);
+    fn key_of(&self, row: ARow, snapshot: &SkillsSnapshot) -> BindingKey {
+        let global = BindingKey::global(self.skill);
         match row {
             ARow::Global => global,
-            ARow::Workspace(workspace) => SkillBindingKey::workspace(self.skill, workspace),
-            ARow::Project { p } => SkillBindingKey {
+            ARow::Workspace(workspace) => BindingKey::workspace(self.skill, workspace),
+            ARow::Project { p } => BindingKey {
                 project: snapshot.projects.get(p).map(|entry| entry.project),
                 ..global
             },
-            ARow::ItemKind(project, kind) => SkillBindingKey::item_kind(self.skill, project, kind),
+            ARow::ItemKind(project, kind) => BindingKey::item_kind(self.skill, project, kind),
             ARow::Phase { p, g, i } => {
                 let entry = snapshot.projects.get(p);
-                SkillBindingKey {
+                BindingKey {
                     project: entry.map(|entry| entry.project),
                     phase: entry.and_then(|entry| phase_id(entry, g, i)),
                     ..global
@@ -952,7 +952,7 @@ impl AttachPane {
             return Vec::new();
         };
         let name = entry.skill.name.clone();
-        let mine = |row: &&SkillBinding| row.skill_id == self.skill;
+        let mine = |row: &&Binding| row.skill_id == self.skill;
         let workspaces: Vec<Option<&WorkspaceSkills>> = if snapshot.workspaces.is_empty() {
             vec![None]
         } else {
@@ -982,7 +982,7 @@ impl AttachPane {
                 for at in phases {
                     let phase = at.map(|(_, _, id)| id);
                     for kind in &kinds {
-                        let applies: Vec<(SkillBinding, String)> = snapshot
+                        let applies: Vec<(Binding, String)> = snapshot
                             .global
                             .iter()
                             .filter(mine)
@@ -1003,15 +1003,15 @@ impl AttachPane {
                             continue;
                         };
                         let row = match (winner.level, at, kind, workspace) {
-                            (SkillLevel::Global, ..) => ARow::Global,
-                            (SkillLevel::Workspace, _, _, Some(entry)) => {
+                            (BindingLevel::Global, ..) => ARow::Global,
+                            (BindingLevel::Workspace, _, _, Some(entry)) => {
                                 ARow::Workspace(entry.workspace)
                             }
-                            (SkillLevel::Project, ..) => ARow::Project { p },
-                            (SkillLevel::ItemKind, _, Some(kind), _) => {
+                            (BindingLevel::Project, ..) => ARow::Project { p },
+                            (BindingLevel::ItemKind, _, Some(kind), _) => {
                                 ARow::ItemKind(project.project, *kind)
                             }
-                            (SkillLevel::Phase, Some((g, i, _)), ..) => ARow::Phase { p, g, i },
+                            (BindingLevel::Phase, Some((g, i, _)), ..) => ARow::Phase { p, g, i },
                             // A level whose key the scope does not carry cannot have won here.
                             _ => continue,
                         };
@@ -1068,12 +1068,12 @@ fn label(row: ARow, snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> String {
         ARow::Global => "global".to_owned(),
         ARow::Workspace(workspace) => format!(
             "{} {}",
-            label::skill_level(SkillLevel::Workspace),
+            label::skill_level(BindingLevel::Workspace),
             workspace_name(snapshot, workspace)
         ),
         ARow::ItemKind(project, kind) => format!(
             "  {} {}",
-            label::skill_level(SkillLevel::ItemKind),
+            label::skill_level(BindingLevel::ItemKind),
             item_kind_prefix(snapshot, project, kind)
         ),
         ARow::Project { p } => snapshot
@@ -1358,6 +1358,7 @@ fn detach_question(name: &str, target: &str, yes: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::ui::cells::cell_width;
+    use htui_core::model::BindingRef;
 
     /// MOD-67 M6 D4: the detach question names the answer in force through `ATTACH_CONFIRM`, and
     /// asks alone when none is bound.
@@ -1379,7 +1380,7 @@ mod tests {
     /// A form over the global row, focus on the activation.
     fn activation_form(activation: Activation) -> Form {
         Form {
-            key: SkillBindingKey::global(SkillId::new()),
+            key: BindingKey::global(SkillId::new()),
             target: "global".to_owned(),
             token: None,
             activation,
@@ -1510,7 +1511,7 @@ mod tests {
     /// The pane over an empty scope (only the `global` row), its form open on `form`, drawn at
     /// 100 x 20 in `theme`, as the buffer and its rows.
     fn drawn_form(form: Form, theme: &crate::ui::Theme) -> (ratatui::buffer::Buffer, Vec<String>) {
-        let skill = form.key.skill;
+        let BindingRef::Skill(skill) = form.key.target;
         drawn(AttachMode::Form(form), skill, &no_projects(), theme)
     }
 
@@ -1678,7 +1679,7 @@ mod tests {
         for theme in both_themes() {
             let mut form = activation_form(Activation::Glob);
             form.key.project = Some(project);
-            let skill = form.key.skill;
+            let BindingRef::Skill(skill) = form.key.target;
             let mode = AttachMode::Picker { form, cursor: 1 };
             let (buffer, rows) = drawn(mode, skill, &snapshot, &theme);
             let top = row_of(&rows, "repos of ");
@@ -1780,7 +1781,7 @@ mod tests {
     }
 
     /// Opens the form over `row` and saves it unchanged: the key the write goes under.
-    fn saved_key(pane: &mut AttachPane, row: ARow, snapshot: &SkillsSnapshot) -> SkillBindingKey {
+    fn saved_key(pane: &mut AttachPane, row: ARow, snapshot: &SkillsSnapshot) -> BindingKey {
         in_graphics(|ctx| {
             let rows = rows(snapshot);
             pane.cursor = rows
@@ -1847,11 +1848,8 @@ mod tests {
             ARow::Workspace(ids::WORKSPACE_GRAPHICS),
             &snapshot,
         );
-        assert_eq!(
-            key,
-            SkillBindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
-        );
-        assert_eq!(key.level(), SkillLevel::Workspace);
+        assert_eq!(key, BindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS));
+        assert_eq!(key.level(), BindingLevel::Workspace);
         in_graphics(|ctx| {
             assert_eq!(
                 target(ARow::Workspace(ids::WORKSPACE_GRAPHICS), &snapshot, ctx),
@@ -1873,11 +1871,8 @@ mod tests {
         };
         let row = ARow::ItemKind(ids::PROJECT_VULKAN, kind);
         let key = saved_key(&mut pane, row, &snapshot);
-        assert_eq!(
-            key,
-            SkillBindingKey::item_kind(skill, ids::PROJECT_VULKAN, kind)
-        );
-        assert_eq!(key.level(), SkillLevel::ItemKind);
+        assert_eq!(key, BindingKey::item_kind(skill, ids::PROJECT_VULKAN, kind));
+        assert_eq!(key.level(), BindingLevel::ItemKind);
         in_graphics(|ctx| {
             assert_eq!(
                 target(row, &snapshot, ctx),
