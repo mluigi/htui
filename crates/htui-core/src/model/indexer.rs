@@ -1,17 +1,25 @@
 //! The knowledge index's collections and the lease that names their one indexer (MOD-159 M1,
-//! plan D1, D3; `0038_indexer_lease.sql`).
+//! plan D1, D3; `0038_indexer_lease.sql`), and what changed since a pass (MOD-159 M2, plan D2,
+//! D3).
 //!
 //! Each workspace has its own Qdrant collection and there is one global one
 //! ([`IndexedCollection`]). Exactly one htui process indexes a collection: the holder of its
 //! `indexer_lease` row. [`IndexerLease`] is that row as people see it (which box holds it, until
 //! when) and never carries the holder's owner token, as `Run` keeps `lease_owner` out.
 //! [`LeaseTake`] is what a take answers.
+//!
+//! Between full reconciles the indexer runs incremental passes: [`IndexCursor`] is where the last
+//! pass of a collection began, on the store's clock, and [`IndexChanges`] is what the store
+//! answers when asked which rows were written since then
+//! ([`IndexChangesStore`](crate::store::IndexChangesStore)).
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::ids::{BoxId, WorkspaceId};
+use crate::model::ids::{BoxId, DocumentId, ItemId, ProjectId, RequirementId, WorkspaceId};
 
 /// The prefix of a workspace's collection name; the workspace's UUID follows it in simple form.
 const WORKSPACE_PREFIX: &str = "htui_ws_";
@@ -98,9 +106,70 @@ pub enum LeaseTake {
     Held(IndexerLease),
 }
 
+/// Where a collection's last completed pass began (MOD-159 M2 plan D2): the store-clock instant
+/// read before that pass read the changes, kept in process. One field per change source; a later
+/// source (MOD-112's transcripts) adds its own beside `rows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexCursor {
+    /// The store's clock when the last pass began: items, requirements and documents written
+    /// after it (less the overlap) are the next pass's.
+    pub rows: DateTime<Utc>,
+}
+
+impl IndexCursor {
+    /// A cursor whose rows source stands at `rows`.
+    #[must_use]
+    pub const fn at(rows: DateTime<Utc>) -> Self {
+        Self { rows }
+    }
+}
+
+/// The rows written strictly after an instant, by project (MOD-159 M2 plan D3): what
+/// [`IndexChangesStore::index_changes`](crate::store::IndexChangesStore::index_changes) answers.
+/// Only a project with at least one change has an entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexChanges {
+    /// Each changed project's changes.
+    pub projects: BTreeMap<ProjectId, ProjectChanges>,
+}
+
+impl IndexChanges {
+    /// Whether nothing changed: no project has an entry.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.projects.is_empty()
+    }
+}
+
+/// One project's changed rows (MOD-159 M2 plan D3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectChanges {
+    /// Items of the project (its current one) whose `updated_at` is after the instant, or that
+    /// gained a document version created after it.
+    pub items: BTreeSet<ItemId>,
+    /// Requirements of the project whose `updated_at` is after the instant.
+    pub requirements: BTreeSet<RequirementId>,
+    /// The project's owner documents (no item) created after the instant.
+    pub owner_documents: BTreeSet<DocumentId>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_changes_are_empty_until_a_project_has_an_entry() {
+        assert!(IndexChanges::default().is_empty());
+        let mut changes = IndexChanges::default();
+        changes.projects.insert(
+            ProjectId::new(),
+            ProjectChanges {
+                items: BTreeSet::from([ItemId::new()]),
+                ..ProjectChanges::default()
+            },
+        );
+        assert!(!changes.is_empty());
+    }
 
     #[test]
     fn a_workspace_collection_is_named_by_its_uuid_in_simple_form() {

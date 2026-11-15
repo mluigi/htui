@@ -45,6 +45,13 @@ async fn mem_store_indexer_lease_conformance() {
     conformance::run_all_indexer_leases(|| async { MemStore::demo() }).await;
 }
 
+/// The index change read half of the suite (MOD-159 M2 plan D3), bound to the same fixture: a
+/// sixth binding, because `run_all_index_changes` is generic over `WriteStore + IndexChangesStore`.
+#[tokio::test]
+async fn mem_store_index_changes_conformance() {
+    conformance::run_all_index_changes(|| async { MemStore::demo() }).await;
+}
+
 #[tokio::test]
 async fn demo_store_loads_the_fixture() {
     let store = MemStore::demo();
@@ -138,5 +145,10 @@ async fn demo_store_loads_the_fixture() {
         10,
         "MOD-159 M1's eight indexer lease cases (plan D2, D3) and review R1's lapsed-`Ours` and \
          single-release cases"
+    );
+    assert_eq!(
+        conformance::INDEX_CHANGES_CASES.len(),
+        7,
+        "MOD-159 M2's seven change-read cases (plan D3)"
     );
 }

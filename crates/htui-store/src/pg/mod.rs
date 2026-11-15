@@ -7,6 +7,7 @@
 mod activity;
 #[cfg(feature = "demo")]
 mod demo;
+mod index_changes;
 mod indexer_lease;
 mod read;
 mod relay;

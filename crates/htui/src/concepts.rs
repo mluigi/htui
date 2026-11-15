@@ -24,18 +24,20 @@
 //! [`IndexJob`] runs [`index_job`] in `htui worker` and in the TUI while it is online. Every beat
 //! (the run lease's refresh) it resolves the Qdrant URL, takes or renews the lease of every
 //! collection, and reconciles each one it holds at start and then every [`sync_interval`].
+//! Between reconciles (MOD-159 M2) it indexes, every [`INCREMENTAL_CYCLE`], only the rows written
+//! since its last pass of that collection, pulled back by [`overlap_window`].
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
-    BoxId, IndexedCollection, IndexerLease, LeaseTake, ProjectId, RequirementState, Resolution,
-    Scope,
+    BoxId, IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, ProjectId,
+    RequirementState, Resolution, Scope,
 };
-use htui_core::store::{IndexerLeaseStore, MemStore, ReadStore, StoreError};
+use htui_core::store::{IndexChangesStore, IndexerLeaseStore, MemStore, ReadStore, StoreError};
 use htui_orch::recover::LeaseTimes;
 use htui_store::embed::DenseEmbedder;
 use htui_store::embed::RtenEmbedder;
@@ -476,10 +478,38 @@ pub fn sync_interval(app: &BTreeMap<String, Value>) -> Duration {
     Duration::from_secs(minutes.saturating_mul(60))
 }
 
-/// What the worker's index job reads besides [`ReadStore`]: both are inherent on the stores, not
-/// on a trait (MOD-41 plan D19).
+/// How often the index job indexes what was written since its last pass of a held collection,
+/// between two full reconciles (MOD-159 M2 plan D6, ANA-37 Q4). A constant, not a setting; revisit
+/// with MOD-46 (NOTIFY).
+pub const INCREMENTAL_CYCLE: Duration = Duration::from_secs(60);
+
+/// The `app_setting` key of the overlap an incremental pass reads back behind its cursor (MOD-159
+/// M2 plan D5): the cache refresh's own, a positive JSON integer of seconds.
+pub const OVERLAP_KEY: &str = "cache_overlap_seconds";
+
+/// The overlap, in seconds, when [`OVERLAP_KEY`] is absent, non-positive or not an integer.
+pub const DEFAULT_OVERLAP_SECONDS: u64 = 300;
+
+/// How far behind its cursor an incremental pass reads, from [`OVERLAP_KEY`] in `app`, re-read
+/// each beat (the rule of `htui_store::connect`'s refresh settings): absent, `null`, a string, a
+/// bool, a fraction, zero and a negative all mean [`DEFAULT_OVERLAP_SECONDS`]. A row committed
+/// later than its stamp by less than this, or a document whose writer's clock lags the store's by
+/// less, is still read; anything later is the full reconcile's.
+#[must_use]
+pub fn overlap_window(app: &BTreeMap<String, Value>) -> Duration {
+    let seconds = app
+        .get(OVERLAP_KEY)
+        .and_then(Value::as_u64)
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_OVERLAP_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+/// What the worker's index job reads besides [`ReadStore`] and the change read of its incremental
+/// passes ([`IndexChangesStore`], MOD-159 M2 plan D10): both are inherent on the stores, not on a
+/// trait (MOD-41 plan D19).
 #[allow(async_fn_in_trait, reason = "no dyn IndexSource is formed")]
-pub trait IndexSource: ReadStore {
+pub trait IndexSource: ReadStore + IndexChangesStore {
     /// Every workspace's scope, its scope row first and then its members (MOD-147 M4 D7), a
     /// workspace with neither left out.
     async fn index_scopes(&self) -> anyhow::Result<Vec<Scope>>;
@@ -583,13 +613,41 @@ impl JobIndex for QdrantIndex {
     }
 }
 
-/// What the index job remembers from one beat to the next (MOD-159 M1 plan D7).
+/// One collection the index job holds (MOD-159 M2 plan D8).
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    /// When its last full reconcile started (M1's value).
+    reconciled: tokio::time::Instant,
+    /// When its last pass, full or incremental, started.
+    passed: tokio::time::Instant,
+    /// Where its last completed pass began, on the store's clock: `None` until a full reconcile
+    /// of its workspace completes (not abandoned, no error), and always for the global collection.
+    cursor: Option<IndexCursor>,
+}
+
+impl Held {
+    /// When its next incremental pass is due, from now: `None` without a cursor.
+    fn incremental_in(&self) -> Option<Duration> {
+        self.cursor?;
+        Some(INCREMENTAL_CYCLE.saturating_sub(self.passed.elapsed()))
+    }
+}
+
+/// What the index job remembers from one beat to the next (MOD-159 M1 plan D7, M2 plan D8).
 #[derive(Debug, Default)]
 pub struct JobState {
-    /// Each collection this job holds, and when its last full reconcile started. Forgotten when
-    /// another owner holds the lease, when a sync was abandoned, when the settings stop
-    /// resolving, and when the key cannot be read, so the next take reconciles at once.
-    held: HashMap<IndexedCollection, tokio::time::Instant>,
+    /// Each collection this job holds, when its last reconcile and pass started, and its cursor.
+    /// Forgotten when another owner holds the lease, when a sync was abandoned, when the settings
+    /// stop resolving, when the key cannot be read and when the URL changes, so the next take
+    /// reconciles at once (MOD-159 M2 D1: the cursor goes with it).
+    held: HashMap<IndexedCollection, Held>,
+    /// The settings, key included, the last due full reconcile resolved (MOD-159 M2 plan D8): an
+    /// incremental pass opens with them, so a 60 s cycle never reads the keyring. Cleared when the
+    /// settings stop resolving or the key cannot be read; replaced by each key read.
+    keyed: Option<QdrantSettings>,
+    /// The collections whose failed incremental pass was logged at `warn`, each once until a pass
+    /// of it succeeds (MOD-159 M2 plan D9).
+    incremental_failed: HashSet<IndexedCollection>,
     /// The collections whose embedder mismatch was logged at `error` (review L3), each once
     /// until it opens again (MOD-159 M1 R2).
     mismatch: HashSet<IndexedCollection>,
@@ -615,7 +673,8 @@ impl JobState {
 }
 
 /// One beat of the index job (MOD-159 M1 plan D7); answers how long to sleep before the next: the
-/// lease times' refresh, read now (D4).
+/// lease times' refresh, read now (D4), or less when a held collection's incremental pass is due
+/// sooner (MOD-159 M2 D9; that term floored at a second).
 ///
 /// The URL first: none resolves, and nothing is taken, opened or loaded (no URL is one `info`
 /// line until a URL is set). Then, for every workspace of [`IndexSource::index_scopes`] and the
@@ -627,6 +686,12 @@ impl JobState {
 /// reconciles every lease the job holds is renewed each refresh. A key that cannot be read lets
 /// every lease the job holds go, so a box with a key takes the indexing over, and the job takes
 /// no lease, and reads no key, until [`sync_interval`] has passed since.
+/// Between reconciles (MOD-159 M2 D9), a workspace collection whose last reconcile completed is
+/// passed over every [`INCREMENTAL_CYCLE`]: the rows its scope's projects had written since its
+/// cursor less [`overlap_window`] are rebuilt with [`Indexer::sync_changes`] under the lease,
+/// opened with the key the last reconcile read; a pass that finds nothing opens nothing. Its
+/// cursor is the store's clock read before the pass's read, kept in this process only, so a
+/// restart, a lost lease or a changed URL (which drops every cursor) reconciles in full first.
 /// The global collection has nothing to sync yet: it is opened (created), and its holder drops the
 /// legacy collection once per process (D10). Failures are log lines; the next beat or interval is
 /// the retry.
@@ -650,6 +715,7 @@ where
     };
     let times = LeaseTimes::from_app(&app);
     let every = sync_interval(&app);
+    let overlap = overlap_window(&app);
     // MOD-159 M1 R2: the URL alone; the key is read only when a collection is due (below).
     let url = match settings.url().await {
         Ok(url) => {
@@ -659,6 +725,7 @@ where
         Err(why) => {
             index.forget(None);
             state.held.clear();
+            state.keyed = None;
             match why {
                 concepts_worker::Unresolved::NoUrl => {
                     if !std::mem::replace(&mut state.no_url_said, true) {
@@ -672,6 +739,12 @@ where
             return times.refresh;
         }
     };
+    // MOD-159 M2 D9: another Qdrant may hold none of what the last one did, so every held
+    // collection reconciles in full against it now, and no pass opens with the old settings.
+    if state.keyed.as_ref().is_some_and(|keyed| keyed.url != url) {
+        state.keyed = None;
+        state.held.clear();
+    }
     // MOD-159 M1 R2 review: a box that cannot read the key leaves the indexing to one that can,
     // and does not ask the keyring again before the interval.
     if state
@@ -709,8 +782,8 @@ where
         owner,
         ttl: times.ttl,
     };
-    // The settings with the key, read at the first due collection and kept for this beat.
-    let mut keyed: Option<QdrantSettings> = None;
+    // The key is read at the first due full reconcile, once for this beat (MOD-159 M1 R2).
+    let mut key_read = false;
     for (collection, scope) in collections {
         match source
             .take_indexer_lease(&collection, box_id, owner, times.ttl)
@@ -723,66 +796,143 @@ where
             }
             Err(err) => {
                 tracing::warn!(%err, %collection, "concepts index lease not taken; next beat");
+                // No pass without the lease: the next waits a cycle, not a second.
+                if let Some(held) = state.held.get_mut(&collection) {
+                    held.passed = tokio::time::Instant::now();
+                }
                 continue;
             }
         }
-        let due = state
-            .held
-            .get(&collection)
-            .is_none_or(|last| last.elapsed() >= every);
-        if !due {
+        let now = tokio::time::Instant::now();
+        let last = state.held.get(&collection).copied();
+        if let Some(held) = last.filter(|held| held.reconciled.elapsed() < every) {
+            // MOD-159 M2 D9: between reconciles, the rows written since the last pass.
+            let (Some(cursor), Some(scope)) = (held.cursor, scope.as_ref()) else {
+                continue;
+            };
+            if held.passed.elapsed() < INCREMENTAL_CYCLE {
+                continue;
+            }
+            if let Some(held) = state.held.get_mut(&collection) {
+                held.passed = now;
+            }
+            let pass = match changes_since(source, scope, cursor, overlap).await {
+                Ok(pass) => pass,
+                Err(err) => {
+                    pass_failed(state, collection, &err);
+                    continue;
+                }
+            };
+            if pass.changes.is_empty() {
+                // Nothing written: nothing opened, no key, no model, no Qdrant call.
+                pass_done(state, collection, pass.as_of);
+                continue;
+            }
+            if state.keyed.is_none() {
+                key_read = true;
+                if !with_key(settings, index, &url, state).await {
+                    release_held(source, owner, state).await;
+                    state.key_failed_at = Some(tokio::time::Instant::now());
+                    break;
+                }
+            }
+            let leases: Vec<IndexedCollection> = state.held.keys().copied().collect();
+            let work = incremental(source, index, collection, scope, pass, holder, state);
+            let ((), lost) = while_renewing(source, &leases, holder, times.refresh, work).await;
+            for collection in lost {
+                state.held.remove(&collection);
+            }
             continue;
         }
-        state.held.insert(collection, tokio::time::Instant::now());
-        if keyed.is_none() {
-            keyed = with_key(settings, index, &url, state).await;
+        // MOD-159 M2 D9: the cursor a completed reconcile sets is the store's clock before it
+        // read anything, so a row written during the reconcile is the next pass's.
+        let as_of = if scope.is_some() {
+            match source.index_clock().await {
+                Ok(as_of) => Some(as_of),
+                Err(err) => {
+                    tracing::warn!(%err, %collection, "concepts index clock unread; next beat");
+                    state.held.remove(&collection);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        state.held.insert(
+            collection,
+            Held {
+                reconciled: now,
+                passed: now,
+                cursor: last.and_then(|held| held.cursor),
+            },
+        );
+        if !key_read {
+            key_read = true;
+            if !with_key(settings, index, &url, state).await {
+                // MOD-159 M1 R2 review: a held lease this box cannot sync under would keep a box
+                // with a key from taking it over for as long as this one stays online.
+                release_held(source, owner, state).await;
+                state.key_failed_at = Some(tokio::time::Instant::now());
+                break;
+            }
         }
-        let Some(resolved) = &keyed else {
-            // MOD-159 M1 R2 review: a held lease this box cannot sync under would keep a box
-            // with a key from taking it over for as long as this one stays online.
-            release_held(source, owner, state).await;
-            state.key_failed_at = Some(tokio::time::Instant::now());
-            break;
+        let Some(resolved) = state.keyed.clone() else {
+            continue;
         };
         // MOD-159 M1 R2: a reconcile may outlast the TTL (a first build), so every lease this
         // job holds, this collection's included, is renewed every refresh while it runs.
         let leases: Vec<IndexedCollection> = state.held.keys().copied().collect();
-        let work = reconcile(source, index, resolved, collection, scope, holder, state);
-        let lost = while_renewing(source, &leases, holder, times.refresh, work).await;
+        let work = reconcile(source, index, &resolved, collection, scope, holder, state);
+        let (completed, lost) = while_renewing(source, &leases, holder, times.refresh, work).await;
+        if completed && let Some(as_of) = as_of {
+            pass_done(state, collection, as_of);
+        }
         for collection in lost {
             state.held.remove(&collection);
         }
     }
-    times.refresh
+    // MOD-159 M2 D9: wake for the earliest pass due before the next lease beat; only that term
+    // is floored, since the refresh may itself be under a second (a short TTL) and must not grow.
+    state
+        .held
+        .values()
+        .filter_map(Held::incremental_in)
+        .min()
+        .map_or(times.refresh, |due| {
+            times.refresh.min(due.max(Duration::from_secs(1)))
+        })
 }
 
 /// `url` with the key [`concepts_worker::QdrantSource::api_key`] reads now (MOD-159 M1 R2: only
 /// when a collection is due, since an interactive key may prompt a locked keyring). A key that
-/// cannot be read is `None`, said at `warn` once until its sentence changes, and drops only the
-/// connections a sync made ([`JobIndex::forget_synced`]).
+/// cannot be read is `false`, said at `warn` once until its sentence changes, and drops only the
+/// connections a sync made ([`JobIndex::forget_synced`]). The settings are kept in
+/// [`JobState::keyed`] (MOD-159 M2 D8), the incremental passes' until the next due reconcile.
 async fn with_key<I: JobIndex>(
     settings: &concepts_worker::QdrantSource,
     index: &I,
     url: &htui_core::qdrant::QdrantUrl,
     state: &mut JobState,
-) -> Option<QdrantSettings> {
+) -> bool {
     match settings.api_key().await {
         Ok(api_key) => {
             state.key_said = None;
             state.key_failed_at = None;
-            Some(QdrantSettings {
+            state.keyed = Some(QdrantSettings {
                 url: url.clone(),
                 api_key,
-            })
+            });
+            true
         }
         Err(why) => {
             index.forget_synced();
+            state.keyed = None;
             let sentence = why.sentence();
             if state.key_said.as_deref() != Some(sentence.as_str()) {
                 tracing::warn!(err = %sentence, "concepts index not synced: no key; next interval");
                 state.key_said = Some(sentence);
             }
-            None
+            false
         }
     }
 }
@@ -799,15 +949,16 @@ async fn release_held<L: IndexerLeaseStore>(leases: &L, owner: Uuid, state: &mut
 }
 
 /// `work`, with `collections`' leases renewed for `holder` every `every` while it runs (MOD-159
-/// M1 R2). Answers the collections whose renewal touched nothing (another owner took the lease):
-/// the caller stops holding them. A renewal that fails is a log line; the next beat retries.
-async fn while_renewing<L: IndexerLeaseStore>(
+/// M1 R2). Answers what `work` answered, and the collections whose renewal touched nothing
+/// (another owner took the lease): the caller stops holding them. A renewal that fails is a log
+/// line; the next beat retries.
+async fn while_renewing<L: IndexerLeaseStore, T>(
     leases: &L,
     collections: &[IndexedCollection],
     holder: Holder,
     every: Duration,
-    work: impl Future<Output = ()>,
-) -> Vec<IndexedCollection> {
+    work: impl Future<Output = T>,
+) -> (T, Vec<IndexedCollection>) {
     let every = every.max(Duration::from_secs(1));
     let mut work = std::pin::pin!(work);
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
@@ -815,7 +966,7 @@ async fn while_renewing<L: IndexerLeaseStore>(
     let mut lost = Vec::new();
     loop {
         tokio::select! {
-            () = &mut work => return lost,
+            out = &mut work => return (out, lost),
             _ = ticker.tick() => {
                 for collection in collections {
                     if lost.contains(collection) {
@@ -840,7 +991,9 @@ async fn while_renewing<L: IndexerLeaseStore>(
     }
 }
 
-/// [`index_beat`]'s work on one held, due collection.
+/// [`index_beat`]'s work on one held, due collection. Answers whether a workspace's sync
+/// completed, not abandoned (MOD-159 M2 C43): only then does its cursor move. A failed open, a
+/// failed sync, an abandon and the global collection (nothing to sync) answer `false`.
 async fn reconcile<S, I>(
     source: &S,
     index: &I,
@@ -849,7 +1002,8 @@ async fn reconcile<S, I>(
     scope: Option<Scope>,
     holder: Holder,
     state: &mut JobState,
-) where
+) -> bool
+where
     S: IndexSource + IndexerLeaseStore,
     I: JobIndex,
 {
@@ -871,7 +1025,7 @@ async fn reconcile<S, I>(
                 }
                 _ => tracing::warn!(%err, %collection, "concepts index not opened; next interval"),
             }
-            return;
+            return false;
         }
     };
     let Some(scope) = scope else {
@@ -889,7 +1043,7 @@ async fn reconcile<S, I>(
                 Err(err) => tracing::warn!(%err, "the old concepts collection was not dropped"),
             }
         }
-        return;
+        return false;
     };
     let guard = Renewing {
         leases: source,
@@ -903,12 +1057,116 @@ async fn reconcile<S, I>(
                 %collection,
                 "concepts index lease taken over during the sync; stopped, nothing deleted"
             );
+            false
         }
-        Ok(report) => tracing::info!(?report, %collection, "concepts index synced"),
+        Ok(report) => {
+            tracing::info!(?report, %collection, "concepts index synced");
+            true
+        }
         Err(err) => {
             index.forget(Some(&store));
             tracing::warn!(%err, %collection, "concepts index sync failed; next interval");
+            false
         }
+    }
+}
+
+/// What one incremental pass reads before it writes (MOD-159 M2 plan D9).
+struct Pass {
+    /// The store's clock before the change read: the collection's next cursor.
+    as_of: DateTime<Utc>,
+    /// The rows written since the cursor, less the overlap.
+    changes: IndexChanges,
+}
+
+/// The rows of `scope` written since `cursor`, pulled back by `overlap` (MOD-159 M2 plan D5), and
+/// the store's clock read before them.
+async fn changes_since<S: IndexChangesStore>(
+    source: &S,
+    scope: &Scope,
+    cursor: IndexCursor,
+    overlap: Duration,
+) -> Result<Pass, StoreError> {
+    let as_of = source.index_clock().await?;
+    let back = TimeDelta::from_std(overlap).unwrap_or(TimeDelta::MAX);
+    let since = cursor
+        .rows
+        .checked_sub_signed(back)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let changes = source.index_changes(&scope.project_ids, since).await?;
+    Ok(Pass { as_of, changes })
+}
+
+/// [`index_beat`]'s incremental pass of one held collection with changes (MOD-159 M2 plan D9):
+/// opened with [`JobState::keyed`], then [`Indexer::sync_changes`] under the lease. Success moves
+/// the cursor to `pass.as_of`; an abandon forgets the collection, as a reconcile's does; a failed
+/// open or sync keeps the cursor, so the next cycle reads the same window again, and is a `warn`
+/// line once per collection, `debug` after, until a pass succeeds.
+async fn incremental<S, I>(
+    source: &S,
+    index: &I,
+    collection: IndexedCollection,
+    scope: &Scope,
+    pass: Pass,
+    holder: Holder,
+    state: &mut JobState,
+) where
+    S: IndexSource + IndexerLeaseStore,
+    I: JobIndex,
+{
+    let Some(resolved) = state.keyed.clone() else {
+        return;
+    };
+    let store = match index.open(resolved, &collection).await {
+        Ok(store) => {
+            state.mismatch.remove(&collection);
+            store
+        }
+        Err(err) => {
+            pass_failed(state, collection, &err);
+            return;
+        }
+    };
+    let guard = Renewing {
+        leases: source,
+        collection,
+        holder,
+    };
+    match Indexer::sync_changes(source, scope, &pass.changes, &*store, &guard).await {
+        Ok(report) if report.abandoned => {
+            state.held.remove(&collection);
+            tracing::info!(
+                %collection,
+                "concepts index lease taken over during a pass; stopped, nothing deleted"
+            );
+        }
+        Ok(report) => {
+            tracing::debug!(?report, %collection, "concepts index pass done");
+            pass_done(state, collection, pass.as_of);
+        }
+        Err(err) => {
+            index.forget(Some(&store));
+            pass_failed(state, collection, &err);
+        }
+    }
+}
+
+/// A completed pass of `collection`, full or incremental, that began at `as_of`: its cursor
+/// moves there, and a failed pass logged before may be logged again.
+fn pass_done(state: &mut JobState, collection: IndexedCollection, as_of: DateTime<Utc>) {
+    if let Some(held) = state.held.get_mut(&collection) {
+        held.cursor = Some(IndexCursor::at(as_of));
+    }
+    state.incremental_failed.remove(&collection);
+}
+
+/// A failed incremental pass of `collection`: `warn` the first time, `debug` until a pass
+/// succeeds. Its cursor stays where it was.
+fn pass_failed(state: &mut JobState, collection: IndexedCollection, err: &dyn std::fmt::Display) {
+    if state.incremental_failed.insert(collection) {
+        tracing::warn!(%err, %collection, "concepts index pass failed; same window next cycle");
+    } else {
+        tracing::debug!(%err, %collection, "concepts index pass still failing");
     }
 }
 
@@ -1833,7 +2091,7 @@ mod tests {
                     .expect("canonical")
                     .display()
                     .to_string(),
-                updated_at: chrono::Utc::now(),
+                updated_at: Utc::now(),
             })
             .await
             .expect("this box's checkout");
@@ -2234,7 +2492,12 @@ mod tests {
         use chrono::{DateTime, SubsecRound as _, Utc};
         use htui_core::clock::Clock;
         use htui_core::fixtures::ids;
-        use htui_core::model::{ItemId, TIMESTAMPTZ_DIGITS};
+        use htui_core::model::document::GOALS_KIND;
+        use htui_core::model::{
+            DocumentId, IndexCursor, ItemId, NewItem, NewOwnerDocument, RequirementPatch,
+            TIMESTAMPTZ_DIGITS,
+        };
+        use htui_core::store::WriteStore as _;
         use htui_store::vector::{ConceptPoint, IndexedPoint, MemVectorStore, Subject};
         use serde_json::json;
         use std::sync::Mutex;
@@ -2294,6 +2557,9 @@ mod tests {
             inner: MemVectorStore,
             syncs: AtomicUsize,
             reads: AtomicUsize,
+            /// `indexed` reads of the agy project: a full sync of Platform reads every project,
+            /// an incremental pass (MOD-159 M2) only a changed one, and no test changes agy.
+            agy: AtomicUsize,
             fail: AtomicUsize,
             takeover: Mutex<Option<Takeover>>,
             /// How long its next read of the htui project sleeps (a sync longer than the TTL).
@@ -2307,6 +2573,11 @@ mod tests {
 
             fn reads(&self) -> usize {
                 self.reads.load(Ordering::SeqCst)
+            }
+
+            /// The full syncs of Platform's collection that reached this store (see `agy`).
+            fn full_syncs(&self) -> usize {
+                self.agy.load(Ordering::SeqCst)
             }
         }
 
@@ -2330,6 +2601,9 @@ mod tests {
 
             async fn indexed(&self, project: ProjectId) -> Result<Vec<IndexedPoint>, StoreError> {
                 self.reads.fetch_add(1, Ordering::SeqCst);
+                if project == ids::PROJECT_AGY {
+                    self.agy.fetch_add(1, Ordering::SeqCst);
+                }
                 if project == ids::PROJECT_HTUI {
                     self.syncs.fetch_add(1, Ordering::SeqCst);
                     let pause = self.pause.lock().expect("not poisoned").take();
@@ -2984,6 +3258,396 @@ mod tests {
                 Duration::from_secs(u64::MAX),
                 "a huge value saturates rather than overflowing"
             );
+        }
+
+        /// MOD-159 M2 D5: the overlap's rule, the cache refresh's: positive whole seconds, else
+        /// 300.
+        #[test]
+        fn the_overlap_reads_cache_overlap_seconds_with_a_300_second_default() {
+            let default = Duration::from_secs(DEFAULT_OVERLAP_SECONDS);
+            assert_eq!(default, 5 * MINUTE);
+            let with = |value: Value| BTreeMap::from([(OVERLAP_KEY.to_owned(), value)]);
+            assert_eq!(overlap_window(&BTreeMap::new()), default, "absent");
+            for value in [
+                json!(0),
+                json!(-3),
+                json!("5"),
+                json!(2.5),
+                json!(null),
+                json!(true),
+            ] {
+                assert_eq!(overlap_window(&with(value.clone())), default, "{value}");
+            }
+            assert_eq!(overlap_window(&with(json!(90))), Duration::from_secs(90));
+        }
+
+        /// A new htui item, stamped by `read`'s clock.
+        async fn mint_item(read: &MemStore, title: &str) -> ItemId {
+            read.mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: title.into(),
+                body: "a body about the incremental cycle".into(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the memory store never fails")
+            .id
+        }
+
+        /// A new htui owner document of `kind`, stamped from the store's clock (C34: the writer
+        /// stamps a document, and a wall-clock stamp falls behind `TokioClock`).
+        async fn write_goals(read: &MemStore, body: &str) -> DocumentId {
+            let created_at = read
+                .index_clock()
+                .await
+                .expect("the memory store never fails");
+            read.write_owner_document(NewOwnerDocument {
+                id: DocumentId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind: GOALS_KIND.into(),
+                title: "Goals".into(),
+                body: body.into(),
+                created_by: ids::USER,
+                created_at,
+            })
+            .await
+            .expect("the memory store never fails")
+            .id
+        }
+
+        fn has_item(store: &Counting, id: ItemId) -> bool {
+            store
+                .inner
+                .points()
+                .iter()
+                .any(|p| p.subject.owner().item() == Some(id))
+        }
+
+        fn has_owner_document(store: &Counting, id: DocumentId) -> bool {
+            store
+                .inner
+                .points()
+                .iter()
+                .any(|p| matches!(p.subject, Subject::OwnerDocument { id: of } if of == id))
+        }
+
+        /// `collection`'s cursor in `state`.
+        fn cursor_of(state: &JobState, collection: IndexedCollection) -> Option<IndexCursor> {
+            state.held.get(&collection).and_then(|held| held.cursor)
+        }
+
+        /// One job over `read` and a fresh index, its first beat (every collection reconciled)
+        /// done.
+        async fn reconciled(
+            read: &MemStore,
+        ) -> (concepts_worker::QdrantSource, Fakes, Uuid, JobState) {
+            let settings = settings_over(read);
+            let index = Fakes::default();
+            let owner = Uuid::now_v7();
+            let mut state = JobState::default();
+            index_beat(read, &settings, &index, owner, &mut state).await;
+            assert_eq!(
+                index.store(PLATFORM).full_syncs(),
+                1,
+                "the reconcile at the take"
+            );
+            assert!(
+                cursor_of(&state, PLATFORM).is_some(),
+                "a completed reconcile sets the cursor"
+            );
+            (settings, index, owner, state)
+        }
+
+        /// MOD-159 M2 D9: an item filed after the reconcile is indexed by the next incremental
+        /// pass, with no second full sync.
+        #[tokio::test(start_paused = true)]
+        async fn an_item_filed_after_the_reconcile_is_indexed_within_one_cycle() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            let platform = index.store(PLATFORM);
+            let htui_reads = platform.syncs();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let item = mint_item(&read, "Filed after the reconcile").await;
+            tokio::time::advance(INCREMENTAL_CYCLE - Duration::from_secs(1)).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert!(has_item(&platform, item), "indexed within one cycle");
+            assert_eq!(platform.full_syncs(), 1, "no second full sync");
+            // `syncs` counts every read of htui's points: the pass read them once.
+            assert_eq!(platform.syncs(), htui_reads + 1);
+            assert!(
+                index
+                    .store(GRAPHICS)
+                    .inner
+                    .points()
+                    .iter()
+                    .all(|p| p.subject.owner().item() != Some(item)),
+                "only the item's collection"
+            );
+        }
+
+        /// MOD-159 M2 D9: an amended requirement and a new owner document are each indexed by
+        /// the next incremental pass.
+        #[tokio::test(start_paused = true)]
+        async fn an_amended_requirement_and_a_new_owner_document_are_indexed_within_one_cycle() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            let platform = index.store(PLATFORM);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let row = read
+                .requirement(ids::REQ_STO_1)
+                .await
+                .expect("the memory store never fails")
+                .expect("a demo requirement");
+            read.amend_requirement(
+                row.id,
+                row.version,
+                RequirementPatch {
+                    body: Some("Search finds requirements within a minute.".into()),
+                    rationale: None,
+                    priority: None,
+                    author_id: ids::USER,
+                    box_id: Some(ids::BOX),
+                    reason: "amended".into(),
+                },
+                ids::HTUI_FEAT_3,
+            )
+            .await
+            .expect("the memory store never fails");
+            let goals = write_goals(&read, "## Aim\nindex within a minute").await;
+            tokio::time::advance(INCREMENTAL_CYCLE).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            let requirement = platform
+                .inner
+                .points()
+                .into_iter()
+                .find(|p| p.subject.owner().requirement() == Some(row.id))
+                .expect("the requirement's point");
+            assert!(
+                requirement.text.contains("within a minute"),
+                "{}",
+                requirement.text
+            );
+            assert!(has_owner_document(&platform, goals), "the owner document");
+            assert_eq!(platform.full_syncs(), 1, "no second full sync");
+        }
+
+        /// MOD-159 M2 D9: a pass that finds nothing written opens nothing, loads nothing and
+        /// reads no key; its cursor still moves.
+        #[tokio::test(start_paused = true)]
+        async fn a_cycle_with_nothing_written_opens_nothing_and_reads_no_key() {
+            static READS: AtomicUsize = AtomicUsize::new(0);
+            fn ring() -> htui_core::store::Result<Option<String>> {
+                READS.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            let read = indexable().await;
+            let settings =
+                concepts_worker::QdrantSource::new(QdrantEnv::default(), KeySource::Interactive)
+                    .with_keyring(ring);
+            settings.publish(Some(Arc::new(read.clone())));
+            let index = Fakes::default();
+            let owner = Uuid::now_v7();
+            let mut state = JobState::default();
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(READS.load(Ordering::SeqCst), 1, "the reconcile's read");
+            let opened = index.opened();
+            let reads = index.store(PLATFORM).reads();
+            let first = cursor_of(&state, PLATFORM).expect("reconciled");
+            for _ in 0..5 {
+                tokio::time::advance(INCREMENTAL_CYCLE).await;
+                index_beat(&read, &settings, &index, owner, &mut state).await;
+            }
+            assert_eq!(READS.load(Ordering::SeqCst), 1, "no key read");
+            assert_eq!(index.opened(), opened, "nothing opened");
+            assert_eq!(index.store(PLATFORM).reads(), reads, "no Qdrant call");
+            let last = cursor_of(&state, PLATFORM).expect("still held");
+            assert!(
+                last.rows > first.rows,
+                "the cursor moved: {first:?} -> {last:?}"
+            );
+        }
+
+        /// MOD-159 M2 D5: a write committed late, stamped inside the overlap behind the cursor,
+        /// is still read by the next pass.
+        #[tokio::test(start_paused = true)]
+        async fn a_write_stamped_inside_the_overlap_is_still_indexed() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            let cursor = cursor_of(&state, PLATFORM).expect("reconciled");
+            let late = read.handle_at(cursor.rows - TimeDelta::seconds(100));
+            let item = mint_item(&late, "Committed late").await;
+            tokio::time::advance(INCREMENTAL_CYCLE).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert!(has_item(&index.store(PLATFORM), item));
+        }
+
+        /// MOD-159 M2 D5: a write stamped further behind than the overlap is the full
+        /// reconcile's.
+        #[tokio::test(start_paused = true)]
+        async fn a_write_stamped_before_the_overlap_waits_for_the_reconcile() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            let cursor = cursor_of(&state, PLATFORM).expect("reconciled");
+            let late = read.handle_at(cursor.rows - TimeDelta::seconds(400));
+            let item = mint_item(&late, "Committed very late").await;
+            let platform = index.store(PLATFORM);
+            for _ in 0..14 {
+                tokio::time::advance(INCREMENTAL_CYCLE).await;
+                index_beat(&read, &settings, &index, owner, &mut state).await;
+                assert!(!has_item(&platform, item), "not the passes'");
+            }
+            tokio::time::advance(INCREMENTAL_CYCLE).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(platform.full_syncs(), 2, "the reconcile at 15 minutes");
+            assert!(has_item(&platform, item), "found by the reconcile");
+        }
+
+        /// MOD-159 M2 D7, D9: an incremental pass whose lease another box takes before its delete
+        /// batch deletes nothing and stops holding the collection.
+        #[tokio::test(start_paused = true)]
+        async fn an_incremental_pass_whose_lease_was_taken_over_deletes_nothing_and_stops_holding()
+        {
+            let read = indexable().await;
+            let first = write_goals(&read, "## Aim\nthe first goals").await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let (settings, index, victim, mut state) = reconciled(&read).await;
+            let platform = index.store(PLATFORM);
+            assert!(has_owner_document(&platform, first));
+            tokio::time::advance(Duration::from_secs(1)).await;
+            // Supersedes the first: its points are the pass's delete batch.
+            let second = write_goals(&read, "## Aim\nthe second goals").await;
+            let thief = Uuid::now_v7();
+            *platform.takeover.lock().expect("not poisoned") = Some(Takeover {
+                leases: read.clone(),
+                collection: PLATFORM,
+                from: victim,
+                to: thief,
+            });
+            tokio::time::advance(INCREMENTAL_CYCLE).await;
+            index_beat(&read, &settings, &index, victim, &mut state).await;
+            assert!(
+                platform.takeover.lock().expect("not poisoned").is_none(),
+                "the pass read Platform's points"
+            );
+            assert!(has_owner_document(&platform, first), "nothing was deleted");
+            assert!(
+                has_owner_document(&platform, second),
+                "the upsert came first"
+            );
+            assert!(!state.held().contains(&PLATFORM), "{:?}", state.held());
+            assert!(state.held().contains(&GRAPHICS), "{:?}", state.held());
+            let take = read
+                .take_indexer_lease(&PLATFORM, ids::BOX, victim, TimeDelta::seconds(120))
+                .await
+                .expect("the memory store never fails");
+            assert!(
+                matches!(take, LeaseTake::Held(_)),
+                "the thief holds it: {take:?}"
+            );
+        }
+
+        /// MOD-159 M2 D9: a pass that fails forgets its connection and keeps its cursor, so the
+        /// next cycle reads the same window again.
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_incremental_pass_keeps_its_window_and_retries_next_cycle() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            let platform = index.store(PLATFORM);
+            let cursor = cursor_of(&state, PLATFORM);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let item = mint_item(&read, "Filed before a failure").await;
+            platform.fail.store(1, Ordering::SeqCst);
+            tokio::time::advance(INCREMENTAL_CYCLE).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert!(!has_item(&platform, item), "the upsert failed");
+            assert_eq!(index.forgotten(), [true], "the failed pass's store");
+            assert_eq!(cursor_of(&state, PLATFORM), cursor, "the window is kept");
+            tokio::time::advance(INCREMENTAL_CYCLE).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert!(has_item(&platform, item), "retried");
+            assert!(
+                cursor_of(&state, PLATFORM).map(|c| c.rows) > cursor.map(|c| c.rows),
+                "and moved on"
+            );
+            assert_eq!(platform.full_syncs(), 1, "no full sync for it");
+        }
+
+        /// MOD-159 M2 D1: the cursor is the process's; a job that takes a collection over
+        /// reconciles it in full first.
+        #[tokio::test(start_paused = true)]
+        async fn a_taken_over_collection_starts_with_a_full_reconcile() {
+            let read = indexable().await;
+            let (first, second) = (Arc::new(Fakes::default()), Arc::new(Fakes::default()));
+            let first_job = spawn_job(&read, &first, Uuid::now_v7());
+            tokio::time::sleep(INCREMENTAL_CYCLE + Duration::from_secs(1)).await;
+            assert_eq!(first.store(PLATFORM).full_syncs(), 1);
+            first_job.stop(WORKER_RELEASE_WAIT).await;
+            let second_job = spawn_job(&read, &second, Uuid::now_v7());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let platform = second.store(PLATFORM);
+            assert_eq!(
+                platform.full_syncs(),
+                1,
+                "the new holder reconciled in full"
+            );
+            assert!(!platform.inner.points().is_empty());
+            second_job.stop(WORKER_RELEASE_WAIT).await;
+        }
+
+        /// MOD-159 M2 D9: a changed URL drops every cursor, so every held collection is
+        /// reconciled in full against the new Qdrant at once, not at the next interval.
+        #[tokio::test(start_paused = true)]
+        async fn a_changed_url_reconciles_every_held_collection_at_once() {
+            let read = indexable().await;
+            let (settings, index, owner, mut state) = reconciled(&read).await;
+            set_row(&read, "http://elsewhere:6334").await;
+            tokio::time::advance(BEAT).await;
+            index_beat(&read, &settings, &index, owner, &mut state).await;
+            let elsewhere: Vec<IndexedCollection> = {
+                let opens = index.opens.lock().expect("not poisoned");
+                let mut opened: Vec<_> = opens
+                    .iter()
+                    .filter(|(url, _)| url == "http://elsewhere:6334")
+                    .map(|(_, collection)| *collection)
+                    .collect();
+                opened.sort_by_key(IndexedCollection::name);
+                opened
+            };
+            assert_eq!(elsewhere, every_collection());
+            assert_eq!(index.store(PLATFORM).full_syncs(), 2, "reconciled in full");
+            assert_eq!(state.held(), every_collection());
+        }
+
+        /// MOD-159 M2 D9: the job wakes for a pass between lease beats, so with the default 40 s
+        /// beat a collection's pass runs every 60 s, not every 80 s.
+        #[tokio::test(start_paused = true)]
+        async fn the_job_wakes_for_the_cycle_between_lease_beats() {
+            let read = indexable().await;
+            let settings = settings_over(&read);
+            let index = Fakes::default();
+            let owner = Uuid::now_v7();
+            let mut state = JobState::default();
+            let pause = index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(pause, BEAT, "the lease beat comes first");
+            tokio::time::advance(pause).await;
+            let pause = index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert_eq!(
+                pause,
+                INCREMENTAL_CYCLE - BEAT,
+                "woken for the pass at 60 s"
+            );
+            let item = mint_item(&read, "Filed at 40 s").await;
+            tokio::time::advance(pause).await;
+            let pause = index_beat(&read, &settings, &index, owner, &mut state).await;
+            assert!(has_item(&index.store(PLATFORM), item), "indexed at 60 s");
+            assert_eq!(pause, BEAT);
         }
 
         /// D12: `--index-items` syncs each workspace whose lease it takes, says which box indexes

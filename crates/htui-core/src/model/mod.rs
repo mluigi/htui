@@ -141,7 +141,9 @@ pub use ids::{
     RelaySessionId, RepoId, RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId,
     SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
 };
-pub use indexer::{IndexedCollection, IndexerLease, LeaseTake};
+pub use indexer::{
+    IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, ProjectChanges,
+};
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution, Status,
 };

@@ -469,6 +469,17 @@ for now).
   process holds, that collection's included, is still renewed every beat interval, so none lapses
   behind it. If another process has taken a lease meanwhile (this one stalled past the lease's
   time-to-live), it stops there, deletes nothing, and leaves the collection to the new holder.
+- **Between reconciles, every 60 seconds, it indexes what was written since its last pass** of
+  that collection: new and edited items, items with a new document version, amended requirements
+  and new project documents. It reads them a little further back than its last pass, by the
+  `cache_overlap_seconds` `app_setting` (300 seconds by default, the cache refresh's own), so a
+  write committed late is still caught; anything older is left to the next reconcile. A pass with
+  nothing to index opens nothing. A pass reads no API key: it reuses the one the last reconcile
+  read, so the 60-second cycle never touches the keyring. It deletes only the superseded points of
+  what it rebuilds (under the same lease check as a reconcile); points of a deleted row stay until
+  the next reconcile. A pass that fails is one `warn` line and is retried over the same window a
+  cycle later. A process that takes a collection over, restarts, or sees the Qdrant URL change
+  reconciles it in full first, then runs passes.
 - **On shutdown the worker lets go of its leases**, so another process takes its collections over
   on its next beat rather than after the lease lapses (it waits at most 5 seconds for that; the
   TUI, whose whole shutdown has 5 seconds, waits at most 1). A worker that dies without letting go
@@ -491,8 +502,9 @@ for now).
   comes from [these sources](#where-the-qdrant-api-key-comes-from).
 - **The URL is read again every beat.** Without one, the worker takes no lease, loads no model and
   logs one `info` line ("no Qdrant URL is set; …") until a URL is set; a URL set later is indexed
-  into from the next beat, with no restart, and a changed URL or key reconnects at the next
-  reconcile. A setting that is not a usable URL is a `warn` line naming it, every beat.
+  into from the next beat, with no restart; a changed URL reconciles every collection the worker
+  holds in full at the next beat, and a changed key reconnects at the next reconcile. A setting
+  that is not a usable URL is a `warn` line naming it, every beat.
 - **An old Qdrant URL in this box's keyring is no longer read.** Earlier versions kept the URL
   there; if the worker finds one at start it says so once, at `info`, so you can make it the setting
   for every box in **Settings › Qdrant** or with `htui --set-qdrant-url`.

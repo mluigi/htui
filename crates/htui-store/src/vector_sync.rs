@@ -24,12 +24,19 @@
 //! re-listing of its kind confirms the row is gone from the project (or, for an owner document,
 //! no longer the newest of its kind), and a [`DeleteGuard`] (the indexer lease's renewal) is asked
 //! right before a batch that is not empty. Upserts are idempotent and never guarded.
+//!
+//! [`Indexer::sync_changes`] is the incremental pass between two full reconciles (MOD-159 M2
+//! D7): given the rows the store says were written since the last pass ([`IndexChanges`]), it
+//! runs the same freshness test and rebuild on those rows alone, and deletes only the stale
+//! points of what it rebuilds (stale sections, a rebuilt requirement's off-ID points, superseded
+//! owner documents), under the same guard. It never deletes a row's points because the row is
+//! gone or moved: that is the full reconcile's, which confirms orphans against a re-listing.
 use crate::vector::{
     ConceptPoint, DocumentRef, IndexedPoint, Owner, PointType, Subject, VectorStore,
 };
 use htui_core::model::{
-    Document, DocumentId, Item, ItemFilter, ItemId, OwnerDocument, Project, ProjectId, Requirement,
-    RequirementFilter, RequirementId, Scope,
+    Document, DocumentId, IndexChanges, Item, ItemFilter, ItemId, OwnerDocument, Project,
+    ProjectId, Requirement, RequirementFilter, RequirementId, Scope, Status,
 };
 use htui_core::store::{ReadStore, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -203,48 +210,24 @@ impl Indexer {
                 project_ids: vec![project],
             };
             let items = read.items(&one, &ItemFilter::default()).await?;
-            let mut indexed: HashMap<ItemId, Vec<IndexedPoint>> = HashMap::new();
-            let mut requirement_points: HashMap<RequirementId, Vec<IndexedPoint>> = HashMap::new();
-            let mut owner_points: HashMap<DocumentId, Vec<IndexedPoint>> = HashMap::new();
-            for point in store.indexed(project).await? {
-                match point.owner {
-                    Owner::Item(id) => indexed.entry(id).or_default().push(point),
-                    Owner::Requirement(id) => requirement_points.entry(id).or_default().push(point),
-                    Owner::Document(id) => owner_points.entry(id).or_default().push(point),
-                }
-            }
+            let Held {
+                items: mut indexed,
+                requirements: requirement_points,
+                documents: owner_points,
+            } = Held::read(store, project).await?;
 
             let mut doomed = Doomed::default();
             for summary in items {
                 let old = indexed.remove(&summary.id).unwrap_or_default();
                 let latest = latest_documents(read, summary.id).await?;
-                let item_fresh = old.iter().any(|p| {
-                    p.point_type == PointType::Item
-                        && p.updated_at == summary.updated_at
-                        && p.status == Some(summary.status)
-                });
-                let old_docs: BTreeSet<DocumentId> =
-                    old.iter().filter_map(|p| p.document_id).collect();
-                if item_fresh && old_docs == latest {
+                if item_in_step(&old, summary.updated_at, summary.status, &latest) {
                     report.items_unchanged += 1;
                     continue;
                 }
                 let Some(item) = read.item(summary.id).await? else {
                     continue; // gone between the listing and now; the next sync drops it
                 };
-                let mut points = vec![item_point(&item)];
-                for id in &latest {
-                    if let Some(doc) = read.document(*id).await? {
-                        points.extend(document_points(&item, &doc));
-                    }
-                }
-                let keep: BTreeSet<Uuid> = points.iter().map(ConceptPoint::id).collect();
-                report.items_rebuilt += 1;
-                report.points_upserted += points.len();
-                store.upsert(points).await?;
-                doomed
-                    .stale
-                    .extend(old.iter().map(|p| p.id).filter(|id| !keep.contains(id)));
+                report += rebuild_item(read, &item, &latest, &old, store, &mut doomed).await?;
             }
 
             report +=
@@ -274,6 +257,195 @@ impl Indexer {
         }
         Ok(report)
     }
+
+    /// The incremental pass (MOD-159 M2 D7): rebuilds the rows `changes` lists for the projects
+    /// of `scope`, in scope order, with [`sync`](Self::sync)'s freshness test, reading each
+    /// project's points once. A listed item or requirement that is gone, or that belongs to
+    /// another project than the one it is listed under, is skipped: its own project's entry, or
+    /// the full reconcile, settles it. A listed owner document runs the project's owner-document
+    /// half as `sync` does. The one delete batch per project holds only stale points of what was
+    /// rebuilt (no orphan: deleting a row's points is the full reconcile's, which confirms them),
+    /// and `guard` is asked right before it, as in `sync`; a refusal ends the pass with
+    /// [`abandoned`](SyncReport::abandoned) set and nothing of the batch deleted.
+    ///
+    /// # Errors
+    /// The first failed store read, vector-store call or guard check.
+    pub async fn sync_changes(
+        read: &impl ReadStore,
+        scope: &Scope,
+        changes: &IndexChanges,
+        store: &impl VectorStore,
+        guard: &impl DeleteGuard,
+    ) -> Result<SyncReport, StoreError> {
+        let mut report = SyncReport::default();
+        for &project in &scope.project_ids {
+            let Some(listed) = changes.projects.get(&project) else {
+                continue;
+            };
+            let Held {
+                items: mut item_points,
+                requirements: mut requirement_points,
+                documents: owner_points,
+            } = Held::read(store, project).await?;
+
+            let mut doomed = Doomed::default();
+            for &id in &listed.items {
+                let Some(item) = read.item(id).await? else {
+                    continue; // gone: the full reconcile drops its points
+                };
+                if item.project_id != project {
+                    continue; // its own project's entry or the full reconcile settles it
+                }
+                let old = item_points.remove(&id).unwrap_or_default();
+                let latest = latest_documents(read, id).await?;
+                if item_in_step(&old, item.updated_at, item.status, &latest) {
+                    report.items_unchanged += 1;
+                    continue;
+                }
+                report += rebuild_item(read, &item, &latest, &old, store, &mut doomed).await?;
+            }
+
+            let mut points = Vec::new();
+            for &id in &listed.requirements {
+                let Some(row) = read.requirement(id).await? else {
+                    continue;
+                };
+                if row.project_id != project {
+                    continue;
+                }
+                let old = requirement_points.remove(&id).unwrap_or_default();
+                if let Some(point) = rebuilt_requirement(&row, &old, &mut doomed) {
+                    report.requirements_rebuilt += 1;
+                    points.push(point);
+                } else {
+                    report.requirements_unchanged += 1;
+                }
+            }
+            report.points_upserted += points.len();
+            upsert_requirements(&points, store).await?;
+
+            if !listed.owner_documents.is_empty() {
+                report +=
+                    sync_owner_documents(read, project, owner_points, store, &mut doomed).await?;
+                // Only superseded documents' points stay doomed: an orphan is the full
+                // reconcile's to confirm.
+                doomed.documents.clear();
+            }
+
+            let batch = doomed.stale;
+            if batch.is_empty() {
+                continue;
+            }
+            if !guard.before_delete().await? {
+                report.abandoned = true;
+                return Ok(report);
+            }
+            report.points_deleted += batch.len();
+            store.delete(batch).await?;
+        }
+        Ok(report)
+    }
+}
+
+/// One project's points in the index, by owner.
+#[derive(Debug, Default)]
+struct Held {
+    items: HashMap<ItemId, Vec<IndexedPoint>>,
+    requirements: HashMap<RequirementId, Vec<IndexedPoint>>,
+    documents: HashMap<DocumentId, Vec<IndexedPoint>>,
+}
+
+impl Held {
+    /// One read of `project`'s points, grouped by owner.
+    async fn read(store: &impl VectorStore, project: ProjectId) -> Result<Self, StoreError> {
+        let mut held = Self::default();
+        for point in store.indexed(project).await? {
+            match point.owner {
+                Owner::Item(id) => held.items.entry(id).or_default().push(point),
+                Owner::Requirement(id) => held.requirements.entry(id).or_default().push(point),
+                Owner::Document(id) => held.documents.entry(id).or_default().push(point),
+            }
+        }
+        Ok(held)
+    }
+}
+
+/// Whether an item's points `old` are in step with it: its item point carries `updated_at` and
+/// `status` (a status move does not touch `updated_at`), and its document points are those of
+/// the `latest` documents.
+fn item_in_step(
+    old: &[IndexedPoint],
+    updated_at: chrono::DateTime<chrono::Utc>,
+    status: Status,
+    latest: &BTreeSet<DocumentId>,
+) -> bool {
+    let item_fresh = old.iter().any(|p| {
+        p.point_type == PointType::Item && p.updated_at == updated_at && p.status == Some(status)
+    });
+    let old_docs: BTreeSet<DocumentId> = old.iter().filter_map(|p| p.document_id).collect();
+    item_fresh && old_docs == *latest
+}
+
+/// Rebuilds all of `item`'s points (its own and those of its `latest` documents) in one upsert;
+/// its `old` points the rebuild does not rewrite join `doomed`'s stale ones.
+async fn rebuild_item(
+    read: &impl ReadStore,
+    item: &Item,
+    latest: &BTreeSet<DocumentId>,
+    old: &[IndexedPoint],
+    store: &impl VectorStore,
+    doomed: &mut Doomed,
+) -> Result<SyncReport, StoreError> {
+    let mut points = vec![item_point(item)];
+    for id in latest {
+        if let Some(doc) = read.document(*id).await? {
+            points.extend(document_points(item, &doc));
+        }
+    }
+    let keep: BTreeSet<Uuid> = points.iter().map(ConceptPoint::id).collect();
+    let report = SyncReport {
+        items_rebuilt: 1,
+        points_upserted: points.len(),
+        ..SyncReport::default()
+    };
+    store.upsert(points).await?;
+    doomed
+        .stale
+        .extend(old.iter().map(|p| p.id).filter(|id| !keep.contains(id)));
+    Ok(report)
+}
+
+/// `row`'s point when its `old` points do not hold it at its `version`, or `None` when they do.
+/// A rebuilt row's off-ID points join `doomed`'s stale ones.
+fn rebuilt_requirement(
+    row: &Requirement,
+    old: &[IndexedPoint],
+    doomed: &mut Doomed,
+) -> Option<ConceptPoint> {
+    let point = requirement_point(row);
+    let id = point.id();
+    if old
+        .iter()
+        .any(|p| p.id == id && p.version == Some(row.version))
+    {
+        return None;
+    }
+    doomed
+        .stale
+        .extend(old.iter().map(|p| p.id).filter(|old| *old != id));
+    Some(point)
+}
+
+/// Writes requirement points in bounded batches: a first build of a large spec would otherwise
+/// embed and send every requirement of the project in one request.
+async fn upsert_requirements(
+    points: &[ConceptPoint],
+    store: &impl VectorStore,
+) -> Result<(), StoreError> {
+    for batch in points.chunks(UPSERT_BATCH) {
+        store.upsert(batch.to_vec()).await?;
+    }
+    Ok(())
 }
 
 /// The requirement half of one project's sync: one listing and stale points rebuilt in one
@@ -293,20 +465,12 @@ async fn sync_requirements(
         .await?
     {
         let old = indexed.remove(&row.id).unwrap_or_default();
-        let point = requirement_point(&row);
-        let id = point.id();
-        if old
-            .iter()
-            .any(|p| p.id == id && p.version == Some(row.version))
-        {
+        if let Some(point) = rebuilt_requirement(&row, &old, doomed) {
+            report.requirements_rebuilt += 1;
+            points.push(point);
+        } else {
             report.requirements_unchanged += 1;
-            continue;
         }
-        doomed
-            .stale
-            .extend(old.iter().map(|p| p.id).filter(|old| *old != id));
-        report.requirements_rebuilt += 1;
-        points.push(point);
     }
     for (id, old) in indexed {
         doomed
@@ -314,11 +478,7 @@ async fn sync_requirements(
             .insert(id, old.into_iter().map(|p| p.id).collect());
     }
     report.points_upserted += points.len();
-    // Bounded batches: a first build of a large spec would otherwise embed and send every
-    // requirement of the project in one request.
-    for batch in points.chunks(UPSERT_BATCH) {
-        store.upsert(batch.to_vec()).await?;
-    }
+    upsert_requirements(&points, store).await?;
     Ok(report)
 }
 
@@ -580,12 +740,12 @@ mod tests {
     use htui_core::model::{
         CoverageRow, DocumentHead, ItemCitation, ItemPatch, ItemSummary, LinkGraph, MemoryEntry,
         MemoryEntryId, MemoryRevision, MemoryState, NewDocument, NewItem, NewOwnerDocument, Note,
-        PromptScope, RequirementArea, RequirementPatch, RequirementRevision, RequirementSpec,
-        RequirementState, Resolution, ResolvedInput, Run, RunId, RunPlan, RunStep, RunStepCommit,
-        RunStepTree, RunSummary, SessionEvent, Status, StepId, ToolCallCount, UpstreamEntry,
-        WaitingCandidate, WorkspaceId,
+        ProjectChanges, PromptScope, RequirementArea, RequirementPatch, RequirementRevision,
+        RequirementSpec, RequirementState, Resolution, ResolvedInput, Run, RunId, RunPlan, RunStep,
+        RunStepCommit, RunStepTree, RunSummary, SessionEvent, Status, StepId, ToolCallCount,
+        UpstreamEntry, WaitingCandidate, WorkspaceId,
     };
-    use htui_core::store::{MemStore, Result as StoreResult, WriteStore};
+    use htui_core::store::{IndexChangesStore, MemStore, Result as StoreResult, WriteStore};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1754,5 +1914,431 @@ mod tests {
                 .filter(|p| matches!(p.subject, Subject::Item { status, .. } if status != Status::Closed))
                 .all(|p| matches!(p.subject, Subject::Item { resolution: None, .. }))
         );
+    }
+
+    // MOD-159 M2 D7: the incremental pass.
+
+    /// The store's clock now: the `since` of a change read covering every write after it.
+    async fn clock(read: &MemStore) -> chrono::DateTime<Utc> {
+        read.index_clock().await.unwrap()
+    }
+
+    /// What `read` says changed in `projects` after `since`.
+    async fn changes_since(
+        read: &MemStore,
+        projects: &[ProjectId],
+        since: chrono::DateTime<Utc>,
+    ) -> IndexChanges {
+        read.index_changes(projects, since).await.unwrap()
+    }
+
+    /// A hand-built change set: `project` with these rows.
+    fn listing(
+        project: ProjectId,
+        items: &[ItemId],
+        requirements: &[RequirementId],
+        owner_documents: &[DocumentId],
+    ) -> IndexChanges {
+        IndexChanges {
+            projects: BTreeMap::from([(
+                project,
+                ProjectChanges {
+                    items: items.iter().copied().collect(),
+                    requirements: requirements.iter().copied().collect(),
+                    owner_documents: owner_documents.iter().copied().collect(),
+                },
+            )]),
+        }
+    }
+
+    async fn mint_htui_item(read: &MemStore, title: &str) -> Item {
+        read.mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: title.into(),
+            body: "a body about incremental indexing".into(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn new_version_of(read: &MemStore, item: ItemId, kind: &str, body: &str) -> Document {
+        read.write_document(NewDocument {
+            id: DocumentId::new(),
+            item_id: item,
+            kind: kind.into(),
+            title: "Revised".into(),
+            body: body.into(),
+            produced_by_step_id: None,
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn edit_body(read: &MemStore, id: ItemId, body: &str) {
+        let item = read.item(id).await.unwrap().unwrap();
+        read.update_item(
+            item.id,
+            item.version,
+            ItemPatch {
+                body: Some(body.into()),
+                author_id: ids::USER,
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn item_text(store: &MemVectorStore, id: ItemId) -> String {
+        store
+            .points()
+            .into_iter()
+            .find(|p| item_of(p) == Some(id) && p.point_type() == PointType::Item)
+            .expect("the item has its point")
+            .text
+    }
+
+    #[tokio::test]
+    async fn sync_changes_indexes_a_new_item_and_its_documents() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        Indexer::sync(&read, &s, &store, &Unguarded).await.unwrap();
+        let since = clock(&read).await;
+        let item = mint_htui_item(&read, "Incremental index").await;
+        let doc = new_version_of(&read, item.id, "summary", "## One\na\n## Two\nb").await;
+        let changes = changes_since(&read, &s.project_ids, since).await;
+
+        let guard = CountingGuard::answering(true);
+        let report = Indexer::sync_changes(&read, &s, &changes, &store, &guard)
+            .await
+            .unwrap();
+        assert_eq!(report.items_rebuilt, 1, "{report:?}");
+        assert_eq!(report.points_upserted, 3, "the item and two sections");
+        assert_eq!(report.points_deleted, 0);
+        assert_eq!(guard.asked(), 0, "nothing is to go");
+        let points: Vec<_> = store
+            .points()
+            .into_iter()
+            .filter(|p| item_of(p) == Some(item.id))
+            .collect();
+        assert_eq!(points.len(), 3);
+        assert_eq!(indexed_documents(&points), BTreeSet::from([doc.id]));
+    }
+
+    #[tokio::test]
+    async fn sync_changes_rebuilds_only_the_listed_items() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        Indexer::sync(&read, &s, &store, &Unguarded).await.unwrap();
+        let rows = read.items(&s, &ItemFilter::default()).await.unwrap();
+        let (listed, unlisted) = (rows[0].id, rows[1].id);
+        let unlisted_before = item_text(&store, unlisted);
+        edit_body(&read, listed, "the listed edit").await;
+        edit_body(&read, unlisted, "the unlisted edit").await;
+
+        let report = Indexer::sync_changes(
+            &read,
+            &s,
+            &listing(ids::PROJECT_HTUI, &[listed], &[], &[]),
+            &store,
+            &Unguarded,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.items_rebuilt, 1, "{report:?}");
+        assert_eq!(report.requirements_rebuilt, 0);
+        assert!(item_text(&store, listed).contains("the listed edit"));
+        assert_eq!(
+            item_text(&store, unlisted),
+            unlisted_before,
+            "an unlisted stale item waits for its own listing or the full reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_document_version_reaches_the_index_through_its_item() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        Indexer::sync(&read, &s, &store, &Unguarded).await.unwrap();
+        let item = item_with_documents(&read).await;
+        let old = read.documents(item.id).await.unwrap().remove(0);
+        let since = clock(&read).await;
+        let new = new_version_of(&read, item.id, &old.kind, "## Verdict\nuse qdrant").await;
+        let changes = changes_since(&read, &s.project_ids, since).await;
+        assert_eq!(
+            changes.projects[&ids::PROJECT_HTUI].items,
+            BTreeSet::from([item.id]),
+            "a document version lists its item"
+        );
+
+        let guard = CountingGuard::answering(true);
+        let report = Indexer::sync_changes(&read, &s, &changes, &store, &guard)
+            .await
+            .unwrap();
+        assert_eq!(report.items_rebuilt, 1);
+        assert!(report.points_deleted > 0, "{report:?}");
+        assert_eq!(guard.asked(), 1);
+        let points: Vec<_> = store
+            .points()
+            .into_iter()
+            .filter(|p| item_of(p) == Some(item.id))
+            .collect();
+        let docs = indexed_documents(&points);
+        assert!(docs.contains(&new.id));
+        assert_eq!(docs, latest_documents(&read, item.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sync_changes_rebuilds_an_amended_requirement() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        Indexer::sync(&read, &s, &store, &Unguarded).await.unwrap();
+        let row = read.requirement(ids::REQ_STO_1).await.unwrap().unwrap();
+        let since = clock(&read).await;
+        read.amend_requirement(
+            row.id,
+            row.version,
+            RequirementPatch {
+                body: Some("Search finds requirements incrementally.".into()),
+                rationale: None,
+                priority: None,
+                author_id: ids::USER,
+                box_id: Some(ids::BOX),
+                reason: "amended".into(),
+            },
+            ids::HTUI_FEAT_3,
+        )
+        .await
+        .unwrap();
+        let changes = changes_since(&read, &s.project_ids, since).await;
+
+        let report = Indexer::sync_changes(&read, &s, &changes, &store, &Unguarded)
+            .await
+            .unwrap();
+        assert_eq!(report.requirements_rebuilt, 1, "{report:?}");
+        assert_eq!(
+            report.requirements_unchanged, 0,
+            "only the listed row is read"
+        );
+        let p = requirement_points(&store)
+            .into_iter()
+            .find(|p| p.subject.owner().requirement() == Some(row.id))
+            .unwrap();
+        assert!(p.text.contains("Search finds requirements incrementally."));
+        assert!(
+            matches!(p.subject, Subject::Requirement { version, .. } if version == row.version + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_changes_replaces_a_superseded_owner_document() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let p = ids::PROJECT_HTUI;
+        let s = scope(vec![p]);
+        let v1 = write_owner_document(&read, p, GOALS_KIND, "Goals", "## A\none\n## B\ntwo").await;
+        Indexer::sync(&read, &s, &store, &Unguarded).await.unwrap();
+        // An owner document the store does not have: an orphan, the full reconcile's to delete.
+        let owner = read.project(p).await.unwrap().unwrap();
+        let ghost = OwnerDocument {
+            id: DocumentId::new(),
+            kind: "notes".into(),
+            ..v1.clone()
+        };
+        store
+            .upsert(super::owner_document_points(&owner, &ghost))
+            .await
+            .unwrap();
+        let since = clock(&read).await;
+        let v2 = write_owner_document(&read, p, GOALS_KIND, "Goals", "## A\nrewritten").await;
+        let changes = changes_since(&read, &s.project_ids, since).await;
+        assert_eq!(
+            changes.projects[&p].owner_documents,
+            BTreeSet::from([v2.id])
+        );
+
+        let guard = CountingGuard::answering(true);
+        let report = Indexer::sync_changes(&read, &s, &changes, &store, &guard)
+            .await
+            .unwrap();
+        assert_eq!(report.points_deleted, 2, "v1's two sections, {report:?}");
+        assert_eq!(guard.asked(), 1);
+        let points = owner_document_points(&store);
+        assert_eq!(
+            indexed_documents(&points),
+            BTreeSet::from([v2.id, ghost.id]),
+            "the orphan stays for the full reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_changes_leaves_a_deleted_rows_points_to_the_full_reconcile() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        Indexer::sync(&read, &s, &store, &Unguarded).await.unwrap();
+        let ghost = plant_ghost_item(&read, &store, ids::PROJECT_HTUI).await;
+        let before = store.points();
+
+        let guard = CountingGuard::answering(true);
+        let report = Indexer::sync_changes(
+            &read,
+            &s,
+            &listing(ids::PROJECT_HTUI, &[ghost], &[RequirementId::new()], &[]),
+            &store,
+            &guard,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report, SyncReport::default());
+        assert_eq!(guard.asked(), 0);
+        assert_eq!(store.points(), before);
+    }
+
+    #[tokio::test]
+    async fn sync_changes_skips_an_item_listed_under_a_project_it_left() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let both = scope(vec![ids::PROJECT_HTUI, ids::PROJECT_AGY]);
+        Indexer::sync(&read, &both, &store, &Unguarded)
+            .await
+            .unwrap();
+        let item = item_with_documents(&read).await;
+        let row = read.requirement(ids::REQ_STO_1).await.unwrap().unwrap();
+        edit_body(&read, item.id, "an edit listed under the wrong project").await;
+        let before = store.points();
+
+        let guard = CountingGuard::answering(true);
+        let report = Indexer::sync_changes(
+            &read,
+            &both,
+            &listing(ids::PROJECT_AGY, &[item.id], &[row.id], &[]),
+            &store,
+            &guard,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report, SyncReport::default());
+        assert_eq!(guard.asked(), 0);
+        assert_eq!(store.points(), before);
+    }
+
+    #[tokio::test]
+    async fn a_refused_guard_stops_sync_changes_with_nothing_deleted() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let both = scope(vec![ids::PROJECT_HTUI, ids::PROJECT_AGY]);
+        Indexer::sync(&read, &both, &store, &Unguarded)
+            .await
+            .unwrap();
+        let item = item_with_documents(&read).await;
+        let old = read.documents(item.id).await.unwrap().remove(0);
+        let agy = read
+            .items(&scope(vec![ids::PROJECT_AGY]), &ItemFilter::default())
+            .await
+            .unwrap()[0]
+            .id;
+        let held = |store: &MemVectorStore| {
+            let points: Vec<_> = store
+                .points()
+                .into_iter()
+                .filter(|p| item_of(p) == Some(item.id))
+                .collect();
+            indexed_documents(&points)
+        };
+        let before = held(&store);
+        let since = clock(&read).await;
+        new_version_of(&read, item.id, &old.kind, "## Verdict\nrefused").await;
+        edit_body(&read, agy, "an agy edit after the refusal").await;
+        let changes = changes_since(&read, &both.project_ids, since).await;
+        assert_eq!(changes.projects.len(), 2);
+
+        let guard = CountingGuard::answering(false);
+        let report = Indexer::sync_changes(&read, &both, &changes, &store, &guard)
+            .await
+            .unwrap();
+        assert!(report.abandoned);
+        assert_eq!(report.points_deleted, 0);
+        assert_eq!(guard.asked(), 1);
+        let after = held(&store);
+        assert!(
+            before.is_subset(&after) && after.len() > before.len(),
+            "the superseded version's points stay beside the new one's: {before:?} {after:?}"
+        );
+        assert!(
+            !item_text(&store, agy).contains("after the refusal"),
+            "no later project is visited"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_sync_changes_a_full_sync_rebuilds_nothing() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let p = ids::PROJECT_HTUI;
+        let both = scope(vec![p, ids::PROJECT_AGY]);
+        write_owner_document(&read, p, GOALS_KIND, "Goals", "## A\none").await;
+        Indexer::sync(&read, &both, &store, &Unguarded)
+            .await
+            .unwrap();
+        let since = clock(&read).await;
+
+        mint_htui_item(&read, "Minted after the reconcile").await;
+        let item = item_with_documents(&read).await;
+        let old = read.documents(item.id).await.unwrap().remove(0);
+        new_version_of(&read, item.id, &old.kind, "## Verdict\nnewer").await;
+        let fix = read.item(ids::HTUI_FIX_1).await.unwrap().unwrap();
+        edit_body(&read, fix.id, "an edited closed item").await;
+        let agy = read
+            .items(&scope(vec![ids::PROJECT_AGY]), &ItemFilter::default())
+            .await
+            .unwrap()[0]
+            .clone();
+        let to = Status::ALL
+            .iter()
+            .copied()
+            .find(|&to| to != agy.status && htui_core::store::legal_move(agy.status, to).is_ok())
+            .expect("the agy item can move");
+        assert!(read.transition(agy.id, agy.status, to).await.unwrap());
+        let row = read.requirement(ids::REQ_STO_1).await.unwrap().unwrap();
+        read.withdraw_requirement(
+            row.id,
+            row.version,
+            ids::HTUI_FEAT_3,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .unwrap();
+        write_owner_document(&read, p, GOALS_KIND, "Goals", "## A\ntwo\n## B\nthree").await;
+
+        let changes = changes_since(&read, &both.project_ids, since).await;
+        let report = Indexer::sync_changes(&read, &both, &changes, &store, &Unguarded)
+            .await
+            .unwrap();
+        assert!(report.items_rebuilt >= 4, "{report:?}");
+        assert_eq!(report.requirements_rebuilt, 1);
+
+        let full = Indexer::sync(&read, &both, &store, &Unguarded)
+            .await
+            .unwrap();
+        assert_eq!(full.items_rebuilt, 0, "{full:?}");
+        assert_eq!(full.requirements_rebuilt, 0);
+        assert_eq!(full.points_upserted, 0);
+        assert_eq!(full.points_deleted, 0);
     }
 }

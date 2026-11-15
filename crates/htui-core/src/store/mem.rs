@@ -68,7 +68,7 @@ use crate::model::{
 };
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
-use crate::model::{IndexedCollection, IndexerLease, LeaseTake};
+use crate::model::{IndexChanges, IndexedCollection, IndexerLease, LeaseTake};
 use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::model::{LogShipLevel, NewWorkerLog, WorkerLogLine};
 use crate::model::{NewOwnerDocument, NewRunPlan, OwnerDocument, PlanStatus, RunPlan, StepRole};
@@ -84,6 +84,7 @@ use crate::store::graph_rules::{
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_usable_by, phase_row_refusal,
 };
+use crate::store::index_changes::IndexChangesStore;
 use crate::store::indexer_lease::IndexerLeaseStore;
 use crate::store::traits::command_log_too_large;
 use crate::store::traits::{
@@ -12523,6 +12524,74 @@ impl IndexerLeaseStore for MemStore {
     async fn indexer_lease(&self, collection: &IndexedCollection) -> Result<Option<IndexerLease>> {
         let now = self.now();
         Ok(self.read(|state| state.indexer_lease_view(&collection.name(), now)))
+    }
+}
+
+/// MOD-159 M2 plan D3: the index change read in memory, `PgStore`'s rules. The clock is this
+/// handle's, the one every write stamps `updated_at` with; a row counts when its stamp is strictly
+/// after `since`, and an item document is listed under its item's current project.
+impl IndexChangesStore for MemStore {
+    async fn index_clock(&self) -> Result<DateTime<Utc>> {
+        Ok(self.now())
+    }
+
+    async fn index_changes(
+        &self,
+        projects: &[ProjectId],
+        since: DateTime<Utc>,
+    ) -> Result<IndexChanges> {
+        let asked: HashSet<ProjectId> = projects.iter().copied().collect();
+        Ok(self.read(|state| state.index_changes(&asked, since)))
+    }
+}
+
+impl State {
+    /// [`MemStore::index_changes`]'s body: the four arms of `PgStore`'s `UNION`.
+    fn index_changes(&self, asked: &HashSet<ProjectId>, since: DateTime<Utc>) -> IndexChanges {
+        let mut changes = IndexChanges::default();
+        let projects = &mut changes.projects;
+        for item in self.items.values() {
+            if asked.contains(&item.project_id) && item.updated_at > since {
+                projects
+                    .entry(item.project_id)
+                    .or_default()
+                    .items
+                    .insert(item.id);
+            }
+        }
+        for document in &self.documents {
+            if document.created_at <= since {
+                continue;
+            }
+            if let Some(item) = self.items.get(&document.item_id)
+                && asked.contains(&item.project_id)
+            {
+                projects
+                    .entry(item.project_id)
+                    .or_default()
+                    .items
+                    .insert(item.id);
+            }
+        }
+        for requirement in self.requirements.values() {
+            if asked.contains(&requirement.project_id) && requirement.updated_at > since {
+                projects
+                    .entry(requirement.project_id)
+                    .or_default()
+                    .requirements
+                    .insert(requirement.id);
+            }
+        }
+        for document in &self.owner_documents {
+            if asked.contains(&document.project_id) && document.created_at > since {
+                projects
+                    .entry(document.project_id)
+                    .or_default()
+                    .owner_documents
+                    .insert(document.id);
+            }
+        }
+        changes
     }
 }
 
