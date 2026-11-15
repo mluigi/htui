@@ -3710,7 +3710,8 @@ async fn stopped_workspace_refusal<H: htui_core::store::WorkerHost>(
 
 /// `Unblock` (D161): a reopen needs no run; the follow and resume cases lock the run they name
 /// and check the case again under the lock (§8.6). A landing retry (MOD-133 M2 E6) takes no run
-/// lock either: its reset is a compare-and-set on `refused`, and the landing lease guards the push.
+/// lock either: its reset is a compare-and-set on `refused` of exactly the run the case named, and
+/// the run's walk token, held across the reset and the land, keeps the sweep's land arm off it.
 /// After the answer, a process that executes the box lands the reset records at once, in this
 /// same task ([`executes_this_box`]); any other process leaves them to the executing one's sweep.
 async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>, item: ItemId) {
@@ -3738,27 +3739,30 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
                 Err(err) => ctx.refuse(err.to_string()),
             };
         }
-        UnblockCase::RetryLanding(_) => {
-            let outcome = match engine.dispatch(Command::Unblock { item }).await {
-                Ok(outcome) => outcome,
-                Err(err) => return ctx.refuse(err.to_string()),
-            };
-            // The case the dispatch itself decided, which a concurrent write may have moved.
-            let retried = match outcome {
-                CommandOutcome::Unblocked {
-                    case: UnblockCase::RetryLanding(run),
-                    ..
-                } => Some(run),
-                _ => None,
-            };
-            ctx.done(outcome);
+        UnblockCase::RetryLanding(run) => {
+            // MOD-133 M2 R1 (F1): the run counts as live in this process's walks from before the
+            // reset to after the land, as a walk's own land does: the sweep's land arm skips a
+            // live run, so it never takes the reset record while this task pushes it under the
+            // same lease owner.
+            let walk = ctx.shared.walks.child(run);
+            // F3: exactly the run the case named, with no second derivation, which a concurrent
+            // write could have moved to a case that needs the run lock. A stale press (nothing
+            // `refused` any more) is the engine's `nothing_is_refused` refusal.
+            if let Err(err) = engine.retry_landing(item, run).await {
+                return ctx.refuse(err.to_string());
+            }
+            ctx.done(CommandOutcome::Unblocked {
+                item,
+                case,
+                rest: None,
+            });
             // The answer is sent; the engine borrows `kit`, so the landing stays in this task.
-            if let Some(run) = retried
-                && executes_this_box(&ctx).await
+            if executes_this_box(&ctx).await
                 && let Err(err) = Box::pin(engine.land(Some(run))).await
             {
                 tracing::warn!(%run, %err, "landing the retried run failed; the sweep retries it");
             }
+            drop(walk);
             return;
         }
         UnblockCase::FollowRun(run) | UnblockCase::Resume(run) => run,

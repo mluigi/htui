@@ -2770,7 +2770,7 @@ where
                 })
             }
             UnblockCase::RetryLanding(run) => {
-                self.retry_landing(item, run, now).await?;
+                self.retry_landing(item, run).await?;
                 None
             }
         };
@@ -2782,12 +2782,12 @@ where
     /// noted with how many. None moved is a stale press (another press or process retried them
     /// first): [`EngineError::NotBlocked`] with [`crate::command::nothing_is_refused`], and no
     /// note.
-    async fn retry_landing(
-        &self,
-        item: ItemId,
-        run: RunId,
-        now: DateTime<Utc>,
-    ) -> Result<(), EngineError> {
+    ///
+    /// Public for the worker's `Unblock` task (MOD-133 M2 R1): once [`Self::unblock_case`] named
+    /// the case, it retries exactly that run, so no second derivation can turn the press into a
+    /// case that needs the run lock.
+    pub async fn retry_landing(&self, item: ItemId, run: RunId) -> Result<(), EngineError> {
+        let now = self.now();
         let moved = self.parts.store.retry_landing(run).await?;
         if moved == 0 {
             let row = self.item(item).await?;
@@ -20498,7 +20498,7 @@ mod tests {
 
         // A stale press: the record moved between the case and the write.
         let refused = engine
-            .retry_landing(ids::HTUI_FEAT_3, run, harness.orch.clock.now())
+            .retry_landing(ids::HTUI_FEAT_3, run)
             .await
             .expect_err("nothing is refused any more");
         assert!(
