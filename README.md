@@ -186,7 +186,7 @@ create one in **Settings › Hierarchy** with `N`.
 
 | Tab | What it is for |
 |---|---|
-| **1 Workspaces** | Every workspace with its state (open, in the background, stopping, stopped) and an overview of each and of its projects; `o` opens one. |
+| **1 Workspaces** | Every workspace with its state (open, in the background, stopping, stopped) and an overview of each, its runs and its projects; `o` opens one, `s` stops its runs, `r` resumes them. |
 | **2 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
 | **3 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
 | **4 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |

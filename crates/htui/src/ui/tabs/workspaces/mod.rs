@@ -21,15 +21,28 @@
 //!
 //! Offline the shell's counts are the last ones read, not current (D8 over D5): the rows stay,
 //! but no workspace other than the open one shows a state (R1 F6).
+//!
+//! MOD-116 M2 (`R-ORCH-16`, `R-TUI-14`): `s` ([`Act::WorkspacesStop`]) and `r`
+//! ([`Act::WorkspacesResume`]) on any row of a workspace read its overview afresh and ask from its
+//! stop report (D6): stop its live runs gracefully, force a graceful stop that still has a running
+//! run, or resume it; each question lists the runs and what the answer does to each. A `y` (or
+//! `Enter`) sends the write with the stop row the question was decided on, so a stop that changed
+//! meanwhile writes nothing and is said (D3). Whatever there is nothing to ask about is told in the
+//! same box. The detail lists the workspace's runs and how each resumes (D5); the open workspace's
+//! state carries its stop (`● open · 1 running · stopping…`, D7); the hint row offers what the
+//! selected workspace's state allows (D8). Offline the detail shows no state the counts cannot
+//! vouch for, and no Runs section (D7).
 
 mod overview;
+mod question;
 
 use std::collections::BTreeSet;
 
 use core::cell::Cell;
 use crossterm::event::KeyEvent;
 use htui_core::model::{
-    ProjectId, Scope, WorkspaceId, WorkspaceLifecycle, WorkspaceRunCounts, WorkspaceSummary,
+    ProjectId, RunStatus, Scope, StopMode, WorkspaceId, WorkspaceLifecycle, WorkspaceRunCounts,
+    WorkspaceStop, WorkspaceSummary,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -38,12 +51,14 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, Stack, views};
+use crate::stop_report::{ResumeWrite, StopTarget, StopWrite};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::kit::modal::{Ask, modal_rest};
 use crate::ui::kit::pane::{Focus, Pane};
 use crate::ui::kit::scroll::{Scroll, Step, window};
 use crate::ui::shell::{PaneId, Panes, TabLayout, TabLoc};
@@ -60,12 +75,67 @@ const WORKSPACE_OVERVIEW: &str = "workspace_overview";
 /// states are current at once; a refusal (offline) leaves the open workspace reading `open`.
 const WORKSPACE_RUN_COUNTS: &str = "workspace_run_counts";
 
-/// The hint row the focused pane carries.
-const HINT: HintSpec = &[
+/// [`StoreRequest::StopWorkspaces`]'s name, whose refusal the tab tells in its box (D6).
+const STOP_WORKSPACES: &str = "stop_workspaces";
+
+/// [`StoreRequest::ResumeWorkspace`]'s name, whose refusal the tab tells in its box (D6).
+const RESUME_WORKSPACE: &str = "resume_workspace";
+
+/// The hint row of a workspace with nothing to stop or resume (M1's).
+const HINT_IDLE: HintSpec = &[
     Hint::One(Act::WorkspacesOpen, "open"),
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::ListFold, "fold"),
 ];
+
+/// MOD-116 M2 D8: a workspace with live runs and no stop row.
+const HINT_STOP: HintSpec = &[
+    Hint::One(Act::WorkspacesOpen, "open"),
+    Hint::One(Act::WorkspacesStop, "stop"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::ListFold, "fold"),
+];
+
+/// MOD-116 M2 D8: a graceful stop with a run still running.
+const HINT_FORCE: HintSpec = &[
+    Hint::One(Act::WorkspacesOpen, "open"),
+    Hint::One(Act::WorkspacesStop, "force stop"),
+    Hint::One(Act::WorkspacesResume, "resume"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::ListFold, "fold"),
+];
+
+/// MOD-116 M2 D8: any other stop row.
+const HINT_RESUME: HintSpec = &[
+    Hint::One(Act::WorkspacesOpen, "open"),
+    Hint::One(Act::WorkspacesResume, "resume"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::ListFold, "fold"),
+];
+
+/// The graceful stop question's keys (D6).
+const STOP_HINT: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "stop"),
+    Hint::One(Act::ConfirmNo, "cancel"),
+];
+
+/// The forced stop question's keys: no writes nothing, and the graceful stop goes on (D6).
+const FORCE_HINT: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "stop"),
+    Hint::One(Act::ConfirmNo, "keep the graceful stop"),
+];
+
+/// The resume question's keys (D6).
+const RESUME_HINT: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "resume"),
+    Hint::One(Act::ConfirmNo, "cancel"),
+];
+
+/// A told box's one answer (D6).
+const TOLD_HINT: HintSpec = &[Hint::One(Act::ConfirmNo, "close")];
+
+/// The widest a question's content grows (D6).
+const QUESTION_WIDTH: u16 = 72;
 
 /// The detail pane's sub-tabs (MOD-117 and MOD-118 add theirs).
 const SUB_TABS: &[&str] = &["overview"];
@@ -165,6 +235,51 @@ enum Held {
     Refused(String),
 }
 
+/// Which key waits on a fresh overview read (MOD-116 M2 D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    /// `workspaces.stop`.
+    Stop,
+    /// `workspaces.resume`.
+    Resume,
+}
+
+/// What the tab asks, or tells, in a kit `Ask` over its body (MOD-116 M2 D6).
+#[derive(Debug, Clone, PartialEq)]
+enum Question {
+    /// Stop `workspace`'s runs in `mode`, decided on the stop row `decided_on`.
+    Stop {
+        /// The workspace.
+        workspace: WorkspaceId,
+        /// Its name, for the title.
+        name: String,
+        /// The mode a yes writes.
+        mode: StopMode,
+        /// The stop row the question was built from.
+        decided_on: Option<WorkspaceStop>,
+        /// The first line, a blank one, and each run with what the stop does to it.
+        lines: Vec<Line<'static>>,
+    },
+    /// Resume `workspace`, decided on the stop row `decided_on`.
+    Resume {
+        /// The workspace.
+        workspace: WorkspaceId,
+        /// Its name, for the title.
+        name: String,
+        /// The stop row the question was built from.
+        decided_on: Option<WorkspaceStop>,
+        /// The first line, a blank one, and each run with how it resumes.
+        lines: Vec<Line<'static>>,
+    },
+    /// Nothing to ask: why, with one answer that closes it.
+    Told {
+        /// The box's title.
+        title: String,
+        /// What it says.
+        text: String,
+    },
+}
+
 /// The Workspaces tab (MOD-116 M1 D8).
 #[derive(Debug, Default)]
 pub struct WorkspacesTab {
@@ -194,6 +309,11 @@ pub struct WorkspacesTab {
     scroll: Scroll,
     /// The detail's rows as last drawn, so a scroll is clamped to them.
     detail_rows: Cell<usize>,
+    /// MOD-116 M2 D6: the workspace whose `s` or `r` waits on its fresh overview; a cursor moved
+    /// onto another workspace drops it.
+    pending: Option<(WorkspaceId, Asked)>,
+    /// MOD-116 M2 D6: the question or told box over the tab; it holds the keys while up.
+    question: Option<Question>,
 }
 
 impl WorkspacesTab {
@@ -245,10 +365,17 @@ impl WorkspacesTab {
             })
     }
 
-    /// Moves the cursor to `entry`; another workspace's row resets the detail's scroll.
+    /// Moves the cursor to `entry`; another workspace's row resets the detail's scroll and drops
+    /// a pending ask about the one it leaves (D6).
     fn select(&mut self, entry: Entry) {
         if self.cursor != Some(entry) {
             self.scroll.reset();
+        }
+        if self
+            .pending
+            .is_some_and(|(workspace, _)| workspace != entry.workspace())
+        {
+            self.pending = None;
         }
         self.cursor = Some(entry);
     }
@@ -339,6 +466,230 @@ impl WorkspacesTab {
         }
     }
 
+    /// MOD-116 M2 D6: `s` or `r` on a row of a listed workspace: the question waits on a fresh
+    /// overview of it, the one in flight or one asked now whatever the counts say.
+    fn ask(&mut self, asked: Asked, ctx: &Ctx<'_>) {
+        let Some(workspace) = self
+            .cursor
+            .filter(|entry| self.holds(*entry))
+            .map(Entry::workspace)
+        else {
+            return;
+        };
+        self.pending = Some((workspace, asked));
+        if self.in_flight != Some(workspace) {
+            self.stale = true;
+            self.read_if_due(ctx);
+        }
+    }
+
+    /// MOD-116 M2 D6: the question `asked` raises over `overview`, from its stop report: what is
+    /// live and what stop row there is decide which one, or what is told instead.
+    fn question_of(
+        asked: Asked,
+        workspace: WorkspaceId,
+        overview: &WorkspaceOverview,
+        ctx: &Ctx<'_>,
+    ) -> Question {
+        let theme = ctx.theme;
+        let width = usize::from(QUESTION_WIDTH);
+        let name = overview.tree.workspace.name.clone();
+        let report = &overview.report;
+        let first = |text: &'static str| vec![Line::styled(text, theme.base), Line::default()];
+        let told = |title: &str, text: String| Question::Told {
+            title: title.to_owned(),
+            text,
+        };
+        match asked {
+            Asked::Stop => match report.stop.as_ref().map(|row| row.mode) {
+                None if !report.lines.iter().any(question::is_live) => {
+                    told(question::STOP_TOLD_TITLE, question::nothing_running(&name))
+                }
+                None => {
+                    let mut lines = first(question::GRACEFUL_FIRST);
+                    lines.extend(question::stop_lines(
+                        report,
+                        StopMode::Graceful,
+                        width,
+                        theme,
+                    ));
+                    Question::Stop {
+                        workspace,
+                        name,
+                        mode: StopMode::Graceful,
+                        decided_on: None,
+                        lines,
+                    }
+                }
+                Some(StopMode::Graceful)
+                    if report
+                        .lines
+                        .iter()
+                        .any(|line| line.status == RunStatus::Running) =>
+                {
+                    let mut lines = first(question::FORCED_FIRST);
+                    lines.extend(question::stop_lines(report, StopMode::Forced, width, theme));
+                    Question::Stop {
+                        workspace,
+                        name,
+                        mode: StopMode::Forced,
+                        decided_on: report.stop.clone(),
+                        lines,
+                    }
+                }
+                Some(StopMode::Graceful) => {
+                    told(question::STOP_TOLD_TITLE, question::settled(&name))
+                }
+                Some(mode) => told(
+                    question::STOP_TOLD_TITLE,
+                    question::already_stopped(&name, mode),
+                ),
+            },
+            Asked::Resume => match &report.stop {
+                None => told(question::RESUME_TOLD_TITLE, question::not_stopped(&name)),
+                Some(_) => {
+                    let mut lines = first(question::RESUME_FIRST);
+                    lines.extend(question::resume_lines(report, width, theme));
+                    Question::Resume {
+                        workspace,
+                        name,
+                        decided_on: report.stop.clone(),
+                        lines,
+                    }
+                }
+            },
+        }
+    }
+
+    /// Puts up a told box.
+    fn tell(&mut self, title: &str, text: String) {
+        self.question = Some(Question::Told {
+            title: title.to_owned(),
+            text,
+        });
+    }
+
+    /// `workspace`'s name as listed, for a told box.
+    fn name_of(&self, workspace: WorkspaceId) -> String {
+        self.summary(workspace).map_or_else(
+            || "this workspace".to_owned(),
+            |summary| summary.name.clone(),
+        )
+    }
+
+    /// D6: a stop or a resume was written: the states move at once (the counts and the
+    /// overview are read again).
+    fn written(&mut self, ctx: &Ctx<'_>) {
+        ctx.request(StoreRequest::WorkspaceRunCounts);
+        self.stale = true;
+        self.read_if_due(ctx);
+    }
+
+    /// D3/D6: a write refused because the stop row moved while asking.
+    fn changed(&mut self, workspace: WorkspaceId, stop: bool, ctx: &Ctx<'_>) {
+        let act = if stop {
+            Act::WorkspacesStop
+        } else {
+            Act::WorkspacesResume
+        };
+        let key = ctx.keys().label(views::WORKSPACES_BROWSE, act);
+        let title = if stop {
+            question::STOP_TOLD_TITLE
+        } else {
+            question::RESUME_TOLD_TITLE
+        };
+        let text = question::changed(&self.name_of(workspace), stop, key.as_deref());
+        self.tell(title, text);
+    }
+
+    /// D6: a key while the question is up, through [`views::WORKSPACES_CONFIRM`]: `confirm.yes`
+    /// sends the write the question was decided on and closes it (a told box just closes),
+    /// `confirm.no` closes it, and every other chord is `modal_rest`'s.
+    fn question_key(&mut self, question: Question, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let stack = views::WORKSPACES_CONFIRM;
+        let chord = ctx.pressed(&key);
+        let act = ctx.keys().actions(stack, chord).first().copied();
+        match (act, question) {
+            (
+                Some(Act::ConfirmYes),
+                Question::Stop {
+                    workspace,
+                    mode,
+                    decided_on,
+                    ..
+                },
+            ) => ctx.request(StoreRequest::StopWorkspaces {
+                mode,
+                targets: vec![StopTarget {
+                    workspace,
+                    decided_on,
+                }],
+            }),
+            (
+                Some(Act::ConfirmYes),
+                Question::Resume {
+                    workspace,
+                    decided_on,
+                    ..
+                },
+            ) => ctx.request(StoreRequest::ResumeWorkspace {
+                workspace,
+                decided_on,
+            }),
+            (Some(Act::ConfirmYes | Act::ConfirmNo), _) => {}
+            (_, question) => {
+                self.question = Some(question);
+                return modal_rest(stack, chord);
+            }
+        }
+        Handled::Consumed
+    }
+
+    /// D8: the selected workspace's counts row, as the hint row reads it: none offline.
+    fn selected_counts<'a>(&self, ctx: &Ctx<'a>) -> Option<&'a WorkspaceRunCounts> {
+        self.cursor
+            .and_then(|entry| counts_of(ctx, entry.workspace()))
+            .filter(|_| !ctx.top_bar.offline())
+    }
+
+    /// The browse hint row (D8), or none while a question is up (its box carries its keys).
+    fn browse_hints(&self, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        if self.question.is_some() {
+            return None;
+        }
+        let spec = hint_for(self.selected_counts(ctx));
+        key_line(ctx.keys().hint(views::WORKSPACES_BROWSE, spec), ctx.theme)
+    }
+
+    /// D6: the question or told box over `area`, its keys on its border.
+    fn render_question(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        let Some(question) = &self.question else {
+            return;
+        };
+        let told;
+        let (title, lines, spec) = match question {
+            Question::Stop {
+                name, mode, lines, ..
+            } => match mode {
+                StopMode::Graceful => (question::stop_title(name), lines, STOP_HINT),
+                StopMode::Forced => (question::force_title(name), lines, FORCE_HINT),
+            },
+            Question::Resume { name, lines, .. } => {
+                (question::resume_title(name), lines, RESUME_HINT)
+            }
+            Question::Told { title, text } => {
+                told = vec![Line::styled(text.clone(), ctx.theme.base)];
+                (title.clone(), &told, TOLD_HINT)
+            }
+        };
+        let hint = ctx.keys().hint(views::WORKSPACES_CONFIRM, spec);
+        let mut ask = Ask::new(&title).width(QUESTION_WIDTH).hint(&hint);
+        for line in lines {
+            ask = ask.line(line.clone());
+        }
+        let _ = ask.render(frame, area, ctx.theme);
+    }
+
     /// D7: asks for the selected workspace's overview when none is out, there is a scope, and
     /// either none is held for it (a refusal is not held, R1 F3), it is [`stale`](Self::stale),
     /// or its counts row moved since it was asked for.
@@ -391,6 +742,7 @@ impl WorkspacesTab {
                 column,
                 folded,
                 lifecycle(ctx, id),
+                counts_of(ctx, id).filter(|_| !ctx.top_bar.offline()),
                 theme,
             ));
             if folded {
@@ -492,9 +844,17 @@ impl WorkspacesTab {
                 }
             }
             (Some(entry), Some(Held::Read(overview))) => {
+                // MOD-116 M2 D7: offline the overview's counts are the last read's: a workspace
+                // that is not open shows no state, the open one `● open` alone, and neither
+                // its runs.
                 let open = ctx.scope.workspace_id == entry.workspace();
-                let state = WorkspaceLifecycle::of(open, &overview.counts);
-                lines = overview::workspace_lines(overview, state, width, theme);
+                let current = !ctx.top_bar.offline();
+                let state = match (current, open) {
+                    (true, _) => Some(WorkspaceLifecycle::of(open, &overview.counts)),
+                    (false, true) => Some(WorkspaceLifecycle::Open { running: 0 }),
+                    (false, false) => None,
+                };
+                lines = overview::workspace_lines(overview, state, current, width, theme);
             }
             (Some(_), Some(Held::Refused(message))) => {
                 let what = format!("{NEEDS_THE_DATABASE}: {message}");
@@ -569,12 +929,29 @@ fn lifecycle(ctx: &Ctx<'_>, workspace: WorkspaceId) -> Option<WorkspaceLifecycle
     }
 }
 
-/// A workspace's group row: `▾ Platform  ◐ background · 1 running`, the name padded to `column`.
+/// MOD-116 M2 D8: the hint row `row` (the selected workspace's counts, `None` offline) offers:
+/// stop while runs are live and nothing stops them, force stop and resume while a graceful stop
+/// still has a run running, resume under any other stop, M1's otherwise.
+fn hint_for(row: Option<&WorkspaceRunCounts>) -> HintSpec {
+    let Some(row) = row else {
+        return HINT_IDLE;
+    };
+    match &row.stop {
+        None if row.live() > 0 => HINT_STOP,
+        None => HINT_IDLE,
+        Some(stop) if stop.mode == StopMode::Graceful && row.running > 0 => HINT_FORCE,
+        Some(_) => HINT_RESUME,
+    }
+}
+
+/// A workspace's group row: `▾ Platform  ◐ background · 1 running`, the name padded to `column`;
+/// `counts` (none offline) carries the open workspace's stop (D7).
 fn group_row(
     summary: &WorkspaceSummary,
     column: usize,
     folded: bool,
     state: Option<WorkspaceLifecycle>,
+    counts: Option<&WorkspaceRunCounts>,
     theme: &Theme,
 ) -> Row<'static> {
     let glyph = if folded { "\u{25b8}" } else { "\u{25be}" };
@@ -585,7 +962,7 @@ fn group_row(
     ];
     if let Some(state) = state {
         spans.push(Span::raw("  "));
-        spans.extend(overview::state_spans(state, theme));
+        spans.extend(overview::state_spans(state, counts, theme));
     }
     Row {
         line: Line::from(spans),
@@ -630,8 +1007,13 @@ impl Tab for WorkspacesTab {
 
     /// Every key resolves through [`views::WORKSPACES_BROWSE`]: a list motion moves the cursor
     /// (or, with the detail focused, scrolls it), `list.fold` folds the group, the pane scroll
-    /// moves the detail and `workspaces.open` opens the selected workspace.
+    /// moves the detail, `workspaces.open` opens the selected workspace, and `workspaces.stop`
+    /// and `workspaces.resume` ask (D6). While a question is up, through
+    /// [`views::WORKSPACES_CONFIRM`].
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if let Some(question) = self.question.take() {
+            return self.question_key(question, key, ctx);
+        }
         let chord = ctx.pressed(&key);
         let focus = ctx.focus();
         let rows = self.detail_rows.get();
@@ -649,6 +1031,8 @@ impl Tab for WorkspacesTab {
                     let _ = self.scroll.apply(act, rows);
                 }
                 Act::WorkspacesOpen => self.open(ctx),
+                Act::WorkspacesStop => self.ask(Asked::Stop, ctx),
+                Act::WorkspacesResume => self.ask(Asked::Resume, ctx),
                 // A layout, history or global act: the shell's.
                 _ => continue,
             }
@@ -680,14 +1064,64 @@ impl Tab for WorkspacesTab {
                 if self.in_flight == Some(*workspace) {
                     self.in_flight = None;
                 }
+                // D6: the pending ask's fresh overview raises its question.
+                if let Some((_, asked)) = self.pending.take_if(|(pending, _)| pending == workspace)
+                    && let Some(read) = overview
+                {
+                    self.question = Some(Self::question_of(asked, *workspace, read, ctx));
+                }
                 let held = overview
                     .as_ref()
                     .map_or(Held::Gone, |overview| Held::Read(overview.clone()));
                 self.overview = Some((*workspace, held));
                 self.read_if_due(ctx);
             }
+            StoreReply::StopsWritten { outcomes, .. } => {
+                for (workspace, outcome) in outcomes {
+                    match outcome {
+                        StopWrite::Written => self.written(ctx),
+                        StopWrite::Already(mode) => {
+                            let text = question::already_stopped(&self.name_of(*workspace), *mode);
+                            self.tell(question::STOP_TOLD_TITLE, text);
+                        }
+                        StopWrite::Changed => self.changed(*workspace, true, ctx),
+                    }
+                }
+            }
+            StoreReply::ResumeWritten { workspace, outcome } => match outcome {
+                ResumeWrite::Resumed => self.written(ctx),
+                ResumeWrite::NotStopped => {
+                    let text = question::not_stopped(&self.name_of(*workspace));
+                    self.tell(question::RESUME_TOLD_TITLE, text);
+                }
+                ResumeWrite::Changed => self.changed(*workspace, false, ctx),
+            },
+            StoreReply::Failed { request, message } if *request == STOP_WORKSPACES => {
+                self.tell(
+                    question::STOP_TOLD_TITLE,
+                    question::needs_the_database(true, message),
+                );
+            }
+            StoreReply::Failed { request, message } if *request == RESUME_WORKSPACE => {
+                self.tell(
+                    question::RESUME_TOLD_TITLE,
+                    question::needs_the_database(false, message),
+                );
+            }
             StoreReply::Failed { request, message } if *request == WORKSPACE_OVERVIEW => {
                 if let Some(workspace) = self.in_flight.take() {
+                    // D6: the pending ask's read was refused: said in the box.
+                    if let Some((_, asked)) =
+                        self.pending.take_if(|(pending, _)| *pending == workspace)
+                    {
+                        let stop = asked == Asked::Stop;
+                        let title = if stop {
+                            question::STOP_TOLD_TITLE
+                        } else {
+                            question::RESUME_TOLD_TITLE
+                        };
+                        self.tell(title, question::needs_the_database(stop, message));
+                    }
                     self.overview = Some((workspace, Held::Refused(message.clone())));
                     // R1 F3: the refused workspace is asked again on the next refresh, not at
                     // once, which would ask on every refusal; another one now selected is read.
@@ -703,18 +1137,26 @@ impl Tab for WorkspacesTab {
     }
 
     /// The detail pane says a refused overview itself; a refused counts read leaves the states
-    /// as they were (the shell's own poll is absorbed too, D5).
+    /// as they were (the shell's own poll is absorbed too, D5); a refused stop or resume is told
+    /// in the tab's box (MOD-116 M2 D6).
     fn absorbs_failure(&self, request: &str) -> bool {
-        request == WORKSPACE_OVERVIEW || request == WORKSPACE_RUN_COUNTS
+        [
+            WORKSPACE_OVERVIEW,
+            WORKSPACE_RUN_COUNTS,
+            STOP_WORKSPACES,
+            RESUME_WORKSPACE,
+        ]
+        .contains(&request)
     }
 
+    /// D8's hint row; none while a question is up (its box carries its keys).
     fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
-        key_line(ctx.keys().hint(views::WORKSPACES_BROWSE, HINT), ctx.theme)
+        self.browse_hints(ctx)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let areas = ctx.split(area, WORKSPACES_LAYOUT);
-        let hints = key_line(ctx.keys().hint(views::WORKSPACES_BROWSE, HINT), ctx.theme);
+        let hints = self.browse_hints(ctx);
         if let Some(list) = areas.list.filter(|rect| !rect.is_empty()) {
             let focus = ctx.pane_focus(PaneId::List);
             self.render_list(frame, list, focus, hints.as_ref(), ctx);
@@ -723,10 +1165,21 @@ impl Tab for WorkspacesTab {
             let focus = ctx.pane_focus(PaneId::Detail);
             self.render_detail(frame, areas.detail, focus, hints.as_ref(), ctx);
         }
+        self.render_question(frame, area, ctx);
     }
 
+    /// [`views::WORKSPACES_CONFIRM`] while a question is up (D6), else the browse stack.
     fn key_stack(&self) -> Option<Stack<'static>> {
-        Some(views::WORKSPACES_BROWSE)
+        Some(if self.question.is_some() {
+            views::WORKSPACES_CONFIRM
+        } else {
+            views::WORKSPACES_BROWSE
+        })
+    }
+
+    /// The about panel labels the browse keys whatever is up.
+    fn browse_stack(&self) -> Stack<'static> {
+        views::WORKSPACES_BROWSE
     }
 
     /// D7: once a second while in front, a moved counts row reads the overview again, and a

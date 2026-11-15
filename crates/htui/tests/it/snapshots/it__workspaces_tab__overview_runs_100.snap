@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_tab.rs
+expression: frame
+---
+Graphics   ¹Workspaces          0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ Platform ─────────────────────────── overview ╮
+│ ▾ Graphics  ● open                             ││◌ stopping…                                     │
+│     overview                                   ││                                                │
+│     Vulkan Tutorials                           ││folder on this box  /srv/platform               │
+│▌▾ Platform  ◌ stopping…                        ││default target      inherits the Settings       │
+│     overview                                   ││                    default (this box)          │
+│     htui                                       ││held runs           2                           │
+│     agy                                        ││                                                │
+│                                                ││Runs                                            │
+│                                                ││FEAT-3  queued                                  │
+│                                                ││  starts when the workspace is resumed          │
+│                                                ││FEAT-1  running                                 │
+│                                                ││  stops before its next step                    │
+│                                                ││TOOL-1  awaiting approval                       │
+│                                                ││  its gate can be answered once resumed         │
+│                                                ││                                                │
+│                                                ││The agent platform and its driver               │
+│                                                ││                                                │
+│                                                ││Goals                                           │
+│                                                ││no goals yet                                    │
+│                                                ││                                                │
+│                                                ││Projects                                        │
+│                                                ││htui  no repos yet                              │
+│                                                ││  8 items · 1 running · 2 waiting               │
+│                                                ││agy   no repos yet                              │
+│                                                ││  3 items · 0 running · 0 waiting               │
+│                                                ││                                                │
+│                                                ││                                                │
+╰─o open · s force stop · r resume · j/k move …──╯╰────────────────────────────────────────────────╯

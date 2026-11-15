@@ -704,3 +704,499 @@ async fn folding_from_a_child_row_hides_the_group_s_rows() {
     );
     insta::assert_snapshot!("folded_100", frame);
 }
+
+/// MOD-116 M2: the cursor onto Platform's group row (Graphics, overview, Vulkan Tutorials,
+/// Platform), its overview read.
+async fn onto_platform(harness: &mut Harness) {
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.settle().await;
+    assert!(
+        selected(&harness.render()).contains("\u{25be} Platform"),
+        "the cursor is on Platform"
+    );
+}
+
+/// The text of the kit box titled `title`: its content rows between its borders, each trimmed,
+/// joined by one space, so a sentence the box wrapped reads whole again.
+fn boxed(frame: &str, title: &str) -> String {
+    let rows: Vec<Vec<char>> = frame.lines().map(|line| line.chars().collect()).collect();
+    let top = rows
+        .iter()
+        .position(|row| row.iter().collect::<String>().contains(title))
+        .unwrap_or_else(|| panic!("no box titled `{title}`:\n{frame}"));
+    let at = rows[top]
+        .iter()
+        .collect::<String>()
+        .find(title)
+        .map(|byte| {
+            frame.lines().nth(top).unwrap_or_default()[..byte]
+                .chars()
+                .count()
+        })
+        .unwrap_or_default();
+    let left = rows[top][..at]
+        .iter()
+        .rposition(|cell| *cell == '\u{256d}')
+        .unwrap_or_else(|| panic!("no corner left of `{title}`:\n{frame}"));
+    let right = rows[top][at..]
+        .iter()
+        .position(|cell| *cell == '\u{256e}')
+        .map(|offset| at + offset)
+        .unwrap_or_else(|| panic!("no corner right of `{title}`:\n{frame}"));
+    let mut words = Vec::new();
+    for row in &rows[top + 1..] {
+        if row.get(left) == Some(&'\u{2570}') {
+            break;
+        }
+        let content: String = row
+            .get(left + 1..right)
+            .unwrap_or_default()
+            .iter()
+            .collect();
+        words.extend(content.split_whitespace().map(str::to_owned));
+    }
+    words.join(" ")
+}
+
+/// `workspace`'s stop row's mode, if any.
+async fn stop_of(store: &MemStore, workspace: htui_core::model::WorkspaceId) -> Option<StopMode> {
+    store
+        .workspace_stop(workspace)
+        .await
+        .expect("the stop row is read")
+        .map(|row| row.mode)
+}
+
+/// A stop of `mode` written on `workspace` straight into the store.
+async fn stop_directly(store: &MemStore, workspace: htui_core::model::WorkspaceId, mode: StopMode) {
+    store
+        .stop_workspace(workspace, mode, ids::USER, Utc::now())
+        .await
+        .expect("the stop is written");
+}
+
+/// The hint row of the focused pane (the list's bottom border).
+fn hint_row(frame: &str) -> String {
+    row_with(frame, "o open")
+}
+
+/// MOD-116 M2 D6: `s` on Platform asks to stop its runs gracefully, listing every live run with
+/// what the stop does to it: the parity metric is `stop_report::report` over the same store.
+#[tokio::test]
+async fn s_asks_to_stop_the_runs_listing_each() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    onto_platform(&mut harness).await;
+    harness.key("s");
+    harness.settle().await;
+    let frame = harness.render();
+    let text = boxed(&frame, "Stop the runs in Platform?");
+    assert!(
+        text.starts_with(
+            "Each agent step stops at its turn boundary, checks stop at once; nothing new starts \
+             until it is resumed."
+        ),
+        "{text}"
+    );
+    let agents = store.agents().await.expect("the agents are read");
+    let names = htui::stop_report::agent_names(&agents);
+    let caps = htui::stop_report::caps_map(agents);
+    let report =
+        htui::stop_report::report(&store, &caps, &names, ids::WORKSPACE_PLATFORM, "platform")
+            .await
+            .expect("the report is read");
+    let live: Vec<_> = report
+        .lines
+        .iter()
+        .filter(|line| {
+            matches!(
+                line.status,
+                RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingApproval
+            )
+        })
+        .collect();
+    assert_eq!(live.len(), 3, "{report:?}");
+    for line in live {
+        assert!(
+            text.contains(&format!("{}  {}", line.item, line.status_words()).replace("  ", " ")),
+            "{} in {text}",
+            line.item
+        );
+        for fate in line.under(StopMode::Graceful) {
+            assert!(text.contains(&fate), "{fate} in {text}");
+        }
+    }
+    assert_eq!(stop_of(&store, ids::WORKSPACE_PLATFORM).await, None);
+    assert_eq!(harness.app().status, None);
+    insta::assert_snapshot!("stop_question_100", frame);
+}
+
+/// D6: `y` writes a graceful stop as this user, and the state moves at once; `Enter` answers
+/// the same.
+#[tokio::test]
+async fn confirming_writes_a_graceful_stop_and_the_state_moves() {
+    for answer in ["y", "enter"] {
+        let store = demo().await;
+        let mut harness = open_over(store.clone(), 100, 30).await;
+        onto_platform(&mut harness).await;
+        harness.key("s");
+        harness.settle().await;
+        harness.key(answer);
+        harness.settle().await;
+        let row = store
+            .workspace_stop(ids::WORKSPACE_PLATFORM)
+            .await
+            .expect("the stop row is read")
+            .unwrap_or_else(|| panic!("{answer} wrote a stop"));
+        assert_eq!(row.mode, StopMode::Graceful, "{answer}");
+        assert_eq!(row.requested_by, ids::USER, "{answer}");
+        let frame = harness.render();
+        assert!(!frame.contains("Stop the runs in"), "{answer}: {frame}");
+        assert!(
+            group(&frame, "Platform").contains("\u{25cc} stopping\u{2026}"),
+            "{answer}: {frame}"
+        );
+        assert_eq!(harness.app().status, None);
+    }
+}
+
+/// D6: `Esc` closes the question and writes nothing.
+#[tokio::test]
+async fn esc_on_the_stop_question_writes_nothing() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    onto_platform(&mut harness).await;
+    harness.key("s");
+    harness.settle().await;
+    harness.key("j");
+    harness.settle().await;
+    assert!(
+        harness.render().contains("Stop the runs in Platform?"),
+        "a list key does not close it"
+    );
+    harness.key("esc");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(!frame.contains("Stop the runs in"), "{frame}");
+    assert!(
+        selected(&frame).contains("\u{25be} Platform"),
+        "`j` under the question moved nothing: {frame}"
+    );
+    assert_eq!(stop_of(&store, ids::WORKSPACE_PLATFORM).await, None);
+}
+
+/// D6: `s` on a stopping workspace asks to force it; `Esc` keeps the graceful stop, `y` forces.
+#[tokio::test]
+async fn s_on_a_stopping_workspace_asks_to_force_and_esc_keeps_the_graceful_stop() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    stop_directly(&store, ids::WORKSPACE_PLATFORM, StopMode::Graceful).await;
+    refresh(&mut harness).await;
+    onto_platform(&mut harness).await;
+    harness.key("s");
+    harness.settle().await;
+    let frame = harness.render();
+    let text = boxed(&frame, "Stop the runs in Platform now?");
+    assert!(
+        text.starts_with(
+            "Every step still running is killed mid-turn and redoes its turn on resume."
+        ),
+        "{text}"
+    );
+    assert!(text.contains("keep the graceful stop") || frame.contains("keep the graceful stop"));
+    insta::assert_snapshot!("force_question_100", frame);
+
+    harness.key("esc");
+    harness.settle().await;
+    assert_eq!(
+        stop_of(&store, ids::WORKSPACE_PLATFORM).await,
+        Some(StopMode::Graceful)
+    );
+
+    harness.key("s");
+    harness.settle().await;
+    harness.key("y");
+    harness.settle().await;
+    assert_eq!(
+        stop_of(&store, ids::WORKSPACE_PLATFORM).await,
+        Some(StopMode::Forced)
+    );
+}
+
+/// D6: `s` on Graphics, whose one run is stopped already, says nothing is running and writes no
+/// stop row.
+#[tokio::test]
+async fn nothing_running_says_so_and_writes_nothing() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    harness.key("s");
+    harness.settle().await;
+    let frame = harness.render();
+    assert_eq!(boxed(&frame, "Stop runs"), "Nothing is running in Graphics");
+    insta::assert_snapshot!("nothing_running_100", frame);
+    harness.key("y");
+    harness.settle().await;
+    assert!(!harness.render().contains("Nothing is running"));
+    assert_eq!(stop_of(&store, ids::WORKSPACE_GRAPHICS).await, None);
+}
+
+/// D6: `s` on a forced stop says it is already stopped.
+#[tokio::test]
+async fn a_forced_workspace_is_already_stopped() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    stop_directly(&store, ids::WORKSPACE_PLATFORM, StopMode::Forced).await;
+    refresh(&mut harness).await;
+    onto_platform(&mut harness).await;
+    harness.key("s");
+    harness.settle().await;
+    let frame = harness.render();
+    assert_eq!(
+        boxed(&frame, "Stop runs"),
+        "Platform is already stopped (forced)"
+    );
+    harness.key("esc");
+    harness.settle().await;
+    assert!(!harness.render().contains("already stopped"));
+}
+
+/// D6: `r` on a stopped workspace asks, listing every run with how it resumes; `y` deletes the
+/// stop row and Platform reads background again.
+#[tokio::test]
+async fn r_asks_then_resumes() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    stop_directly(&store, ids::WORKSPACE_PLATFORM, StopMode::Graceful).await;
+    refresh(&mut harness).await;
+    onto_platform(&mut harness).await;
+    harness.key("r");
+    harness.settle().await;
+    let frame = harness.render();
+    let text = boxed(&frame, "Resume Platform?");
+    assert!(
+        text.starts_with(
+            "Its stopped runs resume on the boxes that ran them and its queued runs can start."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("starts when the workspace is resumed"),
+        "{text}"
+    );
+    insta::assert_snapshot!("resume_question_100", frame);
+    harness.key("y");
+    harness.settle().await;
+    assert_eq!(stop_of(&store, ids::WORKSPACE_PLATFORM).await, None);
+    let frame = harness.render();
+    assert!(
+        group(&frame, "Platform").contains("\u{25d0} background"),
+        "{frame}"
+    );
+}
+
+/// D6: `r` on a workspace with no stop row says so.
+#[tokio::test]
+async fn r_on_a_workspace_not_stopped_says_so() {
+    let mut harness = open_over(demo().await, 100, 30).await;
+    onto_platform(&mut harness).await;
+    harness.key("r");
+    harness.settle().await;
+    assert_eq!(
+        boxed(&harness.render(), "Resume runs"),
+        "Platform is not stopped"
+    );
+}
+
+/// D3/D6: a stop written by someone else while the question is up: `y` writes nothing, and the
+/// box says so; the row is theirs.
+#[tokio::test]
+async fn a_stop_changed_while_asking_is_refused_and_said() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    onto_platform(&mut harness).await;
+    harness.key("s");
+    harness.settle().await;
+    stop_directly(&store, ids::WORKSPACE_PLATFORM, StopMode::Forced).await;
+    harness.key("y");
+    harness.settle().await;
+    assert_eq!(
+        boxed(&harness.render(), "Stop runs"),
+        "The stop of Platform changed while asking; nothing was stopped. Press s again."
+    );
+    assert_eq!(
+        stop_of(&store, ids::WORKSPACE_PLATFORM).await,
+        Some(StopMode::Forced)
+    );
+    assert_eq!(harness.app().status, None);
+}
+
+/// D6: a stop whose overview read is refused (offline) says it needs the database, in the box,
+/// not on the status line.
+#[tokio::test]
+async fn offline_the_stop_says_it_needs_the_database() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    onto_platform(&mut harness).await;
+    harness.key("s");
+    harness
+        .settle_refusing("workspace_overview", "the database is unreachable")
+        .await;
+    assert_eq!(
+        boxed(&harness.render(), "Stop runs"),
+        "Stopping needs the database: the database is unreachable"
+    );
+    assert_eq!(harness.app().status, None);
+    assert_eq!(stop_of(&store, ids::WORKSPACE_PLATFORM).await, None);
+}
+
+/// R-ORCH-16, D7: the open workspace stops too, and reads `open` with its stop after its counts.
+#[tokio::test]
+async fn the_open_workspace_stops_too_and_reads_open_stopping() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    onto_platform(&mut harness).await;
+    harness.key("o");
+    harness.settle().await;
+    harness.key("s");
+    harness.settle().await;
+    harness.key("y");
+    harness.settle().await;
+    assert_eq!(
+        stop_of(&store, ids::WORKSPACE_PLATFORM).await,
+        Some(StopMode::Graceful)
+    );
+    let frame = harness.render();
+    assert!(
+        group(&frame, "Platform")
+            .contains("\u{25cf} open \u{b7} 1 running \u{b7} stopping\u{2026}"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("open_stopping_100", frame);
+}
+
+/// D5: the overview lists the workspace's runs and what the stop does to each.
+#[tokio::test]
+async fn the_overview_lists_the_runs_and_how_each_resumes() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    stop_directly(&store, ids::WORKSPACE_PLATFORM, StopMode::Graceful).await;
+    refresh(&mut harness).await;
+    onto_platform(&mut harness).await;
+    let frame = harness.render();
+    assert!(frame.contains("\u{2502}Runs "), "{frame}");
+    assert!(
+        frame.contains("starts when the workspace is resumed"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("its gate can be answered once resumed"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("overview_runs_100", frame);
+}
+
+/// D8: the hint row offers what the selected workspace's state allows.
+#[tokio::test]
+async fn the_hints_follow_the_state() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    onto_platform(&mut harness).await;
+    let hints = hint_row(&harness.render());
+    assert!(
+        hints.contains("s stop") && !hints.contains("r resume"),
+        "{hints}"
+    );
+
+    stop_directly(&store, ids::WORKSPACE_PLATFORM, StopMode::Graceful).await;
+    refresh(&mut harness).await;
+    let hints = hint_row(&harness.render());
+    assert!(
+        hints.contains("s force stop") && hints.contains("r resume"),
+        "{hints}"
+    );
+
+    store
+        .finish_run(ids::RUN_4, RunStatus::Done, None, Utc::now())
+        .await
+        .expect("RUN_4 finishes");
+    refresh(&mut harness).await;
+    let hints = hint_row(&harness.render());
+    assert!(
+        hints.contains("r resume") && !hints.contains("s "),
+        "{hints}"
+    );
+
+    for _ in 0..3 {
+        harness.key("k");
+    }
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(selected(&frame).contains("\u{25be} Graphics"), "{frame}");
+    let hints = hint_row(&frame);
+    assert!(
+        !hints.contains("s stop") && !hints.contains("r resume"),
+        "{hints}"
+    );
+}
+
+/// D7 (fact-check): offline a workspace that is not open shows no state in its detail, no Runs
+/// section and M1's hints; back online they return.
+#[tokio::test]
+async fn offline_a_non_open_workspace_s_detail_shows_no_state() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    stop_directly(&store, ids::WORKSPACE_PLATFORM, StopMode::Graceful).await;
+    refresh(&mut harness).await;
+    onto_platform(&mut harness).await;
+    let frame = harness.render();
+    assert!(frame.contains("\u{2502}Runs "), "{frame}");
+    assert!(frame.contains("stopping"), "{frame}");
+    assert!(hint_row(&frame).contains("r resume"), "{frame}");
+
+    harness.app().top_bar.store = "offline \u{b7} 0s".to_owned();
+    let frame = harness.render();
+    for absent in [
+        "\u{25d0}",
+        "\u{25cc}",
+        "\u{25cb}",
+        "background",
+        "stopping",
+        "\u{2502}Runs ",
+    ] {
+        assert!(!frame.contains(absent), "{absent}: {frame}");
+    }
+    assert!(frame.contains("folder on this box"), "{frame}");
+    assert!(!hint_row(&frame).contains("r resume"), "{frame}");
+
+    harness.app().top_bar.store = "memory".to_owned();
+    let frame = harness.render();
+    assert!(frame.contains("\u{2502}Runs "), "{frame}");
+    assert!(frame.contains("stopping"), "{frame}");
+    assert!(hint_row(&frame).contains("r resume"), "{frame}");
+}
+
+/// D7 (fact-check): offline the open workspace's detail reads `● open` alone: no stop
+/// annotation, no Runs section.
+#[tokio::test]
+async fn offline_the_open_workspace_s_detail_reads_open_only() {
+    let store = demo().await;
+    let mut harness = open_over(store.clone(), 100, 30).await;
+    stop_directly(&store, ids::WORKSPACE_GRAPHICS, StopMode::Graceful).await;
+    // One refresh reads the counts, the next one sees the row moved and reads the overview.
+    refresh(&mut harness).await;
+    refresh(&mut harness).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{2502}\u{25cf} open \u{b7} stopped \u{b7} 1 held"),
+        "{frame}"
+    );
+    assert!(frame.contains("\u{2502}Runs "), "{frame}");
+
+    harness.app().top_bar.store = "offline \u{b7} 0s".to_owned();
+    let frame = harness.render();
+    assert!(frame.contains("\u{2502}\u{25cf} open"), "{frame}");
+    assert!(!frame.contains("stopped"), "{frame}");
+    assert!(!frame.contains("\u{2502}Runs "), "{frame}");
+}

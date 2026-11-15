@@ -12,6 +12,11 @@ Graphics   ¹Workspaces     0 working · 0 waiting · memory ·  F9  about   ?  
 │     htui                             ││                    (this box)        │
 │     agy                              ││held runs           1                 │
 │                                      ││                                      │
+│                                      ││Runs                                  │
+│                                      ││FEAT-1  stopped, no box               │
+│                                      ││  cannot be resumed: cancel it from   │
+│                                      ││  the Runs pane                       │
+│                                      ││                                      │
 │                                      ││Rendering experiments                 │
 │                                      ││                                      │
 │                                      ││Goals                                 │
@@ -20,9 +25,4 @@ Graphics   ¹Workspaces     0 working · 0 waiting · memory ·  F9  about   ?  
 │                                      ││Projects                              │
 │                                      ││Vulkan Tutorials  no repos yet        │
 │                                      ││  2 items · 0 running · 0 waiting     │
-│                                      ││                                      │
-│                                      ││                                      │
-│                                      ││                                      │
-│                                      ││                                      │
-│                                      ││                                      │
 ╰─o open · j/k move · Enter fold───────╯╰──────────────────────────────────────╯

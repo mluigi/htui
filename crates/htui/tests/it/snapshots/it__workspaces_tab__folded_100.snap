@@ -11,6 +11,11 @@ Graphics   ¹Workspaces          0 working · 0 waiting · memory · DESKTOP-HTU
 │     agy                                        ││                    default (this box)          │
 │                                                ││held runs           1                           │
 │                                                ││                                                │
+│                                                ││Runs                                            │
+│                                                ││FEAT-1  stopped, no box                         │
+│                                                ││  cannot be resumed: cancel it from the Runs    │
+│                                                ││  pane                                          │
+│                                                ││                                                │
 │                                                ││Rendering experiments                           │
 │                                                ││                                                │
 │                                                ││Goals                                           │
@@ -19,11 +24,6 @@ Graphics   ¹Workspaces          0 working · 0 waiting · memory · DESKTOP-HTU
 │                                                ││Projects                                        │
 │                                                ││Vulkan Tutorials  no repos yet                  │
 │                                                ││  2 items · 0 running · 0 waiting               │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
 │                                                ││                                                │
 │                                                ││                                                │
 │                                                ││                                                │

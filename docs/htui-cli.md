@@ -2,8 +2,9 @@
 
 Three commands let a script, a status bar or another tool read htui's state without starting the
 TUI, and two more stop and resume a workspace's runs from a shell (see
-[Stopping and resuming a workspace](#stopping-and-resuming-a-workspace)). Each of the three
-reading commands reads, prints one answer and exits:
+[Stopping and resuming a workspace](#stopping-and-resuming-a-workspace)); the Workspaces tab's `s`
+and `r` do the same from the TUI. Each of the three reading commands reads, prints one answer and
+exits:
 
 - `htui status` prints the top bar's facts: the store's state, the workspace, this box, and how
   many runs are working and how many rows wait on you.
