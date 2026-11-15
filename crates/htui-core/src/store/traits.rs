@@ -1568,13 +1568,15 @@ pub trait WriteStore: ReadStore {
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
     ///
     /// The decision order: `NotFound` for the run, then the box; [`Claim::NotClaimable`] when the
-    /// run is not `queued` or its `target_box_id` is not `box_id`; then
+    /// run is not `queued` or is not driven by `box_id`, its driver being
+    /// `COALESCE(executing_box_id, target_box_id)` (MOD-130 M3, D8, P4); then
     /// [`Claim::WorkspaceStopped`] when the run's `workspace_id` names a workspace with a
     /// `workspace_stop` row (MOD-125 D5; nothing written, the run stays `queued`; a run with no
-    /// workspace is never gated); [`Claim::MissingTags`] when the run's item requires a tag in neither the box's `probed_tags` nor its `declared_tags`
-    /// (`R-ORCH-10`, MOD-7 milestone 3 D80, D81: exact bytes, the missing tags in byte order and
-    /// deduplicated; a run with no item has none); [`Claim::SlotFull`] when the box already runs
-    /// its limit of **`running`** runs
+    /// workspace is never gated); [`Claim::MissingTags`] when the run's item requires a tag in
+    /// neither the `probed_tags` nor the `declared_tags` of the run's target box, the box the work
+    /// runs on (`R-ORCH-10`, MOD-7 milestone 3 D80, D81, MOD-130 M3 D9: exact bytes, the missing
+    /// tags in byte order and deduplicated; a run with no item has none); [`Claim::SlotFull`] when
+    /// the claiming box (the driver) already runs its limit of **`running`** runs
     /// ([`BoxSettings::max_concurrent_items`](crate::model::BoxSettings::max_concurrent_items),
     /// else `app_setting`, else
     /// [`DEFAULT_MAX_CONCURRENT_ITEMS`](crate::model::DEFAULT_MAX_CONCURRENT_ITEMS)); then

@@ -6978,7 +6978,8 @@ impl State {
                 id: box_id.to_string(),
             });
         }
-        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
+        // MOD-130 M3 (D8, P4): a run is claimable by the box that drives it, not by its target box.
+        if claimed.status != RunStatus::Queued || claimed.driver() != box_id {
             return Ok(Claim::NotClaimable);
         }
         // MOD-125 D5: after claimability, before the tags, so a stopped workspace never fails a run.
@@ -6992,11 +6993,12 @@ impl State {
         // and the overlap, so a permanent refusal wins over a transient one. A run whose item row
         // is absent has no tags to check, as the Postgres join finds none (D94). A chat run is not
         // such a run: `start_chat_run` inserts at `running`, so it is `NotClaimable` at the status
-        // half above and never reaches this check (MOD-58).
+        // half above and never reaches this check (MOD-58). The tags are the run's target box's,
+        // the box the work runs on, not the driver's (MOD-130 M3, D9, P4).
         let missing = claimed
             .item_id
             .and_then(|item| self.items.get(&item))
-            .map(|row| self.missing_for(&row.required_tags, box_id))
+            .map(|row| self.missing_for(&row.required_tags, claimed.target_box_id))
             .unwrap_or_default();
         if !missing.is_empty() {
             if let Some(row) = self.runs.get_mut(&run) {

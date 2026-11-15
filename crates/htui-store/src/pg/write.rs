@@ -8081,15 +8081,18 @@ impl WriteStore for PgStore {
     /// right after `NotClaimable` under a `FOR SHARE` on the `workspace_stop` row, included),
     /// except [`Claim::MissingTags`]: the run is failed
     /// and its item blocked in this same transaction, which is then committed (MOD-7 milestone 3,
-    /// D80). The run row and the box row are both locked `FOR UPDATE` before the tag read, so a
-    /// concurrent `record_box_probe` or `edit_box` waits for the decision and the check cannot
-    /// race a re-probe.
+    /// D80). The run row and the claiming box's row are both locked `FOR UPDATE`, and the run's
+    /// target box row, the box whose tags are read, `FOR SHARE` when it is another box (MOD-130
+    /// M3, P4, fact-check C24: the driver first, then its child), all before the tag read, so a
+    /// concurrent `record_box_probe` or `edit_box` of either box waits for the decision and the
+    /// check cannot race a re-probe.
     ///
     /// The item row is **not** locked. A concurrent `update_item` of `required_tags` is ordered
     /// after the claim: the claim decides on the tags it read, the same end state `MemStore`
     /// reaches when the edit lands just after it. No lock, because `create_run` locks the item
-    /// and then the box (through `run.target_box_id`'s foreign key); an item lock taken here after
-    /// the box lock would take the two in the opposite order and could deadlock.
+    /// and then the boxes (through the foreign keys of `run.target_box_id` and
+    /// `run.executing_box_id`); an item lock taken here after the box locks would take them in
+    /// the opposite order and could deadlock.
     async fn claim_run(
         &self,
         run: RunId,
@@ -8103,9 +8106,10 @@ impl WriteStore for PgStore {
 
         let claimed = sqlx::query!(
             r#"
-            SELECT status         AS "status: RunStatus",
-                   target_box_id  AS "target_box_id: BoxId",
-                   workspace_id   AS "workspace_id: WorkspaceId",
+            SELECT status           AS "status: RunStatus",
+                   target_box_id    AS "target_box_id: BoxId",
+                   executing_box_id AS "executing_box_id: BoxId",
+                   workspace_id     AS "workspace_id: WorkspaceId",
                    repo_scope     AS "repo_scope: Vec<RepoId>",
                    graph_snapshot
               FROM run WHERE id = $1 FOR UPDATE
@@ -8132,11 +8136,28 @@ impl WriteStore for PgStore {
             id: box_id.to_string(),
         })?;
 
-        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
+        // MOD-130 M3 (D8, P4): the driver claims, `COALESCE(executing_box_id, target_box_id)`.
+        if claimed.status != RunStatus::Queued
+            || claimed.executing_box_id.unwrap_or(claimed.target_box_id) != box_id
+        {
             return Ok(Claim::NotClaimable);
         }
 
-        // MOD-125 D5: run, then box, then the stop row. resume_workspace locks only workspace_stop;
+        // MOD-130 M3 (P4, fact-check C24): the box the work runs on is read `FOR SHARE` when it is
+        // not the claiming box, after the claiming box (parent before child for a container run)
+        // and before the tag read, so its re-probe or tag edit waits for this decision. A local
+        // run takes no extra lock. No box writer locks a child row before its parent's.
+        if claimed.target_box_id != box_id {
+            sqlx::query_scalar!(
+                r#"SELECT 1 AS "one!" FROM box WHERE id = $1 FOR SHARE"#,
+                claimed.target_box_id.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        // MOD-125 D5: run, then box (and the target box, above), then the stop row. resume_workspace locks only workspace_stop;
         // stop_workspace also takes FOR KEY SHARE on workspace and app_user through its foreign
         // keys, neither of which a claim locks; delete_workspace locks run rows before the stop
         // row, the claim's own order. So no cycle. FOR SHARE makes a racing resume (DELETE) or
@@ -8159,19 +8180,20 @@ impl WriteStore for PgStore {
         // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): inside the admission transaction,
         // after claimability and before the slot and the overlap. The shipped read's form
         // (`pg/read.rs`'s `missing_tags`), joined through the run; a chat run joins no item and is
-        // never refused.
+        // never refused. The tags are the run's target box's, the box the work runs on, not the
+        // driver's (MOD-130 M3, D9, P4).
         let missing = sqlx::query_scalar!(
             r#"
             SELECT DISTINCT t COLLATE "C" AS "tag!"
               FROM run r
               JOIN item i ON i.id = r.item_id
-             CROSS JOIN box b, UNNEST(i.required_tags) t
-             WHERE r.id = $1 AND b.id = $2
+              JOIN box b ON b.id = r.target_box_id
+             CROSS JOIN UNNEST(i.required_tags) t
+             WHERE r.id = $1
                AND t <> ALL (b.probed_tags || b.declared_tags)
              ORDER BY 1
             "#,
             run.as_uuid(),
-            box_id.as_uuid(),
         )
         .fetch_all(&mut *tx)
         .await
