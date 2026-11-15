@@ -2418,8 +2418,9 @@ async fn two_boxes_with_one_hostname_carry_their_id_suffix() {
     });
 }
 
-/// The demo world plus a container box `docker-here` on the fixture box, and a second machine
-/// `SECOND-BOX` whose id sorts before it: the store lists the machine first, the container after.
+/// The demo world plus a container box `docker-here` on the fixture box. The container's id
+/// (`from_u128(1)`) sorts before the machine's, so the store lists the container first and only
+/// `tree_order` puts it under its parent.
 fn parent_and_container() -> MemStore {
     let mut data = demo_data();
     let fixture = data

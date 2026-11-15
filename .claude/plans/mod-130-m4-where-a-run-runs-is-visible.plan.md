@@ -48,7 +48,7 @@ Every task's brief carries this section.
 - **P1 — when the target line shows.** `target_line(run, theme)` returns a line only when
   `run.target_id` is `Some` **and** not (`target_id == LOCAL_TARGET_ID` **and** `target_source == Default`). So:
   a chat run, a run queued before M2, and every plain local run read exactly as today (no snapshot of them moves);
-  a local run a level *pinned* reads `runs on local · from project`; a child-box run reads
+  a local run a level *pinned* reads `runs on this box · from project` (the seeded local target is named `this box`, `seed::LOCAL_TARGET_NAME`); a child-box run reads
   `runs on docker-here · from item`. Text: `runs on {name} · from {source}` with `{source}` =
   `TargetSource::as_str()` (`item`, `workflow`, `project`, `workspace`, `settings`, `default`), clipped to `PANE`
   (43 cells) by `cells::fit` like the lines around it. The separator is the middle dot `\u{b7}` the Boxes pane
