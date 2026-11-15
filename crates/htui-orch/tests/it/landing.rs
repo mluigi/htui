@@ -19,6 +19,7 @@ use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteSto
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer};
 use htui_orch::fake::{FakeOrchestrator, IsolatorCall, ScriptedStep};
 use htui_orch::graph::ResolveError;
+use htui_orch::isolate::real::no_run_branch;
 use htui_orch::isolate::{Clock as _, IsolateError};
 
 /// The remote every `push` repo of this file names, with a credential in it.
@@ -874,6 +875,52 @@ async fn a_pull_request_run_settles_pushed_and_the_sweep_leaves_it() {
         "a pushed record is not taken again"
     );
     assert_eq!(orch.isolator.land_requests().len(), 1);
+}
+
+/// D5: a `pending` `pull_request` record whose run's snapshot names no run branch (here edited
+/// out after a landing failed) is never pushed as M1's target branch: the pass settles it
+/// `refused` (`no_run_branch`) and notes it, so it waits in Unblock rather than silently.
+#[tokio::test]
+async fn a_pull_request_record_without_a_run_branch_is_refused() {
+    let orch = harness(&[]).await;
+    let repo = repo(&orch, Some(REMOTE), Some(IntegrateMode::PullRequest)).await;
+    orch.isolator.fail_land(IsolateError::Git(
+        "git push timed out after 120s".to_owned(),
+    ));
+    let (run, rest) = started(&orch, repo).await;
+    assert_eq!(rest, RunStatus::Done);
+    assert_eq!(orch.isolator.land_requests().len(), 1);
+
+    let mut snapshot = orch.run(run).await.graph_snapshot.expect("a graph run");
+    let entry = snapshot["integrate"][repo.to_string()]
+        .as_object_mut()
+        .expect("the snapshot freezes the repo's integrate entry");
+    assert!(entry.remove("run_branch").is_some(), "{entry:?}");
+    assert!(orch.store.set_run_snapshot(run, snapshot));
+
+    assert_eq!(orch.land(Some(run)).await.expect("the pass runs"), 1);
+    assert_eq!(
+        orch.isolator.land_requests().len(),
+        1,
+        "the isolator is not asked"
+    );
+    let reason = no_run_branch("(none in the run's snapshot)");
+    let records = orch
+        .store
+        .integrations(run)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(
+        (records[0].state, records[0].refusal.as_deref()),
+        (IntegrationState::Refused, Some(reason.as_str()))
+    );
+    assert_eq!(
+        integration_notes(&orch).await,
+        [format!(
+            "integration refused for repo `htui` (pull_request to main): {reason}; the run's \
+             work has not landed"
+        )]
+    );
 }
 
 /// A fresh `FEAT` item of the HTUI project, `blocked_by` `FEAT-3`. The link is proposed by a step

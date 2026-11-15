@@ -3897,7 +3897,9 @@ where
     /// the next sweep retries it), is logged, and the loop goes on; F2 M1: the pass's later
     /// records for the same remote are skipped (they stay `pending`, and this owner takes them
     /// again next pass), so a remote that does not answer costs one verb budget a pass, not one
-    /// per record. Answers how many records were settled.
+    /// per record. MOD-133 M3 D5: a `pull_request` record whose run's snapshot names no run
+    /// branch is never landed on its target: it is settled refused (`real::no_run_branch`)
+    /// without asking the isolator. Answers how many records were settled.
     ///
     /// # Errors
     /// The store's own.
@@ -3918,11 +3920,8 @@ where
                 continue;
             };
             let run_branch = reads.run_branches.get(&record.repo_id).cloned();
-            if record.mode == htui_core::model::IntegrateMode::PullRequest && run_branch.is_none() {
-                // MOD-133 M3 D5: never M1's push of the target branch for a pull request.
-                tracing::warn!(run = %record.run_id, repo = %record.repo_id, "the run's snapshot names no run branch for this pull_request record; it stays pending");
-                continue;
-            }
+            let unbranched =
+                record.mode == htui_core::model::IntegrateMode::PullRequest && run_branch.is_none();
             let request = LandRequest {
                 repo: record.repo_id,
                 remote: record.remote.clone(),
@@ -3930,12 +3929,21 @@ where
                 commits: land::landed_commits(&reads.steps, &reads.commits, record.repo_id),
                 run_branch,
             };
-            let outcome = match self.parts.isolator.land(&request).await {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    tracing::warn!(run = %record.run_id, repo = %record.repo_id, %err, "landing failed; the integration record, and this pass's later ones for the same remote, stay pending for the next sweep");
-                    unreachable.insert(record.remote.clone());
-                    continue;
+            let outcome = if unbranched {
+                // MOD-133 M3 D5: never M1's push of the target branch for a pull request; the
+                // record is refused, so it waits for a human in Unblock rather than silently.
+                tracing::warn!(run = %record.run_id, repo = %record.repo_id, "the run's snapshot names no run branch for this pull_request record; it is refused");
+                LandOutcome::Refused {
+                    reason: crate::isolate::real::no_run_branch("(none in the run's snapshot)"),
+                }
+            } else {
+                match self.parts.isolator.land(&request).await {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        tracing::warn!(run = %record.run_id, repo = %record.repo_id, %err, "landing failed; the integration record, and this pass's later ones for the same remote, stay pending for the next sweep");
+                        unreachable.insert(record.remote.clone());
+                        continue;
+                    }
                 }
             };
             if !self
@@ -3984,8 +3992,8 @@ where
 
     /// MOD-133 D9: what landing reads of one run: its item, its steps and their commit rows (as
     /// [`Self::close_out_reads`] reads them), and (M3 D5) its snapshot's run branches. A snapshot
-    /// that does not decode is warned and read as naming none, which leaves the run's
-    /// `pull_request` records `pending` rather than failing the pass.
+    /// that does not decode is warned and read as naming none, which refuses the run's
+    /// `pull_request` records ([`Self::land_taken`]) rather than failing the pass.
     async fn land_reads(&self, run: RunId) -> Result<LandReads, EngineError> {
         let row = self.run(run).await?;
         let run_branches = match Self::snapshot_of(&row) {
