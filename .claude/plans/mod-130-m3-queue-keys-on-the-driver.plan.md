@@ -10,11 +10,12 @@ seam. It re-keys four existing reads and one writer, and moves two checks to ano
 
 ## Open questions
 
-Neither question blocks M3. For every target this build can run (`local` only, D1), both answers behave
-the same. The plan goes ahead on the stated default. The maintainer may overrule either one, and Q1's
-alternative costs one line plus the pins listed under it.
+**Both resolved by the maintainer, 2026-11-15**, each on the stated default: Q1 confirms P1, Q2 confirms
+P8. The text below is kept as the record of what was asked.
 
-- **Q1 — Does a queued `local` run carry `executing_box_id = here` (D8 read literally), or `NULL`?**
+- **Q1 (resolved 2026-11-15: keep `NULL` for local; P1 stands as written: `executing_box_id` is written
+  at enqueue only when the work runs on a box other than the driver, and never for `enrolled`) — Does a
+  queued `local` run carry `executing_box_id = here` (D8 read literally), or `NULL`?**
   D8 says `enqueue` writes the driving box "for every kind but `enrolled`". The fixed constraint says "a
   run on the seeded local target is byte-for-byte today's run". The first risk row says "existing claim,
   worker and queue tests stay unedited except counts". These cannot all hold literally, because a queued
@@ -27,8 +28,9 @@ alternative costs one line plus the pins listed under it.
   - every engine-test assertion that a queued or failed-at-claim run has `executing_box_id == None`;
   - the `htui stop` report's `on_box` for queued runs (`crates/htui/src/stop_cmd.rs:521`), which then
     prints this box.
-- **Q2 — Do the queue runner's tag filter and the Backlog's "missing tags" check the item's resolved
-  target box (D9), or this box?** These are `ready_items`, `missing_tags` and `missing_tags_of`
+- **Q2 (resolved 2026-11-15: the pre-enqueue filters stay on this box and are MOD-44's; P8 stands) — Do
+  the queue runner's tag filter and the Backlog's "missing tags" check the item's resolved target box
+  (D9), or this box?** These are `ready_items`, `missing_tags` and `missing_tags_of`
   (`crates/htui-core/src/store/mem.rs:1095`, `:1132`, `:1152`, and their Pg twins). They run before any
   target is resolved. Resolving the cascade per item inside a store read would pull the engine's
   cascade inputs into the store: the `app` map, the graph pin and the scope rows. **Default (P8):** they
@@ -129,7 +131,18 @@ Every task's brief carries this section.
   - **Pg:** the `FOR UPDATE` run read also selects `executing_box_id AS "executing_box_id: BoxId"`.
   - **Docs:** update `Claim::NotClaimable` (`crates/htui-core/src/model/overlap.rs:134`) and the
     `WriteStore::claim_run` docs (`crates/htui-core/src/store/traits.rs:1571-1613`) to "not driven by
-    `box`".
+    `box`"; the `MissingTags` clause there (`:1574`, "the box's `probed_tags` … `declared_tags`") to
+    the run's target box.
+  - **Pg doc, lock sentence (fact-check C24):** `PgStore::claim_run`'s doc (`pg/write.rs:8082-8085`)
+    says the run row and the box row are locked `FOR UPDATE` before the tag read, "so a concurrent
+    `record_box_probe` or `edit_box` waits for the decision and the check cannot race a re-probe".
+    Under P4 the tags are read from `target_box_id`. For a child-box run that is not the locked
+    (claiming) box, so the sentence becomes false. T2 must at least rewrite it. Whether the claim
+    should also lock the target box (e.g. `FOR SHARE` after the driver's `FOR UPDATE`) is a design
+    choice the fact-check left to the maintainer; until answered, T2 changes no lock and states the
+    race in the doc (benign while no child-box run can be enqueued, D1). The same doc's last paragraph
+    (`:8086-8090`, "`create_run` locks the item and then the box (through `run.target_box_id`'s
+    foreign key)") gains `executing_box_id`'s key as well (P6).
 - **P5 — The queue facts are additive.** `QueueRunFact` (`crates/htui-core/src/model/queue.rs:210`)
   keeps `target_box_id`/`target_hostname` (M4's "runs on" needs them) and gains:
 
@@ -145,6 +158,8 @@ Every task's brief carries this section.
     - `Running`: "driven by this box; its work may run on a child box";
     - `Elsewhere`: "driven by another box (MOD-43 owns choosing)";
     - `Elsewhere.hostname`: "the driving box's hostname".
+  - Update `classify_entry`'s own doc (`queue.rs:446-449`, rules 1 and 2: "targeted here" /
+    "targeted elsewhere") to "driven by this box" / "driven by another box" (fact-check C26).
   - The overlay sentence (`crates/htui/src/ui/overlay/queue.rs:303`) is **not** touched (M4).
 - **P6 — `NewRun.executing_box_id`.** `#[serde(default)] pub executing_box_id: Option<BoxId>` on `NewRun`
   (`crates/htui-core/src/model/run.rs:509`), documented as "the driving box when it is not the target box
@@ -155,7 +170,11 @@ Every task's brief carries this section.
   - **Pg `create_run`:** binds it in place of the literal `NULL` (`pg/write.rs:8001`). A phantom box is
     the column's FK, `Constraint` through `map_sqlx`, the same as `target_box_id` (`:7853`).
   - **Lock order:** the extra FK takes `FOR KEY SHARE` on the driver box. `claim_run` takes run → box
-    `FOR UPDATE` and never locks an item, so no new cycle appears (C21).
+    `FOR UPDATE`, and writes (so locks) an item only on its `MissingTags` branch
+    (`pg/write.rs:8194`), and only the item of the queued run it claims. `create_run` locks its item
+    `FOR UPDATE` and refuses an item with a live (`queued` included) run before its `INSERT`
+    (`:7903-7915`), so it never holds that item while waiting on the box key share. No new cycle
+    (C21, amended at fact-check).
   - Add `Run::driver(&self) -> BoxId` (`self.executing_box_id.unwrap_or(self.target_box_id)`, `const fn`,
     doc MOD-130 M3 D8). Mem's `claim_run`, `queued_runs_on_box`, `latest_queue_run` and `run_hostname`
     use it.
@@ -223,13 +242,13 @@ Readers that **become target-keyed**: the claim tags (`mem.rs` `missing_for(.., 
 ### Conventions
 
 - **Conformance pattern.** Each case is `async fn <name><S: WriteStore>(store: &S)` and starts with
-  `const CASE: &str = "<name>";`. Register it twice: in `CASES` (`conformance.rs:120`) and as an arm of
+  `const CASE: &str = "<name>";`. Register it twice: in `CASES` (`conformance.rs:137`) and as an arm of
   `run_case_inline`. Mirror `claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks`
   (`conformance.rs:10481`) and `claim_run_admits_one_and_refuses_the_second` (`:9491`).
   - **A child box:** `create_target(NewTarget { kind: Docker, .. })`, then
     `attach_child_box(NewChildBox { parent: ids::BOX, target, .. })`.
   - **A second machine:** register one as `pg_criteria`'s `queue_rows_answer_alike_on_both_stores` does
-    for `laptop` (`pg_criteria.rs:~13119`), or as an existing conformance case does.
+    for `laptop` (`pg_criteria.rs:13044`), or as an existing conformance case does.
   - **Tags:** set them with `edit_box(id, edit_version, BoxEdit { declared_tags: Some(..), .. })`. If
     `edit_box` refuses a container row, add a `test-support` seam beside `set_target_probed` and say so in
     the commit.
@@ -284,7 +303,7 @@ Readers that **become target-keyed**: the claim tags (`mem.rs` `missing_for(.., 
 | Claim refusal ordering | `State::claim_run` (`mem.rs:6941-7060`), `PgStore::claim_run` (`pg/write.rs:8091-8293`) | claimability → stop → tags → slot → overlap → write, decided before any write |
 | Claim conformance | `claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks` (`conformance.rs:10481`), `claim_run_checks_tags_after_claimability_and_before_the_slot` (`:10650`) | create a run with `NewRun`, claim, assert the verdict and the row |
 | Inherent read with a Pg twin | `queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order` (`mem.rs:18268`, `pg_criteria.rs:6350`) | Mem unit test and `pg_criteria` test naming each other in their docs |
-| Queue classification tests | `a_live_run_elsewhere_beats_everything` (`queue.rs:~960`), helper `run(status, target)` (`queue.rs:840`) | `QueueRow` fixtures through helpers, `classify_entry` asserted per state |
+| Queue classification tests | `a_live_run_elsewhere_beats_everything` (`queue.rs:931`), helper `run(status, target)` (`queue.rs:840`) | `QueueRow` fixtures through helpers, `classify_entry` asserted per state |
 | Test-only store seam | `MemStore::set_run_snapshot` (`mem.rs:1786`) | `#[cfg(feature = "test-support")]`, "as no writer does", answers whether the row exists |
 | Engine refusal tests | `enqueue_refuses_missing_tags_before_resolving` (`engine.rs:19292`), `enqueue_refuses_a_target_this_build_cannot_run` (`:19799`) | MemStore harness, assert the error, no run written, note and `blocked` |
 | Rung-3 tests | `graph.rs:2901-2970` (`agent_box` row on the fixture box; `without_candidates`) | `upsert_agent_box` then resolve |
@@ -297,7 +316,7 @@ Readers that **become target-keyed**: the claim tags (`mem.rs` `missing_for(.., 
 | `crates/htui-core/src/model/{run,target,mod}.rs` | T1 |
 | `crates/htui-core/src/store/{mem,conformance}.rs` | T1, T2, T3 (mem) |
 | `crates/htui-store/src/pg/write.rs`, `crates/htui-store/.sqlx/` | T1, T2 (`.sqlx` also T3) |
-| every `NewRun { … }` literal (C14: 78 in 20 files; `htui-core`, `htui-store/tests`, `htui-orch` incl. `engine.rs`, `htui-agent/tests`, `htui-mcp/tests`, `htui-worker`, `htui`) | T1 |
+| every full `NewRun { … }` literal (C14, amended: 76 literals in 19 files, of which 43 use `..base` struct update and need no edit; the 33 that spell every field, spread over all 19 files, gain `executing_box_id: None`: `htui-core` `mem.rs` 3, `conformance.rs` 2; `htui-store/tests/it` `pg_criteria.rs` 3, `cache.rs` 3; `htui-orch` `engine.rs` 5, `tests/it/review_loop.rs` 1; `htui-agent/tests/it/relay.rs` 1; `htui-mcp/tests/it/tools_backlog.rs` 1; `htui-worker` `src/runtime.rs` 1, `tests/it/landing.rs` 1; `htui` `src/{queue_overview,stop_cmd,store_worker}.rs` 1 each, `src/run_worker.rs` 2, `tests/it/{activity,state_cli_pg,stop_cli_pg}.rs` 1 each, `tests/it/{backlog,waiting}.rs` 2 each) | T1 |
 | `crates/htui-store/tests/it/pg_conformance.rs`, `crates/htui-core/tests/it/mem_store.rs` | T1, T2 |
 | `crates/htui-core/src/model/overlap.rs`, `crates/htui-core/src/store/traits.rs` (docs) | T2 |
 | `crates/htui-core/src/model/queue.rs`, `crates/htui-store/src/pg/read.rs`, `crates/htui-store/tests/it/pg_criteria.rs`, `crates/htui-core/src/store/worker.rs` (doc of `WorkerHost::queued_runs_on_box`) | T3 |
@@ -322,8 +341,11 @@ Two lanes, then a join:
 
 Do P3: add `read_graph`, `resolve_or_refused_with` and `resolve_with`, and make `resolve` and
 `resolve_or_refused` thin wrappers. Signatures of `resolve`/`resolve_or_refused` and every caller stay
-unchanged (`engine.rs:1476`, `:5203`; `crates/htui/tests/it/graph_editor.rs:362`, `:1356`; graph tests
-`:5523`, `:6208`, `:6592`).
+unchanged. Production callers: `engine.rs:1476`, `:5203`. Others (fact-check C29, the list was
+incomplete): `htui-orch/src/conformance.rs:20707`, `fake.rs:3560`, engine tests `:17613`, `:17717`,
+`:23282`, `crates/htui/src/ui/graph_editor/notes.rs:177`, `crates/htui/tests/it/graph_editor.rs:362`,
+`:1356`, and `graph.rs`'s own tests (`resolve` from `:2409`; `resolve_or_refused` at `:5523`, `:6208`,
+`:6592`).
 
 Tests first, in `graph.rs`'s test module:
 - `resolve_with_a_pre_read_graph_answers_as_resolve`: over the demo store, `resolve_with(.., read_graph(..)?, ..)`
@@ -351,8 +373,9 @@ Tests first, in `graph.rs`'s test module:
      `model/mod.rs` is T1's file too.
    - Doc `Run.executing_box_id`: "the box that drives the run: written at enqueue when the work runs on
      another box (MOD-130 M3, D8), else at claim; `NULL` while a run waits for its target box's worker".
-2. **Literals.** Add `executing_box_id: None` to every `NewRun { … }` literal, `enqueue_with`'s too (T4
-   sets it). Let the compiler list them: `cargo check --workspace --all-targets --all-features`.
+2. **Literals.** Add `executing_box_id: None` to every full `NewRun { … }` literal (33 in 19 files, C14),
+   `enqueue_with`'s too (T4 sets it). The 43 `NewRun { …, ..base }` literals need nothing. Let the
+   compiler list them: `cargo check --workspace --all-targets --all-features`.
 3. **Mem `create_run`** stores the field and refuses a phantom box (P6). **Mem `set_target_probed`** (P7).
 4. **Pg `create_run`** binds the field (P6); prepare `.sqlx`.
 5. **Conformance (+1, 346 → 347):** `create_run_records_the_driving_box`:
@@ -365,7 +388,8 @@ Tests first, in `graph.rs`'s test module:
 Tests first, in `target.rs`'s `mod tests`: `driver_of_names_here_only_for_work_elsewhere`:
 - local → `None`;
 - docker on a child of `here` → `Some(here)`;
-- ssh bound to a machine (any id) → `Some(here)`;
+- ssh bound to a machine other than `here` → `Some(here)`; bound to `here` itself → `None` (C28: `runs_on`
+  is then `here`; this is also the only ssh binding `run_start_refusal` lets start, D10);
 - enrolled bound to another machine → `None`.
 
 In `run.rs`: `driver_is_the_executing_box_else_the_target`.
@@ -451,7 +475,7 @@ Tests first:
   - a local run is listed for `BOX`.
 - Mem unit `queue_rows_name_the_driving_box` and its `pg_criteria` twin: a queued child-box run's fact
   has `driver_box_id = BOX`, `driver_hostname = BOX`'s, `target_box_id = child`,
-  `target_hostname = child`'s. Extend `queue_rows_answer_alike_on_both_stores` (`pg_criteria.rs:~13119`)
+  `target_hostname = child`'s. Extend `queue_rows_answer_alike_on_both_stores` (`pg_criteria.rs:13044`)
   to compare the two new fields.
 
 Existing tests stay green unedited apart from the added literal fields. Among them:
@@ -476,7 +500,9 @@ the htui `queue_overview` snapshots (C18).
    with `on = runs_on(&binding, here)`. Check `missing_tags(item.id, on)`. Write
    `NewRun { target_box_id: on, executing_box_id: htui_core::model::driver_of(&binding, here), .. }`.
    Update the refusal-order doc on `Engine::enqueue` (`engine.rs:1380-1389`): target, then tags, then
-   rung 4. Update the `missing_tags` comment ("before resolution, … the cheaper box-level fact") to name
+   rung 4. Update `EngineParts.box_id`'s doc (`engine.rs:561`, "`run.target_box_id` and `claim_run`'s
+   box") to "this box: the driver of the runs it enqueues and the box `claim_run` admits on"
+   (fact-check C27). Update the `missing_tags` comment ("before resolution, … the cheaper box-level fact") to name
    the target box.
 3. **Tests first** (MemStore engine, `engine.rs`'s test module).
    - **Shared fixture:** a `docker` target attached to a child box of `harness.orch.box_id()`
@@ -519,7 +545,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 |---|---|---|
 | Re-keying claim and poll changes who picks up a local run | Low | A local run keeps `executing_box_id = NULL` (P1), so `COALESCE` is `target_box_id` = here, exactly today's key. The regression bar forbids editing an existing claim, worker or queue assertion |
 | The `enqueue_with` re-order changes which refusal an item sees | Medium | Only items with a non-runnable target (now target first) or no graph (now `NoGraph` before tags). M2's risk row anticipated it. T4 pins the new order |
-| `NewRun` literal churn (78 sites, 20 files) breaks the build mid-task | High | T1 does them mechanically in one commit and runs `cargo check --workspace --all-targets --all-features` |
+| `NewRun` literal churn (33 full literals to edit in 19 files; 43 more use `..base`) breaks the build mid-task | High | T1 does them mechanically in one commit and runs `cargo check --workspace --all-targets --all-features` |
 | Pre-enqueue tag filters (`ready_items`, Backlog) disagree with the enqueue check once a non-local kind runs | Low now, Medium at MOD-44 | Q2, P8: exact while only `local` runs. HANDOFF's M3 phase note hands it to MOD-44 |
 | `edit_box` refuses to set tags on a container row | Medium | A `test-support` seam beside `set_target_probed`, named in the commit |
 | A child-box run's walk uses `self.parts.box_id` for paths, agent rows and command records | n/a in M3 | No child-box run can start before MOD-44 (D1). P8 lists the walk-time reads MOD-44 must revisit |
@@ -551,34 +577,55 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | C21 | `PgStore::claim_run` locks the run, then the claiming box `FOR UPDATE`, and no item; `create_run` locks the item, then takes FK key-share on the boxes. The extra FK adds no cycle. |
 | C22 | `edit_box` with `BoxEdit.declared_tags` accepts a `container` row (else T2/T4 add a seam). |
 | C23 | Task independence: T0 ⊂ {`graph.rs`}; T4 ⊂ {`engine.rs`}; T3 ∩ T4 = ∅; T1, T2 and T3 share `mem.rs`, `.sqlx` and the conformance files and are serial. |
+| C24 | (added at fact-check) `PgStore::claim_run`'s tag read cannot race a re-probe, because the box it reads is the row locked `FOR UPDATE` (`pg/write.rs:8082-8085`). |
+| C25 | (added) `TargetKind::ALL` exists as `&'static [TargetKind]`, and `Engine::new` stays a `const fn` with a `runnable: RUNNABLE_KINDS` field (P7). |
+| C26 | (added) P5's doc list covers every doc that says "targeted here/elsewhere". |
+| C27 | (added) No engine doc names `run.target_box_id` as `EngineParts.box_id`. |
+| C28 | (added) `driver_of` on "ssh bound to a machine (any id)" is `Some(here)`. |
+| C29 | (added) T0's caller list of `resolve`/`resolve_or_refused` is complete. |
+| C30 | (added) The plan's other line refs: `CASES` at `conformance.rs:120`, `queue_rows_answer_alike_on_both_stores` at `pg_criteria.rs:~13119`, `a_live_run_elsewhere_beats_everything` at `queue.rs:~960`. |
+| C31 | (added) The rung-3 engine test is buildable: `upsert_agent_box` accepts a container box, the fake source's `agent_boxes` reads the store, `without_candidates` exists on the harness. |
+| C32 | (added) The `.sqlx` queries that change are exactly T1's `create_run` INSERT, T2's claim run read and missing-tags query, T3's `queued_runs_on_box` and `queue_rows`. |
 
 ## Verified claims
 
+Fact-check 2026-11-15 (handoff-run step 3.5): 23 verified, 8 amended (plan text corrected where used),
+1 falsified with a maintainer question (C24). File-set intersection: pass (C23).
+
 | Claim | Verdict | Evidence |
 |---|---|---|
-| C1 | pending | |
-| C2 | pending | |
-| C3 | pending | |
-| C4 | pending | |
-| C5 | pending | |
-| C6 | pending | |
-| C7 | pending | |
-| C8 | pending | |
-| C9 | pending | |
-| C10 | pending | |
-| C11 | pending | |
-| C12 | pending | |
-| C13 | pending | |
-| C14 | pending | |
-| C15 | pending | |
-| C16 | pending | |
-| C17 | pending | |
-| C18 | pending | |
-| C19 | pending | |
-| C20 | pending | |
-| C21 | pending | |
-| C22 | pending | |
-| C23 | pending | |
+| C1 | verified | Mem `create_run` writes `executing_box_id: None` (`mem.rs:6915`); Pg binds the literal `NULL` (`pg/write.rs:8001`). The only other writers are `start_chat_run` (`mem.rs:3192`, `pg/write.rs:4550`) and the claim's admit (`mem.rs:7051`, `pg/write.rs:8274`), plus copies (demo seeder `pg/demo.rs:478`, cache refresh `cache/refresh.rs:1317`). No other `SET executing_box_id`. |
+| C2 | verified | `claimed.status != RunStatus::Queued \|\| claimed.target_box_id != box_id` at `mem.rs:6957` and `pg/write.rs:8133`. |
+| C3 | verified | `self.missing_for(&row.required_tags, box_id)` (`mem.rs:6975`); `CROSS JOIN box b … WHERE r.id = $1 AND b.id = $2` (`pg/write.rs:8164-8167`). |
+| C4 | verified | Mem `live` filters `executing_box_id == Some(box_id)` and `Running \| AwaitingApproval \| Stopped`, slot counts `Running` only (`mem.rs:7004-7017`); Pg `COUNT(*) … executing_box_id = $1 AND status = 'running'` (`:8222`) and the overlap set `IN ('running','awaiting_approval','stopped')` (`:8247`). |
+| C5 | verified | Inherent `MemStore::queued_runs_on_box` (`mem.rs:1202`, filter `:1208`) and `PgStore::queued_runs_on_box` (`pg/read.rs:2659`, `WHERE target_box_id = $1` `:2664`); dispatched by `Backend` (`backend.rs:736`) and the `WorkerHost` trait (`store/worker.rs:701`, impls `htui-store/src/worker.rs:1249`, `:1362`, spy `htui-worker/src/runtime.rs:4654`). Not on `WriteStore`/`WorkerStore`; M3 changes no signature, so no wrapper edit. |
+| C6 | verified | `run` indexes: `idx_run_item`, `idx_run_project_status` (`0001_init.sql:465-466`), `idx_run_lease` (`0003:50`), `idx_run_repo_scope` (`0003:52`), `idx_run_batch` (`0016:41`), `idx_run_workspace_status` (`0019:37`), `uq_run_item_live` (`0024:47`), `idx_run_stopped_box` (`0037:16`), `idx_run_target` (`0040:70`): none leads with `target_box_id`, so the poll already scans; `COALESCE` loses no index. Doc at `pg/read.rs:2650-2652`. |
+| C7 | verified | The only triggers on `run` are `trg_run_activity_update` (`AFTER UPDATE OF status`, `WHEN OLD.status IS DISTINCT FROM NEW.status`, `0036_activity_event.sql:296-302`) and `trg_run_activity_delete` (`:339-341`); `activity_run_update` (`:153-243`) reads no `executing_box_id`. No later migration adds one. |
+| C8 | verified | Writers of `run.status = 'stopped'`: Pg `stop_run` (`pg/write.rs:8890`, CAS `status = running` and `lease_owner = owner`, `:8905`, `:8924`) and `adopt_runs`' settle (`:8512`, `WHERE … status = 'running'`); Mem `stop_run` (`mem.rs:7188-7199`) and `adopt_runs` (`:7122`, running only). Fixture: `RUN_8` is the only `Stopped` run, built by `graph_run` with `executing_box_id: None` (`fixtures.rs:1639`, `:1757-1764`). |
+| C9 | verified | `htui-worker/src/runtime.rs:3346-3366`: with no pending row, a `Queued`/`Stopped`/terminal run takes the rowless CAS; a lost race re-reads and goes durable only for a non-queued run. `pending_commands` matches only terminal/`stopped`/lapsed live statuses (`pg/relay.rs:596-600`, `mem.rs:10952-10958`). |
+| C10 | amended | Four construction sites, not five: `queue.rs:841`, `mem.rs:6609`, `mem.rs:22041`, `pg/read.rs:2810`; none in `crates/htui` or any `tests/`. The task text already listed these four; no other change. |
+| C11 | verified | `box_id` flows `resolve_or_refused` → `snapshot_phase` (`graph.rs:713`) → `candidates` (`:1913`) → `rung_three` (`:2012`) → `source.agent_boxes(box_id)` (`:2052`), its only use. The graph read is first: `Box::pin(source.resolve_graph(item.id))` → `NoGraph` (`:665-667`). `Resolved.workflow_target` = `graph.target_id` (`:859`). |
+| C12 | verified | `Engine { parts, walks }` (`engine.rs:607-620`); no `Engine { … }` literal outside `Engine::new` (`:1293-1298`); every builder (incl. `harness_engine!`, `:14112-14123`) calls `Engine::new`. |
+| C13 | verified | `CASES` has 346 entries (counted); `EXPECTED_CASES: usize = 346` (`pg_conformance.rs:78`), last doc clause `:77`, message "(346 since …" `:85`; `mem_store.rs:65` asserts `346`. (`CASES` itself is at `conformance.rs:137`, see C30.) |
+| C14 | amended | Counted by script over `crates/`: 76 `NewRun { … }` literals in 19 files, not 78 in 20. 43 use struct update (`..base`: `conformance.rs` 11, `mem.rs` 9, `pg_criteria.rs` 23) and need no edit; 33 spell every field (every one of the 19 files has at least one). Amended: Files to Change, T1 step 2, the Risks row. |
+| C15 | verified | Pg writes to `target`: INSERT (`pg/write.rs:4071`, no `probed_at`), name/locator (`:4128`), `retired_at` (`:4349`), `box_id` (`:4506`). Mem inserts with `probed_at: None` (`mem.rs:11383-11389`); `attach_child_box` sets only `box_id` (`:11525`). `status_with` answers `Unprepared` for `probed_at = None` (`target.rs:384-386`). |
+| C16 | verified | `walk_candidates` (`engine.rs:5499-5538`) reads `agent_boxes(self.parts.box_id)` (`:5518`) into `SelectInput.boxes` for `select::walk` (quota latches/enabled); the candidates come from the snapshot. |
+| C17 | verified | Mem: `references_no_row("run.target_box_id", …, "box")` (`mem.rs:6862-6868`). Pg: no check; the INSERT error goes `workspace_fk_refused` → `map_sqlx` (`pg/write.rs:2302-2309`), whose SQLSTATE class `23` is `Constraint` (`error.rs:44-45`). `executing_box_id UUID REFERENCES box(id)` (`0001_init.sql:456`), never altered. |
+| C18 | verified | `push_run` sets `target_box_id = target` and `executing_box_id = (status != Queued).then_some(target)` (`queue_overview.rs:237-238`), so `COALESCE` = target in every fixture row; no `QueueRunFact` literal in `crates/htui`. |
+| C19 | verified | `run_hostname`: `run.executing_box_id.unwrap_or(run.target_box_id)` (`mem.rs:2328`); `LEFT JOIN box b ON b.id = COALESCE(r.executing_box_id, r.target_box_id)` (`pg/read.rs:422`, `cache/read.rs:792`). |
+| C20 | verified | `stop_cmd.rs:483-489` keeps non-terminal runs; `hosts` loaded when any `executing_box_id` is set (`:491`); `on_box: run.executing_box_id.map(…)` (`:521-523`). |
+| C21 | amended | Lock order holds, but "claim_run … no item" is wrong: its `MissingTags` branch runs `UPDATE item SET status = 'blocked'` (`pg/write.rs:8194`) after the run (`:8109`) and box (`:8122`) locks. No cycle: that item is the claimed queued run's, and `create_run` refuses an item with a live (`queued` included) run under its item lock before the INSERT's FK key shares (`:7890`, `:7903-7915`). P6's lock-order bullet amended. |
+| C22 | verified | Mem `edit_box` filters only on `user_id == this_user` and `edit_version` (`mem.rs:3115-3122`), no kind check; Pg `UPDATE box … WHERE id = $1 AND user_id = $5 AND edit_version = $2` (`pg/write.rs:3902-3910`), no kind check; no CHECK on `box.declared_tags` for containers (`0040_execution_targets.sql:48-57`). A child box inherits its parent's `user_id` (`mem.rs:11466`, `pg/write.rs:4450-4456`). No seam needed. |
+| C23 | verified | T0 {`graph.rs`} (no `NewRun` literal there) meets no other set. T3 {`queue.rs`, `mem.rs`, `store/worker.rs`, `pg/read.rs`, `.sqlx`, `pg_criteria.rs`} ∩ T4 {`engine.rs`} = ∅. T1 ∩ T4 = {`engine.rs`} (T1's literals) and T1 ∩ T3 ⊇ {`mem.rs`, `.sqlx`, `pg_criteria.rs`}: both pairs are ordered by "Depends on", so no claimed-independent pair intersects. Note: T0 beside T1 is file-disjoint but not build-disjoint (T1 breaks every crate's build mid-task), so the lanes need their own worktrees. |
+| C24 | falsified (question) | After P4 the tag query reads `target_box_id`; for a child-box run that box is not the one locked `FOR UPDATE` (`pg/write.rs:8122`), so the doc's guarantee (`:8082-8085`) no longer holds. P4 amended: T2 rewrites the doc and changes no lock. Open for the maintainer: also lock the target box (`FOR SHARE`) in `claim_run`? |
+| C25 | verified | `str_enum!` gives `pub const ALL: &'static [Self]` (`model/mod.rs:47`; used `target.rs:589`); `pub const RUNNABLE_KINDS: &[TargetKind]` (`target.rs:50`) is a `const`, so a `const fn` may store it. |
+| C26 | amended | `classify_entry`'s doc (`queue.rs:446-449`) says "targeted here" / "targeted elsewhere"; P5 listed only the `EntryState` docs. P5 amended. |
+| C27 | amended | `EngineParts.box_id` doc: "`run.target_box_id` and `claim_run`'s box" (`engine.rs:561`), stale under D8. T4 amended to update it. |
+| C28 | amended | `driver_of` = `… && runs_on(binding, here) != here`; `runs_on` = `target.box_id.unwrap_or(here)` (`target.rs:279-281`), so ssh bound to `here` is `None`. T1's test case amended to "a machine other than `here`". |
+| C29 | amended | Missing callers: `htui-orch/src/conformance.rs:20707`, `fake.rs:3560`, engine tests `:17613`, `:17717`, `:23282`, `htui/src/ui/graph_editor/notes.rs:177`, and `graph.rs` tests from `:2409`. Signatures unchanged, so none moves; T0's list amended. |
+| C30 | amended | `CASES` is at `conformance.rs:137`, `queue_rows_answer_alike_on_both_stores` at `pg_criteria.rs:13044`, `a_live_run_elsewhere_beats_everything` at `queue.rs:931`. All other line refs in the plan and audit table were checked and hold. Amended in Conventions, Patterns and T3. |
+| C31 | verified | Mem `upsert_agent_box` checks only that the agent and box rows exist (`mem.rs:2886-2898`); `FakeGraphSource::agent_boxes` and the harness source read the store (`fake.rs:1613`, `:1763`); `Orch::without_candidates` (`fake.rs:2989`) is used by `engine.rs:19295`. `htui-orch` dev-deps enable `htui-core/test-support` (`Cargo.toml:56`), so `set_target_probed` is reachable from engine tests. |
+| C32 | verified | Pg SQL that M3 edits: `create_run` INSERT (`pg/write.rs:7997-8002`), `claim_run` run read (`:8102-8110`) and missing-tags query (`:8161-8169`), `queued_runs_on_box` (`pg/read.rs:2661-2667`), `queue_rows` (`:2730-2799`). No other Pg query reads the changed keys. |
 
 ## Acceptance
 
