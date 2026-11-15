@@ -200,7 +200,7 @@ create one in **Settings › Hierarchy** with `N`.
 
 | Key | Action |
 |---|---|
-| `q` / `Ctrl+c` | Leave htui: a dialog lists the work leaving stops; `Enter` or a second `Ctrl+c` leaves, `Esc` stays |
+| `q` / `Ctrl+c` | Leave htui: a dialog lists every live workspace; `Enter` or a second `Ctrl+c` leaves, `S` stops them gracefully first, `Esc` stays |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab |
 | `1` … `7` | Go to a tab |

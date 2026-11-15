@@ -232,6 +232,33 @@ Leaving closes htui. Work it is running stops with it:
 
 To keep an edit, leave the editor normally (`:wq`, nano's `Ctrl+X`) and save the view with `Ctrl+S`.
 
+The dialog also lists, under the open workspace's row, every other workspace that has work in the
+background or is stopping (MOD-116, `R-TUI-18`): `◐ 1 working · ⚠ 1 waiting · 1 queued   Platform`,
+with `  ◌ stopping…` after a workspace whose stop is being applied. When any of them, or the open
+one, has work it could stop, the dialog offers `S` (`leave.stop`):
+
+```text
+S stops them gracefully first, waits up to 20 s for their runs to stop,
+then leaves; each resumes later.
+
+ Enter  leave   Esc  stay   S  stop first
+```
+
+`S` writes a graceful stop for every workspace with live work and no stop yet, as `htui stop` does,
+then waits:
+
+```text
+Stopping 2 workspaces gracefully, then leaving…
+  waiting for 1 running run to stop (17 s left)
+
+ Enter  leave now   Esc  stay (the stops stand)
+```
+
+It leaves once no stopped workspace has a running run, or after 20 s. `Enter` (or a second
+`Ctrl+C`) leaves at once; `Esc` closes the dialog and the stops stay written (`htui resume`, or `r`
+on the Workspaces tab, resumes them). A stop the database refuses is said in the box
+(`Could not stop: <message>`) and `S` is offered again.
+
 ### The abort question
 
 `Ctrl+x` (`editor.abort`) acts only on the editor's tab, and asks first:

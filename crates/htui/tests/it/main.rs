@@ -32,6 +32,7 @@ mod keys;
 mod keys_file;
 mod kinds;
 mod kit_chrome;
+mod leave_dialog;
 mod mcp_stdio;
 mod no_hardcoded_keys;
 mod overlays;

@@ -2520,7 +2520,13 @@ pub static CATALOGUE: &[ActionSpec] = &[
     .since(2),
     row(Act::LeaveStay, Leave, "stay", &["esc", "n"], "stay").since(2),
     // MOD-116 M2 D9: stop every live workspace gracefully first, then leave.
-    row(Act::LeaveStop, Leave, "stop", &["S"], "stop gracefully first"),
+    row(
+        Act::LeaveStop,
+        Leave,
+        "stop",
+        &["S"],
+        "stop gracefully first",
+    ),
     // [field]: MOD-115 M2 D7, a text field's editing keys: the `TextField`, `TextArea` and
     // `Composer` literals (text_field.rs, text_area.rs:236-239). All named keys, so in capture.
     capture_row(Act::FieldSubmit, Field, "submit", &["enter"], "submit").since(2),

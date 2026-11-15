@@ -397,6 +397,7 @@ forward = ["alt-right"]              # forward
 [leave]
 confirm = ["enter", "ctrl-c"]  # leave
 stay    = ["n"]                # stay; Esc always
+stop    = ["S"]                # stop gracefully first
 
 [field]
 submit         = ["enter"]      # submit

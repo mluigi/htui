@@ -369,7 +369,10 @@ impl LeaveDialog {
         };
         let mut spans = vec![
             Span::styled(format!("{LEAD}{ROW}"), theme.base),
-            Span::styled(format!("{working_glyph} {} working", row.running), theme.base),
+            Span::styled(
+                format!("{working_glyph} {} working", row.running),
+                theme.base,
+            ),
             Span::styled(SEP, theme.base),
             Span::styled(
                 format!("{waiting_glyph} {} waiting", row.awaiting_approval),
@@ -916,7 +919,8 @@ mod tests {
     fn the_waiting_count_is_a_warning_only_when_someone_waits() {
         let theme = Theme::default();
         let style_of = |bench: &Bench| {
-            LeaveDialog::new().lines(&bench.ctx())
+            LeaveDialog::new()
+                .lines(&bench.ctx())
                 .iter()
                 .flat_map(|line| line.spans.iter())
                 .find(|span| span.content.contains("waiting"))
@@ -1075,7 +1079,11 @@ mod tests {
     }
 
     /// `S` pressed over `world`, its write answered `outcomes`, what that emitted taken.
-    fn settling(world: &World, bench: &Bench, outcomes: Vec<(WorkspaceId, StopWrite)>) -> LeaveDialog {
+    fn settling(
+        world: &World,
+        bench: &Bench,
+        outcomes: Vec<(WorkspaceId, StopWrite)>,
+    ) -> LeaveDialog {
         let mut dialog = LeaveDialog::new();
         bench.reply(&mut dialog, StoreReply::Workspaces(world.names()));
         assert_eq!(bench.key(&mut dialog, "S"), Handled::Consumed);
@@ -1160,7 +1168,8 @@ mod tests {
     fn stop_first_is_offered_only_when_something_can_stop() {
         let world = World::new();
         const CHIP: &str = "S  stop first";
-        const LINE: &str = "S stops them gracefully first, waits up to 20 s for their runs to stop,";
+        const LINE: &str =
+            "S stops them gracefully first, waits up to 20 s for their runs to stop,";
         const THEN: &str = "then leaves; each resumes later.";
 
         // No counts: nothing is known to stop.
@@ -1395,10 +1404,7 @@ mod tests {
         assert_eq!(bench.key(&mut dialog, "S"), Handled::Consumed);
         let emitted = bench.emit.take();
         assert!(
-            matches!(
-                only_request(&emitted),
-                StoreRequest::StopWorkspaces { .. }
-            ),
+            matches!(only_request(&emitted), StoreRequest::StopWorkspaces { .. }),
             "{emitted:?}"
         );
     }
