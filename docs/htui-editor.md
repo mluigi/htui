@@ -157,8 +157,8 @@ Both keys are generated from htui's key catalogue (the `editor` context: `editor
 The editor waits in its pane, with the tab that asked for it; the rest of htui keeps working.
 
 **The editor's tab stays locked.** On that tab, while htui has the keys, only the editor's keys
-and the global keys act: `Ctrl+4`, `Ctrl+x`, `Tab`/`Shift+Tab` and `1` … `6` (switch tabs), `w`
-(switch workspace), `Ctrl+F` (find), `Ctrl+W` (waiting), `Ctrl+Q` (queue), `q`, `?`/`F1` and
+and the global keys act: `Ctrl+4`, `Ctrl+x`, `Tab`/`Shift+Tab` and `1` … `7` (switch tabs), `w`
+(the Workspaces tab), `Ctrl+F` (find), `Ctrl+W` (waiting), `Ctrl+Q` (queue), `q`, `?`/`F1` and
 `Ctrl+C`, or the keys `keys.toml` gives them. Every other key is refused with
 `the editor is open: Ctrl+4 to the editor · Ctrl+x abort` and never reaches the view: a `Ctrl+S`
 there would save the text the editor has not handed back yet. A paste is dropped there; while the
@@ -174,7 +174,7 @@ lands on the editor's tab with htui holding the keys; `Ctrl+4` then hands them t
 while an edit is open, with `the editor is open in <Tab>: finish or abort it first` on the status
 line (the pop-up that asked closes; nothing else changes):
 
-- a workspace switch: picking a workspace with `w`;
+- a workspace switch: `o` on a workspace in the Workspaces tab;
 - opening a result in the editor's tab: `Enter` on an item, document or step in find, the queue
   or the waiting list, which opens it in Backlog, while the edit is in Backlog. A result that
   opens in another tab opens as usual.
@@ -184,10 +184,11 @@ a project there, or deleting the workspace htui is in, normally moves htui's sco
 an edit that move is refused with the same sentence, and nothing repeats it when the edit ends:
 htui stays on the old scope (the other tabs keep the old project list, or the deleted workspace)
 until Settings › Hierarchy next re-reads its tree or you pick a workspace. After the edit, press
-`w` and pick the workspace you are in (or, after deleting it, another one): every tab reloads.
+`w`, select the workspace you are in (or, after deleting it, another one) and press `o`: every tab
+reloads.
 
 **A modal pop-up over the editor's tab** takes htui's keys, whether a reply opened it (a migration
-prompt, say), you did (find, the queue, the waiting list, the workspace switcher), or it is one of
+prompt, say), you did (find, the queue, the waiting list), or it is one of
 the [questions](#the-leave-dialog-and-the-abort-question). The status line reads
 `the editor is open: close this first`. Keys and pastes go to the pop-up; `Ctrl+4` does not act
 there (under the leave dialog it says `the editor is open: answer the question first`), and

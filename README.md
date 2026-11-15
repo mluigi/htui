@@ -178,19 +178,21 @@ and says why on the status line; update `htui` to connect.
 
 ## Using htui
 
-Everything happens in a **workspace**. Press `w` to switch workspaces. If the database has none
-yet, create one in **Settings › Hierarchy** with `N`.
+Everything happens in a **workspace**. Press `w` for the **Workspaces** tab, select one and press
+`o` to open it; htui reopens the last one you opened when it starts. If the database has none yet,
+create one in **Settings › Hierarchy** with `N`.
 
-`htui` has six tabs. Switch with `Tab` / `Shift+Tab` or the number keys `1` to `6`.
+`htui` has seven tabs. Switch with `Ctrl+PgDn` / `Ctrl+PgUp` or the number keys `1` to `7`.
 
 | Tab | What it is for |
 |---|---|
-| **1 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
-| **2 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
-| **3 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
-| **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile, agent personas and logging. |
-| **5 Chat** | A live conversation with an agent, and replays of recorded ones. |
-| **6 Logs** | htui's own log as it runs, by source (store, orchestrator, agents and so on), with a minimum level and follow, and the log each headless worker ships to the database. |
+| **1 Workspaces** | Every workspace with its state (open, in the background, stopping, stopped) and an overview of each and of its projects; `o` opens one. |
+| **2 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
+| **3 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
+| **4 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
+| **5 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile, agent personas and logging. |
+| **6 Chat** | A live conversation with an agent, and replays of recorded ones. |
+| **7 Logs** | htui's own log as it runs, by source (store, orchestrator, agents and so on), with a minimum level and follow, and the log each headless worker ships to the database. |
 
 **Press `?` on any screen for its full list of keys.** The ones below are the essentials.
 
@@ -201,8 +203,8 @@ yet, create one in **Settings › Hierarchy** with `N`.
 | `q` / `Ctrl+c` | Leave htui: a dialog lists the work leaving stops; `Enter` or a second `Ctrl+c` leaves, `Esc` stays |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab |
-| `1` … `6` | Go to a tab |
-| `w` | Switch workspace |
+| `1` … `7` | Go to a tab |
+| `w` | Go to the Workspaces tab (`o` there opens the selected workspace) |
 | `?` | Show or hide the key help |
 | `Esc` | Close the open pop-up |
 
