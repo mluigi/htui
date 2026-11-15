@@ -1469,6 +1469,7 @@ mod tests {
         WaitingCandidate {
             item: item.clone(),
             runs,
+            refused: Vec::new(),
         }
     }
 

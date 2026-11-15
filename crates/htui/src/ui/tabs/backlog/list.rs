@@ -334,6 +334,7 @@ mod tests {
             updated_at: htui_core::fixtures::demo_at(0, 0),
             touched_paths: Vec::new(),
             latest_run_status: latest,
+            latest_run_landing: None,
         }
     }
 

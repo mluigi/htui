@@ -1237,6 +1237,7 @@ mod tests {
             status: Status::Open,
             depth,
             latest_run_status: None,
+            latest_run_landing: None,
         }
     }
 

@@ -859,6 +859,7 @@ mod tests {
             latest_note: None,
             open_blockers: Vec::new(),
             latest_run_status: None,
+            latest_run_landing: None,
         }
     }
 
