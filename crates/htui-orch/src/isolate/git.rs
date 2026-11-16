@@ -251,6 +251,21 @@ pub struct Cli {
     version: (u32, u32, u32),
     /// [`VERB_TIMEOUT`] in production; a test injects a short one through `Cli::with_budget`.
     budget: Duration,
+    /// MOD-132 R1b M4: the object quarantine every verb reads and writes through, if any.
+    quarantine: Option<ObjectQuarantine>,
+}
+
+/// MOD-132 R1b M4: an object directory a verb writes into instead of the repository's, reading
+/// the repository's own objects as an alternate, as `git receive-pack` quarantines a push. A
+/// [`Cli`] made by [`Cli::in_quarantine`] runs every verb with `GIT_OBJECT_DIRECTORY` set to
+/// [`dir`](Self::dir) and `GIT_ALTERNATE_OBJECT_DIRECTORIES` to [`objects`](Self::objects), so
+/// nothing it indexes reaches the repository until [`migrate_quarantine`] moves it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectQuarantine {
+    /// The quarantine object directory: absolute, and holding a `pack/` directory.
+    pub dir: PathBuf,
+    /// The repository's own object directory, absolute ([`objects_dir`]).
+    pub objects: PathBuf,
 }
 
 impl Cli {
@@ -341,6 +356,7 @@ impl Cli {
             binary,
             version,
             budget: VERB_TIMEOUT,
+            quarantine: None,
         })
     }
 
@@ -393,6 +409,16 @@ impl Cli {
         }
     }
 
+    /// MOD-132 R1b M4: the same `git`, every verb of it run through `quarantine`: objects are
+    /// written into [`ObjectQuarantine::dir`] and read from it and from the repository's own.
+    #[must_use]
+    pub fn in_quarantine(&self, quarantine: &ObjectQuarantine) -> Self {
+        Self {
+            quarantine: Some(quarantine.clone()),
+            ..self.clone()
+        }
+    }
+
     /// The one place a `git` child's environment and stdio are shaped.
     ///
     /// `SCRUBBED_ENV` is removed, and so is `HTUI_OWN_ENV` (MOD-158 D5, `R-SEC-2`: a verb runs
@@ -402,7 +428,9 @@ impl Cli {
     /// `GIT_OPTIONAL_LOCKS=0` stops `git` refreshing the index opportunistically and taking
     /// `index.lock` under a concurrent `gix` read; `GIT_ADVICE=0` suppresses the `hint:` lines
     /// 2.42+ would otherwise print after the `fatal:` one. The last two are simply ignored by a
-    /// `git` that predates them and neither changes an exit status (blueprint H-21).
+    /// `git` that predates them and neither changes an exit status (blueprint H-21). An
+    /// [`ObjectQuarantine`] sets its two variables after the scrub, so they are the ones `git`
+    /// reads.
     fn command(&self, cwd: &Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.binary);
         command.current_dir(cwd);
@@ -421,6 +449,12 @@ impl Cli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(quarantine) = &self.quarantine {
+            command.env("GIT_OBJECT_DIRECTORY", &quarantine.dir).env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                alternate_entry(&quarantine.objects),
+            );
+        }
         command
     }
 
@@ -471,7 +505,7 @@ impl Cli {
     /// MOD-9 D130: [`run_capturing`](Cli::run_capturing)'s body, with stdout handed back as the
     /// undecoded sink, so [`name_only`](Cli::name_only) can read bytes where every other verb
     /// reads text. `stdin` is [`Input::Null`] for every verb but
-    /// [`index_pack`](Cli::index_pack) (MOD-132).
+    /// [`index_pack`](Cli::index_pack) and [`connected`](Cli::connected) (MOD-132).
     async fn run_captured(
         &self,
         verb: &'static str,
@@ -481,30 +515,58 @@ impl Cli {
         stdout: Capture,
         stdin: Input<'_>,
     ) -> Result<Captured, IsolateError> {
-        let stdin = match stdin {
-            Input::Null => None,
-            Input::File { path, offset } => Some(
-                open_at(path, offset)
-                    .map_err(|err| IsolateError::Git(stdin_unreadable(verb, path, &err)))?,
+        let (file, bytes) = match stdin {
+            Input::Null => (None, None),
+            Input::File { path, offset } => (
+                Some((
+                    open_at(path, offset)
+                        .map_err(|err| IsolateError::Git(stdin_unreadable(verb, path, &err)))?,
+                    path,
+                )),
+                None,
             ),
+            Input::Bytes(bytes) => (None, Some(bytes)),
         };
-        let build = || {
-            let mut command = self.command(cwd);
-            command.args(args);
-            for (key, value) in extra_env {
-                command.env(key, value);
-            }
-            // A clone of the one open handle, so a second build (Windows' job-object downgrade)
-            // reads on from the same offset; a clone that fails leaves stdin null, and the verb
-            // then fails on an empty input rather than reading the wrong bytes.
-            if let Some(file) = stdin.as_ref().and_then(|file| file.try_clone().ok()) {
-                command.stdin(file);
-            }
-            command
+        // A stdin handle that cannot be cloned fails the verb: run with a null stdin instead, it
+        // would read an empty input rather than the file.
+        let unreadable = std::sync::Mutex::new(None);
+        let spawned = {
+            let build = || {
+                let mut command = self.command(cwd);
+                command.args(args);
+                for (key, value) in extra_env {
+                    command.env(key, value);
+                }
+                // A clone of the one open handle, so a second build (Windows' job-object
+                // downgrade) reads on from the same offset.
+                if let Some((file, path)) = &file {
+                    match file.try_clone() {
+                        Ok(clone) => {
+                            command.stdin(clone);
+                        }
+                        Err(err) => {
+                            let sentence = stdin_unreadable(verb, path, &err);
+                            *unreadable
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(sentence);
+                            return Err(err);
+                        }
+                    }
+                }
+                if bytes.is_some() {
+                    command.stdin(Stdio::piped());
+                }
+                Ok(command)
+            };
+            spawn_supervised(build)
         };
-
-        let mut child = spawn_supervised(build)
-            .map_err(|err| IsolateError::Git(cannot_spawn(verb, &self.binary, &err)))?;
+        let mut child = spawned.map_err(|err| {
+            let unreadable = unreadable
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            IsolateError::Git(unreadable.unwrap_or_else(|| cannot_spawn(verb, &self.binary, &err)))
+        })?;
         let out = std::sync::Mutex::new(match stdout {
             Capture::Tail => Sink::Tail(TailBuffer::new(CAPTURE_TAIL)),
             Capture::Head => Sink::Head(HeadBuffer::new(DIFF_CAP)),
@@ -513,9 +575,14 @@ impl Cli {
         let err = std::sync::Mutex::new(Sink::Tail(TailBuffer::new(CAPTURE_TAIL)));
         let stdout = child.stdout().take();
         let stderr = child.stderr().take();
+        let stdin_pipe = child.stdin().take();
         // Boxed rather than pinned on the stack so that dropping it drops the pipes with it.
         let mut reading = Box::pin(async {
-            tokio::join!(read_tail(stdout, &out), read_tail(stderr, &err));
+            tokio::join!(
+                read_tail(stdout, &out),
+                read_tail(stderr, &err),
+                write_input(stdin_pipe, bytes)
+            );
         });
 
         let waited = tokio::time::timeout(self.budget, async {
@@ -565,8 +632,10 @@ enum Capture {
 /// MOD-132: what a verb reads on stdin.
 #[derive(Debug, Clone, Copy)]
 enum Input<'a> {
-    /// Nothing: every verb but [`Cli::index_pack`].
+    /// Nothing: every verb but [`Cli::index_pack`] and [`Cli::connected`].
     Null,
+    /// These bytes, then end of file ([`Cli::connected`]'s revisions).
+    Bytes(&'a [u8]),
     /// A file on this box, read from `offset` to its end.
     File {
         /// The file.
@@ -574,6 +643,17 @@ enum Input<'a> {
         /// The first byte read.
         offset: u64,
     },
+}
+
+/// Writes `bytes` into the child's stdin pipe and closes it. A write the child refuses (it exited
+/// first) is left to the child's exit status to report.
+async fn write_input(pipe: Option<tokio::process::ChildStdin>, bytes: Option<&[u8]>) {
+    use tokio::io::AsyncWriteExt as _;
+
+    if let (Some(mut pipe), Some(bytes)) = (pipe, bytes) {
+        let _ = pipe.write_all(bytes).await;
+        let _ = pipe.shutdown().await;
+    }
 }
 
 /// `path` opened for reading and positioned at `offset`.
@@ -1218,33 +1298,34 @@ impl Cli {
         })
     }
 
-    /// MOD-132 plan P5, P6: `git index-pack --stdin --fix-thin [--strict]` in `repo`, its stdin
-    /// the bytes of `file` from `offset` on (a bundle's pack starts after its header). With
-    /// `strict`, every object is fsck'd before any is kept (B6): the check `git fetch` skips on
-    /// a bundle (B5). A refused pack leaves no object behind. Runs under this `Cli`'s budget:
-    /// call it on [`with_transfer_budget`](Cli::with_transfer_budget).
+    /// MOD-132 plan P6: `git index-pack --stdin --fix-thin --strict --max-input-size=<max>` in
+    /// `repo`, its stdin the bytes of `file` from `offset` on (a bundle's pack starts after its
+    /// header). Every object is fsck'd before any is kept (B6): the check `git fetch` skips on a
+    /// bundle (B5). A refused pack leaves no object behind. Runs under this `Cli`'s budget: call
+    /// it on [`with_transfer_budget`](Cli::with_transfer_budget), and on
+    /// [`in_quarantine`](Cli::in_quarantine) to keep the pack out of `repo` (R1b M4).
     ///
     /// # Errors
-    /// [`IsolateError::Refused`] with [`pack_refused`] for a non-zero exit;
-    /// [`IsolateError::Git`] when `file` cannot be read, for a spawn or budget failure, or a
-    /// signal.
+    /// [`IsolateError::Refused`] with [`pack_refused`] for a non-zero exit (a pack over
+    /// `max_input_size` bytes among them); [`IsolateError::Git`] when `file` cannot be read, for
+    /// a spawn or budget failure, or a signal.
     pub async fn index_pack(
         &self,
         repo: &Path,
         file: &Path,
         offset: u64,
-        strict: bool,
+        max_input_size: u64,
     ) -> Result<(), IsolateError> {
-        let mut args = vec![
+        let max = format!("--max-input-size={max_input_size}");
+        let args = [
             OsStr::new(NO_HOOKS[0]),
             OsStr::new(NO_HOOKS[1]),
             OsStr::new("index-pack"),
             OsStr::new("--stdin"),
             OsStr::new("--fix-thin"),
+            OsStr::new("--strict"),
+            OsStr::new(&max),
         ];
-        if strict {
-            args.push(OsStr::new("--strict"));
-        }
         let captured = self
             .run_captured(
                 "index-pack",
@@ -1264,8 +1345,9 @@ impl Cli {
     }
 
     /// MOD-132 plan P6: whether `tip` is connected in `repo`: `git rev-list --objects --quiet
-    /// <tip> --not <not>…` exits 0, so every object `tip` reaches, short of the commits in `not`,
-    /// is present. A missing parent, tree or blob is `false`. Not retried: a read.
+    /// --stdin` fed `<tip>` and `^<not>` for each of `not` exits 0, so every object `tip` reaches,
+    /// short of the commits in `not`, is present. A missing parent, tree or blob is `false`. The
+    /// revisions go on stdin, so a long `not` list never meets an argv limit. Not retried: a read.
     ///
     /// # Errors
     /// [`IsolateError::Refused`] with [`not_a_hash`] when `tip` or an entry of `not` is not a
@@ -1283,21 +1365,189 @@ impl Cli {
         {
             return Err(IsolateError::Refused(not_a_hash(repo, bad)));
         }
-        let mut args = vec![
+        let mut revisions = format!("{tip}\n");
+        for hash in not {
+            revisions.push('^');
+            revisions.push_str(hash);
+            revisions.push('\n');
+        }
+        let args = [
             OsStr::new("rev-list"),
             OsStr::new("--objects"),
             OsStr::new("--quiet"),
-            OsStr::new(tip),
-            OsStr::new("--not"),
+            OsStr::new("--stdin"),
         ];
-        args.extend(not.iter().map(OsStr::new));
-        let exited = self.run("rev-list", repo, &args, &[]).await?;
-        match exited.code {
+        let captured = self
+            .run_captured(
+                "rev-list",
+                repo,
+                &args,
+                &[],
+                Capture::Tail,
+                Input::Bytes(revisions.as_bytes()),
+            )
+            .await?;
+        match captured.code {
             Some(0) => Ok(true),
             Some(_) => Ok(false),
-            None => Err(exited.failure("rev-list")),
+            None => Err(IsolateError::Git(killed_by_signal("rev-list"))),
         }
     }
+
+    /// MOD-132 R1b M1: the kind `git cat-file -t` names for `hash` in `repo` (`"commit"`,
+    /// `"tree"`, `"tag"`, `"blob"`), or `None` when `repo` does not hold it. Read through this
+    /// `Cli`'s [`ObjectQuarantine`], if it has one. Not retried: a read.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`not_a_hash`] when `hash` is not a full lowercase hash;
+    /// [`IsolateError::Git`] for a spawn or budget failure or a signal.
+    pub async fn object_kind(
+        &self,
+        repo: &Path,
+        hash: &str,
+    ) -> Result<Option<String>, IsolateError> {
+        if !crate::target::bundle::is_full_hash(hash) {
+            return Err(IsolateError::Refused(not_a_hash(repo, hash)));
+        }
+        let args = [OsStr::new("cat-file"), OsStr::new("-t"), OsStr::new(hash)];
+        let exited = self.run("cat-file", repo, &args, &[]).await?;
+        match exited.code {
+            Some(0) => Ok(Some(exited.stdout.trim().to_owned())),
+            Some(_) => Ok(None),
+            None => Err(exited.failure("cat-file")),
+        }
+    }
+
+    /// MOD-132 R1b M4: whether the commit `ancestor` is reachable from the commit `descendant`
+    /// in `repo` (`git merge-base --is-ancestor`), read through this `Cli`'s
+    /// [`ObjectQuarantine`], if it has one: the `gix` read [`is_ancestor`] does not see a
+    /// quarantine. Not retried: a read.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`not_a_hash`] when either is not a full lowercase hash;
+    /// [`IsolateError::Git`] for any exit but 0 and 1 (a missing commit among them), a spawn or
+    /// budget failure, or a signal.
+    pub async fn is_ancestor_of(
+        &self,
+        repo: &Path,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, IsolateError> {
+        if let Some(bad) = [ancestor, descendant]
+            .into_iter()
+            .find(|hash| !crate::target::bundle::is_full_hash(hash))
+        {
+            return Err(IsolateError::Refused(not_a_hash(repo, bad)));
+        }
+        let args = [
+            OsStr::new("merge-base"),
+            OsStr::new("--is-ancestor"),
+            OsStr::new(ancestor),
+            OsStr::new(descendant),
+        ];
+        let exited = self.run("merge-base", repo, &args, &[]).await?;
+        match exited.code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(exited.failure("merge-base")),
+        }
+    }
+}
+
+/// The `GIT_ALTERNATE_OBJECT_DIRECTORIES` entry naming `dir`: as it is, unless it holds the list
+/// separator or starts with `"`, in which case it is C-quoted, as `git` reads such an entry.
+fn alternate_entry(dir: &Path) -> std::ffi::OsString {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    match dir.to_str() {
+        Some(text) if text.contains(separator) || text.starts_with('"') => {
+            let mut quoted = String::with_capacity(text.len() + 2);
+            quoted.push('"');
+            for c in text.chars() {
+                if matches!(c, '"' | '\\') {
+                    quoted.push('\\');
+                }
+                quoted.push(c);
+            }
+            quoted.push('"');
+            quoted.into()
+        }
+        // A non-UTF-8 path is passed as it is: a separator byte in one splits the entry, and
+        // the alternate is then simply not found, which fails the verb rather than widening it.
+        _ => dir.as_os_str().to_owned(),
+    }
+}
+
+/// MOD-132 R1b M4: `repo`'s own object directory, absolute (the common directory's `objects`,
+/// so a linked worktree names its main repository's).
+///
+/// # Errors
+/// [`IsolateError::Git`] when the repository cannot be opened or its path made absolute.
+pub fn objects_dir(repo: &Path) -> Result<PathBuf, IsolateError> {
+    let objects = open(repo)?.common_dir().join("objects");
+    std::path::absolute(&objects).map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot resolve the object directory {}: {err}",
+            objects.display()
+        ))
+    })
+}
+
+/// MOD-132 R1b M4: moves every pack `quarantine` holds into its repository's `objects/pack/`:
+/// the `.pack` and its other files first and the `.idx` last, since a pack is visible once its
+/// index is. Each is renamed; across filesystems it is copied beside its destination under a
+/// temporary name and renamed from there, so a reader never sees half a file. A synchronous
+/// filesystem call: an async caller runs it on the blocking pool.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the quarantine cannot be read or a file cannot be moved.
+pub fn migrate_quarantine(quarantine: &ObjectQuarantine) -> Result<(), IsolateError> {
+    let from = quarantine.dir.join("pack");
+    let to = quarantine.objects.join("pack");
+    let failed = |what: &Path, err: &std::io::Error| {
+        IsolateError::Git(format!(
+            "cannot move {} into {}: {err}",
+            what.display(),
+            to.display()
+        ))
+    };
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(&from) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<_, _>>()
+            .map_err(|err| failed(&from, &err))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(failed(&from, &err)),
+    };
+    // Packs only: `index-pack`'s own `tmp_*` leftovers stay behind with the quarantine.
+    files.retain(|file| {
+        file.file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("pack-"))
+    });
+    files.sort_by_key(|file| {
+        (
+            file.extension().is_some_and(|ext| ext == "idx"),
+            file.clone(),
+        )
+    });
+    std::fs::create_dir_all(&to).map_err(|err| failed(&to, &err))?;
+    for file in files {
+        let name = file.file_name().expect("a directory entry has a name");
+        let dest = to.join(name);
+        if std::fs::rename(&file, &dest).is_ok() {
+            continue;
+        }
+        let mut staged_name = std::ffi::OsString::from("tmp_htui_");
+        staged_name.push(name);
+        let staged = to.join(staged_name);
+        std::fs::copy(&file, &staged)
+            .and_then(|_| std::fs::rename(&staged, &dest))
+            .map_err(|err| {
+                let _ = std::fs::remove_file(&staged);
+                failed(&file, &err)
+            })?;
+    }
+    Ok(())
 }
 
 /// `Ok` for exit 0; a signal is [`IsolateError::Git`]; any other exit is
@@ -2049,13 +2299,13 @@ pub(crate) async fn kill_within_grace(
 /// a job object, with the same refused-job-object downgrade `launch.rs` takes — a supervision
 /// mode, not a dead verb.
 fn spawn_supervised(
-    build: impl Fn() -> tokio::process::Command,
+    build: impl Fn() -> std::io::Result<tokio::process::Command>,
 ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
     use process_wrap::tokio::CommandWrap;
 
     #[cfg(unix)]
     {
-        let mut wrapped = CommandWrap::from(build());
+        let mut wrapped = CommandWrap::from(build()?);
         wrapped.wrap(process_wrap::tokio::ProcessGroup::leader());
         wrapped.spawn()
     }
@@ -2065,14 +2315,14 @@ fn spawn_supervised(
         use process_wrap::tokio::{CreationFlags, JobObject};
         use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
-        let mut wrapped = CommandWrap::from(build());
+        let mut wrapped = CommandWrap::from(build()?);
         wrapped.wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)));
         wrapped.wrap(JobObject);
         match wrapped.spawn() {
             Ok(child) => Ok(child),
             Err(error) => {
                 tracing::warn!(%error, "job object assignment refused; spawning the verb without it");
-                let mut wrapped = CommandWrap::from(build());
+                let mut wrapped = CommandWrap::from(build()?);
                 wrapped.wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)));
                 wrapped.spawn()
             }
@@ -3292,12 +3542,32 @@ mod tests {
     use crate::isolate::IsolateError;
 
     /// MOD-132 P10: the transfer budget replaces the verb budget and nothing else.
+    /// MOD-132 R1b M4: an alternate holding the list separator, or starting with `"`, is
+    /// C-quoted as `git` reads it; any other is passed as it is.
+    #[test]
+    fn an_alternate_entry_is_quoted_only_when_it_must_be() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        assert_eq!(
+            super::alternate_entry(std::path::Path::new("/repo/.git/objects")),
+            std::ffi::OsString::from("/repo/.git/objects")
+        );
+        assert_eq!(
+            super::alternate_entry(std::path::Path::new(&format!("/a{sep}b/\\x\"y/objects"))),
+            std::ffi::OsString::from(format!("\"/a{sep}b/\\\\x\\\"y/objects\""))
+        );
+        assert_eq!(
+            super::alternate_entry(std::path::Path::new("\"q/objects")),
+            std::ffi::OsString::from("\"\\\"q/objects\"")
+        );
+    }
+
     #[test]
     fn the_transfer_budget_is_fifteen_minutes() {
         let cli = Cli {
             binary: PathBuf::from("git"),
             version: MIN_GIT,
             budget: super::VERB_TIMEOUT,
+            quarantine: None,
         };
         let long = cli.with_transfer_budget();
         assert_eq!(long.budget, super::TRANSFER_TIMEOUT);
@@ -5577,6 +5847,7 @@ mod tests {
             binary: PathBuf::from("git"),
             version: MIN_GIT,
             budget: super::VERB_TIMEOUT,
+            quarantine: None,
         };
         assert_eq!(super::LS_REMOTE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(cli.ls_remote_budget(), Duration::from_secs(30));

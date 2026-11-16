@@ -6,38 +6,46 @@
 //! this box (`create_new`, `0600`, at most [`CollectRequest::cap`] bytes). A tip at the base is
 //! [`CollectOutcome::Nothing`] and makes no bundle.
 //!
-//! On this box, before any ref is written: the header ([`read_header`]) carries exactly one ref,
-//! the run branch at the tip just read; every prerequisite is a commit this box holds; `git bundle
-//! verify` passes; `git index-pack --strict --fix-thin` takes the pack (the fsck `git fetch`
-//! skips on a bundle, probe B5); and `rev-list --objects` finds the tip connected. Then the temp
-//! ref ([`temp_ref`]) holds the tip through the decision.
+//! On this box, before any object reaches the repository: the header ([`read_header`]) carries
+//! exactly one ref, the run branch at the tip just read; every prerequisite is a commit this box
+//! holds; `git bundle verify` passes; `git index-pack --strict --fix-thin` takes the pack (the
+//! fsck `git fetch` skips on a bundle, probe B5) into an object quarantine
+//! ([`ObjectQuarantine`], R1b M4) that reads the repository's objects as an alternate;
+//! `rev-list --objects` finds the tip connected; and the tip is a commit.
 //!
-//! The decision: the local branch must not be checked out anywhere; it is created, moved forward,
-//! or (rewritten) forced. A rewrite, or a changed path that runs on this box
-//! ([`HOST_EXECUTING_PATHS`], plus the caller's), needs a [`Consent`] naming this tip and this
-//! path list, else the outcome is [`CollectOutcome::NeedsConsent`] and nothing moves. The move is
-//! a compare-and-swap; a branch moved under it is [`CollectRefusal::LocalMoved`].
+//! The decision, read through the quarantine: the local branch must not be checked out anywhere;
+//! it is created, moved forward, or (rewritten) forced. A rewrite, or a changed path that runs on
+//! this box ([`HOST_EXECUTING_PATHS`], plus the caller's), needs a [`Consent`] naming this tip,
+//! the local tip it was given over and this path list, else the outcome is
+//! [`CollectOutcome::NeedsConsent`] and nothing moves. Only a move takes the quarantined pack into
+//! the repository, and then the branch moves by compare-and-swap; a branch moved under it is
+//! [`CollectRefusal::LocalMoved`].
 //!
-//! The temp ref and the quarantine file are removed on every exit. Waiting, retrying and asking
-//! the person are M2's (PRD D5): every fact a waiting row needs is in the outcome.
+//! The bundle file and the quarantine are removed on every exit, a dropped future included.
+//! Nothing writes a temp ref any more: objects stay out of the repository until the move, so
+//! there is nothing to hold through the decision; [`sweep_temp_refs`] removes those an earlier
+//! build left. Waiting, retrying and asking the person are M2's (PRD D5): every fact a waiting
+//! row needs is in the outcome.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::isolate::IsolateError;
+use crate::isolate::git::{
+    self, Cli, ObjectQuarantine, TRANSFER_TIMEOUT, VERB_TIMEOUT, blocking, with_retry,
+};
+use crate::target::bundle::{BundleRefusal, is_full_hash, read_header};
+use crate::target::seed::{bad_run_branch, bad_target_dir, target_git_failed};
+use crate::target::util::{Quarantine, escape_controls, git_in, last_stderr_line};
 use htui_agent::target_channel::{
     ChannelError, ExecOutput, ExecSpec, StdinFrom, StdoutTo, TargetChannel,
 };
-use htui_core::model::{RepoId, RunId};
-
-use crate::isolate::IsolateError;
-use crate::isolate::git::{self, Cli, TRANSFER_TIMEOUT, VERB_TIMEOUT, blocking, with_retry};
-use crate::target::bundle::{BundleRefusal, is_full_hash, read_header};
-use crate::target::seed::{bad_run_branch, bad_target_dir, target_git_failed};
 
 /// The default most bytes a collected bundle may hold: 2 GiB.
 pub const COLLECT_CAP: u64 = 2 << 30;
 
-/// Where every collect temp ref lives (plan P8); [`collect`] refuses a temp ref outside it.
+/// Where the collect temp refs of earlier builds live (plan P8); [`sweep_temp_refs`] removes
+/// them. A collect no longer writes one (R1b M4).
 pub const TEMP_REF_PREFIX: &str = "refs/htui-collect/";
 
 /// The entry [`CollectOutcome::NeedsConsent`] lists when the changed paths overflowed the diff
@@ -45,19 +53,31 @@ pub const TEMP_REF_PREFIX: &str = "refs/htui-collect/";
 pub const UNLISTED_PATHS: &str = "(more changed paths than the diff could list)";
 
 /// The repo-relative paths whose change can run code on this box once the branch is checked out
-/// or worked in here (plan P9, PRD OQ-1). Matched ASCII-case-insensitively, since a
-/// case-insensitive filesystem reads `.Claude/` as `.claude/`.
+/// or worked in here (plan P9, PRD OQ-1). Matched case-insensitively beyond ASCII and with each
+/// segment's trailing `.` and spaces dropped (R1b L1), since a case-insensitive filesystem reads
+/// `.Claude/` and `.huſky/` as `.claude/` and `.husky/`, and NTFS reads `CLAUDE.md.` as
+/// `CLAUDE.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathRules {
     /// Directories at the root, each ending in `/`: anything under one, and the entry itself.
     pub prefixes: &'static [&'static str],
+    /// Directory names, each ending in `/`, matched at any depth: anything under one, and the
+    /// entry itself.
+    pub directories: &'static [&'static str],
     /// Files at the root, matched exactly.
     pub root_files: &'static [&'static str],
     /// File names matched in any directory.
     pub basenames: &'static [&'static str],
 }
 
-/// Plan P9's list.
+/// Plan P9's list, widened by the maintainer's decision of 2026-11-16 (R1b M6).
+///
+/// `.cargo/` counts at any depth, and `rust-toolchain`, `rust-toolchain.toml`, `package.json`
+/// and `.envrc` as names in any directory: each runs code as soon as a tool is used in that
+/// directory (cargo's config can name a runner or a wrapper, a toolchain file installs and runs
+/// a toolchain, `package.json` names install scripts, direnv loads `.envrc`), whatever the
+/// person meant to do there. `Cargo.toml` and the lockfiles stay off the list: what they make a
+/// build run is the person's own step, like any change to the source they choose to build.
 pub const HOST_EXECUTING_PATHS: PathRules = PathRules {
     prefixes: &[
         ".claude/",
@@ -71,18 +91,14 @@ pub const HOST_EXECUTING_PATHS: PathRules = PathRules {
         ".idea/",
         ".githooks/",
         ".husky/",
-        ".cargo/",
         ".devcontainer/",
     ],
+    directories: &[".cargo/"],
     root_files: &[
         ".mcp.json",
-        ".envrc",
         ".pre-commit-config.yaml",
-        "rust-toolchain",
-        "rust-toolchain.toml",
         "Makefile",
         "justfile",
-        "package.json",
         ".npmrc",
         ".gitmodules",
         "compose.yaml",
@@ -95,6 +111,10 @@ pub const HOST_EXECUTING_PATHS: PathRules = PathRules {
         "GEMINI.md",
         ".gitattributes",
         "build.rs",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        "package.json",
+        ".envrc",
     ],
 };
 
@@ -104,9 +124,10 @@ pub const HOST_EXECUTING_PATHS: PathRules = PathRules {
 /// `project.settings.collect_confirm_paths`).
 #[must_use]
 pub fn host_executing(changed: &[String], extra: &[String]) -> Vec<String> {
+    let rules = Rules::new(extra);
     let mut listed: Vec<String> = changed
         .iter()
-        .filter(|path| runs_here(path, extra))
+        .filter(|path| rules.lists(path))
         .cloned()
         .collect();
     listed.sort();
@@ -114,53 +135,125 @@ pub fn host_executing(changed: &[String], extra: &[String]) -> Vec<String> {
     listed
 }
 
-/// Whether `path` is one [`host_executing`] lists.
-fn runs_here(path: &str, extra: &[String]) -> bool {
-    let rules = &HOST_EXECUTING_PATHS;
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    let (extra_prefixes, extra_files): (Vec<&str>, Vec<&str>) = extra
-        .iter()
-        .map(String::as_str)
-        .partition(|entry| entry.ends_with('/'));
-    rules
-        .prefixes
-        .iter()
-        .copied()
-        .chain(extra_prefixes)
-        .any(|prefix| under(path, prefix))
-        || rules
-            .root_files
-            .iter()
-            .copied()
-            .chain(extra_files)
-            .any(|file| path.eq_ignore_ascii_case(file))
-        || rules
-            .basenames
-            .iter()
-            .any(|name| basename.eq_ignore_ascii_case(name))
+/// [`HOST_EXECUTING_PATHS`] and the caller's entries, folded once per [`host_executing`] call.
+struct Rules {
+    prefixes: Vec<String>,
+    directories: Vec<String>,
+    files: Vec<String>,
+    basenames: Vec<String>,
 }
 
-/// Whether `path` is the directory `prefix` (which ends in `/`) or lies under it.
+impl Rules {
+    fn new(extra: &[String]) -> Self {
+        let rules = &HOST_EXECUTING_PATHS;
+        let folded = |entries: &[&str]| entries.iter().map(|entry| fold(entry)).collect();
+        let (extra_prefixes, extra_files): (Vec<&String>, Vec<&String>) =
+            extra.iter().partition(|entry| entry.ends_with('/'));
+        let mut prefixes: Vec<String> = folded(rules.prefixes);
+        prefixes.extend(extra_prefixes.into_iter().map(|entry| fold(entry)));
+        let mut files: Vec<String> = folded(rules.root_files);
+        files.extend(extra_files.into_iter().map(|entry| fold(entry)));
+        Self {
+            prefixes,
+            directories: folded(rules.directories),
+            files,
+            basenames: folded(rules.basenames),
+        }
+    }
+
+    /// Whether `path` is one [`host_executing`] lists.
+    fn lists(&self, path: &str) -> bool {
+        let path = fold(path);
+        let basename = path.rsplit('/').next().unwrap_or(&path);
+        self.prefixes.iter().any(|prefix| under(&path, prefix))
+            || self.directories.iter().any(|dir| anywhere(&path, dir))
+            || self.files.contains(&path)
+            || self.basenames.iter().any(|name| name == basename)
+    }
+}
+
+/// `path` as a case-insensitive filesystem compares it: each `/`-separated segment without its
+/// trailing `.` and spaces (NTFS drops them), upper- then lower-cased, so `ſ` (U+017F) folds to
+/// `s` and `K` (U+212A) to `k` as they do on such a filesystem. Folding can only add matches.
+fn fold(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            segment
+                .trim_end_matches(['.', ' '])
+                .to_uppercase()
+                .to_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Whether the folded `path` is the directory `prefix` (which ends in `/`) or lies under it.
 fn under(path: &str, prefix: &str) -> bool {
     let dir = &prefix[..prefix.len() - 1];
-    (!dir.is_empty() && path.eq_ignore_ascii_case(dir))
+    (!dir.is_empty() && path == dir) || path.starts_with(prefix)
+}
+
+/// Whether the folded `path` is the directory `dir` (which ends in `/`), or lies under it, at
+/// any depth.
+fn anywhere(path: &str, dir: &str) -> bool {
+    under(path, dir)
         || path
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            .match_indices('/')
+            .any(|(at, _)| under(&path[at + 1..], dir))
 }
 
-/// Plan P8: the temp ref of one run's collect of one repo, `refs/htui-collect/<run>/<repo>`. A
-/// run may span repos and an item may have several runs; uuids need no ref-name escaping.
+/// `path` as a consent prompt shows it: every control character and line separator written as
+/// `\u{..}` (R1b L2). [`CollectOutcome::NeedsConsent`] keeps the raw names, which a [`Consent`]
+/// is compared with; M2 renders each through this.
 #[must_use]
-pub fn temp_ref(run: RunId, repo: RepoId) -> String {
-    format!("{TEMP_REF_PREFIX}{run}/{repo}")
+pub fn display_path(path: &str) -> String {
+    escape_controls(path)
 }
 
-/// The person's yes, as a waiting row stores it: valid for one tip and one path list only.
+/// Deletes every ref under [`TEMP_REF_PREFIX`] in `repo`, as earlier builds of collect wrote
+/// them (M2 calls it at startup), and returns how many it deleted.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the repository or its refs cannot be read, or a delete fails.
+pub fn sweep_temp_refs(repo: &Path) -> Result<usize, IsolateError> {
+    let names = {
+        let opened = git::open(repo)?;
+        let unreadable = |err: &dyn std::fmt::Display| {
+            IsolateError::Git(format!("cannot read the refs of {}: {err}", repo.display()))
+        };
+        let refs = opened.references().map_err(|err| unreadable(&err))?;
+        let mut names = Vec::new();
+        for reference in refs.all().map_err(|err| unreadable(&err))? {
+            let name = reference
+                .map_err(|err| unreadable(&err))?
+                .name()
+                .as_bstr()
+                .to_string();
+            if name.starts_with(TEMP_REF_PREFIX) {
+                names.push(name);
+            }
+        }
+        names
+    };
+    let mut swept = 0;
+    for name in names {
+        if git::delete_ref(repo, &name)? {
+            swept += 1;
+        }
+    }
+    Ok(swept)
+}
+
+/// The person's yes, as a waiting row stores it: valid for one tip, one local tip and one path
+/// list only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Consent {
     /// The tip consented to.
     pub tip: String,
+    /// The local branch's tip when the person was asked: [`CollectOutcome::NeedsConsent`]'s
+    /// `rewritten_from` for a rewrite, the local tip when only paths were listed, `None` when the
+    /// branch did not exist (R1b M3). A branch that moved since asks again.
+    pub from: Option<String>,
     /// The local branch may be rewritten; without it a rewrite is never let through.
     pub force: bool,
     /// The host-executing paths consented to, as [`CollectOutcome::NeedsConsent`] listed them.
@@ -180,11 +273,10 @@ pub struct CollectRequest {
     pub base: String,
     /// The branch in [`repo`](Self::repo) that moves to the tip, a short name.
     pub local_branch: String,
-    /// The temp ref, from [`temp_ref`]; it must start with [`TEMP_REF_PREFIX`].
-    pub temp_ref: String,
     /// More host-executing paths: a prefix ends in `/`, anything else is exact.
     pub extra_confirm_paths: Vec<String>,
-    /// An absolute directory on this box the bundle is written to and removed from.
+    /// An absolute directory on this box the bundle and the object quarantine are written to and
+    /// removed from.
     pub scratch: PathBuf,
     /// The most bytes the bundle may hold; [`COLLECT_CAP`] by default.
     pub cap: u64,
@@ -216,13 +308,15 @@ pub enum CollectOutcome {
         /// The collected tip.
         tip: String,
     },
-    /// Nothing moved: the person must consent to this tip (and to `config_paths`).
+    /// Nothing moved: the person must consent to this tip (and to `config_paths`), over the local
+    /// branch as it is now.
     NeedsConsent {
         /// The tip to consent to.
         tip: String,
         /// The local branch's tip the move would drop, when it is a rewrite.
         rewritten_from: Option<String>,
-        /// The changed host-executing paths, sorted; empty when only the rewrite needs consent.
+        /// The changed host-executing paths, raw and sorted; empty when only the rewrite needs
+        /// consent. A prompt shows each through [`display_path`].
         config_paths: Vec<String>,
     },
 }
@@ -276,6 +370,12 @@ pub enum CollectRefusal {
     /// The tip's history is not complete on this box.
     #[error("{}", not_connected(.tip))]
     NotConnected {
+        /// The tip.
+        tip: String,
+    },
+    /// The tip is not a commit (a tree, a tag or a blob): no branch may point at it.
+    #[error("{}", not_a_commit(.tip))]
+    NotACommit {
         /// The tip.
         tip: String,
     },
@@ -340,6 +440,12 @@ pub fn not_connected(tip: &str) -> String {
     format!("the collected tip {tip} is missing part of its history on this box")
 }
 
+/// [`CollectRefusal::NotACommit`].
+#[must_use]
+pub fn not_a_commit(tip: &str) -> String {
+    format!("the collected tip {tip} is not a commit, so no branch is moved to it")
+}
+
 /// [`CollectRefusal::CheckedOut`].
 #[must_use]
 pub fn checked_out(branch: &str, at: &Path) -> String {
@@ -364,15 +470,6 @@ pub fn bad_local_branch(repo: &Path, branch: &str) -> String {
     )
 }
 
-/// The temp ref is not a valid ref under [`TEMP_REF_PREFIX`].
-#[must_use]
-pub fn bad_temp_ref(repo: &Path, name: &str) -> String {
-    format!(
-        "the collect temp ref {name:?} in {} is not a valid ref under {TEMP_REF_PREFIX}",
-        repo.display()
-    )
-}
-
 /// The scratch directory is relative.
 #[must_use]
 pub fn scratch_not_absolute(scratch: &Path) -> String {
@@ -380,16 +477,6 @@ pub fn scratch_not_absolute(scratch: &Path) -> String {
         "the collect scratch {} must be an absolute path",
         scratch.display()
     )
-}
-
-/// The quarantine file: removed on drop, so on every exit.
-struct Quarantine(PathBuf);
-
-impl Drop for Quarantine {
-    fn drop(&mut self) {
-        // NotFound is the normal case after a refusal before the bundle was written.
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 /// Collects `req.run_branch` of the clone behind `channel` into `req.local_branch` of `req.repo`
@@ -430,30 +517,21 @@ async fn collect_with(
     before_cas: &(dyn Fn() + Send + Sync),
 ) -> Result<CollectOutcome, CollectRefusal> {
     validate(req)?;
-    let quarantine = Quarantine(
-        req.scratch
-            .join(format!("collect-{}.bundle", uuid::Uuid::now_v7())),
+    let id = uuid::Uuid::now_v7();
+    // Held across every await: a refusal, a panic, or a future dropped mid-way removes both.
+    let scratch = Quarantine::with_dir(
+        req.scratch.join(format!("collect-{id}.bundle")),
+        req.scratch.join(format!("collect-{id}-objects")),
     );
-    let outcome = Collect {
+    Collect {
         cli,
         channel,
         req,
-        quarantine: &quarantine.0,
+        bundle: scratch.path(),
+        objects: scratch.dir().expect("a collect scratch has a directory"),
     }
     .run(before_cas)
-    .await;
-    let cleared = delete_temp_ref(&req.repo, &req.temp_ref).await;
-    drop(quarantine);
-    if let Err(err) = cleared {
-        // The next collect deletes a leftover before it writes; the outcome already happened.
-        tracing::warn!(
-            temp_ref = %req.temp_ref,
-            repo = %req.repo.display(),
-            %err,
-            "the collect temp ref could not be removed"
-        );
-    }
-    outcome
+    .await
 }
 
 /// Refuses a request before anything runs.
@@ -474,14 +552,6 @@ fn validate(req: &CollectRequest) -> Result<(), IsolateError> {
     if !is_full_hash(&req.base) {
         return Err(IsolateError::Refused(git::not_a_hash(&req.repo, &req.base)));
     }
-    if !req.temp_ref.starts_with(TEMP_REF_PREFIX)
-        || gix::validate::reference::name(req.temp_ref.as_bytes().into()).is_err()
-    {
-        return Err(IsolateError::Refused(bad_temp_ref(
-            &req.repo,
-            &req.temp_ref,
-        )));
-    }
     if req.scratch.is_relative() {
         return Err(IsolateError::Refused(scratch_not_absolute(&req.scratch)));
     }
@@ -496,22 +566,15 @@ fn valid_branch(name: &str) -> bool {
         && gix::validate::reference::name(format!("refs/heads/{name}").as_bytes().into()).is_ok()
 }
 
-/// Deletes `full_ref` in `repo` if it is there.
-async fn delete_temp_ref(repo: &Path, full_ref: &str) -> Result<(), IsolateError> {
-    with_retry("delete-ref", || {
-        let (repo, full_ref) = (repo.to_path_buf(), full_ref.to_owned());
-        blocking(move || git::delete_ref(&repo, &full_ref))
-    })
-    .await
-    .map(drop)
-}
-
 /// One collect in flight.
 struct Collect<'a> {
     cli: &'a Cli,
     channel: &'a dyn TargetChannel,
     req: &'a CollectRequest,
-    quarantine: &'a Path,
+    /// The bundle file in the scratch.
+    bundle: &'a Path,
+    /// The object quarantine directory in the scratch, made by [`Collect::check`].
+    objects: &'a Path,
 }
 
 impl Collect<'_> {
@@ -526,17 +589,9 @@ impl Collect<'_> {
         if tip == req.base {
             return Ok(CollectOutcome::Nothing);
         }
-        self.bundle(&full_run).await?;
-        self.check(&full_run, &tip).await?;
-
-        delete_temp_ref(&req.repo, &req.temp_ref).await?;
-        with_retry("create temp ref", || {
-            let (repo, name, tip) = (req.repo.clone(), req.temp_ref.clone(), tip.clone());
-            blocking(move || git::create_ref(&repo, &name, &tip))
-        })
-        .await?;
-
-        self.decide_and_move(tip, before_cas).await
+        self.make_bundle(&full_run).await?;
+        let quarantine = self.check(&full_run, &tip).await?;
+        self.decide_and_move(tip, &quarantine, before_cas).await
     }
 
     /// Step 1: the run branch's tip on the target.
@@ -577,8 +632,8 @@ impl Collect<'_> {
         Ok(tip.to_owned())
     }
 
-    /// Step 3: the bundle, into the quarantine file.
-    async fn bundle(&self, full_run: &str) -> Result<(), CollectRefusal> {
+    /// Step 3: the bundle, into the scratch file.
+    async fn make_bundle(&self, full_run: &str) -> Result<(), CollectRefusal> {
         let out = self
             .exec(
                 "bundle create",
@@ -593,7 +648,7 @@ impl Collect<'_> {
                     ],
                 ),
                 StdoutTo::File {
-                    path: self.quarantine.to_path_buf(),
+                    path: self.bundle.to_path_buf(),
                     cap: self.req.cap,
                 },
                 TRANSFER_TIMEOUT,
@@ -606,10 +661,11 @@ impl Collect<'_> {
         }
     }
 
-    /// Step 4: every check on this box, before any ref is written.
-    async fn check(&self, full_run: &str, tip: &str) -> Result<(), CollectRefusal> {
+    /// Step 4: every check on this box, before any object reaches the repository. The pack is
+    /// indexed into the object quarantine this returns, and stays there unless the branch moves.
+    async fn check(&self, full_run: &str, tip: &str) -> Result<ObjectQuarantine, CollectRefusal> {
         let req = self.req;
-        let header = read_header(self.quarantine)?;
+        let header = read_header(self.bundle)?;
         if !matches!(header.refs.as_slice(), [(hash, name)] if hash == tip && name == full_run) {
             let got = if header.refs.is_empty() {
                 "no ref".to_owned()
@@ -643,16 +699,29 @@ impl Collect<'_> {
             return Err(CollectRefusal::MissingPrerequisite { hash });
         }
 
-        match self.cli.bundle_verify(&req.repo, self.quarantine).await {
+        match self.cli.bundle_verify(&req.repo, self.bundle).await {
             Err(IsolateError::Refused(sentence)) => {
                 return Err(CollectRefusal::VerifyFailed(sentence));
             }
             other => other?,
         }
-        match self
-            .cli
+
+        let quarantine = {
+            let (repo, dir) = (req.repo.clone(), self.objects.to_path_buf());
+            blocking(move || {
+                private_dir(&dir)?;
+                private_dir(&dir.join("pack"))?;
+                Ok(ObjectQuarantine {
+                    dir,
+                    objects: git::objects_dir(&repo)?,
+                })
+            })
+            .await?
+        };
+        let cli = self.cli.in_quarantine(&quarantine);
+        match cli
             .with_transfer_budget()
-            .index_pack(&req.repo, self.quarantine, header.pack_offset, true)
+            .index_pack(&req.repo, self.bundle, header.pack_offset, req.cap)
             .await
         {
             Err(IsolateError::Refused(sentence)) => {
@@ -660,47 +729,51 @@ impl Collect<'_> {
             }
             other => other?,
         }
-        if !self
-            .cli
-            .connected(&req.repo, tip, &header.prerequisites)
-            .await?
-        {
+        if !cli.connected(&req.repo, tip, &header.prerequisites).await? {
             return Err(CollectRefusal::NotConnected {
                 tip: tip.to_owned(),
             });
         }
-        Ok(())
+        if cli.object_kind(&req.repo, tip).await?.as_deref() != Some("commit") {
+            return Err(CollectRefusal::NotACommit {
+                tip: tip.to_owned(),
+            });
+        }
+        Ok(quarantine)
     }
 
-    /// Step 6: the decision, and the compare-and-swap.
+    /// Step 6: the decision, read through the quarantine; then, for a move, the pack migrates
+    /// into the repository and the branch moves by compare-and-swap.
     async fn decide_and_move(
         &self,
         tip: String,
+        quarantine: &ObjectQuarantine,
         before_cas: &(dyn Fn() + Send + Sync),
     ) -> Result<CollectOutcome, CollectRefusal> {
         let req = self.req;
+        let cli = self.cli.in_quarantine(quarantine);
         let branch = req.local_branch.clone();
         let full_local = format!("refs/heads/{branch}");
 
-        let (local, at, rewritten) = {
-            let (repo, full_local, tip) = (req.repo.clone(), full_local.clone(), tip.clone());
+        let (local, at) = {
+            let (repo, full_local) = (req.repo.clone(), full_local.clone());
             blocking(move || {
                 let local = git::ref_target(&repo, &full_local)?;
                 let at = git::checked_out_at(&repo, &full_local)?;
-                let rewritten = match &local {
-                    Some(old) => !git::is_ancestor(&repo, old, &tip)?,
-                    None => false,
-                };
-                Ok((local, at, rewritten))
+                Ok((local, at))
             })
             .await?
         };
         if let Some(at) = at {
             return Err(CollectRefusal::CheckedOut { branch, at });
         }
+        let rewritten = match &local {
+            Some(old) => !cli.is_ancestor_of(&req.repo, old, &tip).await?,
+            None => false,
+        };
 
         let old = local.clone().unwrap_or_else(|| req.base.clone());
-        let mut changed = self.cli.name_only(&req.repo, &old, &tip).await?;
+        let mut changed = cli.name_only(&req.repo, &old, &tip).await?;
         // A non-UTF-8 name is matched on its lossy decoding: a skill or a `build.rs` under one
         // must not slip past consent (P9).
         changed.paths.append(&mut changed.unreadable);
@@ -717,6 +790,7 @@ impl Collect<'_> {
                 named.sort();
                 named.dedup();
                 consent.tip == tip
+                    && consent.from == local
                     && named == config_paths
                     && (rewritten_from.is_none() || consent.force)
             });
@@ -730,6 +804,10 @@ impl Collect<'_> {
         }
 
         before_cas();
+        {
+            let quarantine = quarantine.clone();
+            blocking(move || git::migrate_quarantine(&quarantine)).await?;
+        }
         let swapped = {
             let (repo, branch, local, tip) =
                 (req.repo.clone(), branch.clone(), local.clone(), tip.clone());
@@ -782,32 +860,24 @@ impl Collect<'_> {
 
     /// [`CollectRefusal::TargetGit`] over `out`'s last stderr line.
     fn target_git(&self, verb: &'static str, out: &ExecOutput) -> CollectRefusal {
-        let stderr = out
-            .stderr
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map_or_else(
-                || match out.code {
-                    Some(code) => format!("exit status {code} with no stderr"),
-                    None => "killed by a signal".to_owned(),
-                },
-                str::to_owned,
-            );
         CollectRefusal::TargetGit {
             verb,
             dir: self.req.target_dir.clone(),
-            stderr,
+            stderr: last_stderr_line(out),
         }
     }
 }
 
-/// `git -C <dir> <args>…` as an argv.
-fn git_in(dir: &str, args: &[&str]) -> Vec<String> {
-    ["git", "-C", dir]
-        .iter()
-        .chain(args)
-        .map(|arg| (*arg).to_owned())
-        .collect()
+/// Makes the directory `dir`, private to this user (`0700`) where the mode exists; it must not
+/// exist yet.
+fn private_dir(dir: &Path) -> Result<(), IsolateError> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot make the collect quarantine {}: {err}",
+            dir.display()
+        ))
+    })
 }

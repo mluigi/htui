@@ -2,13 +2,13 @@
 //! (plan P6, P8, P9), over the test-only [`StandInChannel`], from clones made by T3's [`seed`].
 //!
 //! Every case opens with [`skip_without_git`] and passes on a box without one, and every case
-//! ends on [`World::assert_clean`]: no `refs/htui-collect/*` ref and no quarantine file remain.
+//! ends on [`World::assert_clean`]: no `refs/htui-collect/*` ref and nothing in the scratch (no
+//! bundle, no object quarantine) remain.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use htui_agent::target_channel::{Canned, ChannelError, STAND_IN_MARKER, StandInChannel};
-use htui_core::model::{RepoId, RunId};
 use htui_orch::isolate::IsolateError;
 use htui_orch::isolate::git::testkit::repo_with_one_commit;
 use htui_orch::isolate::git::{SCRUBBED_ENV, branch_target, create_branch, create_ref, has_commit};
@@ -16,9 +16,10 @@ use htui_orch::skip_without_git;
 use htui_orch::target::bundle::BundleRefusal;
 use htui_orch::target::collect::{
     COLLECT_CAP, CollectOutcome, CollectRefusal, CollectRequest, Consent, HOST_EXECUTING_PATHS,
-    TEMP_REF_PREFIX, collect, collect_racing, host_executing, temp_ref,
+    TEMP_REF_PREFIX, collect, collect_racing, display_path, host_executing, not_a_commit,
+    sweep_temp_refs,
 };
-use htui_orch::target::seed::{SeedRequest, seed};
+use htui_orch::target::seed::{SeedRequest, seed, target_git_failed};
 
 use crate::write_executable::write_executable;
 
@@ -90,7 +91,6 @@ impl World {
             run_branch: RUN_BRANCH.to_owned(),
             base: self.base.clone(),
             local_branch: RUN_BRANCH.to_owned(),
-            temp_ref: temp_ref(RunId::new(), RepoId::new()),
             extra_confirm_paths: Vec::new(),
             scratch: self.scratch.clone(),
             cap: COLLECT_CAP,
@@ -102,6 +102,13 @@ impl World {
     /// [`STAND_IN_MARKER`] unset, so it reads `dir`'s own configuration and nothing of this
     /// box's.
     fn git(&self, dir: &Path, args: &[&str]) -> Output {
+        self.git_with_input(dir, args, None)
+    }
+
+    /// [`World::git`], fed `input` on stdin when it is given.
+    fn git_with_input(&self, dir: &Path, args: &[&str], input: Option<&[u8]>) -> Output {
+        use std::io::Write as _;
+
         let mut command = std::process::Command::new("git");
         command.arg("-C").arg(dir).args(args);
         for key in SCRUBBED_ENV {
@@ -113,9 +120,70 @@ impl World {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("git runs")
+            .stdin(if input.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("git runs");
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().expect("a stdin pipe");
+            stdin.write_all(input).expect("the input is written");
+        }
+        child.wait_with_output().expect("git exits")
+    }
+
+    /// The pack `git pack-objects --stdout` makes in `dir` of exactly `objects`.
+    fn pack_of(&self, dir: &Path, objects: &[String]) -> Vec<u8> {
+        let input = objects.join("\n") + "\n";
+        let out = self.git_with_input(
+            dir,
+            &["pack-objects", "--stdout", "-q"],
+            Some(input.as_bytes()),
+        );
+        assert!(out.status.success(), "pack-objects: {out:?}");
+        out.stdout
+    }
+
+    /// Every object `git rev-list --objects <revs>` names in `dir`.
+    fn objects_of(&self, dir: &Path, revs: &[&str]) -> Vec<String> {
+        let mut args = vec!["rev-list", "--objects"];
+        args.extend_from_slice(revs);
+        self.stdout(dir, &args)
+            .lines()
+            .map(|line| line.split(' ').next().expect("a hash").to_owned())
+            .collect()
+    }
+
+    /// A v2 bundle whose one prerequisite is the base and whose one ref is the run branch at
+    /// `tip`, carrying `pack`.
+    fn crafted_bundle(&self, tip: &str, pack: &[u8]) -> Vec<u8> {
+        let mut bytes = format!(
+            "# v2 git bundle\n-{}\n{tip} refs/heads/{RUN_BRANCH}\n\n",
+            self.base
+        )
+        .into_bytes();
+        bytes.extend_from_slice(pack);
+        bytes
+    }
+
+    /// How many packs this box's checkout holds.
+    fn packs(&self) -> usize {
+        let dir = self.host.join(".git/objects/pack");
+        std::fs::read_dir(&dir).map_or(0, |entries| {
+            entries
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .expect("an entry")
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "pack")
+                })
+                .count()
+        })
     }
 
     fn stdout(&self, dir: &Path, args: &[&str]) -> String {
@@ -194,6 +262,17 @@ impl World {
     }
 }
 
+/// A stand-in whose `rev-parse` answers `tip` and whose `bundle create` answers `bytes`.
+fn canned_tip_and_bundle(world: &World, tip: &str, bytes: Vec<u8>) -> StandInChannel {
+    let answer = format!("{tip}\n").into_bytes();
+    canned_bundle(world, bytes).canned(move |argv: &[String]| {
+        argv.iter().any(|arg| arg == "rev-parse").then(|| Canned {
+            stdout: answer.clone(),
+            code: 0,
+        })
+    })
+}
+
 /// A stand-in whose `bundle create` answers `bytes` instead of running.
 fn canned_bundle(world: &World, bytes: Vec<u8>) -> StandInChannel {
     world.channel().canned(move |argv: &[String]| {
@@ -206,23 +285,52 @@ fn canned_bundle(world: &World, bytes: Vec<u8>) -> StandInChannel {
     })
 }
 
-fn consent(tip: &str, force: bool, config_paths: &[&str]) -> Option<Consent> {
+fn consent(tip: &str, from: Option<&str>, force: bool, config_paths: &[&str]) -> Option<Consent> {
     Some(Consent {
         tip: tip.to_owned(),
+        from: from.map(str::to_owned),
         force,
         config_paths: config_paths.iter().map(|path| (*path).to_owned()).collect(),
     })
 }
 
+/// R1b M2: earlier builds' temp refs are swept, and nothing else is.
 #[test]
-fn the_temp_ref_names_the_run_and_the_repo() {
-    let (run, repo) = (RunId::new(), RepoId::new());
+fn sweep_temp_refs_removes_every_leftover_and_nothing_else() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let repo = root.path().join("repo");
+    let base = repo_with_one_commit(&repo);
+    for name in [
+        "refs/htui-collect/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002",
+        "refs/htui-collect/00000000-0000-0000-0000-000000000003/00000000-0000-0000-0000-000000000004",
+        "refs/heads/htui-collect/kept",
+    ] {
+        create_ref(&repo, name, &base).expect("a ref");
+    }
+    assert_eq!(sweep_temp_refs(&repo).expect("the sweep"), 2);
+    assert_eq!(sweep_temp_refs(&repo).expect("the second sweep"), 0);
     assert_eq!(
-        temp_ref(run, repo),
-        format!("refs/htui-collect/{run}/{repo}")
+        branch_target(&repo, "htui-collect/kept").expect("the branch reads"),
+        Some(base)
     );
-    assert!(temp_ref(run, repo).starts_with(TEMP_REF_PREFIX));
+    assert!(TEMP_REF_PREFIX.starts_with("refs/"));
     assert_eq!(COLLECT_CAP, 2 * 1024 * 1024 * 1024);
+}
+
+/// R1b L2: target-supplied text reaches a person escaped.
+#[test]
+fn control_characters_are_escaped_for_a_person() {
+    assert_eq!(
+        display_path(".claude/\u{1b}[2Jx\u{7f}\u{85}\u{2028}\u{2029}\ty\nz"),
+        ".claude/\\u{1b}[2Jx\\u{7f}\\u{85}\\u{2028}\\u{2029}\\u{9}y\\u{a}z"
+    );
+    assert_eq!(display_path("plain/ünïcode.md"), "plain/ünïcode.md");
+    let sentence = target_git_failed("bundle create", "clone", "fatal: \u{1b}]0;owned\u{7}");
+    assert!(
+        sentence.ends_with("fatal: \\u{1b}]0;owned\\u{7}"),
+        "{sentence}"
+    );
+    assert!(!sentence.chars().any(char::is_control), "{sentence}");
 }
 
 #[test]
@@ -268,6 +376,7 @@ fn host_executing_paths_match_prefixes_root_files_and_basenames() {
             "package.json",
             "scripts/run.sh",
             "sub/dir/AGENTS.md",
+            "web/package.json",
         ]
     );
     assert!(host_executing(&changed[..0], &extra).is_empty());
@@ -280,6 +389,54 @@ fn host_executing_paths_match_prefixes_root_files_and_basenames() {
             .iter()
             .all(|prefix| prefix.ends_with('/'))
     );
+}
+
+/// R1b M6: `.cargo/` at any depth, and the tool files that run code in their own directory as
+/// basenames anywhere; `Cargo.toml` is not listed. R1b L1: a name a case-folding filesystem, or
+/// NTFS's trailing-dot rule, reads as a listed one is listed too.
+#[test]
+fn widened_rules_match_at_any_depth_and_beyond_ascii() {
+    let changed: Vec<String> = [
+        "crates/x/.cargo/config.toml",
+        "crates/x/.cargo",
+        "sub/rust-toolchain.toml",
+        "sub/rust-toolchain",
+        "packages/a/package.json",
+        "sub/.envrc",
+        "crates/x/Cargo.toml",
+        "Cargo.lock",
+        "crates/x/cargo/config.toml",
+        ".hu\u{17f}ky/x",
+        "CLAUDE.md.",
+        "docs/AGENTS.md ",
+        ".claude./settings.json",
+        "pac\u{212a}age.json",
+        "src/main.rs",
+    ]
+    .iter()
+    .map(|path| (*path).to_owned())
+    .collect();
+    let extra = vec!["Ops/".to_owned(), "Scripts/Run.sh".to_owned()];
+    let mut more = changed.clone();
+    more.extend(["ops./deploy.sh", "scripts/run.sh.", "ops"].map(str::to_owned));
+    let mut expected = vec![
+        ".claude./settings.json",
+        ".hu\u{17f}ky/x",
+        "CLAUDE.md.",
+        "crates/x/.cargo",
+        "crates/x/.cargo/config.toml",
+        "docs/AGENTS.md ",
+        "pac\u{212a}age.json",
+        "packages/a/package.json",
+        "sub/.envrc",
+        "sub/rust-toolchain",
+        "sub/rust-toolchain.toml",
+    ];
+    expected.sort_unstable();
+    assert_eq!(host_executing(&changed, &extra), expected);
+    expected.extend(["ops", "ops./deploy.sh", "scripts/run.sh."]);
+    expected.sort_unstable();
+    assert_eq!(host_executing(&more, &extra), expected);
 }
 
 #[tokio::test]
@@ -342,18 +499,27 @@ async fn a_rewrite_needs_a_forcing_consent_for_its_tip() {
     world.assert_clean();
 
     let mut req = world.request();
-    req.consent = consent(&rewritten, false, &[]);
+    req.consent = consent(&rewritten, Some(&first), false, &[]);
     let outcome = collect(&cli, &channel, &req).await;
     assert_eq!(outcome.expect("collect"), needs, "consent without force");
     assert_eq!(world.local(), Some(first.clone()));
     world.assert_clean();
 
-    req.consent = consent(&first, true, &[]);
+    req.consent = consent(&first, Some(&first), true, &[]);
     let outcome = collect(&cli, &channel, &req).await;
     assert_eq!(outcome.expect("collect"), needs, "consent for another tip");
     world.assert_clean();
 
-    req.consent = consent(&rewritten, true, &[]);
+    req.consent = consent(&rewritten, None, true, &[]);
+    let outcome = collect(&cli, &channel, &req).await;
+    assert_eq!(
+        outcome.expect("collect"),
+        needs,
+        "consent over another local tip"
+    );
+    world.assert_clean();
+
+    req.consent = consent(&rewritten, Some(&first), true, &[]);
     let outcome = collect(&cli, &channel, &req).await;
     assert_eq!(
         outcome.expect("collect"),
@@ -376,6 +542,7 @@ async fn a_host_executing_path_needs_consent_for_its_tip_and_list() {
         &[(".claude/settings.json", "{}\n"), ("src/lib.rs", "\n")],
         "settings",
     );
+    let packs = world.packs();
 
     let outcome = collect(&cli, &channel, &world.request()).await;
     assert_eq!(
@@ -387,16 +554,18 @@ async fn a_host_executing_path_needs_consent_for_its_tip_and_list() {
         }
     );
     assert_eq!(world.local(), None, "nothing was created");
+    assert_eq!(world.packs(), packs, "no pack was kept");
+    assert!(!has_commit(&world.host, &first).expect("lookup"));
     world.assert_clean();
 
     let mut req = world.request();
-    req.consent = consent(&world.base, false, &[".claude/settings.json"]);
+    req.consent = consent(&world.base, None, false, &[".claude/settings.json"]);
     let outcome = collect(&cli, &channel, &req).await;
     assert!(
         matches!(outcome, Ok(CollectOutcome::NeedsConsent { .. })),
         "consent for another tip is ignored: {outcome:?}"
     );
-    req.consent = consent(&first, false, &[]);
+    req.consent = consent(&first, None, false, &[]);
     let outcome = collect(&cli, &channel, &req).await;
     assert!(
         matches!(outcome, Ok(CollectOutcome::NeedsConsent { .. })),
@@ -405,12 +574,17 @@ async fn a_host_executing_path_needs_consent_for_its_tip_and_list() {
     assert_eq!(world.local(), None);
     world.assert_clean();
 
-    req.consent = consent(&first, false, &[".claude/settings.json"]);
+    req.consent = consent(&first, None, false, &[".claude/settings.json"]);
     let outcome = collect(&cli, &channel, &req).await;
     assert_eq!(
         outcome.expect("collect"),
         CollectOutcome::Created { tip: first.clone() }
     );
+    assert!(
+        has_commit(&world.host, &first).expect("lookup"),
+        "the tip's objects moved in"
+    );
+    assert_eq!(world.packs(), packs + 1);
     world.assert_clean();
 
     let second = world.commit_in_clone(
@@ -442,6 +616,7 @@ async fn a_host_executing_path_needs_consent_for_its_tip_and_list() {
 
     req.consent = Some(Consent {
         tip: second.clone(),
+        from: Some(first.clone()),
         force: false,
         config_paths: listed,
     });
@@ -515,6 +690,7 @@ async fn a_non_utf8_host_executing_path_still_needs_consent() {
     let mut req = world.request();
     req.consent = Some(Consent {
         tip: tip.clone(),
+        from: None,
         force: false,
         config_paths: listed,
     });
@@ -736,6 +912,7 @@ async fn a_truncated_pack_is_refused_and_keeps_nothing() {
         .position(|window| window == b"PACK")
         .expect("a pack");
     bytes.truncate(pack + (bytes.len() - pack) / 2);
+    let packs = world.packs();
 
     let err = collect(&cli, &canned_bundle(&world, bytes), &world.request())
         .await
@@ -747,6 +924,7 @@ async fn a_truncated_pack_is_refused_and_keeps_nothing() {
         "{err:?}"
     );
     assert!(!has_commit(&world.host, &tip).expect("lookup"));
+    assert_eq!(world.packs(), packs, "no pack was kept");
     assert_eq!(world.local(), None);
     world.assert_clean();
 }
@@ -785,6 +963,7 @@ async fn a_commit_fsck_refuses_is_refused_and_keeps_nothing() {
         &clone,
         &["update-ref", &format!("refs/heads/{RUN_BRANCH}"), &bad],
     );
+    let packs = world.packs();
 
     let err = collect(&cli, &world.channel(), &world.request())
         .await
@@ -794,6 +973,7 @@ async fn a_commit_fsck_refuses_is_refused_and_keeps_nothing() {
         other => panic!("expected FsckFailed, got {other:?}"),
     }
     assert!(!has_commit(&world.host, &bad).expect("lookup"));
+    assert_eq!(world.packs(), packs, "no pack was kept");
     assert_eq!(world.local(), None);
     world.assert_clean();
 }
@@ -847,17 +1027,19 @@ async fn an_unreachable_target_is_refused_with_the_channel_sentence() {
     world.assert_clean();
 }
 
+/// R1b M4: a collect writes no temp ref, and leaves one an earlier build wrote to the sweep.
 #[tokio::test]
-async fn a_leftover_temp_ref_is_replaced_and_removed() {
+async fn a_leftover_temp_ref_is_left_to_the_sweep() {
     let Some((cli, world)) = world().await else {
         return;
     };
     let tip = world.commit_in_clone(&[("a.txt", "a\n")], "a");
-    let req = world.request();
-    create_ref(&world.host, &req.temp_ref, &world.base).expect("a leftover");
+    let leftover = format!("{TEMP_REF_PREFIX}earlier/build");
+    create_ref(&world.host, &leftover, &world.base).expect("a leftover");
 
-    let outcome = collect(&cli, &world.channel(), &req).await;
+    let outcome = collect(&cli, &world.channel(), &world.request()).await;
     assert_eq!(outcome.expect("collect"), CollectOutcome::Created { tip });
+    assert_eq!(sweep_temp_refs(&world.host).expect("the sweep"), 1);
     world.assert_clean();
 }
 
@@ -887,10 +1069,6 @@ async fn a_bad_request_is_refused_before_anything_runs() {
             Box::new(|req| req.local_branch = "-f".to_owned()),
         ),
         ("a bad base", Box::new(|req| req.base = "HEAD".to_owned())),
-        (
-            "a temp ref outside refs/htui-collect",
-            Box::new(|req| req.temp_ref = format!("refs/heads/{RUN_BRANCH}")),
-        ),
         (
             "a relative scratch",
             Box::new(|req| req.scratch = PathBuf::from("scratch")),
@@ -992,5 +1170,175 @@ async fn a_hostile_clone_never_runs_on_this_box() {
         .filter(|name| !name.starts_with("on-target-"))
         .collect();
     assert!(fired.is_empty(), "this box ran target code: {fired:?}");
+    world.assert_clean();
+}
+
+/// R1b M1: a target may answer `rev-parse` with a tree or a tag and ship a bundle that matches;
+/// the tip must be a commit before any branch is pointed at it.
+#[tokio::test]
+async fn a_tip_that_is_not_a_commit_is_refused() {
+    let Some((cli, world)) = world().await else {
+        return;
+    };
+    let clone = world.clone_dir();
+    let commit = world.commit_in_clone(&[("a.txt", "a\n")], "a");
+    world.stdout(&clone, &["tag", "-a", "-m", "a tag", "t1", &commit]);
+    let tag = world.stdout(&clone, &["rev-parse", "refs/tags/t1"]);
+    let tree = world.stdout(&clone, &["rev-parse", &format!("{commit}^{{tree}}")]);
+    let base_ref = format!("^{}", world.base);
+
+    let mut tag_objects = world.objects_of(&clone, &[&commit, &base_ref]);
+    tag_objects.push(tag.clone());
+    let tree_objects: Vec<String> = world
+        .objects_of(&clone, &[&commit, &base_ref])
+        .into_iter()
+        .filter(|object| *object != commit)
+        .collect();
+    let packs = world.packs();
+    for (what, tip, objects) in [
+        ("a tree", &tree, tree_objects),
+        ("a tag", &tag, tag_objects),
+    ] {
+        let bytes = world.crafted_bundle(tip, &world.pack_of(&clone, &objects));
+        let err = collect(
+            &cli,
+            &canned_tip_and_bundle(&world, tip, bytes),
+            &world.request(),
+        )
+        .await
+        .expect_err(what);
+        assert!(
+            matches!(&err, CollectRefusal::NotACommit { tip: got } if got == tip),
+            "{what}: {err:?}"
+        );
+        assert_eq!(err.to_string(), not_a_commit(tip), "{what}");
+        assert_eq!(world.local(), None, "{what}: nothing was created");
+        assert_eq!(world.packs(), packs, "{what}: no pack was kept");
+        world.assert_clean();
+    }
+}
+
+/// R1b M4: a tip `index-pack --strict` takes (its parent is here) whose history is not complete
+/// (the parent's own parent is missing) is refused, and nothing it brought is kept.
+#[tokio::test]
+async fn a_disconnected_tip_is_refused_and_keeps_nothing() {
+    let Some((cli, world)) = world().await else {
+        return;
+    };
+    let clone = world.clone_dir();
+    let tree = world.stdout(
+        &world.host,
+        &["rev-parse", &format!("{}^{{tree}}", world.base)],
+    );
+    let write_commit = |dir: &Path, parent: &str, name: &str| -> String {
+        let text = world.root.path().join(name);
+        std::fs::write(
+            &text,
+            format!(
+                "tree {tree}\nparent {parent}\nauthor A <a@localhost> 1600000000 +0000\n\
+                 committer A <a@localhost> 1600000000 +0000\n\n{name}\n"
+            ),
+        )
+        .expect("the commit text");
+        world.stdout(
+            dir,
+            &[
+                "hash-object",
+                "--literally",
+                "-t",
+                "commit",
+                "-w",
+                text.to_str().expect("utf-8"),
+            ],
+        )
+    };
+    let orphan = write_commit(&world.host, &"1".repeat(40), "orphan");
+    let tip = write_commit(&clone, &orphan, "tip");
+    let bytes = world.crafted_bundle(&tip, &world.pack_of(&clone, std::slice::from_ref(&tip)));
+    let packs = world.packs();
+
+    let err = collect(
+        &cli,
+        &canned_tip_and_bundle(&world, &tip, bytes),
+        &world.request(),
+    )
+    .await
+    .expect_err("a disconnected tip");
+    assert!(
+        matches!(&err, CollectRefusal::NotConnected { tip: got } if *got == tip),
+        "{err:?}"
+    );
+    assert!(!has_commit(&world.host, &tip).expect("lookup"));
+    assert_eq!(world.packs(), packs, "no pack was kept");
+    assert_eq!(world.local(), None);
+    world.assert_clean();
+}
+
+/// R1b M2: a collect dropped mid-way (here its `before_cas` panics, as a cancel or a timeout
+/// would drop it) leaves no temp ref, no quarantine and no pack behind.
+#[tokio::test]
+async fn a_collect_dropped_mid_way_leaves_nothing_behind() {
+    let Some((cli, world)) = world().await else {
+        return;
+    };
+    world.commit_in_clone(&[("a.txt", "a\n")], "a");
+    let packs = world.packs();
+    let (channel, req) = (world.channel(), world.request());
+    let joined = tokio::spawn(async move {
+        collect_racing(&cli, &channel, &req, &|| {
+            panic!("the collect is dropped here")
+        })
+        .await
+    })
+    .await;
+    assert!(joined.is_err_and(|err| err.is_panic()));
+    assert_eq!(world.local(), None);
+    assert_eq!(world.packs(), packs, "no pack was kept");
+    world.assert_clean();
+}
+
+/// R1b M3: a consent holds over the local tip the person saw; a local commit since asks again.
+#[tokio::test]
+async fn a_consent_is_bound_to_the_local_tip_it_was_given_over() {
+    let Some((cli, world)) = world().await else {
+        return;
+    };
+    let channel = world.channel();
+    let first = world.commit_in_clone(&[("a.txt", "a\n")], "a");
+    collect(&cli, &channel, &world.request())
+        .await
+        .expect("the first collect");
+    world.reset_clone(&world.base);
+    let rewritten = world.commit_in_clone(&[("c.txt", "c\n")], "c");
+
+    // The person consents over `first`; then a local commit moves the branch to `moved`.
+    let mut req = world.request();
+    req.consent = consent(&rewritten, Some(&first), true, &[]);
+    let moved = htui_orch::isolate::git::testkit::commit_file(&world.host, "h", "h\n", "h");
+    htui_orch::isolate::git::move_branch(&world.host, RUN_BRANCH, &first, &moved)
+        .expect("the local move");
+
+    let outcome = collect(&cli, &channel, &req).await;
+    assert_eq!(
+        outcome.expect("collect"),
+        CollectOutcome::NeedsConsent {
+            tip: rewritten.clone(),
+            rewritten_from: Some(moved.clone()),
+            config_paths: Vec::new(),
+        }
+    );
+    assert_eq!(world.local(), Some(moved.clone()), "nothing moved");
+    world.assert_clean();
+
+    req.consent = consent(&rewritten, Some(&moved), true, &[]);
+    let outcome = collect(&cli, &channel, &req).await;
+    assert_eq!(
+        outcome.expect("collect"),
+        CollectOutcome::Forced {
+            from: moved,
+            tip: rewritten.clone(),
+        }
+    );
+    assert_eq!(world.local(), Some(rewritten));
     world.assert_clean();
 }

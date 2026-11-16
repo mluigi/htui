@@ -6,12 +6,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use htui_agent::target_channel::{STAND_IN_MARKER, StandInChannel};
+use htui_agent::target_channel::{Canned, STAND_IN_MARKER, StandInChannel};
 use htui_orch::isolate::git::SCRUBBED_ENV;
 use htui_orch::isolate::git::testkit::{commit_file, repo_with_one_commit};
 use htui_orch::skip_without_git;
 use htui_orch::target::seed::{
-    PUSH_REFUSED, PrepareRefusal, SeedRequest, Seeded, occupied, seed, seeded_other,
+    PUSH_REFUSED, PrepareRefusal, SeedRequest, Seeded, credential_host, credential_in_url,
+    no_run_branch, occupied, seed, seeded_other,
 };
 
 use crate::write_executable::write_executable;
@@ -393,4 +394,146 @@ async fn the_scratch_keeps_only_what_it_held_before() {
         .map(|entry| entry.expect("an entry").file_name())
         .collect();
     assert_eq!(names, vec![std::ffi::OsString::from("keep.txt")]);
+}
+
+/// R1b M5: a `remote_url` with a password or a token is refused before anything runs, by its host
+/// alone; an ssh user without a password is no credential.
+#[tokio::test]
+async fn a_remote_url_with_a_credential_is_refused() {
+    let Some(cli) = skip_without_git!() else {
+        return;
+    };
+    let world = world();
+    let channel = StandInChannel::new(&world.home).unreachable();
+    for (url, host) in [
+        (
+            "https://user:s3cret-token@forge.example:8443/a/b.git",
+            "forge.example:8443",
+        ),
+        (
+            "https://s3cret-token@forge.example/a/b.git",
+            "forge.example",
+        ),
+        ("HTTP://s3cret-token@forge.example", "forge.example"),
+        (
+            "ssh://git:s3cret-token@forge.example/a/b.git",
+            "forge.example",
+        ),
+    ] {
+        let mut req = world.request("clone");
+        req.remote_url = Some(url.to_owned());
+        let err = seed(&cli, &channel, &req).await.expect_err(url);
+        assert!(
+            matches!(&err, PrepareRefusal::CredentialInUrl { host: got } if got == host),
+            "{url}: {err:?}"
+        );
+        assert_eq!(err.to_string(), credential_in_url(host));
+        assert!(!err.to_string().contains("s3cret"), "{err}");
+    }
+    assert!(world.scratch_is_empty());
+    assert!(!world.home.join("clone").exists());
+
+    for url in [
+        "git@forge.example:a/b.git",
+        "ssh://git@forge.example/a/b.git",
+        "https://forge.example/a/b.git",
+        "/srv/git/a.git",
+        "file:///srv/git/a.git",
+    ] {
+        assert_eq!(credential_host(url), None, "{url}");
+    }
+    let mut req = world.request("clone");
+    req.remote_url = Some("ssh://git@forge.example/a/b.git".to_owned());
+    seed(&cli, &StandInChannel::new(&world.home), &req)
+        .await
+        .expect("an ssh user without a password is seeded");
+    assert_eq!(
+        world.stdout(
+            &world.home.join("clone"),
+            &["config", "--get", "remote.origin.url"]
+        ),
+        "ssh://git@forge.example/a/b.git"
+    );
+}
+
+/// R1b L4: a clone seeded at this base is reused only when it has the run branch; without it the
+/// directory is refused, never seeded again over.
+#[tokio::test]
+async fn a_seeded_clone_without_the_run_branch_is_refused() {
+    let Some(cli) = skip_without_git!() else {
+        return;
+    };
+    let world = world();
+    let channel = StandInChannel::new(&world.home);
+    seed(&cli, &channel, &world.request("clone"))
+        .await
+        .expect("the first seed");
+    let clone = world.home.join("clone");
+    let head = world.stdout(&clone, &["rev-parse", "HEAD"]);
+
+    let mut req = world.request("clone");
+    req.run_branch = "htui/run/two".to_owned();
+    let err = seed(&cli, &channel, &req)
+        .await
+        .expect_err("another run branch is refused");
+    assert!(
+        matches!(&err, PrepareRefusal::NoRunBranch { dir, branch }
+            if dir == "clone" && branch == "htui/run/two"),
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), no_run_branch("clone", "htui/run/two"));
+    assert!(err.to_string().contains("clone") && err.to_string().contains("htui/run/two"));
+    assert_eq!(world.stdout(&clone, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        world
+            .git(
+                &clone,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/htui/run/two"
+                ]
+            )
+            .status
+            .code(),
+        Some(1),
+        "nothing was seeded over it"
+    );
+    assert!(world.scratch_is_empty());
+}
+
+/// R1b L8: the seed bundle is readable by this user only by the time the channel reads it.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_seed_bundle_is_private_when_the_channel_reads_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::{Arc, Mutex};
+
+    let Some(cli) = skip_without_git!() else {
+        return;
+    };
+    let world = world();
+    let modes = Arc::new(Mutex::new(Vec::new()));
+    let (seen, scratch) = (Arc::clone(&modes), world.scratch.clone());
+    let channel =
+        StandInChannel::new(&world.home).canned(move |argv: &[String]| -> Option<Canned> {
+            if argv.iter().any(|arg| arg == "index-pack") {
+                for entry in std::fs::read_dir(&scratch).expect("the scratch reads") {
+                    let mode = entry
+                        .expect("an entry")
+                        .metadata()
+                        .expect("metadata")
+                        .permissions()
+                        .mode();
+                    seen.lock().expect("the lock").push(mode & 0o777);
+                }
+            }
+            None
+        });
+    seed(&cli, &channel, &world.request("clone"))
+        .await
+        .expect("the seed succeeds");
+    assert_eq!(*modes.lock().expect("the lock"), vec![0o600]);
+    assert!(world.scratch_is_empty());
 }

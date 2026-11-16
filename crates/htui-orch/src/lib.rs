@@ -29,7 +29,8 @@
 //! fan-out's pure rules: names, base positions, the admission refusal, part widths and live
 //! siblings. MOD-133 adds [`land`], landing's pure half: a finished run's landed commits and the
 //! sentences a landing is refused or noted with. MOD-132 adds [`target`], preparing a target and
-//! collecting its work as a git bundle; M1 lands the bundle header parser.
+//! collecting its work as a git bundle; M1 lands the bundle header parser, the seed of a
+//! target's clone and the collect of its run branch.
 //!
 //! [`walk`]: mod@walk
 #![warn(missing_docs)]

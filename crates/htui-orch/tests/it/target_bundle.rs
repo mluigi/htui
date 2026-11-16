@@ -8,13 +8,18 @@ use std::path::{Path, PathBuf};
 
 use htui_orch::IsolateError;
 use htui_orch::isolate::git::testkit::{commit_file, empty_repo, repo_with_one_commit};
-use htui_orch::isolate::git::{Cli, SCRUBBED_ENV, create_ref, delete_ref, has_commit, ref_target};
+use htui_orch::isolate::git::{
+    Cli, ObjectQuarantine, SCRUBBED_ENV, create_ref, delete_ref, has_commit, migrate_quarantine,
+    objects_dir, ref_target,
+};
 use htui_orch::skip_without_git;
 use htui_orch::target::bundle::{
     BundleHeader, BundleRefusal, HEADER_CAP, parse_header, read_header,
 };
 
 const A: &str = "0123456789abcdef0123456789abcdef01234567";
+/// The `--max-input-size` the round trips pass: far above any pack they make.
+const CAP: u64 = 1 << 30;
 const B: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
 /// A header from its lines, terminated by the empty line, with a fake pack after it.
@@ -294,7 +299,7 @@ async fn round_trips_a_real_bundle_through_index_pack() {
         cli.bundle_verify(&target, &increment).await.is_err(),
         "the base is missing"
     );
-    cli.index_pack(&target, &seed, offset_of(&seed), true)
+    cli.index_pack(&target, &seed, offset_of(&seed), CAP)
         .await
         .expect("the seed pack indexes");
     create_ref(&target, "refs/heads/run", &base).expect("the run branch");
@@ -304,7 +309,7 @@ async fn round_trips_a_real_bundle_through_index_pack() {
     cli.bundle_verify(&target, &increment)
         .await
         .expect("verify with the base present");
-    cli.index_pack(&target, &increment, header.pack_offset, true)
+    cli.index_pack(&target, &increment, header.pack_offset, CAP)
         .await
         .expect("the increment indexes");
     assert!(has_commit(&target, &tip).expect("lookup"));
@@ -369,13 +374,13 @@ async fn strict_index_pack_refuses_a_commit_without_an_email_and_keeps_nothing()
     let lax = dir_in(root.path(), "lax");
     for target in [&strict, &lax] {
         empty_repo(target);
-        cli.index_pack(target, &seed, offset_of(&seed), true)
+        cli.index_pack(target, &seed, offset_of(&seed), CAP)
             .await
             .expect("the seed pack indexes");
     }
 
     let refused = cli
-        .index_pack(&strict, &hostile, offset_of(&hostile), true)
+        .index_pack(&strict, &hostile, offset_of(&hostile), CAP)
         .await;
     assert!(
         matches!(&refused, Err(IsolateError::Refused(sentence)) if sentence.contains("fsck")),
@@ -386,11 +391,145 @@ async fn strict_index_pack_refuses_a_commit_without_an_email_and_keeps_nothing()
         "nothing was kept"
     );
 
-    // The same pack without `--strict` is taken, which is what makes the flag the check.
-    cli.index_pack(&lax, &hostile, offset_of(&hostile), false)
-        .await
-        .expect("a lax index-pack takes it");
+    // The same pack without `--strict` is taken, which is what makes the flag the check: `git`
+    // itself, since `index_pack` is always strict (R1b L5).
+    let pack = std::fs::read(&hostile).expect("the bundle reads");
+    let offset = usize::try_from(offset_of(&hostile)).expect("small");
+    let mut lax_pack = std::process::Command::new(cli.binary());
+    lax_pack
+        .current_dir(&lax)
+        .args(["index-pack", "--stdin", "--fix-thin"]);
+    for key in SCRUBBED_ENV {
+        lax_pack.env_remove(key);
+    }
+    let mut lax_pack = lax_pack
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("git runs");
+    {
+        use std::io::Write as _;
+        let mut stdin = lax_pack.stdin.take().expect("a pipe");
+        stdin
+            .write_all(&pack[offset..])
+            .expect("the pack is written");
+    }
+    assert!(
+        lax_pack.wait().expect("git exits").success(),
+        "a lax index-pack takes it"
+    );
     assert!(has_commit(&lax, &bad).expect("lookup"));
+}
+
+/// R1b M4: `--max-input-size` refuses a pack over the cap and keeps nothing.
+#[tokio::test]
+async fn index_pack_refuses_a_pack_over_its_cap() {
+    let Some(cli) = skip_without_git!() else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let host = dir_in(root.path(), "host");
+    let base = repo_with_one_commit(&host);
+    create_ref(&host, "refs/heads/seed", &base).expect("seed ref");
+    let seed = root.path().join("seed.bundle");
+    cli.bundle_create(&host, "refs/heads/seed", &seed)
+        .await
+        .expect("bundle create");
+    let target = dir_in(root.path(), "target");
+    empty_repo(&target);
+    let refused = cli.index_pack(&target, &seed, offset_of(&seed), 16).await;
+    assert!(
+        matches!(&refused, Err(IsolateError::Refused(_))),
+        "{refused:?}"
+    );
+    assert!(!has_commit(&target, &base).expect("lookup"));
+}
+
+/// R1b M1, M4: the object-kind and ancestry reads `collect` makes through a quarantine.
+#[tokio::test]
+async fn object_kind_and_ancestry_read_through_a_quarantine() {
+    let Some(cli) = skip_without_git!() else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let host = dir_in(root.path(), "host");
+    let base = repo_with_one_commit(&host);
+    let tip = commit_file(&host, "g", "two\n", "two");
+    create_ref(&host, "refs/heads/seed", &base).expect("seed ref");
+    create_ref(&host, "refs/heads/run", &tip).expect("run ref");
+    let increment = root.path().join("increment.bundle");
+    git(
+        &cli,
+        &host,
+        &[
+            "bundle",
+            "create",
+            increment.to_str().expect("utf-8"),
+            "refs/heads/run",
+            &format!("^{base}"),
+        ],
+    );
+    let seed = root.path().join("seed.bundle");
+    cli.bundle_create(&host, "refs/heads/seed", &seed)
+        .await
+        .expect("bundle create");
+    let target = dir_in(root.path(), "target");
+    empty_repo(&target);
+    cli.index_pack(&target, &seed, offset_of(&seed), CAP)
+        .await
+        .expect("the seed pack indexes");
+
+    let quarantine = ObjectQuarantine {
+        dir: dir_in(root.path(), "quarantine"),
+        objects: objects_dir(&target).expect("the objects dir"),
+    };
+    let held = cli.in_quarantine(&quarantine);
+    held.index_pack(&target, &increment, offset_of(&increment), CAP)
+        .await
+        .expect("the increment indexes into the quarantine");
+    assert!(
+        !has_commit(&target, &tip).expect("lookup"),
+        "not in the repository"
+    );
+    assert_eq!(
+        cli.object_kind(&target, &tip).await.expect("cat-file"),
+        None
+    );
+    assert_eq!(
+        held.object_kind(&target, &tip)
+            .await
+            .expect("cat-file")
+            .as_deref(),
+        Some("commit")
+    );
+    assert!(
+        held.connected(&target, &tip, std::slice::from_ref(&base))
+            .await
+            .expect("rev-list")
+    );
+    assert!(
+        held.is_ancestor_of(&target, &base, &tip)
+            .await
+            .expect("merge-base")
+    );
+    assert!(
+        !held
+            .is_ancestor_of(&target, &tip, &base)
+            .await
+            .expect("merge-base")
+    );
+    assert!(
+        cli.is_ancestor_of(&target, &base, &tip).await.is_err(),
+        "the tip is not here"
+    );
+    assert!(cli.object_kind(&target, "--all").await.is_err());
+
+    migrate_quarantine(&quarantine).expect("the move");
+    assert!(
+        has_commit(&target, &tip).expect("lookup"),
+        "moved into the repository"
+    );
+    assert!(cli.connected(&target, &tip, &[]).await.expect("rev-list"));
 }
 
 #[tokio::test]
