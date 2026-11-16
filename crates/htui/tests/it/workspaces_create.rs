@@ -400,6 +400,39 @@ async fn a_create_reply_leaves_a_later_form_open() {
     assert!(home.join("workspaces").join("web").is_dir());
 }
 
+/// R1b B4 (verifier's follow-up): two creates out at once. The shell drops the first one's
+/// `new_workspace` reply as superseded by the second request of that name from the same tab
+/// (`App::on_reply`'s freshness rule), so it can never close the second, still busy, form: the
+/// second one's refusal lands under its own fields. The first workspace is created all the same.
+#[tokio::test]
+async fn a_create_reply_leaves_another_busy_form_open() {
+    let (_dir, home) = temp_home();
+    let mut harness = open_over(demo(&home).await, &home).await;
+    harness.key("N");
+    harness.key("enter");
+    type_text(&mut harness, "Mobile App");
+    harness.key("enter");
+    harness.key("esc");
+    harness.key("N");
+    harness.key("enter");
+    type_text(&mut harness, "Graphics");
+    harness.key("enter");
+    harness.settle().await;
+
+    assert!(home.join("workspaces").join("mobile-app").is_dir());
+    let frame = harness.render();
+    assert!(
+        frame.contains("New workspace"),
+        "the second form stays:\n{frame}"
+    );
+    assert!(row_with(&frame, "name").contains("Graphics"), "{frame}");
+    assert!(
+        detail_text(&frame).contains("workspace.slug `graphics` is taken"),
+        "its own refusal under its fields:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None);
+}
+
 /// `Esc` closes the form and nothing is written.
 #[tokio::test]
 async fn esc_closes_the_form_and_writes_nothing() {
