@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ids::{
-    AgentId, BatchId, BoxId, CommandRunId, ItemId, PersonaId, ProjectId, RepoId, RunId, RunPlanId,
-    StepGraphId, StepId, TargetId, UserId, WorkspaceId,
+    AgentId, BatchId, BoxId, CommandRunId, ItemId, McpServerId, PersonaId, ProjectId, RepoId,
+    RunId, RunPlanId, StepGraphId, StepId, TargetId, UserId, WorkspaceId,
 };
 use crate::model::integration::IntegrateMode;
 use crate::model::kind::{
     CommandQueue, EdgeKind, EdgePredicate, Gate, GraphScope, Isolation, PlanScope, Split,
 };
+use crate::model::mcp::{EnvValue, McpServer, McpTransport};
+use crate::model::skill::BindingLevel;
 use crate::model::target::{ResolvedTarget, TargetSource};
 
 str_enum!(
@@ -778,6 +780,91 @@ pub struct GraphSnapshot {
     /// `finish_run(Done)` writes one `integration` record per entry whose repo the run changed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub integrate: BTreeMap<RepoId, IntegrateSnapshot>,
+    /// MOD-127 M2 D6: the MCP servers the run's phases bind, frozen at `StartRun` by
+    /// `graph::resolve_with`: each server once, with its secret **names** and never a value.
+    /// `None` when no phase resolved a server and on every snapshot written before M2, which
+    /// launches htui's own server only. **Not** hashed by `topology` and [`GraphSnapshot::V`] is
+    /// not bumped; absent from the JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolbox: Option<SnapshotToolbox>,
+}
+
+/// MOD-127 M2 D6: [`GraphSnapshot::toolbox`], the servers a run's phases bind, as they were at
+/// `StartRun`. A later edit or delete of a server never reaches a started run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotToolbox {
+    /// Every server any phase picked, deduplicated by content and ordered by name bytes then id.
+    /// [`McpPick::server`] indexes it.
+    #[serde(default)]
+    pub servers: Vec<SnapshotMcpServer>,
+}
+
+/// One server of a [`SnapshotToolbox`]: the neutral `mcp_server` record a launch builds its spec
+/// from. [`EnvValue::Secret`] holds the **name** of a project secret, so the snapshot, its
+/// digest and the logs never carry a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMcpServer {
+    /// `mcp_server.id`.
+    pub id: McpServerId,
+    /// `mcp_server.name`, which forms the agent's `mcp__<name>__<tool>` names.
+    pub name: String,
+    /// `mcp_server.description`.
+    #[serde(default)]
+    pub description: String,
+    /// `mcp_server.transport`.
+    pub transport: McpTransport,
+    /// The program to start (`Stdio`).
+    #[serde(default)]
+    pub command: String,
+    /// The program's arguments (`Stdio`).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The endpoint (`Http`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// HTTP headers, in order.
+    #[serde(default)]
+    pub headers: Vec<(String, EnvValue)>,
+    /// Environment variables of the child, in order.
+    #[serde(default)]
+    pub env: Vec<(String, EnvValue)>,
+    /// Tool names pre-approved for the server.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Tool names removed from the agent.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl From<&McpServer> for SnapshotMcpServer {
+    fn from(server: &McpServer) -> Self {
+        Self {
+            id: server.id,
+            name: server.name.clone(),
+            description: server.description.clone(),
+            transport: server.transport,
+            command: server.command.clone(),
+            args: server.args.clone(),
+            url: server.url.clone(),
+            headers: server.headers.clone(),
+            env: server.env.clone(),
+            allow: server.allow.clone(),
+            deny: server.deny.clone(),
+        }
+    }
+}
+
+/// MOD-127 M2 D6: one server a [`SnapshotPhase`] resolved, by index into
+/// [`SnapshotToolbox::servers`]. An `off` winner is kept, `active: false`, so the step record can
+/// show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPick {
+    /// Index into [`SnapshotToolbox::servers`].
+    pub server: usize,
+    /// The level of the attachment that won.
+    pub level: BindingLevel,
+    /// Whether the server launches: the winning attachment is not `off`.
+    pub active: bool,
 }
 
 /// MOD-133 D3: [`GraphSnapshot::integrate`], one non-`local` repo's landing as frozen at
@@ -1039,6 +1126,12 @@ pub struct SnapshotPhase {
     /// MOD-138 D11: `Some` exactly on a node whose stored `split` is `divide`; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub divide: Option<SnapshotDivide>,
+    /// MOD-127 M2 D6: the MCP servers this node resolved at `StartRun`, indexing
+    /// [`GraphSnapshot::toolbox`]; a judge shares its phase's picks, and a divided node's planner
+    /// and integrate rows carry the node's. **Not** hashed by `graph::topology` (editing a server
+    /// never parks a run); absent from the JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpPick>,
 }
 
 impl SnapshotPhase {
@@ -2385,6 +2478,7 @@ mod tests {
             palette: false,
             plan_scope: None,
             divide: None,
+            mcp: Vec::new(),
         }
     }
 
@@ -2424,6 +2518,7 @@ mod tests {
             memory: None,
             capture: None,
             integrate: std::collections::BTreeMap::new(),
+            toolbox: None,
         }
     }
 
@@ -2523,6 +2618,98 @@ mod tests {
             tools: PersonaTools::default(),
             permission: PersonaPermission::default(),
         }
+    }
+
+    fn toolbox_with(server: &str) -> super::SnapshotToolbox {
+        super::SnapshotToolbox {
+            servers: vec![super::SnapshotMcpServer {
+                id: crate::model::ids::McpServerId::new(),
+                name: server.to_owned(),
+                description: String::new(),
+                transport: crate::model::mcp::McpTransport::Stdio,
+                command: "mcp-docs".to_owned(),
+                args: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                env: vec![(
+                    "API_TOKEN".to_owned(),
+                    crate::model::mcp::EnvValue::Secret("billing".to_owned()),
+                )],
+                allow: Vec::new(),
+                deny: Vec::new(),
+            }],
+        }
+    }
+
+    /// MOD-127 M2 D6: no toolbox and no pick is absent from the JSON, so a run with no server
+    /// (and every snapshot written before M2) keeps its bytes and decodes to the same value.
+    #[test]
+    fn a_snapshot_without_a_toolbox_omits_the_keys_and_decodes_without_one() {
+        let snapshot = graph_snapshot(vec![snapshot_phase(None)], Vec::new());
+        let json = serde_json::to_value(&snapshot).expect("encodes");
+        assert!(json.get("toolbox").is_none(), "{json}");
+        assert!(json["phases"][0].get("mcp").is_none(), "{json}");
+        let back: super::GraphSnapshot = serde_json::from_value(json).expect("decodes");
+        assert_eq!(back, snapshot);
+        assert_eq!(back.toolbox, None);
+        assert!(back.phases[0].mcp.is_empty());
+    }
+
+    /// MOD-127 M2 D6, D3: the toolbox and a phase's picks round-trip, and the record names a secret
+    /// and never holds its value.
+    #[test]
+    fn a_frozen_toolbox_round_trips_with_secret_names_only() {
+        let mut phase = snapshot_phase(None);
+        phase.mcp = vec![super::McpPick {
+            server: 0,
+            level: crate::model::skill::BindingLevel::Phase,
+            active: false,
+        }];
+        let mut snapshot = graph_snapshot(vec![phase], Vec::new());
+        snapshot.toolbox = Some(toolbox_with("docs"));
+
+        let json = serde_json::to_value(&snapshot).expect("encodes");
+        assert_eq!(
+            json["phases"][0]["mcp"],
+            serde_json::json!([{ "server": 0, "level": "phase", "active": false }])
+        );
+        assert_eq!(
+            json["toolbox"]["servers"][0]["env"],
+            serde_json::json!([["API_TOKEN", { "secret": "billing" }]])
+        );
+        let back: super::GraphSnapshot = serde_json::from_value(json).expect("decodes");
+        assert_eq!(back, snapshot);
+    }
+
+    /// MOD-127 M2 D6: [`super::SnapshotMcpServer::from`] copies the record's launch fields and
+    /// leaves out its stamps and author.
+    #[test]
+    fn a_frozen_server_is_the_neutral_record() {
+        let server = crate::model::mcp::McpServer {
+            id: crate::model::ids::McpServerId::new(),
+            name: "web".to_owned(),
+            description: "fetch".to_owned(),
+            transport: crate::model::mcp::McpTransport::Http,
+            command: String::new(),
+            args: Vec::new(),
+            url: Some("https://mcp.example.test".to_owned()),
+            headers: vec![(
+                "Authorization".to_owned(),
+                crate::model::mcp::EnvValue::Secret("gateway".to_owned()),
+            )],
+            env: Vec::new(),
+            allow: vec!["fetch".to_owned()],
+            deny: vec!["post".to_owned()],
+            created_by: crate::model::ids::UserId::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let frozen = super::SnapshotMcpServer::from(&server);
+        let json = serde_json::to_value(&frozen).expect("encodes");
+        assert!(json.get("created_by").is_none() && json.get("updated_at").is_none());
+        assert_eq!(frozen.id, server.id);
+        assert_eq!(frozen.headers, server.headers);
+        assert_eq!((frozen.allow, frozen.deny), (server.allow, server.deny));
     }
 
     #[test]

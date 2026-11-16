@@ -33,38 +33,42 @@ use crate::model::{
 };
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
-    BOX_PROBE_SPEC_KEY, BatchClose, BatchId, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo,
-    BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, EventKind, Executor,
-    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
-    FollowUpSettle, FollowUpView, FollowUpWindow, GateOutcome, Item, ItemCitation, ItemFilter,
-    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryBody, MemoryEntry,
-    MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState, MemorySubject,
-    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
-    NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona,
-    PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    ProjectRef, ProjectType, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry,
-    QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementState, RequirementUpdate, Resolution, ResolveScope, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillLevel, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode,
-    TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
-    WorkspaceSummary, canonical_declared_tags, memory_subject_key, missing_tags_failure,
-    moved_order, overlaps, prompt_summary, scope_of,
+    BOX_PROBE_SPEC_KEY, BatchClose, BatchId, Binding, BindingChange, BindingKey, BindingLevel,
+    BindingRef, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow,
+    BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
+    CommandRunId, CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document,
+    DocumentHead, DocumentId, EventKind, Executor, FOLLOW_UP_RUN_CANCELLED,
+    FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpView,
+    FollowUpWindow, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge,
+    LinkGraph, LinkKind, LinkNode, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch,
+    MemoryRevision, MemoryState, MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun,
+    NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewPersona,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PendingStop,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, ProjectType, PromptScope,
+    PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueRow, QueueRunFact,
+    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, ResolveScope, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand,
+    RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
+    Skill, SkillBindingId, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop, WorkspaceSummary, canonical_declared_tags, memory_subject_key,
+    missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::model::{
     AttachedBox, BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind,
     locator_refusal, target_name_refusal,
+};
+use crate::model::{
+    BoundMcp, McpCandidate, McpServer, McpServerId, McpServerPatch, NewMcpServer,
+    mcp_server_patch_refusal, new_mcp_server_refusal, resolve_mcp,
 };
 use crate::model::{
     CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemorySource, MemoryUsage, NewRunMemory, RunMemoryWrite,
@@ -323,13 +327,18 @@ struct State {
     /// [`WriteStore::create_persona`] and [`WriteStore::update_persona`]; global, so
     /// `delete_project` leaves it.
     personas: HashMap<PersonaId, Persona>,
-    /// `skill_version`, resolved through [`SkillBinding::version_in_force`], read by
+    /// `skill_version`, resolved through [`Binding::version_in_force`], read by
     /// [`WriteStore::skill_versions`] and appended to by [`WriteStore::create_skill`] and
     /// [`WriteStore::add_skill_version`].
     skill_versions: Vec<SkillVersion>,
     /// `toolbox_binding`, resolved through `model::skill::resolve`, read by
     /// [`WriteStore::skill_bindings`] and written by [`WriteStore::set_skill_binding`].
-    skill_bindings: Vec<SkillBinding>,
+    skill_bindings: Vec<Binding>,
+    /// `mcp_server` (MOD-127 M2 D2): a global registry like `skills`, no versions, no fixture. Its
+    /// attachments are rows of `skill_bindings` whose `skill_id` holds the server's id (`kind =
+    /// 'mcp_server'` in Postgres): the two id spaces are disjoint UUIDv7s, so a row is a server's
+    /// exactly when its `skill_id` is a key here ([`State::binding_key`]).
+    mcp_servers: HashMap<McpServerId, McpServer>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
     /// `box.probe_spec_digest`, which `BoxRow` does not carry (D14). Written by
@@ -570,6 +579,7 @@ impl MemStore {
             personas: data.personas.into_iter().map(|row| (row.id, row)).collect(),
             skill_versions: data.skill_versions,
             skill_bindings: data.skill_bindings,
+            mcp_servers: HashMap::new(),
             box_tools: data.box_tools,
             box_probe_digests: HashMap::new(),
             app_settings: BTreeMap::new(),
@@ -792,6 +802,34 @@ impl MemStore {
         }))
     }
 
+    /// A step's MCP servers (MOD-127 M2 D5): the `mcp_server` attachments that apply in `scope`
+    /// (`binding_applies`, the filter `PgStore`'s `WHERE` says in SQL), resolved most-specific-wins
+    /// by [`resolve_mcp`] and ordered by server name bytes. An `off` winner is included, inactive.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        Ok(self.read(|state| {
+            let candidates: Vec<McpCandidate> = state
+                .skill_bindings
+                .iter()
+                .filter(|binding| binding_applies(binding, scope))
+                .filter_map(|binding| {
+                    state
+                        .mcp_servers
+                        .get(&McpServerId::from_uuid(binding.skill_id.as_uuid()))
+                        .map(|server| McpCandidate {
+                            server: server.clone(),
+                            level: binding.level(),
+                            activation: binding.activation,
+                        })
+                })
+                .collect();
+            resolve_mcp(&candidates)
+        }))
+    }
+
     /// One box projected for the prompt's `box` section, or `None` when no row has that id.
     ///
     /// The `box_tool` join is [`BoxProfile::project`](crate::model::BoxProfile::project)'s: name
@@ -998,7 +1036,7 @@ impl MemStore {
 
     /// One `prompt_template` by `(project, name)`: the pinned `version` when there is one, else
     /// the highest. `None` when the pin cannot be honoured, which is
-    /// [`SkillBinding::version_in_force`]'s rule for the same shape of question.
+    /// [`Binding::version_in_force`]'s rule for the same shape of question.
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
@@ -4964,8 +5002,8 @@ impl State {
     /// D91, MOD-127 D6: the rows `home` lists, sorted by `(skill_id, item_kind_id, phase_id)`
     /// (`None < Some`, as `NULLS FIRST`; `Uuid`'s `Ord` is byte order, as Postgres's `uuid`
     /// comparison).
-    fn skill_binding_rows(&self, home: BindingHome) -> Vec<SkillBinding> {
-        let mut rows: Vec<SkillBinding> = self
+    fn skill_binding_rows(&self, home: BindingHome) -> Vec<Binding> {
+        let mut rows: Vec<Binding> = self
             .skill_bindings
             .iter()
             .filter(|row| home.lists(row))
@@ -4982,14 +5020,136 @@ impl State {
     }
 
     /// The row at a natural key, `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`.
-    fn skill_binding_at(&self, key: SkillBindingKey) -> Option<&SkillBinding> {
+    fn skill_binding_at(&self, key: BindingKey) -> Option<&Binding> {
         self.skill_bindings
             .iter()
-            .find(|row| SkillBindingKey::of(row) == key)
+            .find(|row| self.binding_key(row) == key)
+    }
+
+    /// The key a stored row sits under, kind included: a row whose `skill_id` is a registered
+    /// server's id is that server's attachment (MOD-127 M2 D1; [`State::mcp_servers`]).
+    fn binding_key(&self, row: &Binding) -> BindingKey {
+        let server = McpServerId::from_uuid(row.skill_id.as_uuid());
+        BindingKey {
+            target: if self.mcp_servers.contains_key(&server) {
+                BindingRef::McpServer(server)
+            } else {
+                BindingRef::Skill(row.skill_id)
+            },
+            ..BindingKey::of(row)
+        }
+    }
+
+    /// Every server, by `name` bytes (`COLLATE "C"`).
+    fn mcp_server_rows(&self) -> Vec<McpServer> {
+        let mut rows: Vec<McpServer> = self.mcp_servers.values().cloned().collect();
+        rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        rows
+    }
+
+    /// Order: [`new_mcp_server_refusal`]; `require_user(created_by, "mcp_server.created_by")`; a
+    /// taken id → `already_exists("mcp_server", id)`; an id a skill holds →
+    /// `already_exists("skill", id)`; a taken name → `already_exists("mcp_server",
+    /// name)`. Both stamps are `now`.
+    fn create_mcp_server(&mut self, new: NewMcpServer, now: DateTime<Utc>) -> Result<McpServer> {
+        if let Some(refusal) = new_mcp_server_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "mcp_server.created_by")?;
+        if self.mcp_servers.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("mcp_server", new.id)));
+        }
+        if self
+            .skills
+            .contains_key(&SkillId::from_uuid(new.id.as_uuid()))
+        {
+            return Err(StoreError::Constraint(already_exists("skill", new.id)));
+        }
+        if self.mcp_servers.values().any(|row| row.name == new.name) {
+            return Err(StoreError::Constraint(already_exists(
+                "mcp_server",
+                &new.name,
+            )));
+        }
+        let server = McpServer {
+            id: new.id,
+            name: new.name,
+            description: new.description,
+            transport: new.transport,
+            command: new.command,
+            args: new.args,
+            url: new.url,
+            headers: new.headers,
+            env: new.env,
+            allow: new.allow,
+            deny: new.deny,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        self.mcp_servers.insert(server.id, server.clone());
+        Ok(server)
+    }
+
+    /// `update_skill`'s shape: `NotFound("mcp_server")` → `Stale(current)` →
+    /// [`mcp_server_patch_refusal`] → a name another row holds → apply and stamp `now` (an
+    /// all-`None` patch still stamps, as the Postgres trigger does).
+    fn update_mcp_server(
+        &mut self,
+        id: McpServerId,
+        expected: DateTime<Utc>,
+        patch: McpServerPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<McpServer>> {
+        let current = self
+            .mcp_servers
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "mcp_server",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(refusal) = mcp_server_patch_refusal(&current, &patch) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(name) = &patch.name
+            && self
+                .mcp_servers
+                .values()
+                .any(|row| row.id != id && row.name == *name)
+        {
+            return Err(StoreError::Constraint(already_exists("mcp_server", name)));
+        }
+        let row = self
+            .mcp_servers
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        patch.apply(row);
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// Removes the server and every attachment that names it (`toolbox_binding.ref_id` has no
+    /// foreign key, M1 D3), returning how many attachments went.
+    fn delete_mcp_server(&mut self, id: McpServerId) -> Result<u64> {
+        if self.mcp_servers.remove(&id).is_none() {
+            return Err(StoreError::NotFound {
+                entity: "mcp_server",
+                id: id.to_string(),
+            });
+        }
+        let before = self.skill_bindings.len();
+        self.skill_bindings
+            .retain(|row| row.skill_id.as_uuid() != id.as_uuid());
+        Ok(u64::try_from(before - self.skill_bindings.len()).unwrap_or(u64::MAX))
     }
 
     /// Order: `new_skill_refusal`; `require_user(created_by, "skill.created_by")`; a taken id →
-    /// `already_exists("skill", id)`; a taken name → `already_exists("skill", name)`. Writes the
+    /// `already_exists("skill", id)`; an id an MCP server holds → `already_exists("mcp_server",
+    /// id)`; a taken name → `already_exists("skill", name)`. Writes the
     /// row and its version 1, both stamped `now`.
     fn create_skill(&mut self, new: NewSkill, now: DateTime<Utc>) -> Result<(Skill, SkillVersion)> {
         if let Some(refusal) = new_skill_refusal(&new.name, &new.description, &new.body) {
@@ -4998,6 +5158,12 @@ impl State {
         self.require_user(new.created_by, "skill.created_by")?;
         if self.skills.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists("skill", new.id)));
+        }
+        if self
+            .mcp_servers
+            .contains_key(&McpServerId::from_uuid(new.id.as_uuid()))
+        {
+            return Err(StoreError::Constraint(already_exists("mcp_server", new.id)));
         }
         if self.skills.values().any(|row| row.name == new.name) {
             return Err(StoreError::Constraint(already_exists("skill", &new.name)));
@@ -5277,23 +5443,38 @@ impl State {
     /// editable columns in place and stamps `now` (the id is kept); a detach removes the row.
     fn set_skill_binding(
         &mut self,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
         now: DateTime<Utc>,
-    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+    ) -> Result<CasOutcome<Option<Binding>>> {
         let current = self.skill_binding_at(key).cloned();
         if current.as_ref().map(|row| row.updated_at) != expected {
             return Ok(CasOutcome::Stale(current));
         }
-        let skill_name = self
-            .skills
-            .get(&key.skill)
-            .map(|row| row.name.clone())
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "skill",
-                id: key.skill.to_string(),
-            })?;
+        // The target's own facts; an `mcp_server` attachment has no name to quote and no versions
+        // (MOD-127 M2 D4), and its row keeps the server's id in `skill_id`.
+        let (skill, skill_name) = match key.target {
+            BindingRef::Skill(skill) => (
+                skill,
+                self.skills
+                    .get(&skill)
+                    .map(|row| row.name.clone())
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "skill",
+                        id: skill.to_string(),
+                    })?,
+            ),
+            BindingRef::McpServer(server) => {
+                if !self.mcp_servers.contains_key(&server) {
+                    return Err(StoreError::NotFound {
+                        entity: "mcp_server",
+                        id: server.to_string(),
+                    });
+                }
+                (SkillId::from_uuid(server.as_uuid()), String::new())
+            }
+        };
         let project_slug = match key.project {
             Some(id) => self
                 .projects
@@ -5351,11 +5532,14 @@ impl State {
             }
             BindingChange::Attach(attachment) => attachment,
         };
-        let versions: Vec<i32> = self
-            .skill_version_rows(key.skill)
-            .iter()
-            .map(|row| row.version)
-            .collect();
+        let versions: Vec<i32> = match key.target {
+            BindingRef::Skill(_) => self
+                .skill_version_rows(skill)
+                .iter()
+                .map(|row| row.version)
+                .collect(),
+            BindingRef::McpServer(_) => Vec::new(),
+        };
         let repos: Vec<String> = key
             .project
             .map(|id| self.repo_rows(id))
@@ -5373,14 +5557,15 @@ impl State {
                 versions: &versions,
                 repos: &repos,
                 project_slug: &project_slug,
+                target_exists: true,
             },
             &attachment,
         )
         .map_err(StoreError::Constraint)?;
 
-        let row = SkillBinding {
+        let row = Binding {
             id: current.map_or_else(SkillBindingId::new, |row| row.id),
-            skill_id: key.skill,
+            skill_id: skill,
             workspace_id: key.workspace,
             project_id: key.project,
             item_kind_id: key.item_kind,
@@ -10751,19 +10936,19 @@ impl State {
 /// `WHERE`. A row applies when its keys match the scope exactly at its level; a `None` in the
 /// scope (a workspace, item kind or phase it does not name) matches no row of that level, as
 /// `b.phase_id = NULL` matches none.
-fn binding_applies(binding: &SkillBinding, scope: ResolveScope) -> bool {
+fn binding_applies(binding: &Binding, scope: ResolveScope) -> bool {
     match binding.level() {
-        SkillLevel::Global => true,
-        SkillLevel::Workspace => {
+        BindingLevel::Global => true,
+        BindingLevel::Workspace => {
             binding.workspace_id.is_some() && binding.workspace_id == scope.workspace
         }
-        SkillLevel::Project => binding.project_id == Some(scope.project),
-        SkillLevel::ItemKind => {
+        BindingLevel::Project => binding.project_id == Some(scope.project),
+        BindingLevel::ItemKind => {
             binding.project_id == Some(scope.project)
                 && binding.item_kind_id.is_some()
                 && binding.item_kind_id == scope.item_kind
         }
-        SkillLevel::Phase => {
+        BindingLevel::Phase => {
             binding.project_id == Some(scope.project)
                 && binding.phase_id.is_some()
                 && binding.phase_id == scope.phase
@@ -12514,7 +12699,7 @@ impl WriteStore for MemStore {
         Ok(self.read(|state| state.skill_version_rows(skill)))
     }
 
-    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<Binding>> {
         Ok(self.read(|state| state.skill_binding_rows(home)))
     }
 
@@ -12545,12 +12730,35 @@ impl WriteStore for MemStore {
 
     async fn set_skill_binding(
         &self,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
-    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+    ) -> Result<CasOutcome<Option<Binding>>> {
         let now = self.now();
         self.write(|state| state.set_skill_binding(key, expected, change, now))
+    }
+
+    async fn mcp_servers(&self) -> Result<Vec<McpServer>> {
+        Ok(self.read(State::mcp_server_rows))
+    }
+
+    async fn create_mcp_server(&self, new: NewMcpServer) -> Result<McpServer> {
+        let now = self.now();
+        self.write(|state| state.create_mcp_server(new, now))
+    }
+
+    async fn update_mcp_server(
+        &self,
+        id: McpServerId,
+        expected: DateTime<Utc>,
+        patch: McpServerPatch,
+    ) -> Result<CasOutcome<McpServer>> {
+        let now = self.now();
+        self.write(|state| state.update_mcp_server(id, expected, patch, now))
+    }
+
+    async fn delete_mcp_server(&self, id: McpServerId) -> Result<u64> {
+        self.write(|state| state.delete_mcp_server(id))
     }
 
     async fn personas(&self) -> Result<Vec<Persona>> {
@@ -14959,7 +15167,7 @@ mod tests {
             created_by: ids::USER,
             created_at: now,
         });
-        data.skill_bindings.push(crate::model::SkillBinding {
+        data.skill_bindings.push(crate::model::Binding {
             id: crate::model::SkillBindingId::new(),
             skill_id: house,
             workspace_id: None,
@@ -14980,7 +15188,7 @@ mod tests {
     /// with the project's and the phase's by `(position, name bytes)`.
     #[tokio::test]
     async fn a_global_attachment_reaches_every_project() {
-        use crate::model::SkillLevel;
+        use crate::model::BindingLevel;
         let (store, house) = demo_with_a_global_skill();
 
         let agy = store
@@ -14991,7 +15199,7 @@ mod tests {
             agy.iter()
                 .map(|s| (s.skill_id, s.level, s.version, s.position))
                 .collect::<Vec<_>>(),
-            vec![(house, SkillLevel::Global, Some(1), 5)],
+            vec![(house, BindingLevel::Global, Some(1), 5)],
             "a project with no attachment of its own still gets the global one"
         );
         assert_eq!(agy[0].body, "House rules.");
@@ -15009,9 +15217,9 @@ mod tests {
                 .map(|s| (s.name.as_str(), s.level, s.version, s.position))
                 .collect::<Vec<_>>(),
             vec![
-                ("tests", SkillLevel::Project, Some(1), 0),
-                ("rust-style", SkillLevel::Phase, Some(1), 2),
-                ("house", SkillLevel::Global, Some(1), 5),
+                ("tests", BindingLevel::Project, Some(1), 0),
+                ("rust-style", BindingLevel::Phase, Some(1), 2),
+                ("house", BindingLevel::Global, Some(1), 5),
             ],
             "the global attachment joins the project's and the phase's, in (position, name) order"
         );
@@ -17942,6 +18150,7 @@ mod tests {
             source: None,
             edges: Vec::new(),
             integrate: std::collections::BTreeMap::new(),
+            toolbox: None,
         }
     }
 

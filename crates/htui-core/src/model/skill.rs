@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{
-    ItemKindId, PhaseId, ProjectId, SkillBindingId, SkillId, UserId, WorkspaceId,
+    ItemKindId, McpServerId, PhaseId, ProjectId, SkillBindingId, SkillId, UserId, WorkspaceId,
 };
 use crate::model::skill_glob::SkillGlobs;
 
@@ -31,16 +31,75 @@ str_enum!(
     }
 );
 
+/// Which kind of thing a `toolbox_binding` row attaches (MOD-127 D1): `toolbox_binding.kind`.
+///
+/// Serde and [`as_str`](Self::as_str) spell it as the column does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingKind {
+    /// `kind = 'skill'`: `ref_id` is a `skill.id`.
+    Skill,
+    /// `kind = 'mcp_server'`: `ref_id` is an `mcp_server.id` (MOD-127 M2).
+    McpServer,
+}
+
+impl BindingKind {
+    /// `skill` or `mcp_server`: the column's spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::McpServer => "mcp_server",
+        }
+    }
+}
+
+/// What a `toolbox_binding` row points at: `ref_id` read together with `kind` (MOD-127 D1). The
+/// row has no foreign key on `ref_id` (M1 D3), so the kind is what says which table it names.
+///
+/// Serde is externally tagged by the kind's spelling: `{"skill": "<uuid>"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingRef {
+    /// A `skill` row.
+    Skill(SkillId),
+    /// An `mcp_server` row (MOD-127 M2).
+    McpServer(McpServerId),
+}
+
+impl BindingRef {
+    /// The `kind` column this reference is stored under.
+    #[must_use]
+    pub const fn kind(self) -> BindingKind {
+        match self {
+            Self::Skill(_) => BindingKind::Skill,
+            Self::McpServer(_) => BindingKind::McpServer,
+        }
+    }
+}
+
+impl From<SkillId> for BindingRef {
+    fn from(skill: SkillId) -> Self {
+        Self::Skill(skill)
+    }
+}
+
+impl From<McpServerId> for BindingRef {
+    fn from(server: McpServerId) -> Self {
+        Self::McpServer(server)
+    }
+}
+
 /// Which level an attachment sits at (ANA-22 §6 item 2, MOD-127 D1). **Declaration order is
 /// specificity**: `Global < Workspace < Project < ItemKind < Phase`, so the attachment that wins
 /// is the `max` (`R-SKL-2` as amended).
 ///
-/// Not a column — it is derived from the four nullable keys by [`SkillBinding::level`] — so it is
+/// Not a column — it is derived from the four nullable keys by [`Binding::level`] — so it is
 /// a plain enum rather than a `str_enum!`, and its serde spelling is its
 /// [`as_str`](Self::as_str).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SkillLevel {
+pub enum BindingLevel {
     /// `project_id IS NULL`: every project.
     Global,
     /// `workspace_id` set, nothing else: every project of one workspace.
@@ -53,7 +112,7 @@ pub enum SkillLevel {
     Phase,
 }
 
-impl SkillLevel {
+impl BindingLevel {
     /// `global`, `workspace`, `project`, `item_kind` or `phase`: the record's and the Prompt
     /// sub-tab's spelling.
     #[must_use]
@@ -105,15 +164,19 @@ pub struct SkillVersion {
     pub created_at: DateTime<Utc>,
 }
 
-/// A `kind = 'skill'` row of `toolbox_binding` (§5.6 as amended by ANA-22 §7.1 and MOD-127): one
-/// attachment of a skill, globally, to a workspace, a project, an item kind or one phase of it.
+/// A row of `toolbox_binding` (§5.6 as amended by ANA-22 §7.1 and MOD-127): one
+/// attachment of a skill, or of an MCP server (M2), globally, to a workspace, a project, an item kind or one phase of it.
 /// `UNIQUE NULLS NOT DISTINCT (kind, ref_id, workspace_id, project_id, item_kind_id, phase_id)`
 /// allows one attachment per skill per level, which is why [`resolve`] has to pick one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillBinding {
+pub struct Binding {
     /// `toolbox_binding.id`.
     pub id: SkillBindingId,
-    /// `toolbox_binding.ref_id`.
+    /// `toolbox_binding.ref_id`. For a row of kind `mcp_server` this holds the **server's** id,
+    /// typed as a [`SkillId`]; the row does not say which kind it is, so a caller tells the kinds
+    /// apart by the [`BindingRef`] it asked under (a `target` key) or by looking the id up. The
+    /// stores keep the two id spaces disjoint (`create_skill` and `create_mcp_server` refuse an id
+    /// the other kind holds).
     pub skill_id: SkillId,
     /// `toolbox_binding.workspace_id`; `Some` is a workspace attachment and excludes every other
     /// key.
@@ -142,7 +205,7 @@ pub struct SkillBinding {
     pub updated_at: DateTime<Utc>,
 }
 
-impl SkillBinding {
+impl Binding {
     /// The `skill_version` this binding puts in force (`docs/ANA-5.md` §4.2): `pinned_version`
     /// when set, otherwise the highest `version` of the skill.
     ///
@@ -164,8 +227,8 @@ impl SkillBinding {
     /// project is refused by `toolbox_binding_phase_needs_project`; were one ever read, it is
     /// `Global`, the same answer `PgStore`'s `WHERE b.project_id IS NULL` gives it.
     #[must_use]
-    pub fn level(&self) -> SkillLevel {
-        SkillBindingKey::of(self).level()
+    pub fn level(&self) -> BindingLevel {
+        BindingKey::of(self).level()
     }
 }
 
@@ -228,9 +291,9 @@ pub struct NewSkillVersion {
 /// `(workspace)`, `(project)`, `(project, item_kind)` and `(project, phase)`; the constructors
 /// build exactly those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SkillBindingKey {
-    /// `toolbox_binding.ref_id`.
-    pub skill: SkillId,
+pub struct BindingKey {
+    /// `toolbox_binding.ref_id` with `toolbox_binding.kind`.
+    pub target: BindingRef,
     /// `toolbox_binding.workspace_id`.
     pub workspace: Option<WorkspaceId>,
     /// `toolbox_binding.project_id`.
@@ -241,12 +304,15 @@ pub struct SkillBindingKey {
     pub phase: Option<PhaseId>,
 }
 
-impl SkillBindingKey {
-    /// The key a stored row sits under.
+impl BindingKey {
+    /// The key a stored **skill** row sits under: `target` is always [`BindingRef::Skill`]. A
+    /// [`Binding`] of kind `mcp_server` holds the server's id in `skill_id` and carries no kind, so
+    /// this would name a skill that is not there; a caller holding such a row builds its key from
+    /// the `target` it read the row under, not from here.
     #[must_use]
-    pub fn of(binding: &SkillBinding) -> Self {
+    pub fn of(binding: &Binding) -> Self {
         Self {
-            skill: binding.skill_id,
+            target: BindingRef::Skill(binding.skill_id),
             workspace: binding.workspace_id,
             project: binding.project_id,
             item_kind: binding.item_kind_id,
@@ -256,9 +322,9 @@ impl SkillBindingKey {
 
     /// The key of a global attachment: every project.
     #[must_use]
-    pub const fn global(skill: SkillId) -> Self {
+    pub fn global(target: impl Into<BindingRef>) -> Self {
         Self {
-            skill,
+            target: target.into(),
             workspace: None,
             project: None,
             item_kind: None,
@@ -268,52 +334,56 @@ impl SkillBindingKey {
 
     /// The key of a workspace attachment.
     #[must_use]
-    pub const fn workspace(skill: SkillId, workspace: WorkspaceId) -> Self {
+    pub fn workspace(target: impl Into<BindingRef>, workspace: WorkspaceId) -> Self {
         Self {
             workspace: Some(workspace),
-            ..Self::global(skill)
+            ..Self::global(target)
         }
     }
 
     /// The key of a project attachment.
     #[must_use]
-    pub const fn project(skill: SkillId, project: ProjectId) -> Self {
+    pub fn project(target: impl Into<BindingRef>, project: ProjectId) -> Self {
         Self {
             project: Some(project),
-            ..Self::global(skill)
+            ..Self::global(target)
         }
     }
 
     /// The key of an item-kind attachment: one kind of one project.
     #[must_use]
-    pub const fn item_kind(skill: SkillId, project: ProjectId, item_kind: ItemKindId) -> Self {
+    pub fn item_kind(
+        target: impl Into<BindingRef>,
+        project: ProjectId,
+        item_kind: ItemKindId,
+    ) -> Self {
         Self {
             item_kind: Some(item_kind),
-            ..Self::project(skill, project)
+            ..Self::project(target, project)
         }
     }
 
     /// The key of a phase attachment: one phase of one project.
     #[must_use]
-    pub const fn phase(skill: SkillId, project: ProjectId, phase: PhaseId) -> Self {
+    pub fn phase(target: impl Into<BindingRef>, project: ProjectId, phase: PhaseId) -> Self {
         Self {
             phase: Some(phase),
-            ..Self::project(skill, project)
+            ..Self::project(target, project)
         }
     }
 
-    /// The level this key names, by [`SkillBinding::level`]'s rule. A shape outside the valid
+    /// The level this key names, by [`Binding::level`]'s rule. A shape outside the valid
     /// ones reports the narrowest level its keys imply (a phase over an item kind over a
     /// project); a phase or item kind with no project reads as `Workspace` or `Global`, as the
     /// project-less rows do. `check_attachment` refuses those shapes.
     #[must_use]
-    pub fn level(self) -> SkillLevel {
+    pub fn level(self) -> BindingLevel {
         match (self.project, self.phase, self.item_kind) {
-            (None, ..) if self.workspace.is_some() => SkillLevel::Workspace,
-            (None, ..) => SkillLevel::Global,
-            (Some(_), Some(_), _) => SkillLevel::Phase,
-            (Some(_), None, Some(_)) => SkillLevel::ItemKind,
-            (Some(_), None, None) => SkillLevel::Project,
+            (None, ..) if self.workspace.is_some() => BindingLevel::Workspace,
+            (None, ..) => BindingLevel::Global,
+            (Some(_), Some(_), _) => BindingLevel::Phase,
+            (Some(_), None, Some(_)) => BindingLevel::ItemKind,
+            (Some(_), None, None) => BindingLevel::Project,
         }
     }
 }
@@ -338,7 +408,7 @@ impl Attachment {
     /// A stored row's attachment, as D80's clone copies it: the stored `globs` passed as typed with
     /// the stored `languages`, which `canonical_globs` leaves unchanged (it is idempotent).
     #[must_use]
-    pub fn of(binding: &SkillBinding) -> Self {
+    pub fn of(binding: &Binding) -> Self {
         Self {
             pinned_version: binding.pinned_version,
             position: binding.position,
@@ -409,7 +479,7 @@ pub struct BoundSkill {
     /// `skill_version.body`, inlined verbatim; empty when `version` is `None`.
     pub body: String,
     /// The level of the attachment that won.
-    pub level: SkillLevel,
+    pub level: BindingLevel,
     /// The winning attachment's activation, which [`select`] reads.
     pub activation: Activation,
     /// The winning attachment's globs, matched by `select` against `StepFiles`, MOD-9 D111.
@@ -460,12 +530,12 @@ impl BoundSkill {
 /// force, and [`BoundSkill::collapse`] keeps the most specific per skill.
 ///
 /// `rows` are every attachment that applies to the step — the global ones, the project's, and the
-/// phase's — and `versions` may hold any skill's rows, as [`SkillBinding::version_in_force`]
+/// phase's — and `versions` may hold any skill's rows, as [`Binding::version_in_force`]
 /// allows. **The winner is picked by level before its version is looked at**: a winning pin that
 /// names no version yields `version: None` rather than the broader attachment's body (OQ-9). Both
 /// stores call this, so "which attachment wins" has one definition.
 #[must_use]
-pub fn resolve(rows: Vec<(SkillBinding, String)>, versions: &[SkillVersion]) -> Vec<BoundSkill> {
+pub fn resolve(rows: Vec<(Binding, String)>, versions: &[SkillVersion]) -> Vec<BoundSkill> {
     let candidates = rows
         .into_iter()
         .map(|(binding, name)| {
@@ -539,7 +609,7 @@ pub struct SkillChoice {
     /// The version in force; `null` in the record when none is.
     pub version: Option<i32>,
     /// The winning attachment's level.
-    pub level: SkillLevel,
+    pub level: BindingLevel,
     /// The winning attachment's activation.
     pub activation: Activation,
     /// Whether the skill rendered.
@@ -696,7 +766,7 @@ mod tests {
         name: &str,
         version: i32,
         position: i32,
-        level: SkillLevel,
+        level: BindingLevel,
     ) -> BoundSkill {
         BoundSkill {
             skill_id,
@@ -715,7 +785,7 @@ mod tests {
         BoundSkill {
             activation: Activation::Glob,
             globs: globs.iter().map(|&glob| glob.to_owned()).collect(),
-            ..bound(SkillId::new(), name, 1, 0, SkillLevel::Project)
+            ..bound(SkillId::new(), name, 1, 0, BindingLevel::Project)
         }
     }
 
@@ -728,8 +798,8 @@ mod tests {
         files
     }
 
-    fn binding(skill_id: SkillId, pinned_version: Option<i32>) -> SkillBinding {
-        SkillBinding {
+    fn binding(skill_id: SkillId, pinned_version: Option<i32>) -> Binding {
+        Binding {
             id: SkillBindingId::new(),
             skill_id,
             workspace_id: None,
@@ -753,7 +823,7 @@ mod tests {
         pinned_version: Option<i32>,
         position: i32,
         activation: Activation,
-    ) -> (SkillBinding, String) {
+    ) -> (Binding, String) {
         let (project_id, phase_id) = keys;
         let globs = if activation == Activation::Glob {
             vec!["**/*.rs".to_owned()]
@@ -761,7 +831,7 @@ mod tests {
             Vec::new()
         };
         (
-            SkillBinding {
+            Binding {
                 id: SkillBindingId::new(),
                 skill_id,
                 workspace_id: None,
@@ -780,9 +850,12 @@ mod tests {
     }
 
     /// One attachment row at the level `key` names, `Always`, unpinned, at position 0.
-    fn attach_at(key: SkillBindingKey, name: &str) -> (SkillBinding, String) {
+    fn attach_at(key: BindingKey, name: &str) -> (Binding, String) {
+        let BindingRef::Skill(skill) = key.target else {
+            panic!("a skill key");
+        };
         let (mut row, name) = attach(
-            key.skill,
+            skill,
             name,
             (key.project, key.phase),
             None,
@@ -814,10 +887,10 @@ mod tests {
         let rust_style = SkillId::new();
         let tests = SkillId::new();
         let project = vec![
-            bound(rust_style, "rust-style", 1, 0, SkillLevel::Project),
-            bound(tests, "tests", 2, 1, SkillLevel::Project),
+            bound(rust_style, "rust-style", 1, 0, BindingLevel::Project),
+            bound(tests, "tests", 2, 1, BindingLevel::Project),
         ];
-        let phase = vec![bound(rust_style, "rust-style", 3, 5, SkillLevel::Phase)];
+        let phase = vec![bound(rust_style, "rust-style", 3, 5, BindingLevel::Phase)];
 
         let resolved = BoundSkill::collapse([project, phase].concat());
 
@@ -829,8 +902,8 @@ mod tests {
         assert_eq!(
             resolved,
             vec![
-                bound(tests, "tests", 2, 1, SkillLevel::Project),
-                bound(rust_style, "rust-style", 3, 5, SkillLevel::Phase),
+                bound(tests, "tests", 2, 1, BindingLevel::Project),
+                bound(rust_style, "rust-style", 3, 5, BindingLevel::Phase),
             ],
             "the phase binding's version and position are the ones in force"
         );
@@ -841,9 +914,9 @@ mod tests {
     #[test]
     fn equal_positions_break_on_name_bytes() {
         let project = vec![
-            bound(SkillId::new(), "apple", 1, 0, SkillLevel::Project),
-            bound(SkillId::new(), "Ångström", 1, 0, SkillLevel::Project),
-            bound(SkillId::new(), "Zebra", 1, 0, SkillLevel::Project),
+            bound(SkillId::new(), "apple", 1, 0, BindingLevel::Project),
+            bound(SkillId::new(), "Ångström", 1, 0, BindingLevel::Project),
+            bound(SkillId::new(), "Zebra", 1, 0, BindingLevel::Project),
         ];
 
         let names: Vec<String> = BoundSkill::collapse(project)
@@ -919,7 +992,7 @@ mod tests {
             2,
             Activation::Always,
         );
-        let summary = |rows: Vec<(SkillBinding, String)>| {
+        let summary = |rows: Vec<(Binding, String)>| {
             resolve(rows, &versions)
                 .into_iter()
                 .map(|s| (s.level, s.version, s.position, s.body))
@@ -932,22 +1005,22 @@ mod tests {
                 project_row.clone(),
                 phase_row.clone()
             ]),
-            vec![(SkillLevel::Phase, Some(3), 2, "v3".to_owned())],
+            vec![(BindingLevel::Phase, Some(3), 2, "v3".to_owned())],
             "the phase attachment wins, with its own pin and position"
         );
         assert_eq!(
             summary(vec![phase_row, global_row.clone(), project_row.clone()]),
-            vec![(SkillLevel::Phase, Some(3), 2, "v3".to_owned())],
+            vec![(BindingLevel::Phase, Some(3), 2, "v3".to_owned())],
             "input order does not pick the winner; the level does"
         );
         assert_eq!(
             summary(vec![global_row.clone(), project_row]),
-            vec![(SkillLevel::Project, Some(2), 5, "v2".to_owned())],
+            vec![(BindingLevel::Project, Some(2), 5, "v2".to_owned())],
             "without a phase row the project attachment wins"
         );
         assert_eq!(
             summary(vec![global_row]),
-            vec![(SkillLevel::Global, Some(1), 7, "v1".to_owned())],
+            vec![(BindingLevel::Global, Some(1), 7, "v1".to_owned())],
             "without either, the global attachment stands"
         );
     }
@@ -976,7 +1049,7 @@ mod tests {
         assert_eq!(candidates.len(), 1, "one candidate per skill");
         assert_eq!(
             (candidates[0].level, candidates[0].activation),
-            (SkillLevel::Project, Activation::Off),
+            (BindingLevel::Project, Activation::Off),
             "the project's off wins over the global always"
         );
 
@@ -987,7 +1060,7 @@ mod tests {
                 .iter()
                 .map(|c| (c.active, c.reason, c.level))
                 .collect::<Vec<_>>(),
-            vec![(false, ChoiceReason::Off, SkillLevel::Project)],
+            vec![(false, ChoiceReason::Off, BindingLevel::Project)],
             "and is recorded off, at the level that switched it off"
         );
     }
@@ -1026,7 +1099,7 @@ mod tests {
                 .iter()
                 .map(|s| (s.level, s.version, s.body.as_str(), s.position))
                 .collect::<Vec<_>>(),
-            vec![(SkillLevel::Phase, None, "", 4)],
+            vec![(BindingLevel::Phase, None, "", 4)],
             "the phase attachment wins with no version, not the project's v1"
         );
     }
@@ -1061,7 +1134,7 @@ mod tests {
     #[test]
     fn level_of_a_binding_follows_its_nullable_keys() {
         let level = |project_id: Option<ProjectId>, phase_id: Option<PhaseId>| {
-            SkillBinding {
+            Binding {
                 project_id,
                 phase_id,
                 ..binding(SkillId::new(), None)
@@ -1070,12 +1143,12 @@ mod tests {
         };
         let project = Some(ProjectId::new());
         let phase = Some(PhaseId::new());
-        assert_eq!(level(None, None), SkillLevel::Global);
-        assert_eq!(level(project, None), SkillLevel::Project);
-        assert_eq!(level(project, phase), SkillLevel::Phase);
+        assert_eq!(level(None, None), BindingLevel::Global);
+        assert_eq!(level(project, None), BindingLevel::Project);
+        assert_eq!(level(project, phase), BindingLevel::Phase);
         assert_eq!(
             level(None, phase),
-            SkillLevel::Global,
+            BindingLevel::Global,
             "a phase row with no project is refused by toolbox_binding_phase_needs_project; were \
              one read, it is global"
         );
@@ -1087,7 +1160,7 @@ mod tests {
         let with = |name: &str, activation: Activation, version: Option<i32>| BoundSkill {
             activation,
             version,
-            ..bound(SkillId::new(), name, 1, 0, SkillLevel::Project)
+            ..bound(SkillId::new(), name, 1, 0, BindingLevel::Project)
         };
         let candidates = vec![
             with("a", Activation::Always, Some(1)),
@@ -1243,7 +1316,7 @@ mod tests {
     fn needs_files_sees_only_a_glob_winner_with_a_version() {
         let project = glob("g", &["**/*.rs"]);
         let phase_off = BoundSkill {
-            level: SkillLevel::Phase,
+            level: BindingLevel::Phase,
             activation: Activation::Off,
             ..project.clone()
         };
@@ -1261,7 +1334,7 @@ mod tests {
             "a",
             1,
             0,
-            SkillLevel::Project
+            BindingLevel::Project
         )]));
         assert!(needs_files(&[project]));
     }
@@ -1273,7 +1346,7 @@ mod tests {
             skill: SkillId::new(),
             name: "house".to_owned(),
             version: None,
-            level: SkillLevel::Phase,
+            level: BindingLevel::Phase,
             activation: Activation::Glob,
             active: false,
             reason: ChoiceReason::MissingVersion,
@@ -1320,11 +1393,11 @@ mod tests {
             );
         }
         for (level, spelling) in [
-            (SkillLevel::Global, "global"),
-            (SkillLevel::Workspace, "workspace"),
-            (SkillLevel::Project, "project"),
-            (SkillLevel::ItemKind, "item_kind"),
-            (SkillLevel::Phase, "phase"),
+            (BindingLevel::Global, "global"),
+            (BindingLevel::Workspace, "workspace"),
+            (BindingLevel::Project, "project"),
+            (BindingLevel::ItemKind, "item_kind"),
+            (BindingLevel::Phase, "phase"),
         ] {
             assert_eq!(
                 serde_json::to_value(level).expect("a level serialises"),
@@ -1333,13 +1406,14 @@ mod tests {
             );
             assert_eq!(level.as_str(), spelling);
             assert_eq!(
-                serde_json::from_value::<SkillLevel>(serde_json::json!(spelling))
+                serde_json::from_value::<BindingLevel>(serde_json::json!(spelling))
                     .expect("a level reads back"),
                 level
             );
         }
         assert!(
-            SkillLevel::Global < SkillLevel::Project && SkillLevel::Project < SkillLevel::Phase
+            BindingLevel::Global < BindingLevel::Project
+                && BindingLevel::Project < BindingLevel::Phase
         );
 
         // MOD-9 D109: a matched choice adds `path`, last; a v 2 choice reads back with none.
@@ -1387,7 +1461,7 @@ mod tests {
     fn a_key_and_an_attachment_copy_a_row() {
         let project = ProjectId::new();
         let phase = PhaseId::new();
-        let row = SkillBinding {
+        let row = Binding {
             project_id: Some(project),
             phase_id: Some(phase),
             pinned_version: Some(2),
@@ -1398,37 +1472,37 @@ mod tests {
             ..binding(SkillId::new(), None)
         };
 
-        let key = SkillBindingKey::of(&row);
+        let key = BindingKey::of(&row);
         assert_eq!(
             key,
-            SkillBindingKey {
-                skill: row.skill_id,
+            BindingKey {
+                target: BindingRef::Skill(row.skill_id),
                 workspace: None,
                 project: Some(project),
                 item_kind: None,
                 phase: Some(phase),
             }
         );
-        assert_eq!(key.level(), SkillLevel::Phase);
+        assert_eq!(key.level(), BindingLevel::Phase);
         assert_eq!(key.level(), row.level(), "one rule for both");
         assert_eq!(
-            SkillBindingKey { phase: None, ..key }.level(),
-            SkillLevel::Project
+            BindingKey { phase: None, ..key }.level(),
+            BindingLevel::Project
         );
         assert_eq!(
-            SkillBindingKey {
+            BindingKey {
                 project: None,
                 phase: None,
                 ..key
             }
             .level(),
-            SkillLevel::Global
+            BindingLevel::Global
         );
 
         // The two new keys are copied too.
         let workspace = WorkspaceId::new();
         let kind = ItemKindId::new();
-        let row = SkillBinding {
+        let row = Binding {
             workspace_id: Some(workspace),
             project_id: None,
             item_kind_id: None,
@@ -1436,21 +1510,21 @@ mod tests {
             ..row
         };
         assert_eq!(
-            SkillBindingKey::of(&row),
-            SkillBindingKey::workspace(row.skill_id, workspace)
+            BindingKey::of(&row),
+            BindingKey::workspace(row.skill_id, workspace)
         );
-        assert_eq!(SkillBindingKey::of(&row).level(), SkillLevel::Workspace);
-        let row = SkillBinding {
+        assert_eq!(BindingKey::of(&row).level(), BindingLevel::Workspace);
+        let row = Binding {
             workspace_id: None,
             project_id: Some(project),
             item_kind_id: Some(kind),
             ..row
         };
-        let key = SkillBindingKey::of(&row);
-        assert_eq!(key, SkillBindingKey::item_kind(row.skill_id, project, kind));
+        let key = BindingKey::of(&row);
+        assert_eq!(key, BindingKey::item_kind(row.skill_id, project, kind));
         assert_eq!(key.item_kind, Some(kind));
         assert_eq!(key.level(), row.level(), "one rule for both");
-        assert_eq!(key.level(), SkillLevel::ItemKind);
+        assert_eq!(key.level(), BindingLevel::ItemKind);
 
         assert_eq!(
             Attachment::of(&row),
@@ -1468,11 +1542,11 @@ mod tests {
     #[test]
     fn five_levels_order_by_specificity() {
         let ascending = [
-            SkillLevel::Global,
-            SkillLevel::Workspace,
-            SkillLevel::Project,
-            SkillLevel::ItemKind,
-            SkillLevel::Phase,
+            BindingLevel::Global,
+            BindingLevel::Workspace,
+            BindingLevel::Project,
+            BindingLevel::ItemKind,
+            BindingLevel::Phase,
         ];
         for pair in ascending.windows(2) {
             assert!(
@@ -1501,62 +1575,62 @@ mod tests {
         let project = ProjectId::new();
         let kind = ItemKindId::new();
         let phase = PhaseId::new();
-        assert_eq!(SkillBindingKey::global(skill).level(), SkillLevel::Global);
+        assert_eq!(BindingKey::global(skill).level(), BindingLevel::Global);
         assert_eq!(
-            SkillBindingKey::workspace(skill, workspace).level(),
-            SkillLevel::Workspace
+            BindingKey::workspace(skill, workspace).level(),
+            BindingLevel::Workspace
         );
         assert_eq!(
-            SkillBindingKey::project(skill, project).level(),
-            SkillLevel::Project
+            BindingKey::project(skill, project).level(),
+            BindingLevel::Project
         );
         assert_eq!(
-            SkillBindingKey::item_kind(skill, project, kind).level(),
-            SkillLevel::ItemKind
+            BindingKey::item_kind(skill, project, kind).level(),
+            BindingLevel::ItemKind
         );
         assert_eq!(
-            SkillBindingKey::phase(skill, project, phase).level(),
-            SkillLevel::Phase
+            BindingKey::phase(skill, project, phase).level(),
+            BindingLevel::Phase
         );
-        let key = SkillBindingKey::global(skill);
+        let key = BindingKey::global(skill);
         assert_eq!(
             (key.workspace, key.project, key.item_kind, key.phase),
             (None, None, None, None)
         );
-        let key = SkillBindingKey::item_kind(skill, project, kind);
+        let key = BindingKey::item_kind(skill, project, kind);
         assert_eq!(
             (key.workspace, key.project, key.item_kind, key.phase),
             (None, Some(project), Some(kind), None)
         );
 
         // Shapes outside D2 report the narrowest level the keys imply (T2 refuses them).
-        let odd = SkillBindingKey::project(skill, project);
+        let odd = BindingKey::project(skill, project);
         assert_eq!(
-            SkillBindingKey {
+            BindingKey {
                 workspace: Some(workspace),
                 ..odd
             }
             .level(),
-            SkillLevel::Project,
+            BindingLevel::Project,
             "a workspace beside a project reads as the project"
         );
         assert_eq!(
-            SkillBindingKey {
+            BindingKey {
                 item_kind: Some(kind),
                 phase: Some(phase),
                 ..odd
             }
             .level(),
-            SkillLevel::Phase,
+            BindingLevel::Phase,
             "an item kind beside a phase reads as the phase"
         );
         assert_eq!(
-            SkillBindingKey {
+            BindingKey {
                 item_kind: Some(kind),
-                ..SkillBindingKey::global(skill)
+                ..BindingKey::global(skill)
             }
             .level(),
-            SkillLevel::Global,
+            BindingLevel::Global,
             "an item kind with no project reads as global, like a phase with none"
         );
     }
@@ -1569,21 +1643,21 @@ mod tests {
         let project = ProjectId::new();
         let versions: Vec<SkillVersion> = (1..=3).map(|n| version(skill, n)).collect();
         let global = {
-            let mut row = attach_at(SkillBindingKey::global(skill), "house");
+            let mut row = attach_at(BindingKey::global(skill), "house");
             row.0.pinned_version = Some(1);
             row
         };
         let ws = {
-            let mut row = attach_at(SkillBindingKey::workspace(skill, workspace), "house");
+            let mut row = attach_at(BindingKey::workspace(skill, workspace), "house");
             row.0.pinned_version = Some(2);
             row
         };
         let proj = {
-            let mut row = attach_at(SkillBindingKey::project(skill, project), "house");
+            let mut row = attach_at(BindingKey::project(skill, project), "house");
             row.0.pinned_version = Some(3);
             row
         };
-        let winner = |rows: Vec<(SkillBinding, String)>| {
+        let winner = |rows: Vec<(Binding, String)>| {
             resolve(rows, &versions)
                 .into_iter()
                 .map(|s| (s.level, s.version))
@@ -1591,13 +1665,13 @@ mod tests {
         };
         assert_eq!(
             winner(vec![global.clone(), ws.clone()]),
-            vec![(SkillLevel::Workspace, Some(2))]
+            vec![(BindingLevel::Workspace, Some(2))]
         );
         assert_eq!(
             winner(vec![proj.clone(), ws.clone(), global.clone()]),
-            vec![(SkillLevel::Project, Some(3))]
+            vec![(BindingLevel::Project, Some(3))]
         );
-        assert_eq!(winner(vec![global]), vec![(SkillLevel::Global, Some(1))]);
+        assert_eq!(winner(vec![global]), vec![(BindingLevel::Global, Some(1))]);
     }
 
     /// D1: an item-kind row beats project and loses to phase.
@@ -1608,15 +1682,15 @@ mod tests {
         let kind = ItemKindId::new();
         let phase = PhaseId::new();
         let versions: Vec<SkillVersion> = (1..=3).map(|n| version(skill, n)).collect();
-        let pinned = |key: SkillBindingKey, pin: i32| {
+        let pinned = |key: BindingKey, pin: i32| {
             let mut row = attach_at(key, "house");
             row.0.pinned_version = Some(pin);
             row
         };
-        let proj = pinned(SkillBindingKey::project(skill, project), 1);
-        let item_kind = pinned(SkillBindingKey::item_kind(skill, project, kind), 2);
-        let phased = pinned(SkillBindingKey::phase(skill, project, phase), 3);
-        let winner = |rows: Vec<(SkillBinding, String)>| {
+        let proj = pinned(BindingKey::project(skill, project), 1);
+        let item_kind = pinned(BindingKey::item_kind(skill, project, kind), 2);
+        let phased = pinned(BindingKey::phase(skill, project, phase), 3);
+        let winner = |rows: Vec<(Binding, String)>| {
             resolve(rows, &versions)
                 .into_iter()
                 .map(|s| (s.level, s.version))
@@ -1624,11 +1698,11 @@ mod tests {
         };
         assert_eq!(
             winner(vec![proj.clone(), item_kind.clone()]),
-            vec![(SkillLevel::ItemKind, Some(2))]
+            vec![(BindingLevel::ItemKind, Some(2))]
         );
         assert_eq!(
             winner(vec![phased.clone(), item_kind, proj]),
-            vec![(SkillLevel::Phase, Some(3))]
+            vec![(BindingLevel::Phase, Some(3))]
         );
     }
 
@@ -1639,13 +1713,10 @@ mod tests {
         let project = ProjectId::new();
         let kind = ItemKindId::new();
         let versions = vec![version(skill, 1)];
-        let mut off = attach_at(SkillBindingKey::item_kind(skill, project, kind), "house");
+        let mut off = attach_at(BindingKey::item_kind(skill, project, kind), "house");
         off.0.activation = Activation::Off;
         let candidates = resolve(
-            vec![
-                attach_at(SkillBindingKey::project(skill, project), "house"),
-                off,
-            ],
+            vec![attach_at(BindingKey::project(skill, project), "house"), off],
             &versions,
         );
         assert_eq!(
@@ -1653,7 +1724,7 @@ mod tests {
                 .iter()
                 .map(|c| (c.level, c.activation))
                 .collect::<Vec<_>>(),
-            vec![(SkillLevel::ItemKind, Activation::Off)]
+            vec![(BindingLevel::ItemKind, Activation::Off)]
         );
         let (active, choices) = select(candidates, true, &StepFiles::default());
         assert!(active.is_empty(), "an off winner renders nothing");
@@ -1662,7 +1733,7 @@ mod tests {
                 .iter()
                 .map(|c| (c.active, c.reason, c.level))
                 .collect::<Vec<_>>(),
-            vec![(false, ChoiceReason::Off, SkillLevel::ItemKind)]
+            vec![(false, ChoiceReason::Off, BindingLevel::ItemKind)]
         );
     }
 
@@ -1674,9 +1745,9 @@ mod tests {
         let project = ProjectId::new();
         let kind = ItemKindId::new();
         let versions = vec![version(skill, 1)];
-        let mut project_row = attach_at(SkillBindingKey::project(skill, project), "house");
+        let mut project_row = attach_at(BindingKey::project(skill, project), "house");
         project_row.0.pinned_version = Some(1);
-        let mut kind_row = attach_at(SkillBindingKey::item_kind(skill, project, kind), "house");
+        let mut kind_row = attach_at(BindingKey::item_kind(skill, project, kind), "house");
         kind_row.0.pinned_version = Some(7);
         kind_row.0.position = 4;
         let resolved = resolve(vec![project_row, kind_row], &versions);
@@ -1685,7 +1756,7 @@ mod tests {
                 .iter()
                 .map(|s| (s.level, s.version, s.body.as_str(), s.position))
                 .collect::<Vec<_>>(),
-            vec![(SkillLevel::ItemKind, None, "", 4)]
+            vec![(BindingLevel::ItemKind, None, "", 4)]
         );
     }
 
@@ -1704,5 +1775,41 @@ mod tests {
             }
         );
         assert_eq!(ResolveScope::project(project, None).phase, None);
+    }
+
+    #[test]
+    fn a_binding_ref_knows_its_kind() {
+        let skill = SkillId::new();
+        assert_eq!(BindingRef::Skill(skill).kind(), BindingKind::Skill);
+        assert_eq!(BindingRef::from(skill), BindingRef::Skill(skill));
+        assert_eq!(BindingKey::global(skill).target.kind(), BindingKind::Skill);
+    }
+
+    #[test]
+    fn a_binding_kind_spells_itself_as_the_column_does() {
+        for (kind, word) in [
+            (BindingKind::Skill, "skill"),
+            (BindingKind::McpServer, "mcp_server"),
+        ] {
+            assert_eq!(kind.as_str(), word);
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialises"),
+                format!("\"{word}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<BindingKind>(&format!("\"{word}\"")).expect("parses"),
+                kind
+            );
+        }
+        assert!(serde_json::from_str::<BindingKind>("\"persona\"").is_err());
+    }
+
+    #[test]
+    fn a_binding_ref_serialises_tagged_by_kind() {
+        let skill = SkillId::new();
+        let json = serde_json::to_value(BindingRef::Skill(skill)).expect("serialises");
+        assert_eq!(json, serde_json::json!({ "skill": skill }));
+        let back: BindingRef = serde_json::from_value(json).expect("parses");
+        assert_eq!(back, BindingRef::Skill(skill));
     }
 }

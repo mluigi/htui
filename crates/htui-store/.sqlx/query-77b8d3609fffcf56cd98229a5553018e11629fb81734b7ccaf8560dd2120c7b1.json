@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM toolbox_binding WHERE kind = 'mcp_server' AND ref_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "77b8d3609fffcf56cd98229a5553018e11629fb81734b7ccaf8560dd2120c7b1"
+}

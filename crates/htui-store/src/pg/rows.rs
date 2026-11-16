@@ -30,12 +30,13 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Activation, AgentId, BoxId, GateOutcome, ItemId, ItemKindId, LinkNode, MemoryEntry,
+    Activation, AgentId, Binding, BindingKey, BindingLevel, BindingRef, BoxId, EnvValue,
+    GateOutcome, ItemId, ItemKindId, LinkNode, McpServer, McpServerId, McpTransport, MemoryEntry,
     MemoryEntryId, MemoryEvidence, MemoryKind, MemorySource, MemoryState, MemoryUsage, Persona,
     PersonaId, PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunLanding,
-    RunMode, RunProvenance, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId,
-    SkillId, Status, StepId, StepOpening, StepStatus, TargetId, TargetSource, UpstreamEntry,
-    UserId, VerifyOutcome, WorkspaceId,
+    RunMode, RunProvenance, RunStatus, RunStepSummary, RunSummary, SkillBindingId, SkillId, Status,
+    StepId, StepOpening, StepStatus, TargetId, TargetSource, UpstreamEntry, UserId, VerifyOutcome,
+    WorkspaceId,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -286,7 +287,7 @@ impl UpstreamRow {
 /// `htui_core::model::skill::resolve`.
 ///
 /// Every `toolbox_binding` column is carried, so [`into_binding`](SkillBindingRow::into_binding)
-/// rebuilds the real [`SkillBinding`] and `resolve` applies the level and pin rules to it rather
+/// rebuilds the real [`Binding`] and `resolve` applies the level and pin rules to it rather
 /// than a second copy of them living here.
 #[derive(Debug, Clone)]
 pub(crate) struct SkillBindingRow {
@@ -319,11 +320,11 @@ pub(crate) struct SkillBindingRow {
 }
 
 impl SkillBindingRow {
-    /// The row as the model's [`SkillBinding`], paired with its joined `skill.name`: the shape
+    /// The row as the model's [`Binding`], paired with its joined `skill.name`: the shape
     /// `resolve` takes.
-    pub(crate) fn into_binding(self) -> (SkillBinding, String) {
+    pub(crate) fn into_binding(self) -> (Binding, String) {
         (
-            SkillBinding {
+            Binding {
                 id: self.id,
                 skill_id: self.skill_id,
                 workspace_id: self.workspace_id,
@@ -379,6 +380,97 @@ impl From<PersonaRow> for Persona {
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
+    }
+}
+
+/// One `mcp_server` row with its two `JSONB` columns still wrapped (MOD-127 M2 D2, D3).
+///
+/// A hand-written blob that does not decode is the driver's decode error, which
+/// [`map_sqlx`](crate::error::map_sqlx) answers as a backend failure: a read refuses rather than
+/// hand out half a server.
+#[derive(Debug)]
+pub(crate) struct McpServerRow {
+    /// `mcp_server.id`.
+    pub(crate) id: McpServerId,
+    /// `mcp_server.name`.
+    pub(crate) name: String,
+    /// `mcp_server.description`.
+    pub(crate) description: String,
+    /// `mcp_server.transport`.
+    pub(crate) transport: McpTransport,
+    /// `mcp_server.command`.
+    pub(crate) command: String,
+    /// `mcp_server.args`.
+    pub(crate) args: Vec<String>,
+    /// `mcp_server.url`.
+    pub(crate) url: Option<String>,
+    /// `mcp_server.headers`.
+    pub(crate) headers: Json<Vec<(String, EnvValue)>>,
+    /// `mcp_server.env`.
+    pub(crate) env: Json<Vec<(String, EnvValue)>>,
+    /// `mcp_server.allow`.
+    pub(crate) allow: Vec<String>,
+    /// `mcp_server.deny`.
+    pub(crate) deny: Vec<String>,
+    /// `mcp_server.created_by`.
+    pub(crate) created_by: UserId,
+    /// `mcp_server.created_at`.
+    pub(crate) created_at: DateTime<Utc>,
+    /// `mcp_server.updated_at`.
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+impl From<McpServerRow> for McpServer {
+    fn from(row: McpServerRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            transport: row.transport,
+            command: row.command,
+            args: row.args,
+            url: row.url,
+            headers: row.headers.0,
+            env: row.env.0,
+            allow: row.allow,
+            deny: row.deny,
+            created_by: row.created_by,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+/// One `kind = 'mcp_server'` `toolbox_binding` row, reduced to what
+/// [`PgStore::bound_mcp_servers`](crate::PgStore::bound_mcp_servers) resolves on: the server, the
+/// four scope keys (the level is derived from them) and the activation.
+#[derive(Debug, Clone)]
+pub(crate) struct McpBindingRow {
+    /// `toolbox_binding.ref_id`: the server.
+    pub(crate) server_id: McpServerId,
+    /// `toolbox_binding.workspace_id`.
+    pub(crate) workspace_id: Option<WorkspaceId>,
+    /// `toolbox_binding.project_id`.
+    pub(crate) project_id: Option<ProjectId>,
+    /// `toolbox_binding.item_kind_id`.
+    pub(crate) item_kind_id: Option<ItemKindId>,
+    /// `toolbox_binding.phase_id`.
+    pub(crate) phase_id: Option<PhaseId>,
+    /// `toolbox_binding.activation`.
+    pub(crate) activation: Activation,
+}
+
+impl McpBindingRow {
+    /// The level this attachment sits at, by the model's one rule for the four keys.
+    pub(crate) fn level(&self) -> BindingLevel {
+        BindingKey {
+            target: BindingRef::McpServer(self.server_id),
+            workspace: self.workspace_id,
+            project: self.project_id,
+            item_kind: self.item_kind_id,
+            phase: self.phase_id,
+        }
+        .level()
     }
 }
 

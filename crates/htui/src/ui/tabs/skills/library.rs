@@ -25,7 +25,8 @@ use core::cell::Cell;
 use chrono::{DateTime, Utc};
 use htui_core::model::skill::validate_name;
 use htui_core::model::{
-    Activation, BindingChange, BoundSkill, SkillId, SkillLevel, SkillPatch, SkillVersion,
+    Activation, BindingChange, BindingKind, BindingLevel, BoundSkill, SkillId, SkillPatch,
+    SkillVersion,
 };
 use htui_core::prompt::edit_help::HelpTarget;
 use htui_core::prompt::{TokenEstimator, render};
@@ -61,7 +62,7 @@ use crate::ui::{FieldOutcome, TextArea, TextField, diff};
 use crossterm::event::KeyEvent;
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
-const NOTICE_LINES: usize = 2;
+pub(super) const NOTICE_LINES: usize = 2;
 
 /// The `StoreRequest::ImportSkills` name: what `busy` holds while a walk is in flight. The slice
 /// index rather than a literal, so the two cannot drift (`request_names_match_the_name_arms`).
@@ -118,7 +119,7 @@ const IMPORT_HELP: &str = "a SKILL.md or rules file, or a directory: its */SKILL
 const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
 
 /// A write went out.
-const SAVING: &str = "saving\u{2026}";
+pub(super) const SAVING: &str = "saving\u{2026}";
 
 /// A `SkillsStale` for a skill the library no longer holds.
 const SKILL_GONE: &str = "the skill is gone";
@@ -191,7 +192,7 @@ const DETAIL_HINT: HintSpec = &[
 /// The pane's keys while its lines overflow it, through `LIBRARY_BROWSE` whatever the mode:
 /// they close the detail pane's hints when it is focused, after the view's own keys, so they are
 /// the first a narrow pane drops (MOD-115 M4 E5, T3; MOD-82 carried: no key literal in a title).
-const SCROLL_HINT: HintSpec = &[
+pub(super) const SCROLL_HINT: HintSpec = &[
     Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
 ];
@@ -268,14 +269,14 @@ fn version_changed_elsewhere(head: i32, save: Option<&str>) -> String {
 }
 
 /// A key while a write is in flight: one at a time (`settings/prompt.rs`' rule).
-fn in_flight(busy: &str) -> String {
+pub(super) fn in_flight(busy: &str) -> String {
     format!("`{busy}` is still in flight")
 }
 
 /// MOD-59 D5: a write that applied although its re-read failed. It landed; the view still draws
 /// what it held, and `reload` (`Reload`'s label through `LIBRARY_BROWSE`, MOD-67 M6 D4) reads
 /// again; with none bound the clause goes.
-fn landed_unread(landed: &str, why: &str, reload: Option<&str>) -> String {
+pub(super) fn landed_unread(landed: &str, why: &str, reload: Option<&str>) -> String {
     match reload {
         Some(reload) => format!("{landed} \u{2014} the re-read failed, {reload} reloads: {why}"),
         None => format!("{landed} \u{2014} the re-read failed: {why}"),
@@ -292,7 +293,7 @@ fn estimate(name: &str, version: i32, body: &str) -> i64 {
         version: Some(version),
         position: 0,
         body: body.to_owned(),
-        level: SkillLevel::Global,
+        level: BindingLevel::Global,
         activation: Activation::Always,
         globs: Vec::new(),
     }])
@@ -727,7 +728,10 @@ impl LibraryView {
                 }
                 // No snapshot to check the scope by: only the write in flight owns this reply, and
                 // a scope change has already forgotten that (`on_scope_change`).
-                Err(why) if self.busy == Some(outcome.request_name()) => {
+                Err(why)
+                    if self.busy == Some(outcome.request_name())
+                        && super::write_kind(outcome) == BindingKind::Skill =>
+                {
                     if self.snapshot.is_none() {
                         self.unavailable = Some(why.clone());
                     }
@@ -741,7 +745,9 @@ impl LibraryView {
                 }
                 self.snapshot = Some((**snapshot).clone());
                 self.unavailable = None;
-                if self.busy.take().is_some() {
+                // A server's write shares `set_skill_binding`'s name: only a skill's own reply
+                // frees what this view has in flight (MOD-127 M2 R3).
+                if super::stale_kind(*what) == BindingKind::Skill && self.busy.take().is_some() {
                     let detach = matches!(
                         self.sent.take(),
                         Some(Sent::Binding {
@@ -1502,7 +1508,9 @@ impl LibraryView {
     /// `Skills` read, leaves the draft, the token and `busy` alone. `unread` is the re-read's
     /// failure (D5): the write landed, and the notice says the library drawn is the one held.
     fn land(&mut self, outcome: &SkillWrite, unread: Option<&str>, keys: &Keys) {
-        if self.busy != Some(outcome.request_name()) {
+        if self.busy != Some(outcome.request_name())
+            || super::write_kind(outcome) != BindingKind::Skill
+        {
             return;
         }
         let landed = match (outcome, self.sent.take()) {
@@ -1686,6 +1694,8 @@ impl LibraryView {
                 (Some(_), _) => {}
                 (None, _) => self.gone(),
             },
+            // The MCP servers view's write (MOD-127 M2 T8); no Skills editor holds one.
+            StaleWhat::McpServer(_) => {}
             StaleWhat::Binding(_) => {
                 if let Some(pane) = &mut self.attach {
                     pane.on_stale(snapshot);
@@ -1810,7 +1820,7 @@ impl LibraryView {
         };
         self.cursor = self.cursor.min(snapshot.skills.len().saturating_sub(1));
         if let Some(pane) = &mut self.attach {
-            if snapshot.entry(pane.skill()).is_some() {
+            if pane.exists(snapshot) {
                 pane.clamp(snapshot);
             } else {
                 self.attach = None;
@@ -2160,7 +2170,7 @@ fn snapshot_name(snapshot: Option<&SkillsSnapshot>, skill: SkillId) -> String {
 
 /// Whether a snapshot answers the scope the view is in now: a write's reply that crossed a scope
 /// change belongs to the workspace that was left.
-fn in_scope(snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> bool {
+pub(super) fn in_scope(snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> bool {
     snapshot
         .projects
         .iter()
@@ -2182,7 +2192,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
-    use htui_core::model::{Attachment, ProjectRef, Scope, SkillBindingKey, StepId};
+    use htui_core::model::{Attachment, BindingKey, ProjectRef, Scope, StepId};
     use htui_core::store::{BLANK_SKILL_BODY, CasOutcome, MemStore, WriteStore as _};
     use htui_store::Backend;
 
@@ -2197,6 +2207,7 @@ mod tests {
     use crate::ui::tabs::registry::Tab as _;
     use crate::ui::tabs::skills::agent_help::fixtures as agent_fixtures;
     use htui_agent::event::StopReason;
+    use htui_core::model::McpServerId;
 
     /// MOD-60 D1: the name is fitted in cells, so a wide name never pushes the version right.
     #[test]
@@ -2330,6 +2341,73 @@ mod tests {
         }
     }
 
+    /// MOD-127 M2 R3: an empty snapshot answering a scope with no project.
+    fn empty_snapshot() -> Box<SkillsSnapshot> {
+        Box::new(SkillsSnapshot {
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
+            global: Vec::new(),
+            workspaces: Vec::new(),
+            projects: Vec::new(),
+        })
+    }
+
+    /// MOD-127 M2 R3: a skill detach in flight is the Library's own; the replies of a server's
+    /// write (an MCP attach in flight in the other view) never free it, whichever arrives first,
+    /// and its own reply still does.
+    #[test]
+    fn a_servers_replies_leave_a_skill_detach_in_flight_alone() {
+        let mut bench = Bench::new();
+        bench.scope.project_ids.clear();
+        let mut ctx = bench.ctx();
+        let server = BindingKey::global(McpServerId::new());
+        let skill = BindingKey::global(SkillId::new());
+        let mut view = LibraryView {
+            busy: Some(REQUEST_NAMES[4]),
+            sent: Some(Sent::Binding {
+                change: BindingChange::Detach,
+                target: "global".to_owned(),
+            }),
+            ..LibraryView::default()
+        };
+        let foreign = [
+            StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::McpServer(McpServerId::new()),
+            },
+            StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::Binding(server),
+            },
+            StoreReply::SkillWritten {
+                snapshot: Ok(empty_snapshot()),
+                outcome: SkillWrite::Detached { key: server },
+            },
+            StoreReply::SkillWritten {
+                snapshot: Ok(empty_snapshot()),
+                outcome: SkillWrite::Attached {
+                    key: server,
+                    updated_at: Utc::now(),
+                },
+            },
+            unread(SkillWrite::Detached { key: server }),
+        ];
+        for reply in &foreign {
+            view.on_reply(reply, &mut ctx);
+            assert_eq!(view.busy, Some(REQUEST_NAMES[4]), "{reply:?}");
+            assert!(view.sent.is_some(), "{reply:?}");
+        }
+        view.on_reply(
+            &StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::Binding(skill),
+            },
+            &mut ctx,
+        );
+        assert_eq!(view.busy, None, "its own stale reply frees it");
+        assert!(view.sent.is_none());
+    }
+
     /// MOD-59 D5: the reply to a write that applied although its re-read failed.
     fn unread(outcome: SkillWrite) -> StoreReply {
         StoreReply::SkillWritten {
@@ -2452,7 +2530,7 @@ mod tests {
         assert_eq!(
             (*written, *expected),
             (
-                SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN),
+                BindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN),
                 None
             )
         );
@@ -2510,7 +2588,7 @@ mod tests {
         let mut view = LibraryView::default();
         let untouched = serve(&backend, &StoreRequest::Skills(scope.clone())).await;
         view.on_reply(&untouched, &mut ctx);
-        let written = SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
+        let written = BindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
 
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`).
         view.on_key(key(KeyCode::Char('a')), &mut ctx);
@@ -2823,7 +2901,7 @@ mod tests {
         let mut view = LibraryView::default();
         let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
         view.on_reply(&read, &mut ctx);
-        let written = SkillBindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
+        let written = BindingKey::project(ids::SKILL_RUST_STYLE, ids::PROJECT_VULKAN);
 
         // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`);
         // `Space` twice while the save is in flight: `always` becomes `off`.
@@ -4030,6 +4108,7 @@ mod tests {
                 field: TextField::new(),
             },
             snapshot: Some(SkillsSnapshot {
+                mcp_servers: Vec::new(),
                 skills: Vec::new(),
                 global: Vec::new(),
                 workspaces: Vec::new(),
@@ -4210,6 +4289,7 @@ mod tests {
         );
         let empty = LibraryView {
             snapshot: Some(SkillsSnapshot {
+                mcp_servers: Vec::new(),
                 skills: Vec::new(),
                 global: Vec::new(),
                 workspaces: Vec::new(),

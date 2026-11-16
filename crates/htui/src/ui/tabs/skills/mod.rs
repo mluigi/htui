@@ -18,9 +18,10 @@
 mod agent_help;
 mod attach;
 mod library;
+mod mcp;
 mod templates;
 
-use htui_core::model::Scope;
+use htui_core::model::{BindingKind, Scope};
 use std::cell::Cell;
 
 use ratatui::Frame;
@@ -31,6 +32,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, HintSpec, KeyChord, Stack};
+use crate::skills::{SkillWrite, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
@@ -44,6 +46,7 @@ use crate::ui::{Theme, cells};
 use crossterm::event::KeyEvent;
 
 use library::LibraryView;
+use mcp::McpView;
 use templates::TemplatesView;
 
 /// The Skills tab (MOD-9 PRD D1): `Skills | Templates`.
@@ -55,9 +58,11 @@ pub struct SkillsTab {
     templates: TemplatesView,
     /// The Skills view (milestone 3), alive whichever view is shown, for the same reason.
     library: LibraryView,
+    /// The MCP servers view (MOD-127 M2 T8), alive whichever view is shown, for the same reason.
+    mcp: McpView,
 }
 
-/// The two views, the chips the leading pane carries (MOD-115 M4 E5).
+/// The views, the chips the leading pane carries (MOD-115 M4 E5).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum View {
     /// The skill library and its attachments (milestone 3). The tab opens here (D34).
@@ -65,17 +70,60 @@ enum View {
     Skills,
     /// The prompt templates (milestone 1).
     Templates,
+    /// The toolbox's MCP servers (MOD-127 M2 T8).
+    McpServers,
+}
+
+/// The kind of toolbox row a skill-write reply is about: a skill's own writes are
+/// [`BindingKind::Skill`], an attach or detach by its key's target. The Library and the MCP
+/// servers view share the `set_skill_binding` request name, so a reply is the view's only when
+/// its kind is (MOD-127 M2 R3).
+const fn write_kind(outcome: &SkillWrite) -> BindingKind {
+    match outcome {
+        SkillWrite::Created { .. } | SkillWrite::Versioned { .. } | SkillWrite::Edited { .. } => {
+            BindingKind::Skill
+        }
+        SkillWrite::Attached { key, .. } | SkillWrite::Detached { key } => key.target.kind(),
+    }
+}
+
+/// The kind of row a stale reply is about: see [`write_kind`].
+const fn stale_kind(what: StaleWhat) -> BindingKind {
+    match what {
+        StaleWhat::Skill(_) | StaleWhat::Version(_) => BindingKind::Skill,
+        StaleWhat::Binding(key) => key.target.kind(),
+        StaleWhat::McpServer(_) => BindingKind::McpServer,
+    }
 }
 
 impl View {
-    /// Both views, in chip order.
-    const ALL: [Self; 2] = [Self::Skills, Self::Templates];
+    /// Every view, in chip order.
+    const ALL: [Self; 3] = [Self::Skills, Self::Templates, Self::McpServers];
+
+    /// The view after this one, wrapping: what `skills.switch_view` shows next.
+    const fn next(self) -> Self {
+        match self {
+            Self::Skills => Self::Templates,
+            Self::Templates => Self::McpServers,
+            Self::McpServers => Self::Skills,
+        }
+    }
+
+    /// The view before this one, wrapping: what `skills.prev_view` shows.
+    const fn prev(self) -> Self {
+        match self {
+            Self::Skills => Self::McpServers,
+            Self::Templates => Self::Skills,
+            Self::McpServers => Self::Templates,
+        }
+    }
 
     /// The view's id in a history location (MOD-115 M2 §8).
     const fn id(self) -> &'static str {
         match self {
             Self::Skills => "library",
             Self::Templates => "templates",
+            Self::McpServers => "mcp",
         }
     }
 
@@ -89,12 +137,13 @@ impl View {
         match self {
             Self::Skills => 0,
             Self::Templates => 1,
+            Self::McpServers => 2,
         }
     }
 }
 
-/// The two views' chips, in switch order (MOD-115 M4 E5).
-pub(super) const VIEWS: &[&str] = &["Skills", "Templates"];
+/// The views' chips, in switch order (MOD-115 M4 E5).
+pub(super) const VIEWS: &[&str] = &["Skills", "Templates", "MCP servers"];
 
 /// `pane` with the view chips on its top border, `view` (an index into [`VIEWS`]) the active one:
 /// the pane that leads the shown view carries them, its title kept first (M4 C5).
@@ -278,6 +327,7 @@ impl SkillsTab {
         match self.view {
             View::Skills => self.library.key_stack(),
             View::Templates => self.templates.key_stack(),
+            View::McpServers => self.mcp.key_stack(),
         }
     }
 
@@ -286,15 +336,18 @@ impl SkillsTab {
         [self.view, view].into_iter().any(|view| match view {
             View::Skills => self.library.captures_input(),
             View::Templates => self.templates.captures_input(),
+            View::McpServers => self.mcp.captures_input(),
         })
     }
 
-    /// The other view.
+    /// The next view.
     fn toggle(&mut self) {
-        self.view = match self.view {
-            View::Skills => View::Templates,
-            View::Templates => View::Skills,
-        };
+        self.view = self.view.next();
+    }
+
+    /// The previous view.
+    fn toggle_back(&mut self) {
+        self.view = self.view.prev();
     }
 }
 
@@ -317,6 +370,7 @@ impl Tab for SkillsTab {
     fn on_scope_change(&mut self, _scope: &Scope) {
         self.templates.on_scope_change();
         self.library.on_scope_change();
+        self.mcp.on_scope_change();
     }
 
     /// MOD-22 review M-1: a bracketed paste into the active view's open prompt, form or editor.
@@ -324,6 +378,7 @@ impl Tab for SkillsTab {
         let taken = match self.view {
             View::Skills => self.library.on_paste(text),
             View::Templates => self.templates.on_paste(text),
+            View::McpServers => self.mcp.on_paste(text),
         };
         if taken {
             Handled::Consumed
@@ -345,6 +400,7 @@ impl Tab for SkillsTab {
         match self.view {
             View::Skills => LibraryView::browse_stack(),
             View::Templates => TemplatesView::browse_stack(),
+            View::McpServers => McpView::browse_stack(),
         }
     }
 
@@ -358,26 +414,36 @@ impl Tab for SkillsTab {
         let captured = match self.view {
             View::Skills => self.library.captures_input(),
             View::Templates => self.templates.captures_input(),
+            View::McpServers => self.mcp.captures_input(),
         };
-        if !captured
-            && ctx
+        if !captured {
+            match ctx
                 .keys()
                 .actions(self.stack(), KeyChord::from_event(key))
                 .first()
-                == Some(&Act::SkillsSwitchView)
-        {
-            self.toggle();
-            return Handled::Consumed;
+            {
+                Some(&Act::SkillsSwitchView) => {
+                    self.toggle();
+                    return Handled::Consumed;
+                }
+                Some(&Act::SkillsPrevView) => {
+                    self.toggle_back();
+                    return Handled::Consumed;
+                }
+                _ => {}
+            }
         }
         match self.view {
             View::Skills => self.library.on_key(key, ctx),
             View::Templates => self.templates.on_key(key, ctx),
+            View::McpServers => self.mcp.on_key(key, ctx),
         }
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         self.templates.on_reply(reply, ctx);
         self.library.on_reply(reply, ctx);
+        self.mcp.on_reply(reply, ctx);
     }
 
     /// Both views may have handed off to `$EDITOR`; each ignores an outcome it did not ask for
@@ -394,6 +460,7 @@ impl Tab for SkillsTab {
         let hint = match self.view {
             View::Skills => self.library.key_hint(ctx.keys()),
             View::Templates => self.templates.key_hint(ctx.keys()),
+            View::McpServers => self.mcp.key_hint(ctx.keys()),
         };
         key_line(hint, ctx.theme)
     }
@@ -409,6 +476,7 @@ impl Tab for SkillsTab {
         let cursor = match self.view {
             View::Skills => self.library.location_cursor(),
             View::Templates => self.templates.location_cursor(),
+            View::McpServers => self.mcp.location_cursor(),
         };
         TabLoc {
             subtab: Some(self.view.id()),
@@ -434,6 +502,7 @@ impl Tab for SkillsTab {
         let row = loc.cursor.as_deref().is_some_and(|cursor| match self.view {
             View::Skills => self.library.restore_cursor(cursor),
             View::Templates => self.templates.restore_cursor(cursor),
+            View::McpServers => self.mcp.restore_cursor(cursor),
         });
         target.is_some() || row
     }
@@ -444,6 +513,7 @@ impl Tab for SkillsTab {
         match self.view {
             View::Skills => self.library.render(frame, area, ctx),
             View::Templates => self.templates.render(frame, area, ctx),
+            View::McpServers => self.mcp.render(frame, area, ctx),
         }
     }
 }
@@ -587,10 +657,11 @@ mod tests {
                     let shown = at(&rows[0], &format!(" {} ", view.title()))
                         .unwrap_or_else(|| panic!("{view:?} under {layout:?}: {rows:#?}"));
                     assert!(active(&buffer, shown + 1), "{view:?}: {rows:#?}");
-                    let other = View::ALL[1 - view.index()];
-                    let other = at(&rows[0], &format!(" {} ", other.title()))
-                        .unwrap_or_else(|| panic!("both chips: {rows:#?}"));
-                    assert!(!active(&buffer, other + 1), "{view:?}: {rows:#?}");
+                    for other in View::ALL.into_iter().filter(|other| *other != view) {
+                        let other = at(&rows[0], &format!(" {} ", other.title()))
+                            .unwrap_or_else(|| panic!("every chip: {rows:#?}"));
+                        assert!(!active(&buffer, other + 1), "{view:?}: {rows:#?}");
+                    }
                 }
             }
         }
@@ -607,7 +678,11 @@ mod tests {
         let (buffer, rows) = drawn(&tab, &bench.ctx());
         let templates = at(&rows[0], " Templates ").expect("the Templates chip");
         assert!(active(&buffer, templates + 1), "{rows:#?}");
-        let skills = at(&rows[0], " Skills ").expect("the Skills chip");
-        assert!(!active(&buffer, skills + 1), "{rows:#?}");
+        // The 32-cell list keeps the active chip and its neighbours' marks.
+        assert!(
+            at(&rows[0], " Skills ").is_none_or(|skills| !active(&buffer, skills + 1)),
+            "{rows:#?}"
+        );
+        assert!(at(&rows[0], " MCP servers ").is_some(), "{rows:#?}");
     }
 }

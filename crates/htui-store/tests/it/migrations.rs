@@ -37,7 +37,8 @@ const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// one of `0038_indexer_lease.sql` (MOD-159 M1 plan D2), then the one of
 /// `0039_integration.sql` (MOD-133 M1 plan D5), then the one of
 /// `0040_execution_targets.sql` (MOD-130 M1). `0041_toolbox_binding.sql` (MOD-127 M1) renames
-/// `skill_binding` to `toolbox_binding` and adds none.
+/// `skill_binding` to `toolbox_binding` and adds none; `0042_mcp_server.sql` (MOD-127 M2) adds
+/// `mcp_server`.
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -118,6 +119,8 @@ const TABLES: &[&str] = &[
     "integration",
     // 0040_execution_targets.sql (MOD-130 M1)
     "target",
+    // 0042_mcp_server.sql (MOD-127 M2)
+    "mcp_server",
 ];
 
 #[tokio::test]
@@ -140,7 +143,7 @@ async fn migrations_apply_on_a_clean_database() {
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -159,8 +162,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-164's 0033_memory_capture.sql, MOD-150 M3's 0034_item_artifact_link.sql, \
          MOD-149's 0035_requirement_keys.sql, MOD-122 M3's 0036_activity_event.sql, MOD-125 M4's \
          0037_stopped_run_index.sql, MOD-159 M1's 0038_indexer_lease.sql, MOD-133 M1's \
-         0039_integration.sql, MOD-130 M1's 0040_execution_targets.sql and MOD-127 M1's \
-         0041_toolbox_binding.sql, in ordinal order"
+         0039_integration.sql, MOD-130 M1's 0040_execution_targets.sql, MOD-127 M1's \
+         0041_toolbox_binding.sql and MOD-127 M2's 0042_mcp_server.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -178,7 +181,7 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        60,
+        61,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
@@ -193,13 +196,13 @@ async fn migrations_apply_on_a_clean_database() {
          requirement_child_counter and MOD-122 M3's 0036_activity_event.sql adds activity_event \
          and MOD-159 M1's 0038_indexer_lease.sql adds indexer_lease and MOD-133 M1's \
          0039_integration.sql adds integration and MOD-130 M1's \
-         0040_execution_targets.sql adds target"
+         0040_execution_targets.sql adds target and MOD-127 M2's 0042_mcp_server.sql adds mcp_server"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 59 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 61 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
          0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
          and MOD-146's 0021_project_type.sql (project_type) and MOD-163's 0022_memory.sql \
@@ -210,7 +213,8 @@ async fn migrations_apply_on_a_clean_database() {
          (requirement_child_counter) and MOD-122 M3's 0036_activity_event.sql \
          (activity_event) and MOD-159 M1's 0038_indexer_lease.sql \
          (indexer_lease) and MOD-133 M1's 0039_integration.sql (integration) and MOD-130 M1's \
-         0040_execution_targets.sql (target) and nothing else, \
+         0040_execution_targets.sql (target) and MOD-127 M2's 0042_mcp_server.sql (mcp_server) \
+         and nothing else, \
          got {present:?}"
     );
 
@@ -275,7 +279,8 @@ async fn agent_box_gains_a_jsonb_probe_column() {
 /// `docs/ANA-5.md:2153-2181`; the last nineteen are ANA-2 §9 (`docs/ANA-2.md:1862-1999`).
 /// `run_step.prompt_digest` is restated by `0010_prompt_digest_undigested.sql` (MOD-33 D273) and
 /// pinned in [`MOD33_COLUMN_COMMENTS`]; `run_step.trim_record`, restated by 0010 and again by
-/// `0027_trim_record_v5.sql` (MOD-163 M2 plan D17), is pinned in [`MOD163_M2_COLUMN_COMMENTS`].
+/// `0027_trim_record_v5.sql` (MOD-163 M2 plan D17) and again by `0042_mcp_server.sql` (MOD-127 M2
+/// D10), is pinned in [`MOD127_M2_COLUMN_COMMENTS`].
 /// They live here as literals on purpose: this test is the guard against a
 /// paraphrase drifting into a forward-only migration that cannot be edited afterwards.
 const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
@@ -476,13 +481,9 @@ const MOD9_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
 
 /// The `COMMENT ON COLUMN` texts of `0041_toolbox_binding.sql` (MOD-127 M1 D3), verbatim, for
 /// [`ANA_COLUMN_COMMENTS`]'s reason. `toolbox_binding.languages` keeps its `0007` text, in
-/// [`MOD9_COLUMN_COMMENTS`], and the rename carried it over.
+/// [`MOD9_COLUMN_COMMENTS`], and the rename carried it over; `toolbox_binding.kind` is restated by
+/// `0042_mcp_server.sql` and pinned in [`MOD127_M2_COLUMN_COMMENTS`].
 const MOD127_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
-    (
-        "toolbox_binding",
-        "kind",
-        "the entry kind; skill is the only one so far",
-    ),
     (
         "toolbox_binding",
         "ref_id",
@@ -541,7 +542,7 @@ const MOD23_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[(
 
 /// The `prompt_digest` text of `0010_prompt_digest_undigested.sql` (MOD-33 D273), verbatim, for
 /// [`ANA_COLUMN_COMMENTS`]'s reason. Its `trim_record` text was restated by
-/// `0027_trim_record_v5.sql` and is pinned in [`MOD163_M2_COLUMN_COMMENTS`].
+/// `0027_trim_record_v5.sql` and is pinned in [`MOD127_M2_COLUMN_COMMENTS`].
 const MOD33_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[(
     "run_step",
     "prompt_digest",
@@ -893,30 +894,108 @@ const MOD163_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The one `COMMENT ON COLUMN` of `0027_trim_record_v5.sql` (MOD-163 plan D17), verbatim, for
-/// [`ANA_COLUMN_COMMENTS`]'s reason. It restates `run_step.trim_record`, so the v 4 text left
-/// [`MOD33_COLUMN_COMMENTS`] (blueprint P-12).
-const MOD163_M2_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[(
-    "run_step",
-    "trim_record",
-    "ANA-5 5.1 as amended by MOD-9 D42 and D118, MOD-33 and MOD-163: {v, template, budget, \
-     budget_source, reserve, target, estimator, estimated_before, estimated_after, \
-     sections[], skill_choices[], undigested[], excerpts, notes}, plus memory when a phase \
-     step's run froze project memory, v 5. memory is {shown[], total}: shown[] is each memory \
-     entry that reached the prompt after trimming, as {id, version} in render order, empty \
-     when the cap or the trim left none, and total is how many active entries the project had \
-     when the run started. undigested[] names every span rendered into the prompt but \
-     excluded from prompt_digest: box.hostname, or empty. skill_choices[] is every candidate \
-     skill, ordered by position then name, each {skill, name, version, level, activation, \
-     active, reason} with reason always, matched, no_match, off, no_path, missing_version or \
-     not_placed (ANA-22 6 item 8); a matched choice adds path, <repo>:<path>, the first \
-     matching file in repo then path byte order. A v 4 record, written before 0026, has no \
-     memory and its prompt carried none; a v 3 record, written before 0010, has no undigested \
-     and digested the hostname; a v 2 record, written before 0008, has no matched or \
-     no_match; a v 1 record, written before 0007, has no skill_choices. Canonical; the prompt \
-     payload sections[] array is its abridged projection. Written at stage 3 by \
-     set_step_prompt, before the session starts.",
-)];
+/// The `COMMENT ON COLUMN` texts of `0042_mcp_server.sql` (MOD-127 M2 D2, D4, D10), verbatim, for
+/// [`ANA_COLUMN_COMMENTS`]'s reason. It restates `toolbox_binding.kind` (the M1 text left
+/// [`MOD127_COLUMN_COMMENTS`]) and `run_step.trim_record` (record v 6; the v 5 text of
+/// `0027_trim_record_v5.sql` left the list with it, blueprint P-12).
+const MOD127_M2_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "mcp_server",
+        "name",
+        "a-z start, then a-z, 0-9, _ or -, at most 32 bytes, never htui; the agent sees \
+         mcp__<name>__<tool>; checked on write",
+    ),
+    (
+        "mcp_server",
+        "description",
+        "the picker's one-liner; may be empty",
+    ),
+    (
+        "mcp_server",
+        "transport",
+        "stdio (command, args, env) or http (url, headers)",
+    ),
+    (
+        "mcp_server",
+        "command",
+        "the program to start; empty for http",
+    ),
+    (
+        "mcp_server",
+        "args",
+        "the program's arguments; empty for http",
+    ),
+    (
+        "mcp_server",
+        "url",
+        "the endpoint of an http server; NULL for stdio",
+    ),
+    (
+        "mcp_server",
+        "headers",
+        "ordered [[name, {\"literal\": text} | {\"secret\": project-secret name}], ..]; a \
+         literal under a name that looks secret is refused on write",
+    ),
+    (
+        "mcp_server",
+        "env",
+        "ordered [[name, {\"literal\": text} | {\"secret\": project-secret name}], ..]; the \
+         value of a secret is substituted only when a launch spec is built, never stored",
+    ),
+    (
+        "mcp_server",
+        "allow",
+        "tool names, without the mcp__<name>__ prefix, pre-approved for the server; empty \
+         leaves the existing policy to decide",
+    ),
+    ("mcp_server", "deny", "tool names removed from the agent"),
+    (
+        "mcp_server",
+        "updated_at",
+        "the compare-and-set token of an edit",
+    ),
+    (
+        "toolbox_binding",
+        "kind",
+        "the entry kind: skill or mcp_server; an mcp_server row has no pin, no globs and is \
+         always or off",
+    ),
+    (
+        "run_step",
+        "trim_record",
+        "ANA-5 5.1 as amended by MOD-9 D42 and D118, MOD-33, MOD-163 and MOD-127: {v, \
+         template, budget, budget_source, reserve, target, estimator, estimated_before, \
+         estimated_after, sections[], skill_choices[], undigested[], excerpts, notes}, plus \
+         memory when a phase step's run froze project memory (v 5) and mcp_choices[] when \
+         the step's frozen toolbox bound an MCP server, v 6. memory is {shown[], total}: \
+         shown[] is each memory entry that reached the prompt after trimming, as {id, \
+         version} in render order, empty when the cap or the trim left none, and total is \
+         how many active entries the project had when the run started. mcp_choices[] is \
+         every server the frozen toolbox bound, ordered by server name bytes, each {server, \
+         name, level, activation, active, outcome} with outcome rendered, or {skipped: off | \
+         agent_unsupported | transport_unsupported | reserved_name | {secret_missing: <name \
+         of the project secret>}}; names only, never a value. undigested[] names every span \
+         rendered into the prompt but excluded from prompt_digest: box.hostname, or empty. \
+         skill_choices[] is every candidate skill, ordered by position then name, each \
+         {skill, name, version, level, activation, active, reason} with reason always, \
+         matched, no_match, off, no_path, missing_version or not_placed (ANA-22 6 item 8); a \
+         matched choice adds path, <repo>:<path>, the first matching file in repo then path \
+         byte order. A v 5 record, written before 0042, has no mcp_choices; a v 4 record, \
+         written before 0026, has no memory and its prompt carried none; a v 3 record, \
+         written before 0010, has no undigested and digested the hostname; a v 2 record, \
+         written before 0008, has no matched or no_match; a v 1 record, written before 0007, \
+         has no skill_choices. Canonical; the prompt payload sections[] array is its \
+         abridged projection. Written at stage 3 by set_step_prompt, before the session \
+         starts.",
+    ),
+];
+
+/// The one `COMMENT ON TABLE` of `0042_mcp_server.sql` (MOD-127 M2 D2), verbatim.
+const MOD127_M2_TABLE_COMMENT: (&str, &str) = (
+    "mcp_server",
+    "MOD-127 M2 D2: an MCP server a step may be given beyond htui's own, attached by \
+     toolbox_binding rows of kind mcp_server. One row, no versions. Not mirrored.",
+);
 
 /// The two `COMMENT ON TABLE` texts of `0022_memory.sql` (MOD-163 plan D1), verbatim.
 /// `0033_memory_capture.sql` restates `memory_entry`'s (MOD-164 D1), so that entry carries 0033's.
@@ -1427,7 +1506,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD137_COLUMN_COMMENTS)
         .chain(MOD146_COLUMN_COMMENTS)
         .chain(MOD163_COLUMN_COMMENTS)
-        .chain(MOD163_M2_COLUMN_COMMENTS)
+        .chain(MOD127_M2_COLUMN_COMMENTS)
         .chain(MOD139_COLUMN_COMMENTS)
         .chain(MOD164_COLUMN_COMMENTS)
         .chain(MOD130_COLUMN_COMMENTS)
@@ -1450,7 +1529,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
              MOD-11, MOD-12, MOD-125, MOD-137, MOD-146, MOD-163, MOD-163 M2, MOD-139, MOD-164, \
-             MOD-130 or MOD-127) text byte for byte"
+             MOD-130, MOD-127 or MOD-127 M2) text byte for byte"
         );
     }
 
@@ -1463,6 +1542,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         MOD139_TABLE_COMMENT,
         MOD130_TABLE_COMMENT,
         MOD127_TABLE_COMMENT,
+        MOD127_M2_TABLE_COMMENT,
     ]
     .into_iter()
     .chain(MOD137_TABLE_COMMENTS.iter().copied())
@@ -1510,7 +1590,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD137_COLUMN_COMMENTS)
             .chain(MOD146_COLUMN_COMMENTS)
             .chain(MOD163_COLUMN_COMMENTS)
-            .chain(MOD163_M2_COLUMN_COMMENTS)
+            .chain(MOD127_M2_COLUMN_COMMENTS)
             .chain(MOD139_COLUMN_COMMENTS)
             .chain(MOD164_COLUMN_COMMENTS)
             .chain(MOD130_COLUMN_COMMENTS)
@@ -1537,7 +1617,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD137_COLUMN_COMMENTS)
         .chain(MOD146_COLUMN_COMMENTS)
         .chain(MOD163_COLUMN_COMMENTS)
-        .chain(MOD163_M2_COLUMN_COMMENTS)
+        .chain(MOD127_M2_COLUMN_COMMENTS)
         .chain(MOD139_COLUMN_COMMENTS)
         .chain(MOD164_COLUMN_COMMENTS)
         .chain(MOD130_COLUMN_COMMENTS)
@@ -4446,8 +4526,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(41),
-        "forty-one embedded migrations, none applied (through MOD-127 M1's 0041_toolbox_binding.sql)"
+        MigrationState::Pending(42),
+        "forty-two embedded migrations, none applied (through MOD-127 M2's 0042_mcp_server.sql)"
     );
 
     db.drop_db().await;
@@ -4547,8 +4627,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(41),
-        "forty-one embedded migrations, through MOD-127 M1's 0041_toolbox_binding.sql"
+        MigrationState::Pending(42),
+        "forty-two embedded migrations, through MOD-127 M2's 0042_mcp_server.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4556,8 +4636,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(41),
-        "every one of the forty-one, through MOD-127 M1's 0041_toolbox_binding.sql, is pending"
+        HeadlessError::MigrationsPending(42),
+        "every one of the forty-two, through MOD-127 M2's 0042_mcp_server.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4579,8 +4659,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(41),
-        "every one of the forty-one, through MOD-127 M1's 0041_toolbox_binding.sql, is pending"
+        HeadlessError::MigrationsPending(42),
+        "every one of the forty-two, through MOD-127 M2's 0042_mcp_server.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4731,8 +4811,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        41,
-        "the later applies migrate nothing: the forty-one embedded migrations (through MOD-127 M1's 0041_toolbox_binding.sql) are applied once"
+        42,
+        "the later applies migrate nothing: the forty-two embedded migrations (through MOD-127 M2's 0042_mcp_server.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -9830,6 +9910,169 @@ async fn migration_0041_renames_skill_binding_into_toolbox_binding() {
         common::count(pool, "toolbox_binding").await,
         1,
         "a project's rows go with it and the global row stays"
+    );
+
+    db.drop_db().await;
+}
+
+/// One `toolbox_binding` row as the 0042 test reads it: kind, ref_id, pin, activation, globs.
+type SkillRowShape = (String, uuid::Uuid, Option<i32>, String, Vec<String>);
+
+/// MOD-127 M2 (D2, D4, D10): `0042_mcp_server.sql` over a populated v41 schema. A skill's
+/// attachment keeps its pin and globs; `mcp_server` exists and moves `updated_at` on update; the
+/// `kind` CHECK now admits `mcp_server` (and still refuses a third kind) and the shape CHECK
+/// refuses a pinned, glob or globbed `mcp_server` attachment under its own name; and
+/// `run_step.trim_record` is restated for record v 6.
+#[tokio::test]
+async fn migration_0042_adds_mcp_server_and_the_second_kind() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(41, &db.pool)
+        .await
+        .expect("apply 0001 through 0041");
+    let pool = &db.pool;
+    let user = insert_user(pool, "mod127m2").await;
+    let skill = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO skill (id, name, created_by) VALUES ($1, 'house', $2)")
+        .bind(skill)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert a skill");
+    sqlx::query(
+        "INSERT INTO toolbox_binding (kind, ref_id, pinned_version, activation, globs) \
+         VALUES ('skill', $1, 3, 'glob', ARRAY['**/*.rs'])",
+    )
+    .bind(skill)
+    .execute(pool)
+    .await
+    .expect("insert a pinned glob skill row");
+
+    MIGRATOR.run_to(42, pool).await.expect("apply 0042");
+
+    let kept: Vec<SkillRowShape> = sqlx::query_as(
+        "SELECT kind, ref_id, pinned_version, activation, globs FROM toolbox_binding",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the rows");
+    assert_eq!(
+        kept,
+        vec![(
+            "skill".to_owned(),
+            skill,
+            Some(3),
+            "glob".to_owned(),
+            vec!["**/*.rs".to_owned()]
+        )],
+        "the skill row keeps its pin, activation and globs"
+    );
+    assert_eq!(
+        common::count(pool, "mcp_server").await,
+        0,
+        "a new, empty table"
+    );
+
+    let server = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO mcp_server (id, name, transport, command, created_by, updated_at) \
+         VALUES ($1, 'docs', 'stdio', 'mcp-docs', $2, '2000-01-01T00:00:00Z')",
+    )
+    .bind(server)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("insert a stdio server");
+    sqlx::query("UPDATE mcp_server SET description = 'x' WHERE id = $1")
+        .bind(server)
+        .execute(pool)
+        .await
+        .expect("update the server");
+    let moved: bool = sqlx::query_scalar(
+        "SELECT updated_at > '2000-01-01T00:00:00Z'::timestamptz FROM mcp_server WHERE id = $1",
+    )
+    .bind(server)
+    .fetch_one(pool)
+    .await
+    .expect("read mcp_server.updated_at");
+    assert!(
+        moved,
+        "trg_mcp_server_updated_at moves updated_at on UPDATE"
+    );
+    assert_refused_by(
+        sqlx::query(
+            "INSERT INTO mcp_server (id, name, transport, command, created_by) \
+             VALUES ($1, 'docs', 'stdio', 'other', $2)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect_err("refused"),
+        "mcp_server_name_key",
+        "a second server of one name",
+    );
+
+    try_toolbox_row(pool, "mcp_server", server, [None, None, None, None])
+        .await
+        .expect("the kind CHECK admits mcp_server");
+    assert_refused_by(
+        try_toolbox_row(pool, "persona", server, [None, None, None, None])
+            .await
+            .expect_err("refused"),
+        "toolbox_binding_kind_check",
+        "a third kind",
+    );
+    for (what, pin, activation, globs) in [
+        ("a pinned server", Some(1), "always", Vec::<String>::new()),
+        ("a glob server", None, "glob", vec!["**/*.rs".to_owned()]),
+        (
+            "globs under always",
+            None,
+            "always",
+            vec!["**/*.rs".to_owned()],
+        ),
+    ] {
+        let err = sqlx::query(
+            "INSERT INTO toolbox_binding (kind, ref_id, pinned_version, activation, globs) \
+             VALUES ('mcp_server', $1, $2, $3, $4)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(pin)
+        .bind(activation)
+        .bind(globs)
+        .execute(pool)
+        .await
+        .expect_err("refused");
+        assert_refused_by(err, "toolbox_binding_mcp_shape", what);
+    }
+    assert_refused_by(
+        sqlx::query(
+            "INSERT INTO toolbox_binding (kind, ref_id, activation, languages) \
+             VALUES ('mcp_server', $1, 'always', ARRAY['rust'])",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .execute(pool)
+        .await
+        .expect_err("refused"),
+        "toolbox_binding_mcp_shape",
+        "languages under always",
+    );
+
+    let comment: Option<String> = sqlx::query_scalar(
+        "SELECT col_description('run_step'::regclass, \
+                (SELECT attnum FROM pg_attribute \
+                  WHERE attrelid = 'run_step'::regclass AND attname = 'trim_record'))",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read the trim_record comment");
+    let comment = comment.expect("trim_record carries a comment");
+    assert!(
+        comment.contains("v 6") && comment.contains("mcp_choices[]"),
+        "0042 restates run_step.trim_record for record v 6"
     );
 
     db.drop_db().await;

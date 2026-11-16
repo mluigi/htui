@@ -30,15 +30,16 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, EnvVariable, InitializeRequest, LoadSessionRequest,
-    McpServer, McpServerStdio, Meta, NewSessionRequest, ReadTextFileResponse,
-    RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionConfigOptionValue, SessionModeId, SessionModeState,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, WriteTextFileResponse,
+    AgentCapabilities, CancelNotification, EnvVariable, HttpHeader, InitializeRequest,
+    LoadSessionRequest, McpServer, McpServerHttp, McpServerStdio, Meta, NewSessionRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigOptionValue, SessionModeId,
+    SessionModeState, SetSessionConfigOptionRequest, SetSessionModeRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, RestoredSession, SessionMessage,
 };
+use htui_core::model::mcp::McpTransport;
 use htui_core::model::{Agent as AgentRow, AgentBox};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -1147,22 +1148,36 @@ pub fn session_meta(settings: &AgentSettings) -> Option<Meta> {
     (!settings.user_extensions).then(isolation_meta)
 }
 
-/// One of `htui`'s own MCP servers as ACP's stdio entry (MOD-11 D7).
+/// One MCP server as ACP's entry (MOD-11 D7, MOD-127 M2 D8).
 ///
 /// Stdio is the transport every ACP agent must support (no capability check) and the untagged
 /// variant, so the wire entry carries no `type` key. `env` leaves the spec's `BTreeMap` in key
 /// order, which keeps the request byte-stable.
+///
+/// An http spec becomes `McpServer::Http`, headers in key order. It is built and tested but not
+/// sent: the engine skips an http server for an agent whose `DriverCaps.mcp_http` is `false`, and
+/// no ACP row turns it on yet.
 fn acp_server(spec: &McpServerSpec) -> McpServer {
-    McpServer::Stdio(
-        McpServerStdio::new(spec.name.clone(), PathBuf::from(&spec.command))
-            .args(spec.args.clone())
-            .env(
-                spec.env
+    match spec.transport {
+        McpTransport::Stdio => McpServer::Stdio(
+            McpServerStdio::new(spec.name.clone(), PathBuf::from(&spec.command))
+                .args(spec.args.clone())
+                .env(
+                    spec.env
+                        .iter()
+                        .map(|(name, value)| EnvVariable::new(name.clone(), value.clone()))
+                        .collect(),
+                ),
+        ),
+        McpTransport::Http => McpServer::Http(
+            McpServerHttp::new(spec.name.clone(), spec.url.clone().unwrap_or_default()).headers(
+                spec.headers
                     .iter()
-                    .map(|(name, value)| EnvVariable::new(name.clone(), value.clone()))
+                    .map(|(name, value)| HttpHeader::new(name.clone(), value.clone()))
                     .collect(),
             ),
-    )
+        ),
+    }
 }
 
 /// The foreground future: handshake, banner, first prompt, then the turn loop.
@@ -2134,11 +2149,55 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{Restore, mode_to_set, restore_route, unpinned_under_isolation};
+    use std::collections::BTreeMap;
+
+    use agent_client_protocol::schema::v1::McpServer;
+    use htui_core::model::mcp::McpTransport;
+
+    use super::{Restore, acp_server, mode_to_set, restore_route, unpinned_under_isolation};
+    use crate::driver::McpServerSpec;
     use crate::launch::{AcpSettings, AgentSettings, SessionSettings};
 
     fn caps(document: serde_json::Value) -> AgentCapabilities {
         serde_json::from_value(document).expect("the capabilities parse")
+    }
+
+    /// MOD-127 M2 D8: an Http spec maps to ACP's `McpServer::Http` with its headers in key order.
+    /// Not wired: no ACP row advertises `mcp_http` yet (D7), so no session sends it.
+    #[test]
+    fn the_acp_http_mapping_builds_mcp_server_http() {
+        let spec = McpServerSpec {
+            transport: McpTransport::Http,
+            url: Some("https://mcp.example.test/v1".to_owned()),
+            headers: BTreeMap::from([
+                ("X-Zone".to_owned(), "eu".to_owned()),
+                ("Authorization".to_owned(), "Bearer planted".to_owned()),
+            ]),
+            ..McpServerSpec::new("docs", "", Vec::new(), BTreeMap::new())
+        };
+        let McpServer::Http(http) = acp_server(&spec) else {
+            panic!("an Http spec is the Http variant");
+        };
+        assert_eq!(http.name, "docs");
+        assert_eq!(http.url, "https://mcp.example.test/v1");
+        let headers: Vec<(&str, &str)> = http
+            .headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
+            .collect();
+        assert_eq!(
+            headers,
+            [("Authorization", "Bearer planted"), ("X-Zone", "eu")]
+        );
+        assert!(matches!(
+            acp_server(&McpServerSpec::new(
+                "s",
+                "/bin/s",
+                Vec::new(),
+                BTreeMap::new()
+            )),
+            McpServer::Stdio(_)
+        ));
     }
 
     /// MOD-37 M5 (D4): `session/resume` first, `session/load` next, else a refusal naming both.

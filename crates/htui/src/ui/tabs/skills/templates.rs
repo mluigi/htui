@@ -169,7 +169,7 @@ const BROWSE_HINT: HintSpec = &[
     Hint::One(Act::SkillsEditExternally, "$EDITOR"),
     Hint::One(Act::New, "new"),
     Hint::One(Act::Reload, "reload"),
-    Hint::Two(Act::SkillsSwitchView, "view"),
+    Hint::Pair(Act::SkillsPrevView, Act::SkillsSwitchView, "view"),
 ];
 
 /// The tree pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): the
@@ -2654,7 +2654,9 @@ mod tests {
 
         // RV3 (review M1): each view's cursor moves off the row first, so a restore that put
         // back only the view would leave it there.
-        tab.on_key(key('h'), &mut bench.ctx());
+        // (MOD-127 M2 T8: the switch cycles through the MCP servers view.)
+        tab.on_key(key('l'), &mut bench.ctx());
+        tab.on_key(key('l'), &mut bench.ctx());
         tab.on_key(key('j'), &mut bench.ctx());
         assert_eq!(tab.location().subtab, Some("library"));
         assert_ne!(tab.location(), library, "the library's cursor moved");

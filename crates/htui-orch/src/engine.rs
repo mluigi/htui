@@ -1523,6 +1523,7 @@ where
             &self.parts.app,
             repo_scope.as_deref(),
             on,
+            workspace,
         )
         .await
         {
@@ -6062,7 +6063,8 @@ where
             cap_batch,
         ) = self
             .session(
-                run, step, phase, persona, start, &opening, cwd, extra_dirs, started_at, live,
+                run, snapshot, step, phase, persona, start, &opening, cwd, extra_dirs, started_at,
+                live,
             )
             .await?;
         if let Ok(done) = &result {
@@ -7333,8 +7335,12 @@ where
                 .await?;
 
             // -- stage 3: the group's one prompt (plan D58) ------------------------------------
-            let trim = prompt
-                .trim
+            // MOD-127 M2 R2: the prompt is the group's, assembled for its first pending member, but
+            // `mcp_choices` is what *this* candidate's own agent launches (`drive_once` plans each
+            // by its own caps), so the record is rewritten per candidate.
+            let mut record = prompt.trim.clone();
+            record.mcp_choices = Box::pin(self.mcp_choices(run, snapshot, step, phase)).await?;
+            let trim = record
                 .to_value(self.parts.scrubber)
                 .map_err(htui_agent::RecordError::from)?;
             self.parts
@@ -7380,6 +7386,7 @@ where
         } = match self
             .drive_once(
                 run,
+                Some(snapshot),
                 step,
                 phase,
                 persona,
@@ -8176,6 +8183,7 @@ where
         } = match self
             .drive_once(
                 run,
+                Some(snapshot),
                 step,
                 node,
                 persona,
@@ -8683,7 +8691,7 @@ where
         // -- 3. two fresh sessions, the second reversed (D52) ---------------------------------
         let indices: Vec<i32> = survivors.iter().map(|step| step.fanout_index).collect();
         let verdict = match self
-            .judge_sessions(run, phase, attempt, &judge, &candidate, &prompts)
+            .judge_sessions(run, snapshot, phase, attempt, &judge, &candidate, &prompts)
             .await
         {
             Ok(Ok(documents)) => decide(&documents, &indices),
@@ -9088,9 +9096,15 @@ where
     /// `{{box}}`, so its sent and digest texts are one string (MOD-33 D271) — and the reversed
     /// text is a `follow_up` opening turn 1. The
     /// recorder is finished on every path; a cap breach over the two is `judge_session_failed`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the run and its snapshot, the judged phase, the group's attempt, the judge's row \
+                  and agent and both prompts; bundling them would name a struct used here only"
+    )]
     async fn judge_sessions(
         &self,
         run: &Run,
+        snapshot: &GraphSnapshot,
         phase: &SnapshotPhase,
         attempt: i32,
         judge: &RunStep,
@@ -9102,9 +9116,11 @@ where
             .isolator
             .prepare(run.id, judge.id, &[], Isolation::Local, None)
             .await?;
-        let trim = prompts
-            .forward
-            .trim
+        let jp = judge_phase(phase, prompts.template.clone(), candidate);
+        // MOD-127 M2 D6, D10: a judge shares its phase's picks, launched by the judge's own agent.
+        let mut record = prompts.forward.trim.clone();
+        record.mcp_choices = Box::pin(self.mcp_choices(run, snapshot, judge, &jp)).await?;
+        let trim = record
             .to_value(self.parts.scrubber)
             .map_err(htui_agent::RecordError::from)?;
         self.parts
@@ -9116,7 +9132,6 @@ where
                 &trim,
             )
             .await?;
-        let jp = judge_phase(phase, prompts.template.clone(), candidate);
 
         // MOD-125 M3 D4: a stopped judge with session rows re-runs fresh, both calls, on its
         // continuing log: no second prompt row, and each call's text a follow-up. Its prompts are
@@ -9146,6 +9161,7 @@ where
         let calls = self
             .judge_calls(
                 run,
+                snapshot,
                 &jp,
                 attempt,
                 judge,
@@ -9187,6 +9203,7 @@ where
     async fn judge_calls(
         &self,
         run: &Run,
+        snapshot: &GraphSnapshot,
         jp: &SnapshotPhase,
         attempt: i32,
         judge: &RunStep,
@@ -9211,6 +9228,7 @@ where
             let done = match self
                 .drive_once(
                     run,
+                    Some(snapshot),
                     judge,
                     jp,
                     // MOD-26 OQ-2: the judge runs without a persona; its `{{task}}` replays the
@@ -9651,7 +9669,69 @@ where
         // MOD-7 milestone 4 (D125): here and not in `phase_spec`, which is also the handoff's
         // builder; a handoff reads no file.
         self.with_excerpts(run, step, item, &mut spec).await?;
-        Ok(assemble(&spec, self.parts.scrubber).map_err(StageThree::Refused))
+        let mut assembled = match assemble(&spec, self.parts.scrubber) {
+            Ok(assembled) => assembled,
+            Err(refused) => return Ok(Err(StageThree::Refused(refused))),
+        };
+        // MOD-127 M2 D10: the record names every server the step resolved and what the launch
+        // will do with it, from the same pass `drive_once` launches by.
+        assembled.trim.mcp_choices = Box::pin(self.mcp_choices(run, snapshot, step, phase)).await?;
+        Ok(Ok(assembled))
+    }
+
+    /// MOD-127 M2 D7, D10: `trim_record.mcp_choices` of `step`: [`crate::tools::plan_mcp`] over
+    /// `phase`'s frozen picks, for the step's own agent and the project's secrets, which is what
+    /// `drive_once` launches by. Empty when the phase froze no pick (every run made before M2)
+    /// and when the step names no agent.
+    ///
+    /// `snapshot` is the run's, decoded by the caller. The agent's caps come from a probe driver
+    /// ([`Self::caps_of`]), so no scripted banner or resume refusal of the step's own session is
+    /// spent on them.
+    ///
+    /// # Errors
+    /// [`EngineError::Secrets`] when the project's secrets cannot be fetched, as `drive_once`'s
+    /// own read would answer; a store read's failure.
+    async fn mcp_choices(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+    ) -> Result<Vec<htui_core::prompt::McpChoice>, EngineError> {
+        if phase.mcp.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Ok(candidate) = Self::candidate_of(step, phase) else {
+            return Ok(Vec::new());
+        };
+        let project = self.project(run.project_id).await?;
+        let secrets = self
+            .parts
+            .secrets
+            .env_for(&project)
+            .await
+            .map_err(EngineError::Secrets)?;
+        Ok(crate::tools::plan_mcp(
+            snapshot.toolbox.as_ref(),
+            &phase.mcp,
+            self.caps_of(&candidate),
+            &secrets,
+        )
+        .choices)
+    }
+
+    /// What `candidate`'s agent can carry, read from a driver built for a key no script, banner,
+    /// refusal or hold names (production's factory ignores the key). A driver for the step's own
+    /// key would consume what the step's session needs of the fake: its banner, its resume
+    /// refusal.
+    fn caps_of(&self, candidate: &SnapshotCandidate) -> htui_agent::driver::DriverCaps {
+        let probe = SessionKey {
+            phase: "",
+            attempt: 0,
+            fanout_index: i32::MIN,
+            call: 0,
+        };
+        (self.parts.driver)(candidate, &probe).caps()
     }
 
     /// ANA-5 §4.5 for a phase prompt (MOD-7 milestone 4, plan D107–D109, D125): the roots, then
@@ -10132,6 +10212,7 @@ where
     async fn session(
         &self,
         run: &Run,
+        snapshot: &GraphSnapshot,
         step: &RunStep,
         phase: &SnapshotPhase,
         persona: Option<&SnapshotPersona>,
@@ -10162,6 +10243,7 @@ where
         let result = match self
             .drive_once(
                 run,
+                Some(snapshot),
                 step,
                 phase,
                 persona,
@@ -10412,6 +10494,7 @@ where
     async fn drive_once(
         &self,
         run: &Run,
+        snapshot: Option<&GraphSnapshot>,
         step: &RunStep,
         phase: &SnapshotPhase,
         persona: Option<&SnapshotPersona>,
@@ -10479,7 +10562,7 @@ where
         };
         // MOD-26 D10, D12: the persona narrows the agent's exposure and policy, never widens them
         // (I-1); a persona-less step is exactly today's (I-7).
-        let (tools, mut policy) = match persona {
+        let (mut tools, mut policy) = match persona {
             Some(persona) => htui_agent::persona::narrow(&base, &policy, persona),
             None => (base, policy),
         };
@@ -10500,6 +10583,23 @@ where
                 });
             policy.rules.splice(0..0, denials);
         }
+        // MOD-127 M2 D7: the frozen servers this step's agent can carry, planned by the same pass
+        // that wrote the prompt's `mcp_choices`; the driver is read for its caps first. A run made
+        // before M2 froze no pick, so it is empty and nothing is decoded or resolved live.
+        let driver = (self.parts.driver)(&candidate, key);
+        let mcp = if phase.mcp.is_empty() {
+            crate::tools::McpPlan::default()
+        } else {
+            let decoded;
+            let snapshot = match snapshot {
+                Some(snapshot) => snapshot,
+                None => {
+                    decoded = Self::snapshot_of(run)?;
+                    &decoded
+                }
+            };
+            crate::tools::plan_mcp(snapshot.toolbox.as_ref(), &phase.mcp, driver.caps(), &env)
+        };
         // MOD-11 D10, B-17 (H-25): declared before `session`, so the session — and its agent
         // process — drops first and the token dies after it. Boxed (I-8).
         let lease = match &self.parts.tools {
@@ -10524,7 +10624,9 @@ where
         if let Some(lease) = &lease {
             crate::tools::pre_approve(&mut policy, lease);
         }
-        let driver = (self.parts.driver)(&candidate, key);
+        // MOD-127 M2 D9: each server's `deny` first among the rules and in `tools.deny`, then its
+        // `allow` pre-approved; `tools.allow` is a real allow-list and is never fed.
+        crate::tools::apply_mcp_tools(&mut policy, &mut tools.deny, &mcp);
 
         let spec = SessionSpec {
             agent_id: candidate.agent_id,
@@ -10539,7 +10641,12 @@ where
             env,
             model: Some(candidate.model.clone()),
             tools,
-            mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
+            // htui's own server, then the bound ones by name (MOD-127 M2 D7).
+            mcp: lease
+                .iter()
+                .map(|lease| lease.spec.clone())
+                .chain(mcp.specs)
+                .collect(),
             permission: policy.clone(),
             retain_raw: settings.keep_raw_events,
             // MOD-125 M3 D5: a resumed stopped step reopens its own session.
@@ -12126,6 +12233,31 @@ pub(crate) async fn fake_parts<'a>(
     >,
     EngineError,
 > {
+    fake_parts_with(orch, graphs, driver, secrets, &FirstCandidate).await
+}
+
+/// [`fake_parts`] with the caller's `selector`, for a case that must spread one group over several
+/// agents.
+#[cfg(feature = "test-support")]
+pub(crate) async fn fake_parts_with<'a, A: AgentSelector + ?Sized>(
+    orch: &'a crate::fake::FakeOrchestrator,
+    graphs: &'a crate::fake::FakeGraphSource<'a>,
+    driver: DriverFor<'a>,
+    secrets: &'a RunSecrets,
+    selector: &'a A,
+) -> Result<
+    EngineParts<
+        'a,
+        htui_core::store::MemStore,
+        crate::fake::FakeGraphSource<'a>,
+        crate::fake::FakeIsolator,
+        crate::fake::FakeVerifier,
+        crate::fake::TestClock,
+        A,
+        crate::fake::FakeOrchestrator,
+    >,
+    EngineError,
+> {
     let app = orch.store.app_settings().await?;
     let box_profile = orch
         .store
@@ -12141,7 +12273,7 @@ pub(crate) async fn fake_parts<'a>(
         isolator: &orch.isolator,
         verifier: &orch.verifier,
         clock: &orch.clock,
-        selector: &FirstCandidate,
+        selector,
         sink: orch,
         driver,
         policy: orch.policy_for(),
@@ -12434,6 +12566,7 @@ mod tests {
             palette: false,
             plan_scope: None,
             divide: None,
+            mcp: Vec::new(),
         };
         let candidates = vec![
             SnapshotCandidate {
@@ -13371,6 +13504,7 @@ mod tests {
             palette: false,
             plan_scope: None,
             divide: None,
+            mcp: Vec::new(),
         }
     }
 
@@ -17833,6 +17967,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             harness.orch.box_id(),
+            None,
         )
         .await
         .expect("the bound graph resolves");
@@ -17938,6 +18073,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             harness.orch.box_id(),
+            None,
         )
         .await
         .expect("the bound graph resolves");
@@ -19470,6 +19606,145 @@ mod tests {
             (RunStatus::AwaitingApproval, Some(0), None),
             "`StartRun`'s own first rest"
         );
+    }
+
+    /// MOD-127 M2 D6: attaches a stdio server called `docs` at `key`'s level, `always`, and
+    /// hands it back.
+    async fn attach_docs(
+        harness: &Harness,
+        key: impl FnOnce(htui_core::model::McpServerId) -> htui_core::model::BindingKey,
+    ) -> htui_core::model::McpServer {
+        use htui_core::model::{
+            Activation, Attachment, BindingChange, McpServerId, McpTransport, NewMcpServer,
+        };
+        let store = &harness.orch.store;
+        let server = store
+            .create_mcp_server(NewMcpServer {
+                id: McpServerId::new(),
+                name: "docs".to_owned(),
+                description: String::new(),
+                transport: McpTransport::Stdio,
+                command: "mcp-docs".to_owned(),
+                args: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                env: Vec::new(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("the server is legal");
+        store
+            .set_skill_binding(
+                key(server.id),
+                None,
+                BindingChange::Attach(Attachment {
+                    pinned_version: None,
+                    position: 0,
+                    activation: Activation::Always,
+                    globs: Vec::new(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("the attach is legal");
+        server
+    }
+
+    /// MOD-127 M2 D6: `StartRun`'s workspace reaches the freeze, so a workspace attachment is in
+    /// the snapshot of a run started from that workspace and in none started from nowhere.
+    #[tokio::test]
+    async fn enqueue_freezes_the_workspace_level_of_the_runs_own_workspace() {
+        use htui_core::model::{BindingKey, BindingLevel};
+
+        for (workspace, frozen) in [(Some(ids::WORKSPACE_PLATFORM), true), (None, false)] {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            attach_docs(&harness, |server| {
+                BindingKey::workspace(server, ids::WORKSPACE_PLATFORM)
+            })
+            .await;
+            harness_engine!(harness.orch, engine);
+
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, workspace)
+                .await
+                .expect("the graph resolves");
+
+            let snapshot = snapshot_of(&harness, run).await;
+            assert_eq!(
+                snapshot.toolbox.is_some(),
+                frozen,
+                "workspace {workspace:?}"
+            );
+            if frozen {
+                assert!(
+                    snapshot.phases.iter().all(|phase| {
+                        phase.mcp.iter().map(|pick| pick.level).collect::<Vec<_>>()
+                            == [BindingLevel::Workspace]
+                    }),
+                    "{snapshot:?}"
+                );
+            }
+        }
+    }
+
+    /// MOD-127 M2 D6: a server edited or deleted after `StartRun` never reaches the run, and a
+    /// resume (a v2 run reads its own snapshot; a v1 run resolves the live phases) writes no
+    /// toolbox into it.
+    #[tokio::test]
+    async fn resuming_a_run_keeps_its_frozen_servers_through_a_later_edit() {
+        use htui_core::model::{BindingKey, McpServerPatch};
+
+        let harness = Harness::new().await;
+        let server = attach_docs(&harness, |server| {
+            BindingKey::project(server, ids::PROJECT_HTUI)
+        })
+        .await;
+        let (run, _) = started(&harness).await;
+        let frozen = harness.orch.run(run).await.graph_snapshot;
+        let toolbox = snapshot_of(&harness, run).await.toolbox;
+        assert_eq!(
+            toolbox.as_ref().map(|toolbox| toolbox.servers.len()),
+            Some(1),
+            "the started run froze the server"
+        );
+
+        let outcome = harness
+            .orch
+            .store
+            .update_mcp_server(
+                server.id,
+                server.updated_at,
+                McpServerPatch {
+                    command: Some("mcp-edited".to_owned()),
+                    ..McpServerPatch::default()
+                },
+            )
+            .await
+            .expect("the edit is legal");
+        assert!(
+            matches!(outcome, CasOutcome::Applied(_)),
+            "the edit lands: {outcome:?}"
+        );
+        let resumed = harness.resume(run).await.expect("the run resumes");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+        harness
+            .orch
+            .store
+            .delete_mcp_server(server.id)
+            .await
+            .expect("the server is there");
+        let resumed = harness.resume(run).await.expect("the run resumes");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+
+        assert_eq!(
+            harness.orch.run(run).await.graph_snapshot,
+            frozen,
+            "neither the edit, the delete nor the resumes touched the frozen set"
+        );
+        assert_eq!(snapshot_of(&harness, run).await.toolbox, toolbox);
     }
 
     /// Sets `item`'s `required_tags` through `update_item`, at its current version.
@@ -22789,7 +23064,7 @@ mod tests {
         globs: &[&str],
     ) -> htui_core::model::SkillId {
         use htui_core::model::{
-            Activation, Attachment, BindingChange, NewSkill, SkillBindingKey, SkillId,
+            Activation, Attachment, BindingChange, BindingKey, NewSkill, SkillId,
         };
 
         let store = &harness.orch.store;
@@ -22806,7 +23081,7 @@ mod tests {
             .expect("a new skill");
         let outcome = store
             .set_skill_binding(
-                SkillBindingKey::project(skill.id, ids::PROJECT_HTUI),
+                BindingKey::project(skill.id, ids::PROJECT_HTUI),
                 None,
                 BindingChange::Attach(Attachment {
                     pinned_version: None,
@@ -23382,7 +23657,7 @@ mod tests {
         skills: &[htui_core::model::BoundSkill],
     ) -> Vec<(
         String,
-        htui_core::model::SkillLevel,
+        htui_core::model::BindingLevel,
         Option<i32>,
         i32,
         htui_core::model::Activation,
@@ -23475,7 +23750,7 @@ mod tests {
     /// one (v2), and `tests` comes from the project (`pg_criteria.rs`' phase answer).
     #[tokio::test]
     async fn a_phase_step_renders_its_phase_and_project_skills() {
-        use htui_core::model::{Activation, ChoiceReason, SkillLevel};
+        use htui_core::model::{Activation, BindingLevel, ChoiceReason};
 
         let harness = Harness::new().await;
         let (row, snapshot, prd) = skills_prologue(&harness).await;
@@ -23486,14 +23761,14 @@ mod tests {
             vec![
                 (
                     "tests".to_owned(),
-                    SkillLevel::Project,
+                    BindingLevel::Project,
                     Some(1),
                     0,
                     Activation::Always
                 ),
                 (
                     "rust-style".to_owned(),
-                    SkillLevel::Phase,
+                    BindingLevel::Phase,
                     Some(1),
                     2,
                     Activation::Always
@@ -23645,7 +23920,7 @@ mod tests {
     /// MOD-9 D44: a phase with no phase-level attachment sees the project's, with no note.
     #[tokio::test]
     async fn a_non_implement_phase_renders_project_skills_only() {
-        use htui_core::model::{Activation, SkillLevel};
+        use htui_core::model::{Activation, BindingLevel};
 
         let harness = Harness::new().await;
         let (row, snapshot, prd) = skills_prologue(&harness).await;
@@ -23669,14 +23944,14 @@ mod tests {
             vec![
                 (
                     "tests".to_owned(),
-                    SkillLevel::Project,
+                    BindingLevel::Project,
                     Some(1),
                     0,
                     Activation::Always
                 ),
                 (
                     "rust-style".to_owned(),
-                    SkillLevel::Project,
+                    BindingLevel::Project,
                     Some(2),
                     1,
                     Activation::Always
@@ -23697,7 +23972,7 @@ mod tests {
     #[tokio::test]
     async fn a_phase_off_attachment_turns_a_global_skill_off_for_that_phase_only() {
         use htui_core::model::{
-            Activation, Attachment, BindingChange, ChoiceReason, NewSkill, SkillBindingKey, SkillId,
+            Activation, Attachment, BindingChange, BindingKey, ChoiceReason, NewSkill, SkillId,
         };
         use htui_core::store::CasOutcome;
 
@@ -23726,7 +24001,7 @@ mod tests {
         };
         let global = store
             .set_skill_binding(
-                SkillBindingKey::global(skill.id),
+                BindingKey::global(skill.id),
                 None,
                 attach(Activation::Always),
             )
@@ -23735,7 +24010,7 @@ mod tests {
         assert!(matches!(global, CasOutcome::Applied(Some(_))), "{global:?}");
         let off = store
             .set_skill_binding(
-                SkillBindingKey::phase(skill.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
+                BindingKey::phase(skill.id, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT),
                 None,
                 attach(Activation::Off),
             )
@@ -23797,7 +24072,7 @@ mod tests {
     async fn attach_always(
         harness: &Harness,
         name: &str,
-        key: impl FnOnce(htui_core::model::SkillId) -> htui_core::model::SkillBindingKey,
+        key: impl FnOnce(htui_core::model::SkillId) -> htui_core::model::BindingKey,
     ) {
         use htui_core::model::{Activation, Attachment, BindingChange, NewSkill, SkillId};
         use htui_core::store::CasOutcome;
@@ -23841,7 +24116,7 @@ mod tests {
         snapshot: &GraphSnapshot,
         prd: &htui_core::model::RunStep,
         item: htui_core::model::ItemId,
-    ) -> Vec<(String, htui_core::model::SkillLevel)> {
+    ) -> Vec<(String, htui_core::model::BindingLevel)> {
         harness_engine!(harness.orch, engine);
         let implement = snapshot
             .phases
@@ -23863,13 +24138,13 @@ mod tests {
     /// level, and the judge of that run's phase reads the same candidates.
     #[tokio::test]
     async fn a_workspace_attachment_reaches_a_run_with_a_workspace() {
-        use htui_core::model::SkillBindingKey;
-        use htui_core::model::SkillLevel;
+        use htui_core::model::BindingKey;
+        use htui_core::model::BindingLevel;
 
         let harness = Harness::new().await;
         let (mut row, snapshot, prd) = skills_prologue(&harness).await;
         attach_always(&harness, "ws-style", |skill| {
-            SkillBindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
+            BindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
         })
         .await;
         row.workspace_id = Some(ids::WORKSPACE_PLATFORM);
@@ -23877,7 +24152,7 @@ mod tests {
 
         let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, item).await;
         assert!(
-            levels.contains(&("ws-style".to_owned(), SkillLevel::Workspace)),
+            levels.contains(&("ws-style".to_owned(), BindingLevel::Workspace)),
             "{levels:?}"
         );
 
@@ -23905,7 +24180,7 @@ mod tests {
 
         // Another workspace's attachment does not reach it.
         attach_always(&harness, "other-ws-style", |skill| {
-            SkillBindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
+            BindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
         })
         .await;
         let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, item).await;
@@ -23919,12 +24194,12 @@ mod tests {
     /// workspace-level candidate.
     #[tokio::test]
     async fn a_chat_run_without_a_workspace_gets_no_workspace_attachment() {
-        use htui_core::model::SkillBindingKey;
+        use htui_core::model::BindingKey;
 
         let harness = Harness::new().await;
         let (mut row, snapshot, prd) = skills_prologue(&harness).await;
         attach_always(&harness, "ws-style", |skill| {
-            SkillBindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
+            BindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
         })
         .await;
         row.workspace_id = None;
@@ -23940,12 +24215,12 @@ mod tests {
     /// MOD-127 D5: an item-kind attachment reaches the items of that kind and no others.
     #[tokio::test]
     async fn an_item_kind_attachment_reaches_only_items_of_that_kind() {
-        use htui_core::model::{SkillBindingKey, SkillLevel};
+        use htui_core::model::{BindingKey, BindingLevel};
 
         let harness = Harness::new().await;
         let (row, snapshot, prd) = skills_prologue(&harness).await;
         attach_always(&harness, "feat-style", |skill| {
-            SkillBindingKey::item_kind(skill, ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT)
+            BindingKey::item_kind(skill, ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT)
         })
         .await;
         let feat = row.item_id.expect("an item's run");
@@ -23953,7 +24228,7 @@ mod tests {
 
         let levels = implement_skill_levels(&harness, &row, &snapshot, &prd, feat).await;
         assert!(
-            levels.contains(&("feat-style".to_owned(), SkillLevel::ItemKind)),
+            levels.contains(&("feat-style".to_owned(), BindingLevel::ItemKind)),
             "{levels:?}"
         );
 
@@ -23969,7 +24244,7 @@ mod tests {
     /// silently.
     #[tokio::test]
     async fn a_renamed_phase_falls_back_to_project_skills_with_a_note() {
-        use htui_core::model::SkillLevel;
+        use htui_core::model::BindingLevel;
         use htui_core::store::CasOutcome;
 
         let harness = Harness::new().await;
@@ -24006,7 +24281,7 @@ mod tests {
             .expect("the project still attaches `rust-style`");
         assert_eq!(
             (rust_style.level, rust_style.version),
-            (SkillLevel::Project, Some(2)),
+            (BindingLevel::Project, Some(2)),
             "the project's attachment, since the phase's cannot be found"
         );
         let expected = format!(
@@ -24188,6 +24463,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             orch.box_id(),
+            None,
         )
         .await
         .expect("the stand-in supplies rung 1")
@@ -27546,6 +27822,690 @@ mod tests {
             let text = prompt_of(&without.orch, &step_at(&without.orch, run, 0, 0).await).await;
             assert!(!text.contains("name=\"output\""), "{text}");
             assert!(!text.contains("document_write"), "{text}");
+        }
+    }
+
+    /// MOD-127 M2 T6 (D3, D6, D7, D10): the servers a run froze at `StartRun` are the servers a
+    /// step launches, after htui's own, and the step's prompt record names each of them.
+    mod mcp_launch {
+        use std::sync::Arc;
+
+        use htui_agent::driver::{
+            AgentDriver, AgentSession, DriverCaps, DriverFuture, SessionSpec,
+        };
+        use htui_agent::fake::FakeDriver;
+        use htui_core::fixtures::ids;
+        use htui_core::model::{
+            Activation, AgentId, Attachment, BindingChange, BindingKey, EnvValue, McpServer,
+            McpServerId, McpTransport, NewMcpServer, RunId, RunMode, RunStep, SnapshotCandidate,
+        };
+        use htui_core::secret::fake::{FakeSecretProvider, FakeSecretSource};
+        use htui_core::secret::{INFISICAL, SecretError};
+        use htui_core::store::{ReadStore as _, WriteStore as _};
+
+        use super::Harness;
+        use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
+        use crate::engine::SessionKey;
+        use crate::fake::{FakeOrchestrator, FakeToolHost};
+
+        const SCOPE: &str = r#"{"project_id":"p1","environment":"dev","path":"/"}"#;
+        /// A sentinel: long, and not pattern-shaped, so a refusal cannot stand in for a mask.
+        const VALUE: &str = "sentinel-docs-secret-value-4417";
+
+        fn key(phase: &str) -> SessionKey<'_> {
+            SessionKey {
+                phase,
+                attempt: 1,
+                fanout_index: 0,
+                call: 0,
+            }
+        }
+
+        /// A harness whose agent carries both transports, with htui's tool host.
+        fn capable() -> Harness {
+            Harness {
+                orch: FakeOrchestrator::demo()
+                    .with_tool_host(Arc::new(FakeToolHost::default()))
+                    .with_caps(DriverCaps {
+                        mcp_stdio: true,
+                        mcp_http: true,
+                        ..FakeDriver::full_caps()
+                    }),
+            }
+        }
+
+        /// A harness whose agent carries neither (the fake's own default).
+        fn incapable() -> Harness {
+            Harness {
+                orch: FakeOrchestrator::demo().with_tool_host(Arc::new(FakeToolHost::default())),
+            }
+        }
+
+        async fn attach(harness: &Harness, name: &str, env: Vec<(String, EnvValue)>) -> McpServer {
+            let store = &harness.orch.store;
+            let server = store
+                .create_mcp_server(NewMcpServer {
+                    id: McpServerId::new(),
+                    name: name.to_owned(),
+                    description: String::new(),
+                    transport: McpTransport::Stdio,
+                    command: format!("mcp-{name}"),
+                    args: Vec::new(),
+                    url: None,
+                    headers: Vec::new(),
+                    env,
+                    allow: Vec::new(),
+                    deny: Vec::new(),
+                    created_by: ids::USER,
+                })
+                .await
+                .expect("the server is legal");
+            store
+                .set_skill_binding(
+                    BindingKey::project(server.id, ids::PROJECT_HTUI),
+                    None,
+                    BindingChange::Attach(Attachment {
+                        pinned_version: None,
+                        position: 0,
+                        activation: Activation::Always,
+                        globs: Vec::new(),
+                        languages: Vec::new(),
+                    }),
+                )
+                .await
+                .expect("the attach is legal");
+            server
+        }
+
+        async fn start(harness: &Harness) -> Result<CommandOutcome, EngineError> {
+            Box::pin(harness.dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+                workspace: None,
+            }))
+            .await
+        }
+
+        async fn the_run(harness: &Harness) -> RunId {
+            harness
+                .orch
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .find(|run| run.id != ids::RUN_2)
+                .expect("the walk created a run")
+                .id
+        }
+
+        async fn step_named(harness: &Harness, run: RunId, position: i32) -> RunStep {
+            harness
+                .orch
+                .steps(run)
+                .await
+                .into_iter()
+                .find(|step| step.position == position && step.fanout_index == 0)
+                .expect("the walk created the step")
+        }
+
+        fn names_of(harness: &Harness, phase: &str) -> Vec<String> {
+            harness
+                .orch
+                .spec_for(&key(phase))
+                .unwrap_or_else(|| panic!("{phase} started"))
+                .mcp
+                .iter()
+                .map(|server| server.name.clone())
+                .collect()
+        }
+
+        /// Approves `prd`'s gate, so the walk starts `plan`.
+        async fn approve_prd(harness: &Harness, run: RunId) {
+            let prd = step_named(harness, run, 0).await;
+            Box::pin(harness.dispatch(Command::AnswerGate {
+                run,
+                step: prd.id,
+                answer: GateAnswer::Approved,
+            }))
+            .await
+            .expect("the gate answers");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_run_launches_with_exactly_the_frozen_set() {
+            let harness = capable();
+            harness.free_feat_3().await;
+            attach(&harness, "docs", Vec::new()).await;
+            start(&harness).await.expect("the walk parks at prd's gate");
+            let run = the_run(&harness).await;
+            assert_eq!(
+                names_of(&harness, "prd"),
+                ["htui", "docs"],
+                "htui's own server, then the bound one"
+            );
+            let spec = harness.orch.spec_for(&key("prd")).expect("prd started");
+            assert_eq!(spec.mcp[1].command, "mcp-docs");
+
+            // The record names the choice the launch made.
+            let prd = step_named(&harness, run, 0).await;
+            let record = prd.trim_record.expect("the prompt record");
+            assert_eq!(record["v"], serde_json::json!(6));
+            assert_eq!(record["mcp_choices"][0]["name"], serde_json::json!("docs"));
+            assert_eq!(
+                record["mcp_choices"][0]["outcome"],
+                serde_json::json!("rendered")
+            );
+            assert_eq!(record["mcp_choices"][0]["active"], serde_json::json!(true));
+
+            // A server attached after the run started reaches no later step of it.
+            attach(&harness, "late", Vec::new()).await;
+            approve_prd(&harness, run).await;
+            assert_eq!(
+                names_of(&harness, "plan"),
+                ["htui", "docs"],
+                "`late` is not in the frozen set"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_pre_m2_snapshot_launches_with_the_own_server_only() {
+            let harness = capable();
+            harness.free_feat_3().await;
+            // Nothing bound at `StartRun`: the snapshot carries no toolbox, as a run made before
+            // M2 does. A server bound afterwards is never resolved live.
+            start(&harness).await.expect("the walk parks at prd's gate");
+            let run = the_run(&harness).await;
+            let frozen = harness.orch.run(run).await.graph_snapshot;
+            assert!(
+                frozen
+                    .as_ref()
+                    .is_some_and(|frozen| frozen.get("toolbox").is_none()),
+                "{frozen:?}"
+            );
+            attach(&harness, "late", Vec::new()).await;
+            approve_prd(&harness, run).await;
+
+            assert_eq!(names_of(&harness, "prd"), ["htui"]);
+            assert_eq!(names_of(&harness, "plan"), ["htui"]);
+            let record = step_named(&harness, run, 1)
+                .await
+                .trim_record
+                .expect("the prompt record");
+            assert!(record.get("mcp_choices").is_none(), "{record}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_agent_that_cannot_use_servers_skips_them_and_the_run_starts() {
+            let harness = incapable();
+            harness.free_feat_3().await;
+            attach(&harness, "docs", Vec::new()).await;
+            start(&harness).await.expect("the walk parks at prd's gate");
+            let run = the_run(&harness).await;
+
+            assert_eq!(names_of(&harness, "prd"), ["htui"]);
+            let record = step_named(&harness, run, 0)
+                .await
+                .trim_record
+                .expect("the prompt record");
+            assert_eq!(
+                record["mcp_choices"][0]["outcome"],
+                serde_json::json!({"skipped": "agent_unsupported"})
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_secret_value_reaches_the_launch_and_no_record() {
+            let harness = capable();
+            harness.free_feat_3().await;
+            harness.orch.store.set_project_secret_columns(
+                ids::PROJECT_HTUI,
+                Some(INFISICAL),
+                Some(SCOPE),
+            );
+            harness
+                .orch
+                .set_secret_source(Arc::new(FakeSecretSource::new(Arc::new(
+                    FakeSecretProvider::resolving(&[("DOCS_TOKEN", VALUE)]),
+                ))));
+            attach(
+                &harness,
+                "docs",
+                vec![(
+                    "API_TOKEN".to_owned(),
+                    EnvValue::Secret("DOCS_TOKEN".to_owned()),
+                )],
+            )
+            .await;
+            attach(
+                &harness,
+                "gap",
+                vec![(
+                    "API_TOKEN".to_owned(),
+                    EnvValue::Secret("NOT_THERE".to_owned()),
+                )],
+            )
+            .await;
+            start(&harness).await.expect("the walk parks at prd's gate");
+            let run = the_run(&harness).await;
+
+            let spec = harness.orch.spec_for(&key("prd")).expect("prd started");
+            let named: Vec<&str> = spec.mcp.iter().map(|server| server.name.as_str()).collect();
+            assert_eq!(
+                named,
+                ["htui", "docs"],
+                "`gap` names a secret nobody supplies"
+            );
+            assert_eq!(
+                spec.mcp[1].env.get("API_TOKEN").map(String::as_str),
+                Some(VALUE),
+                "the value is substituted for the launch"
+            );
+            assert!(
+                !format!("{:?}", spec.mcp[1]).contains(VALUE),
+                "Debug redacts it"
+            );
+
+            let row = harness.orch.run(run).await;
+            assert!(
+                !format!("{:?}", row.graph_snapshot).contains(VALUE),
+                "the frozen set"
+            );
+            let prd = step_named(&harness, run, 0).await;
+            let record = prd.trim_record.as_ref().expect("the prompt record");
+            assert!(!record.to_string().contains(VALUE), "{record}");
+            let choices = record["mcp_choices"].as_array().expect("two choices");
+            assert_eq!(choices[1]["name"], serde_json::json!("gap"));
+            assert_eq!(
+                choices[1]["outcome"],
+                serde_json::json!({"skipped": {"secret_missing": "NOT_THERE"}})
+            );
+            let events = harness
+                .orch
+                .store
+                .step_events(prd.id)
+                .await
+                .expect("MemStore never fails a read")
+                .unwrap_or_default();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !event.payload.to_string().contains(VALUE)),
+                "the step log"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_secret_fetch_fails_the_step_and_launches_nothing() {
+            let harness = capable();
+            harness.free_feat_3().await;
+            harness.orch.store.set_project_secret_columns(
+                ids::PROJECT_HTUI,
+                Some(INFISICAL),
+                Some(SCOPE),
+            );
+            harness
+                .orch
+                .set_secret_source(Arc::new(FakeSecretSource::new(Arc::new(
+                    FakeSecretProvider::failing(SecretError::BadCredentials),
+                ))));
+            attach(
+                &harness,
+                "docs",
+                vec![(
+                    "API_TOKEN".to_owned(),
+                    EnvValue::Secret("DOCS_TOKEN".to_owned()),
+                )],
+            )
+            .await;
+            let walked = start(&harness).await;
+            assert!(
+                matches!(
+                    &walked,
+                    Err(EngineError::Secrets(SecretError::BadCredentials))
+                ),
+                "{walked:?}"
+            );
+            assert!(
+                harness.orch.spec_for(&key("prd")).is_none(),
+                "no session started, with no server half-resolved"
+            );
+            // The record pass reads the same fetch, so it records no choice it could not make.
+            let steps = harness.orch.steps(the_run(&harness).await).await;
+            assert!(
+                steps.iter().all(|step| step
+                    .trim_record
+                    .as_ref()
+                    .is_none_or(|record| record.get("mcp_choices").is_none())),
+                "a failed fetch is no `secret_missing`: {steps:?}"
+            );
+        }
+
+        // -- MOD-127 M2 R2 -----------------------------------------------------------------------
+
+        /// A driver whose caps are `caps`, whatever the fake it wraps was built with.
+        #[derive(Debug)]
+        struct Capped {
+            inner: Box<dyn AgentDriver>,
+            caps: DriverCaps,
+        }
+
+        impl AgentDriver for Capped {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+
+            fn caps(&self) -> DriverCaps {
+                self.caps
+            }
+
+            fn start<'a>(
+                &'a self,
+                spec: SessionSpec,
+                prompt: String,
+            ) -> DriverFuture<'a, Box<dyn AgentSession>> {
+                self.inner.start(spec, prompt)
+            }
+        }
+
+        /// What the real registry says of the two seeded agents: `claude` is a CLI row that takes
+        /// both transports, `agy` an ACP row that takes stdio only.
+        fn caps_of(agent: AgentId) -> DriverCaps {
+            let http = agent == ids::AGENT_CLAUDE;
+            DriverCaps {
+                mcp_stdio: true,
+                mcp_http: http,
+                ..FakeDriver::full_caps()
+            }
+        }
+
+        async fn attach_http(harness: &Harness, name: &str) -> McpServer {
+            let store = &harness.orch.store;
+            let server = store
+                .create_mcp_server(NewMcpServer {
+                    id: McpServerId::new(),
+                    name: name.to_owned(),
+                    description: String::new(),
+                    transport: McpTransport::Http,
+                    command: String::new(),
+                    args: Vec::new(),
+                    url: Some(format!("https://{name}.example.test/mcp")),
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                    allow: Vec::new(),
+                    deny: Vec::new(),
+                    created_by: ids::USER,
+                })
+                .await
+                .expect("the server is legal");
+            store
+                .set_skill_binding(
+                    BindingKey::project(server.id, ids::PROJECT_HTUI),
+                    None,
+                    BindingChange::Attach(Attachment {
+                        pinned_version: None,
+                        position: 0,
+                        activation: Activation::Always,
+                        globs: Vec::new(),
+                        languages: Vec::new(),
+                    }),
+                )
+                .await
+                .expect("the attach is legal");
+            server
+        }
+
+        /// Starts `item` on an engine whose selector spreads a group over its candidates and whose
+        /// drivers carry the caps of the agent they were built for.
+        async fn start_spread(harness: &Harness, item: htui_core::model::ItemId) {
+            let orch = &harness.orch;
+            let graphs = orch.graphs();
+            let driver =
+                |candidate: &SnapshotCandidate, key: &SessionKey<'_>| -> Box<dyn AgentDriver> {
+                    Box::new(Capped {
+                        inner: orch.driver_for_key(key),
+                        caps: caps_of(candidate.agent_id),
+                    })
+                };
+            let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
+            let selector = super::IndexSelector::default();
+            let engine = crate::engine::Engine::new(
+                crate::engine::fake_parts_with(orch, &graphs, &driver, &scrubber, &selector)
+                    .await
+                    .expect("the harness has a box"),
+            );
+            let _ = Box::pin(engine.dispatch(Command::StartRun {
+                item,
+                mode: RunMode::Manual,
+                repo_scope: None,
+                workspace: None,
+            }))
+            .await;
+        }
+
+        /// Review M1: a group's one prompt is assembled for its first member, but each candidate's
+        /// record names what its own agent's launch did, in either member order.
+        #[tokio::test(start_paused = true)]
+        async fn a_fan_out_candidate_s_record_names_its_own_agent_s_choice() {
+            for order in [
+                [ids::AGENT_CLAUDE, ids::AGENT_AGY],
+                [ids::AGENT_AGY, ids::AGENT_CLAUDE],
+            ] {
+                let harness = capable();
+                harness.free_feat_3().await;
+                harness
+                    .repoint(ids::HTUI_FEAT_3, |phase| {
+                        if phase.name == "prd" {
+                            phase.fan_out = 2;
+                        }
+                    })
+                    .await;
+                harness.orch.with_candidates(
+                    "prd",
+                    order.iter().map(|agent| (*agent, "default")).collect(),
+                );
+                attach_http(&harness, "docs").await;
+                start_spread(&harness, ids::HTUI_FEAT_3).await;
+
+                let run = the_run(&harness).await;
+                let steps = harness.orch.steps(run).await;
+                assert_eq!(steps.len(), 2, "both candidates ran ({order:?})");
+                for step in &steps {
+                    let record = step.trim_record.as_ref().expect("the prompt record");
+                    let outcome = &record["mcp_choices"][0]["outcome"];
+                    let agent = step.agent_id.expect("a candidate names its agent");
+                    let expected = if agent == ids::AGENT_CLAUDE {
+                        serde_json::json!("rendered")
+                    } else {
+                        serde_json::json!({"skipped": "transport_unsupported"})
+                    };
+                    assert_eq!(
+                        outcome, &expected,
+                        "member {} on {agent:?} ({order:?})",
+                        step.fanout_index
+                    );
+                }
+                // And the launch agrees with the record.
+                for step in &steps {
+                    let launched = harness
+                        .orch
+                        .spec_for(&SessionKey {
+                            phase: "prd",
+                            attempt: 1,
+                            fanout_index: step.fanout_index,
+                            call: 0,
+                        })
+                        .expect("the candidate started")
+                        .mcp
+                        .len();
+                    let agent = step.agent_id.expect("a candidate names its agent");
+                    assert_eq!(launched, 1 + usize::from(agent == ids::AGENT_CLAUDE));
+                }
+            }
+        }
+
+        /// Review L6: the frozen set holds the secret's name, and a provider that supplies a value
+        /// for that name leaves it out of the run's snapshot, however it is serialised.
+        #[tokio::test(start_paused = true)]
+        async fn the_frozen_set_names_the_secret_and_never_its_value() {
+            let harness = capable();
+            harness.free_feat_3().await;
+            harness.orch.store.set_project_secret_columns(
+                ids::PROJECT_HTUI,
+                Some(INFISICAL),
+                Some(SCOPE),
+            );
+            harness
+                .orch
+                .set_secret_source(Arc::new(FakeSecretSource::new(Arc::new(
+                    FakeSecretProvider::resolving(&[("DOCS_TOKEN", VALUE)]),
+                ))));
+            attach(
+                &harness,
+                "docs",
+                vec![(
+                    "API_TOKEN".to_owned(),
+                    EnvValue::Secret("DOCS_TOKEN".to_owned()),
+                )],
+            )
+            .await;
+            start(&harness).await.expect("the walk parks at prd's gate");
+            let run = the_run(&harness).await;
+            let frozen = harness.orch.run(run).await.graph_snapshot;
+            let json = serde_json::to_string(&frozen).expect("encodes");
+            assert!(json.contains(r#"{"secret":"DOCS_TOKEN"}"#), "{json}");
+            // The launch did resolve it, so the value was in reach of the freeze's writer.
+            let spec = harness.orch.spec_for(&key("prd")).expect("prd started");
+            assert_eq!(
+                spec.mcp[1].env.get("API_TOKEN").map(String::as_str),
+                Some(VALUE)
+            );
+            for text in [json, format!("{frozen:?}")] {
+                assert!(!text.contains(VALUE), "{text}");
+            }
+        }
+
+        /// Review L2: planning the record builds no driver a session needs: a banner scripted for
+        /// the step is still the one its session reports, with servers bound.
+        #[tokio::test(start_paused = true)]
+        async fn a_scripted_banner_survives_the_record_pass() {
+            let harness = capable();
+            harness.free_feat_3().await;
+            attach(&harness, "docs", Vec::new()).await;
+            harness
+                .orch
+                .rename_banner("prd", 1, None, "banner-sentinel-7731");
+            start(&harness).await.expect("the walk parks at prd's gate");
+            let run = the_run(&harness).await;
+            let prd = step_named(&harness, run, 0).await;
+            let events = harness
+                .orch
+                .store
+                .step_events(prd.id)
+                .await
+                .expect("MemStore never fails a read")
+                .unwrap_or_default();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.payload.to_string().contains("banner-sentinel-7731")),
+                "the session reported its scripted banner: {events:?}"
+            );
+        }
+
+        /// Review L6: a judge launches the judged phase's servers by its own agent, and its row
+        /// names them.
+        #[tokio::test(start_paused = true)]
+        async fn a_judge_launches_and_records_the_judged_phases_servers() {
+            let harness = capable();
+            harness
+                .repoint(ids::HTUI_ANA_2, |phase| {
+                    if phase.name == "research" {
+                        phase.fan_out = 2;
+                    }
+                    phase.gate = htui_core::model::Gate::Never;
+                })
+                .await;
+            let project = harness.orch.item(ids::HTUI_ANA_2).await.project_id;
+            let mut settings = harness
+                .orch
+                .store
+                .project_settings(project)
+                .await
+                .expect("MemStore never fails a read")
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            settings["judge_agent_id"] = serde_json::json!(ids::AGENT_AGY);
+            harness.orch.store.set_project_settings(project, settings);
+            for index in 0..2 {
+                harness.orch.script_candidate(
+                    "research",
+                    1,
+                    index,
+                    0,
+                    crate::fake::ScriptedStep::done_without_output(),
+                );
+                harness.orch.writes_through_tools(
+                    &SessionKey {
+                        phase: "research",
+                        attempt: 1,
+                        fanout_index: index,
+                        call: 0,
+                    },
+                    &format!("research by candidate {index}"),
+                );
+            }
+            attach(&harness, "docs", Vec::new()).await;
+            let _ = start_item(&harness, ids::HTUI_ANA_2).await;
+
+            let run = harness
+                .orch
+                .store
+                .runs(ids::HTUI_ANA_2)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .find(|run| run.id != ids::RUN_2)
+                .expect("the walk created a run")
+                .id;
+            let judge = harness
+                .orch
+                .steps(run)
+                .await
+                .into_iter()
+                .find(|step| step.fanout_index == -1)
+                .expect("the group was judged");
+            let record = judge.trim_record.expect("the judge's prompt record");
+            assert_eq!(record["mcp_choices"][0]["name"], serde_json::json!("docs"));
+            assert_eq!(
+                record["mcp_choices"][0]["outcome"],
+                serde_json::json!("rendered")
+            );
+            let spec = harness
+                .orch
+                .spec_for(&SessionKey {
+                    phase: "research:judge",
+                    attempt: 1,
+                    fanout_index: -1,
+                    call: 0,
+                })
+                .expect("the judge's first call started");
+            let named: Vec<&str> = spec.mcp.iter().map(|server| server.name.as_str()).collect();
+            assert_eq!(named, ["htui", "docs"], "the judged phase's picks");
+        }
+
+        async fn start_item(
+            harness: &Harness,
+            item: htui_core::model::ItemId,
+        ) -> Result<CommandOutcome, EngineError> {
+            Box::pin(harness.dispatch(Command::StartRun {
+                item,
+                mode: RunMode::Manual,
+                repo_scope: None,
+                workspace: None,
+            }))
+            .await
         }
     }
 

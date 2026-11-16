@@ -15,8 +15,8 @@ use htui_agent::excerpt::{
     run_providers, step_pass, touched_prefixes, walk_pass,
 };
 use htui_core::model::{
-    Activation, BoundSkill, BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId, RunStepTree,
-    SkillId, SkillLevel, StepId,
+    Activation, BindingLevel, BoundSkill, BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId,
+    RunStepTree, SkillId, StepId,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, BuiltinRanker, ExcerptCandidate, ExcerptCaps, ExcerptProvider, ExcerptReason,
@@ -1424,7 +1424,7 @@ fn glob_skill(globs: &[&str]) -> BoundSkill {
         version: Some(1),
         position: 0,
         body: "Mind the globs.\n".to_owned(),
-        level: SkillLevel::Project,
+        level: BindingLevel::Project,
         activation: Activation::Glob,
         globs: globs.iter().map(|glob| (*glob).to_owned()).collect(),
     }

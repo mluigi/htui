@@ -9553,6 +9553,7 @@ pub(crate) mod tests {
                         command: "/proc/1/exe".to_owned(),
                         args: Vec::new(),
                         env: std::collections::BTreeMap::new(),
+                        ..McpServerSpec::default()
                     },
                     None,
                     || {},

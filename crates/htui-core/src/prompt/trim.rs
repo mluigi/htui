@@ -29,13 +29,13 @@
 //! §4.4 makes the first "the one budget condition that is an error rather than a trim", and §4.2
 //! refuses rather than dropping a binding because a silently dropped skill breaks `R-ID-5`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::ids::MemoryEntryId;
+use crate::model::ids::{McpServerId, MemoryEntryId};
 use crate::model::link::UpstreamEntry;
 use crate::model::memory::SnapshotMemoryEntry;
-use crate::model::skill::SkillChoice;
+use crate::model::skill::{Activation, BindingLevel, SkillChoice};
 use crate::prompt::estimate::TokenEstimator;
 use crate::prompt::excerpt::{Excerpt, ExcerptAudit};
 use crate::prompt::render::{self, PartState, Rendered, UpstreamState};
@@ -58,10 +58,11 @@ const DOCUMENT_FLOOR_PERCENT: usize = 25;
 const VERIFY_FLOOR_LINES: usize = 200;
 /// §4.6c's floor for a handoff `step_summary`.
 const STEP_SUMMARY_FLOOR_LINES: usize = 20;
-/// `trim_record.v`: version 5 since MOD-163 D17 added `memory`; 4 since MOD-33 D270 added
+/// `trim_record.v`: version 6 since MOD-127 M2 D10 added `mcp_choices`; 5 since MOD-163 D17 added
+/// `memory`; 4 since MOD-33 D270 added
 /// `undigested`; 3 since MOD-9 D118 added `matched`, `no_match` and `skill_choices[].path`; 2 since
 /// MOD-9 D42 added `skill_choices`; first, so a reader can branch (§5.1).
-const RECORD_VERSION: u8 = 5;
+const RECORD_VERSION: u8 = 6;
 
 /// How a section lost content. Closed vocabulary (§5.1 `:1545`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -153,6 +154,64 @@ pub struct MemoryAudit {
     pub total: u32,
 }
 
+/// MOD-127 M2 D10: one MCP server a step resolved, and whether it launched. The record's `name`
+/// is the server's, scrubbed with the rest of the record by [`TrimRecord::to_value`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpChoice {
+    /// `mcp_server.id`.
+    pub server: McpServerId,
+    /// `mcp_server.name`.
+    pub name: String,
+    /// The winning attachment's level.
+    pub level: BindingLevel,
+    /// The winning attachment's activation.
+    pub activation: Activation,
+    /// Whether the winning attachment is not `off`: the pick the run froze.
+    pub active: bool,
+    /// What the launch did with it.
+    pub outcome: McpOutcome,
+}
+
+/// MOD-127 M2 D10: what a step's launch did with one resolved server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpOutcome {
+    /// The server is in the session's `mcp` list.
+    Rendered,
+    /// It is not, for the stated reason.
+    Skipped(SkipReason),
+}
+
+/// MOD-127 M2 D10: why a resolved server was not launched. Carries names, never a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The winning attachment is `off`.
+    Off,
+    /// The step's agent cannot use MCP servers of this transport at all.
+    AgentUnsupported,
+    /// The agent's transport has no way to carry this server's.
+    TransportUnsupported,
+    /// A `Secret` the server names is not among the project's secrets: the **name**.
+    SecretMissing(String),
+    /// The server's name is htui's own.
+    ReservedName,
+}
+
+impl SkipReason {
+    /// The reason in the words the Prompt pane and the log use.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Off => "off".to_owned(),
+            Self::AgentUnsupported => "agent_unsupported".to_owned(),
+            Self::TransportUnsupported => "transport_unsupported".to_owned(),
+            Self::SecretMissing(name) => format!("secret_missing {name}"),
+            Self::ReservedName => "reserved_name".to_owned(),
+        }
+    }
+}
+
 /// One row of `trim_record.sections` (§5.1 `:1505-1517`).
 ///
 /// `tokens_before` and `tokens_after` are what the section costs **in this prompt**: a placeholder
@@ -229,8 +288,8 @@ pub struct TemplateRecord {
     pub role: TemplateRole,
 }
 
-/// `run_step.trim_record`, version 5 (ANA-5 §5.1 as amended by MOD-9 D42/D118, MOD-33 D270 and
-/// MOD-163 D17).
+/// `run_step.trim_record`, version 6 (ANA-5 §5.1 as amended by MOD-9 D42/D118, MOD-33 D270,
+/// MOD-163 D17 and MOD-127 M2 D10).
 ///
 /// Byte-stable, but **not** by the route §5.1 assumed. §5.1 says "`serde_json::Map` is a `BTreeMap`
 /// in this workspace, so object keys serialise sorted"; that is false in a workspace build
@@ -264,6 +323,11 @@ pub struct TrimRecord {
     /// Every skill candidate and whether it rendered, in collapse order (MOD-9 D42, ANA-22 §6
     /// item 8). Always present; `[]` when the step had no candidate.
     pub skill_choices: Vec<SkillChoice>,
+    /// MOD-127 M2 D10: every MCP server the step resolved and whether it launched, by server name
+    /// bytes. Absent when the step bound none, so a server-less v 6 record differs from v 5 only
+    /// in `v`. Names only: a secret's value is in no row (D3).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mcp_choices: Vec<McpChoice>,
     /// Every span rendered into the prompt but excluded from `prompt_digest` (MOD-33 D270):
     /// `["box.hostname"]` when the box section named the hostname, else `[]`. Always present, and
     /// listed once however often the body places `{{box}}`. In v 4, a `box` entry in `sections`
@@ -1386,6 +1450,7 @@ pub(crate) fn record(
         estimated_after: rows.iter().map(|row| row.tokens_after).sum(),
         sections: rows,
         skill_choices,
+        mcp_choices: Vec::new(),
         undigested,
         memory,
         excerpts,
@@ -1574,5 +1639,39 @@ mod tests {
         assert_eq!(floor_for(&body(400), 40, 25), 100);
         assert_eq!(floor_for(&body(40), 40, 25), 40, "the minimum wins");
         assert_eq!(floor_for(&body(400), 20, 0), 20, "a flat floor");
+    }
+
+    /// MOD-127 M2 D10: a choice serialises by names and snake_case words only.
+    #[test]
+    fn an_mcp_choice_serialises_names_only() {
+        let rendered = McpChoice {
+            server: McpServerId::new(),
+            name: "docs".to_owned(),
+            level: BindingLevel::Project,
+            activation: Activation::Always,
+            active: true,
+            outcome: McpOutcome::Rendered,
+        };
+        let skipped = McpChoice {
+            outcome: McpOutcome::Skipped(SkipReason::SecretMissing("DOCS_KEY".to_owned())),
+            ..rendered.clone()
+        };
+        let json = serde_json::to_value([&rendered, &skipped]).expect("encodes");
+        assert_eq!(json[0]["outcome"], serde_json::json!("rendered"));
+        assert_eq!(
+            json[1]["outcome"],
+            serde_json::json!({"skipped": {"secret_missing": "DOCS_KEY"}})
+        );
+        for (reason, word) in [
+            (SkipReason::Off, "off"),
+            (SkipReason::AgentUnsupported, "agent_unsupported"),
+            (SkipReason::TransportUnsupported, "transport_unsupported"),
+            (SkipReason::ReservedName, "reserved_name"),
+        ] {
+            assert_eq!(serde_json::to_value(&reason).expect("encodes"), word);
+            assert_eq!(reason.describe(), word);
+        }
+        let back: McpChoice = serde_json::from_value(json[1].clone()).expect("decodes");
+        assert_eq!(back, skipped);
     }
 }

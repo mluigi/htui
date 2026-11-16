@@ -31,26 +31,26 @@ use htui_agent::record::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, AnswerOutcome, Billing, BindingChange, BoxEdit, BoxId, BoxProbe,
-    BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow,
-    Document, DocumentHead, DocumentId, EventKind, EventRole, FollowUpRequest, FollowUpSettle,
-    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryPatch,
-    MemoryRevision, MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument,
-    NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewProject, NewPromptTemplate,
-    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PendingStop,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueuedFollowUp, Quota, QuotaSource,
-    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunMemoryWrite, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, ToolCallCount, UpstreamEntry,
-    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, normalize,
+    Agent, AgentBox, AgentId, AnswerOutcome, Billing, Binding, BindingChange, BindingKey, BoxEdit,
+    BoxId, BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim,
+    CommandRun, CoverageRow, Document, DocumentHead, DocumentId, EventKind, EventRole,
+    FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, MemoryEntry,
+    MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede, MemoryUpdate,
+    NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunMemory, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note,
+    OpenPermission, PendingStop, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
+    QueuedFollowUp, Quota, QuotaSource, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunMemoryWrite,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
+    Skill, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, ToolCallCount,
+    UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::prompt::settings::SettingKey;
@@ -881,7 +881,7 @@ impl WriteStore for SpyStore {
     async fn skill_versions(&self, skill: SkillId) -> StoreResult<Vec<SkillVersion>> {
         self.inner.skill_versions(skill).await
     }
-    async fn skill_bindings(&self, home: BindingHome) -> StoreResult<Vec<SkillBinding>> {
+    async fn skill_bindings(&self, home: BindingHome) -> StoreResult<Vec<Binding>> {
         self.inner.skill_bindings(home).await
     }
     async fn create_skill(&self, new: NewSkill) -> StoreResult<(Skill, SkillVersion)> {
@@ -905,12 +905,36 @@ impl WriteStore for SpyStore {
     }
     async fn set_skill_binding(
         &self,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
-    ) -> StoreResult<CasOutcome<Option<SkillBinding>>> {
+    ) -> StoreResult<CasOutcome<Option<Binding>>> {
         self.inner.set_skill_binding(key, expected, change).await
     }
+    async fn mcp_servers(&self) -> StoreResult<Vec<htui_core::model::McpServer>> {
+        self.inner.mcp_servers().await
+    }
+
+    async fn create_mcp_server(
+        &self,
+        new: htui_core::model::NewMcpServer,
+    ) -> StoreResult<htui_core::model::McpServer> {
+        self.inner.create_mcp_server(new).await
+    }
+
+    async fn update_mcp_server(
+        &self,
+        id: htui_core::model::McpServerId,
+        expected: DateTime<Utc>,
+        patch: htui_core::model::McpServerPatch,
+    ) -> StoreResult<CasOutcome<htui_core::model::McpServer>> {
+        self.inner.update_mcp_server(id, expected, patch).await
+    }
+
+    async fn delete_mcp_server(&self, id: htui_core::model::McpServerId) -> StoreResult<u64> {
+        self.inner.delete_mcp_server(id).await
+    }
+
     async fn personas(&self) -> StoreResult<Vec<htui_core::model::Persona>> {
         self.inner.personas().await
     }

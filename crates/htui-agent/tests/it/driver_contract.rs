@@ -357,6 +357,7 @@ fn session_spec_debug_redacts_every_environment_value() {
         command: "htui-mcp".to_owned(),
         args: vec!["--stdio".to_owned()],
         env: BTreeMap::from([("MCP_TOKEN".to_owned(), "s3cr3t".to_owned())]),
+        ..McpServerSpec::default()
     });
 
     let shown = format!("{spec:?}");

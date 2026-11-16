@@ -2301,18 +2301,18 @@ async fn session_new_params_with(mcp: Vec<McpServerSpec>, settings: AgentSetting
 #[cfg(unix)]
 #[tokio::test]
 async fn session_new_carries_the_mcp_server_as_stdio() {
-    let server = McpServerSpec {
-        name: "htui".to_owned(),
-        command: "/abs/htui".to_owned(),
-        args: vec!["mcp".to_owned()],
-        env: BTreeMap::from([
+    let server = McpServerSpec::new(
+        "htui",
+        "/abs/htui",
+        vec!["mcp".to_owned()],
+        BTreeMap::from([
             ("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned()),
             (
                 "HTUI_MCP_ADDR".to_owned(),
                 "/run/htui-mcp-1-abcd/s".to_owned(),
             ),
         ]),
-    };
+    );
 
     let params = session_new_params(vec![server]).await;
 
@@ -2331,6 +2331,47 @@ async fn session_new_carries_the_mcp_server_as_stdio() {
     );
     assert!(
         params["mcpServers"][0].get("type").is_none(),
+        "stdio is untagged on the wire: {params}"
+    );
+}
+
+/// MOD-127 M2 D7: a toolbox server rides next to htui's own as a stdio entry, its `env` as
+/// `{name, value}` pairs in key order, and the order of the spec's list is the order on the wire.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_acp_path_renders_a_stdio_server_with_env() {
+    let own = McpServerSpec::new("htui", "/abs/htui", vec!["mcp".to_owned()], BTreeMap::new());
+    let bound = McpServerSpec::new(
+        "linear",
+        "/usr/bin/linear-mcp",
+        vec!["--read-only".to_owned(), "--stdio".to_owned()],
+        BTreeMap::from([
+            ("LINEAR_TEAM".to_owned(), "core".to_owned()),
+            (
+                "LINEAR_API_KEY".to_owned(),
+                "planted-resolved-value".to_owned(),
+            ),
+        ]),
+    );
+
+    let params = session_new_params(vec![own, bound]).await;
+
+    assert_eq!(
+        params["mcpServers"][1],
+        json!({
+            "name": "linear",
+            "command": "/usr/bin/linear-mcp",
+            "args": ["--read-only", "--stdio"],
+            "env": [
+                { "name": "LINEAR_API_KEY", "value": "planted-resolved-value" },
+                { "name": "LINEAR_TEAM", "value": "core" },
+            ],
+        }),
+        "{params}"
+    );
+    assert_eq!(params["mcpServers"][0]["name"], "htui", "{params}");
+    assert!(
+        params["mcpServers"][1].get("type").is_none(),
         "stdio is untagged on the wire: {params}"
     );
 }

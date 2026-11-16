@@ -1,7 +1,7 @@
 //! The graph source over any host (MOD-4 plan D155, MOD-41 plan D6).
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoundSkill, BoxId, ItemId, PhaseAgent, PhaseId, ProjectId,
+    Agent, AgentBox, AgentId, BoundMcp, BoundSkill, BoxId, ItemId, PhaseAgent, PhaseId, ProjectId,
     PromptTemplate, ResolveScope, ResolvedGraph,
 };
 use htui_core::store::Result as StoreResult;
@@ -51,6 +51,10 @@ impl<H: htui_core::store::WorkerHost> GraphSource for HostGraphs<H> {
 
     async fn bound_skills(&self, scope: ResolveScope) -> StoreResult<Vec<BoundSkill>> {
         self.0.bound_skills(scope).await
+    }
+
+    async fn bound_mcp_servers(&self, scope: ResolveScope) -> StoreResult<Vec<BoundMcp>> {
+        self.0.bound_mcp_servers(scope).await
     }
 
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> StoreResult<Vec<String>> {

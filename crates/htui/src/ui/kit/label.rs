@@ -9,9 +9,9 @@
 use htui_agent::event::{PlanEntryStatus, StopReason, ToolKind};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    Activation, Billing, CitationKind, CommandQueue, Gate, GateOutcome, Isolation, LinkKind,
-    OsFamily, Priority, RequirementState, Resolution, RunKind, RunMode, RunStatus, SkillLevel,
-    StepStatus, Transport,
+    Activation, Billing, BindingKind, BindingLevel, CitationKind, CommandQueue, Gate, GateOutcome,
+    Isolation, LinkKind, McpTransport, OsFamily, Priority, RequirementState, Resolution, RunKind,
+    RunMode, RunStatus, StepStatus, Transport,
 };
 use htui_core::prompt::BudgetSource;
 use ratatui::style::Style;
@@ -335,13 +335,31 @@ pub const fn activation(activation: Activation) -> &'static str {
 
 /// The level a skill is attached at.
 #[must_use]
-pub const fn skill_level(level: SkillLevel) -> &'static str {
+pub const fn skill_level(level: BindingLevel) -> &'static str {
     match level {
-        SkillLevel::Global => "global",
-        SkillLevel::Workspace => "workspace",
-        SkillLevel::Project => "project",
-        SkillLevel::ItemKind => "item kind",
-        SkillLevel::Phase => "phase",
+        BindingLevel::Global => "global",
+        BindingLevel::Workspace => "workspace",
+        BindingLevel::Project => "project",
+        BindingLevel::ItemKind => "item kind",
+        BindingLevel::Phase => "phase",
+    }
+}
+
+/// What an attachment attaches (MOD-127 M2 D1).
+#[must_use]
+pub const fn binding_kind(kind: BindingKind) -> &'static str {
+    match kind {
+        BindingKind::Skill => "skill",
+        BindingKind::McpServer => "MCP server",
+    }
+}
+
+/// How an agent reaches an MCP server (MOD-127 M2 D2).
+#[must_use]
+pub const fn mcp_transport(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Http => "http",
     }
 }
 
@@ -380,30 +398,52 @@ mod tests {
         }
     }
 
-    /// `SkillLevel` is a plain enum without a generated `ALL`, so this list is by hand, checked
+    /// `BindingLevel` is a plain enum without a generated `ALL`, so this list is by hand, checked
     /// against [`skill_level_after`] as [`BUDGET_SOURCES`] is.
-    const SKILL_LEVELS: [SkillLevel; 5] = [
-        SkillLevel::Global,
-        SkillLevel::Workspace,
-        SkillLevel::Project,
-        SkillLevel::ItemKind,
-        SkillLevel::Phase,
+    const SKILL_LEVELS: [BindingLevel; 5] = [
+        BindingLevel::Global,
+        BindingLevel::Workspace,
+        BindingLevel::Project,
+        BindingLevel::ItemKind,
+        BindingLevel::Phase,
     ];
 
     /// The level after `level`, in specificity order; a new variant needs an arm here.
-    const fn skill_level_after(level: SkillLevel) -> Option<SkillLevel> {
+    const fn skill_level_after(level: BindingLevel) -> Option<BindingLevel> {
         match level {
-            SkillLevel::Global => Some(SkillLevel::Workspace),
-            SkillLevel::Workspace => Some(SkillLevel::Project),
-            SkillLevel::Project => Some(SkillLevel::ItemKind),
-            SkillLevel::ItemKind => Some(SkillLevel::Phase),
-            SkillLevel::Phase => None,
+            BindingLevel::Global => Some(BindingLevel::Workspace),
+            BindingLevel::Workspace => Some(BindingLevel::Project),
+            BindingLevel::Project => Some(BindingLevel::ItemKind),
+            BindingLevel::ItemKind => Some(BindingLevel::Phase),
+            BindingLevel::Phase => None,
+        }
+    }
+
+    /// `BindingKind` is a plain enum without a generated `ALL`: by hand, checked against
+    /// [`binding_kind_after`] as [`SKILL_LEVELS`] is.
+    const BINDING_KINDS: [BindingKind; 2] = [BindingKind::Skill, BindingKind::McpServer];
+
+    /// The kind after `kind`; a new variant needs an arm here.
+    const fn binding_kind_after(kind: BindingKind) -> Option<BindingKind> {
+        match kind {
+            BindingKind::Skill => Some(BindingKind::McpServer),
+            BindingKind::McpServer => None,
         }
     }
 
     #[test]
+    fn the_binding_kind_hand_list_is_complete() {
+        let mut chain = vec![BindingKind::Skill];
+        while let Some(next) = chain.last().copied().and_then(binding_kind_after) {
+            assert!(!chain.contains(&next), "the chain loops at {next:?}");
+            chain.push(next);
+        }
+        assert_eq!(BINDING_KINDS.as_slice(), chain.as_slice());
+    }
+
+    #[test]
     fn the_skill_level_hand_list_is_complete() {
-        let mut chain = vec![SkillLevel::Global];
+        let mut chain = vec![BindingLevel::Global];
         while let Some(next) = chain.last().copied().and_then(skill_level_after) {
             assert!(!chain.contains(&next), "the chain loops at {next:?}");
             chain.push(next);
@@ -489,8 +529,16 @@ mod tests {
                 words(Activation::ALL, Activation::as_str, activation),
             ),
             (
-                "SkillLevel",
-                words(&SKILL_LEVELS, SkillLevel::as_str, skill_level),
+                "BindingLevel",
+                words(&SKILL_LEVELS, BindingLevel::as_str, skill_level),
+            ),
+            (
+                "BindingKind",
+                words(&BINDING_KINDS, BindingKind::as_str, binding_kind),
+            ),
+            (
+                "McpTransport",
+                words(McpTransport::ALL, McpTransport::as_str, mcp_transport),
             ),
         ]
     }
@@ -839,8 +887,16 @@ mod tests {
             [("always", "always"), ("glob", "by glob"), ("off", "off")]
         );
         assert_eq!(
-            labels(&words(&SKILL_LEVELS, SkillLevel::as_str, skill_level)),
+            labels(&words(&SKILL_LEVELS, BindingLevel::as_str, skill_level)),
             ["global", "workspace", "project", "item kind", "phase"]
+        );
+        assert_eq!(
+            labels(&words(&BINDING_KINDS, BindingKind::as_str, binding_kind)),
+            ["skill", "MCP server"]
+        );
+        assert_eq!(
+            words(McpTransport::ALL, McpTransport::as_str, mcp_transport),
+            [("stdio", "stdio"), ("http", "http")]
         );
     }
 

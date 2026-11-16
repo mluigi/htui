@@ -171,6 +171,11 @@ fn caps_from(agent: &Agent, settings: &AgentSettings) -> DriverCaps {
             // brake rather than a turn-granular one.
             usage_mid_turn: true,
             authenticate: true,
+            // Stdio is the transport every ACP agent must accept. The schema has an http entry,
+            // but an agent advertises it only in its `initialize` reply, which is not read here
+            // (MOD-127 M2 D7), so an http server is skipped as `transport_unsupported`.
+            mcp_stdio: true,
+            mcp_http: false,
         },
         // §4.3 verbatim: "the CLI transport reports `DriverCaps { permission_requests: false,
         // edit_proposals: false, plans: false }`". The other four are not stated there and are
@@ -193,6 +198,9 @@ fn caps_from(agent: &Agent, settings: &AgentSettings) -> DriverCaps {
             // Plan MOD-21 D10: no CLI transport has a login verb; the vendor CLI's own is not
             // ours to drive, and a stream adapter has nowhere to put a method list.
             authenticate: false,
+            // `--mcp-config` takes both shapes (MOD-127 M2 D7).
+            mcp_stdio: true,
+            mcp_http: true,
         },
     }
 }

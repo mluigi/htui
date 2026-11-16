@@ -485,6 +485,49 @@ async fn ctrl_l_and_ctrl_h_do_not_switch_skills_views() {
     }
 }
 
+/// MOD-127 M2 R3: the back half of the switch is `skills.prev_view` (`h`, `[`, `shift-left`),
+/// and it wraps over the three views: from the Library it reaches the MCP servers, from there
+/// Templates, then the Library again; the forward keys retrace it.
+#[tokio::test]
+async fn prev_view_goes_back_and_wraps_over_three_views() {
+    let mut harness = Harness::demo().with_tab(Box::new(SkillsTab::new()));
+    harness.drive_to_end().await;
+    let on_library = |frame: &str| frame.contains("I import");
+    let on_servers = |frame: &str| frame.contains("no MCP servers");
+    for (forward, back) in [("l", "h"), ("]", "["), ("shift-right", "shift-left")] {
+        harness.key(back);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(
+            on_servers(&frame),
+            "`{back}` wrapped to the servers: {frame}"
+        );
+        harness.key(back);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(
+            !on_library(&frame) && !on_servers(&frame) && frame.contains("implement"),
+            "`{back}` went on to Templates: {frame}"
+        );
+        harness.key(back);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(
+            on_library(&frame),
+            "`{back}` came round to the Library: {frame}"
+        );
+        harness.key(forward);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(
+            !on_library(&frame) && frame.contains("implement"),
+            "`{forward}` goes forward to Templates: {frame}"
+        );
+        harness.key(back);
+        harness.drive_to_end().await;
+    }
+}
+
 /// MOD-67 M4 PA-2 pin at the shell: a capturing Skills mode offers no view switch (`l` is typed)
 /// and still hands the tab key (`ctrl-pgdn` since MOD-115 M2 D4) to the shell, the draft kept;
 /// the agent help over it too.

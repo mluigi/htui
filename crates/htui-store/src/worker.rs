@@ -15,8 +15,8 @@ use htui_core::model::link::{
     WithdrawLink,
 };
 use htui_core::model::{
-    AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
+    AgentBox, AgentId, AgentSummary, BatchId, BoundMcp, BoundSkill, BoxId, BoxInfo, BoxProfile,
+    BoxRow, CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
     GateOutcome, Item, ItemId, ItemKind, ItemSummary, MemoryEntry, MemoryState, NewCommandRun,
     NewDocument, NewNote, NewRun, NewRunMemory, NewRunStep, Note, OpenPermission, PendingStop,
     PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
@@ -1245,6 +1245,9 @@ impl htui_core::store::WorkerHost for PgStore {
     async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
         PgStore::bound_skills(self, scope).await
     }
+    async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        PgStore::bound_mcp_servers(self, scope).await
+    }
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         PgStore::missing_tags(self, item, box_id).await
     }
@@ -1353,6 +1356,9 @@ impl htui_core::store::WorkerHost for Backend {
     }
     async fn bound_skills(&self, scope: ResolveScope) -> Result<Vec<BoundSkill>> {
         Backend::bound_skills(self, scope).await
+    }
+    async fn bound_mcp_servers(&self, scope: ResolveScope) -> Result<Vec<BoundMcp>> {
+        Backend::bound_mcp_servers(self, scope).await
     }
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         Backend::missing_tags(self, item, box_id).await

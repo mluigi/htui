@@ -684,7 +684,8 @@ mod tests {
         let layers = [Layer::all(Context::Skills)];
         let stack = Stack::new(&layers);
         let spec = &[Hint::Two(Act::SkillsSwitchView, "view")];
-        assert_eq!(Keys::compiled().hint(stack, spec), "h/l view");
+        // R3: the switch is forward only (`l`, `]`, `shift-right`); `h` is `skills.prev_view`'s.
+        assert_eq!(Keys::compiled().hint(stack, spec), "l/] view");
         let keys = Keys::defaults().with_chords(Context::Skills, Act::SkillsSwitchView, &["v"]);
         assert_eq!(keys.hint(stack, spec), "v view");
         let keys = Keys::defaults().with_chords(

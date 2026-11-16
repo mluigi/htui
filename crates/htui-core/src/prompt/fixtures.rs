@@ -22,7 +22,7 @@ use crate::model::memory::{
     SnapshotMemoryEntry,
 };
 use crate::model::run::{PartMerge, PartPremerge, PremergeReport, RepoPremerge, RunStatus};
-use crate::model::skill::{Activation, BoundSkill, SkillLevel, StepFiles};
+use crate::model::skill::{Activation, BindingLevel, BoundSkill, StepFiles};
 use crate::model::{EventKind, EventRole, OsFamily, SessionEvent};
 use crate::prompt::excerpt::{
     Excerpt, ExcerptAudit, ExcerptCaps, ExcerptReason, ExcerptSet, FileRecord, RepoRoot,
@@ -233,7 +233,7 @@ pub fn phase_implement_attempt2() -> PromptSpec {
             version: Some(2),
             position: 0,
             body: "Prefer `expect` with a reason over `unwrap`.\nNo `unsafe`.\n".to_owned(),
-            level: SkillLevel::Project,
+            level: BindingLevel::Project,
             activation: Activation::Always,
             globs: Vec::new(),
         }],
@@ -724,7 +724,7 @@ pub fn phase_protected_too_big() -> PromptSpec {
         version: Some(2),
         position: 0,
         body: prose_block("rust-style", 60),
-        level: SkillLevel::Project,
+        level: BindingLevel::Project,
         activation: Activation::Always,
         globs: Vec::new(),
     }];
@@ -747,7 +747,7 @@ pub fn phase_skills_over_cap() -> PromptSpec {
             version: Some(2),
             position: 0,
             body: prose_block("rust-style", 30),
-            level: SkillLevel::Project,
+            level: BindingLevel::Project,
             activation: Activation::Always,
             globs: Vec::new(),
         },
@@ -757,7 +757,7 @@ pub fn phase_skills_over_cap() -> PromptSpec {
             version: Some(1),
             position: 1,
             body: prose_block("command-queue", 30),
-            level: SkillLevel::Project,
+            level: BindingLevel::Project,
             activation: Activation::Always,
             globs: Vec::new(),
         },

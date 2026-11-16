@@ -137,4 +137,6 @@ id_newtype!(
     ArtifactLinkId,
     /// `target.id` (MOD-130 M1).
     TargetId,
+    /// `mcp_server.id` (MOD-127 M2 D2): one MCP server of the global toolbox.
+    McpServerId,
 );

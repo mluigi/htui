@@ -1557,7 +1557,7 @@ quit = ["x", "shift-a"]
                 2,
                 "[skills.templates] import: no such action; [skills.templates] has diff_default, \
                  and may override down, up, scroll_down, scroll_up, page_down, page_up, save, \
-                 external_editor, edit, new, reload, switch_view, prev_version, next_version, \
+                 external_editor, edit, new, reload, switch_view, prev_view, prev_version, next_version, \
                  base, diff, edit_externally, ask_agent"
             )
         );

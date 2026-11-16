@@ -21,33 +21,37 @@ use crate::model::{
 };
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
-    BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
-    Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow, CoverageState,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentId, EditReason, EventKind, EventRole, Executor,
-    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
-    FollowUpSettle, FollowUpText, FollowUpView, Gate, GateOutcome, GraphSnapshot, Isolation, Item,
-    ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind,
-    MEMORY_RUN_WRITE_CAP, MemoryBody, MemoryCitation, MemoryEntry, MemoryEntryId, MemoryEvidence,
-    MemoryKind, MemoryPatch, MemoryRevision, MemorySource, MemoryState, MemorySubject,
-    MemorySupersede, MemoryUpdate, MemoryUsage, NewCommandRun, NewDocument, NewFollowUp, NewItem,
-    NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule,
-    PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer,
-    PersonaId, PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools,
-    PhaseAgent, PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope,
-    PromptTemplate, PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind,
-    RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementState, RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind,
-    RunCommandStatus, RunId, RunKind, RunMemoryWrite, RunMode, RunProvenance, RunScope, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry, UserId,
-    VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
-    executor_scrub_refusal, missing_tags_failure,
+    BindingChange, BindingKey, BindingRef, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest,
+    ChatRunSpec, CitationKind, Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus,
+    CoverageRow, CoverageState, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentId, EditReason,
+    EventKind, EventRole, Executor, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED,
+    FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText, FollowUpView, Gate,
+    GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemSummary, LinkKind, MEMORY_RUN_WRITE_CAP, MemoryBody,
+    MemoryCitation, MemoryEntry, MemoryEntryId, MemoryEvidence, MemoryKind, MemoryPatch,
+    MemoryRevision, MemorySource, MemoryState, MemorySubject, MemorySupersede, MemoryUpdate,
+    MemoryUsage, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
+    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunMemory, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph,
+    NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PendingStop, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId, PersonaMatch, PersonaPatch,
+    PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
+    ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId,
+    QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RelayView,
+    RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
+    RunMemoryWrite, RunMode, RunProvenance, RunScope, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillId, SkillPatch, SkillVersion,
+    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
+    WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
+};
+use crate::model::{
+    Binding, EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart,
+    PlanScope, PredicateError, Split, StepGraphEdge,
 };
 use crate::model::{
     BoxKind, NewChildBox, NewTarget, ResolvedTarget, StepGraph, Target, TargetEdit, TargetId,
@@ -56,8 +60,8 @@ use crate::model::{
 use crate::model::{CAPTURE_KEY, CAPTURE_POSITION, NewOwnerDocument, Project, StepRole};
 use crate::model::{COMMAND_LOG_STORE_MAX, CommandLog};
 use crate::model::{
-    EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
-    PredicateError, SkillBinding, Split, StepGraphEdge,
+    EnvValue, McpServer, McpServerId, McpServerPatch, McpTransport, NewMcpServer,
+    mcp_server_patch_refusal, new_mcp_server_refusal,
 };
 use crate::model::{IndexChanges, ProjectChanges};
 use crate::model::{IndexedCollection, IndexerLease, LeaseTake, LeaseTurn};
@@ -104,6 +108,9 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     MAX_PARENT_DEPTH, parent_cycle, parent_too_deep, second_canonical, second_parent,
+};
+use crate::store::traits::{
+    MCP_BINDING_HAS_NO_GLOBS, MCP_BINDING_HAS_NO_VERSIONS, MCP_BINDING_NEVER_GLOBS,
 };
 use crate::store::traits::{
     back_asks_you_beside_another_asks_you, branch_is_not_an_object_of_booleans,
@@ -226,6 +233,12 @@ pub const CASES: &[&str] = &[
     "item_kind_delete_takes_its_bindings",
     "project_delete_reach_counts_item_kind_bindings",
     "skill_binding_stores_expanded_globs_and_languages_as_typed",
+    "mcp_server_create_edit_delete_with_cas",
+    "mcp_server_refuses_by_rule",
+    "mcp_binding_attach_change_detach_at_each_level",
+    "an_mcp_binding_refuses_pin_and_glob",
+    "deleting_a_server_takes_its_bindings",
+    "a_skill_and_a_server_of_one_name_do_not_collide",
     "a_stale_owner_writes_nothing_to_the_step",
     "the_new_owner_writes_the_step",
     "an_unleased_fence_writes_a_chat_step",
@@ -770,6 +783,22 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             .await;
         }
         "skill_binding_refuses_by_rule" => boxed(skill_binding_refuses_by_rule, store).await,
+        "mcp_server_create_edit_delete_with_cas" => {
+            boxed(mcp_server_create_edit_delete_with_cas, store).await
+        }
+        "mcp_server_refuses_by_rule" => boxed(mcp_server_refuses_by_rule, store).await,
+        "mcp_binding_attach_change_detach_at_each_level" => {
+            boxed(mcp_binding_attach_change_detach_at_each_level, store).await
+        }
+        "an_mcp_binding_refuses_pin_and_glob" => {
+            boxed(an_mcp_binding_refuses_pin_and_glob, store).await
+        }
+        "deleting_a_server_takes_its_bindings" => {
+            boxed(deleting_a_server_takes_its_bindings, store).await
+        }
+        "a_skill_and_a_server_of_one_name_do_not_collide" => {
+            boxed(a_skill_and_a_server_of_one_name_do_not_collide, store).await
+        }
         "skill_binding_workspace_and_item_kind_levels_attach_change_detach" => {
             boxed(
                 skill_binding_workspace_and_item_kind_levels_attach_change_detach,
@@ -9165,6 +9194,7 @@ fn run_snapshot() -> GraphSnapshot {
         source: None,
         edges: Vec::new(),
         integrate: std::collections::BTreeMap::new(),
+        toolbox: None,
     }
 }
 
@@ -15247,9 +15277,9 @@ fn attachment(activation: Activation, position: i32) -> Attachment {
 }
 
 /// The natural key of one attachment.
-fn key(skill: SkillId, project: Option<ProjectId>, phase: Option<PhaseId>) -> SkillBindingKey {
-    SkillBindingKey {
-        skill,
+fn key(skill: SkillId, project: Option<ProjectId>, phase: Option<PhaseId>) -> BindingKey {
+    BindingKey {
+        target: BindingRef::Skill(skill),
         workspace: None,
         project,
         item_kind: None,
@@ -15264,9 +15294,9 @@ fn key_at(
     project: Option<ProjectId>,
     item_kind: Option<ItemKindId>,
     phase: Option<PhaseId>,
-) -> SkillBindingKey {
-    SkillBindingKey {
-        skill,
+) -> BindingKey {
+    BindingKey {
+        target: BindingRef::Skill(skill),
         workspace,
         project,
         item_kind,
@@ -15817,7 +15847,7 @@ async fn skill_binding_refuses_by_rule<S: WriteStore>(store: &S) {
         edit(&mut change);
         BindingChange::Attach(change)
     };
-    let refusals: [(SkillBindingKey, BindingChange, &str, &str); 15] = [
+    let refusals: [(BindingKey, BindingChange, &str, &str); 15] = [
         (
             key_at(
                 ids::SKILL_TESTS,
@@ -16589,6 +16619,1118 @@ async fn skill_binding_stores_expanded_globs_and_languages_as_typed<S: WriteStor
         (&again.globs, &again.languages),
         (&row.globs, &row.languages),
         "{CASE}: a stored row re-saved as typed is the same attachment"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-127 M2 T3: the MCP server registry and its attachments (plan D2-D5)
+// ------------------------------------------------------------------------------------------------
+
+/// A stdio server request with a fresh id and nothing optional set.
+fn new_mcp(name: &str) -> NewMcpServer {
+    NewMcpServer {
+        id: McpServerId::new(),
+        name: name.to_owned(),
+        description: String::new(),
+        transport: McpTransport::Stdio,
+        command: "mcp-docs".to_owned(),
+        args: vec!["--stdio".to_owned()],
+        url: None,
+        headers: Vec::new(),
+        env: Vec::new(),
+        allow: Vec::new(),
+        deny: Vec::new(),
+        created_by: ids::USER,
+    }
+}
+
+/// The key of a server's attachment at any of the five levels.
+fn mcp_key(
+    server: McpServerId,
+    workspace: Option<WorkspaceId>,
+    project: Option<ProjectId>,
+    item_kind: Option<ItemKindId>,
+    phase: Option<PhaseId>,
+) -> BindingKey {
+    BindingKey {
+        target: BindingRef::McpServer(server),
+        workspace,
+        project,
+        item_kind,
+        phase,
+    }
+}
+
+/// The five levels' keys of one server, in specificity order, each with the home that lists it.
+fn mcp_levels(server: McpServerId) -> [(BindingKey, BindingHome); 5] {
+    [
+        (mcp_key(server, None, None, None, None), BindingHome::Global),
+        (
+            mcp_key(server, Some(ids::WORKSPACE_PLATFORM), None, None, None),
+            BindingHome::Workspace(ids::WORKSPACE_PLATFORM),
+        ),
+        (
+            mcp_key(server, None, Some(ids::PROJECT_HTUI), None, None),
+            BindingHome::Project(ids::PROJECT_HTUI),
+        ),
+        (
+            mcp_key(
+                server,
+                None,
+                Some(ids::PROJECT_HTUI),
+                Some(ids::KIND_HTUI_FEAT),
+                None,
+            ),
+            BindingHome::Project(ids::PROJECT_HTUI),
+        ),
+        (
+            mcp_key(
+                server,
+                None,
+                Some(ids::PROJECT_HTUI),
+                None,
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+            ),
+            BindingHome::Project(ids::PROJECT_HTUI),
+        ),
+    ]
+}
+
+/// The rows of `home` that attach `server` (a row's `skill_id` holds its `ref_id`, whatever the
+/// kind, and server ids are never skill ids).
+async fn mcp_rows_at<S: WriteStore>(
+    case: &str,
+    store: &S,
+    home: BindingHome,
+    server: McpServerId,
+) -> Vec<Binding> {
+    store
+        .skill_bindings(home)
+        .await
+        .expect(case)
+        .into_iter()
+        .filter(|row| row.skill_id.as_uuid() == server.as_uuid())
+        .collect()
+}
+
+/// A server created through the store, or a panic naming the case.
+async fn made_mcp<S: WriteStore>(case: &str, store: &S, name: &str) -> McpServer {
+    store
+        .create_mcp_server(new_mcp(name))
+        .await
+        .unwrap_or_else(|error| panic!("{case}: create `{name}`: {error:?}"))
+}
+
+/// MOD-127 M2 D2: a server is created once, listed in name byte order, edited under
+/// compare-and-set on `updated_at` (`NotFound`, then `Stale`, then `Constraint`) and deleted once.
+async fn mcp_server_create_edit_delete_with_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "mcp_server_create_edit_delete_with_cas";
+    assert!(
+        store.mcp_servers().await.expect(CASE).is_empty(),
+        "{CASE}: the demo fixture has no server"
+    );
+
+    let mut docs = new_mcp("docs");
+    docs.description = "Reads the docs.".to_owned();
+    docs.env = vec![
+        ("DOCS_MODE".to_owned(), EnvValue::Literal("fast".to_owned())),
+        (
+            "DOCS_TOKEN".to_owned(),
+            EnvValue::Secret("docs-token".to_owned()),
+        ),
+    ];
+    docs.allow = vec!["search".to_owned()];
+    docs.deny = vec!["delete".to_owned()];
+    let created = store.create_mcp_server(docs.clone()).await.expect(CASE);
+    assert_eq!(
+        (
+            created.id,
+            created.name.as_str(),
+            created.description.as_str(),
+            created.transport,
+            created.command.as_str(),
+            &created.args,
+            &created.url,
+            &created.env,
+            &created.allow,
+            &created.deny,
+            created.created_by,
+        ),
+        (
+            docs.id,
+            "docs",
+            "Reads the docs.",
+            McpTransport::Stdio,
+            "mcp-docs",
+            &docs.args,
+            &None,
+            &docs.env,
+            &docs.allow,
+            &docs.deny,
+            ids::USER,
+        ),
+        "{CASE}: the row is what was asked for, secrets as references"
+    );
+    assert_eq!(
+        created.created_at, created.updated_at,
+        "{CASE}: both stamps are the store's clock"
+    );
+
+    let mut remote = new_mcp("remote");
+    remote.transport = McpTransport::Http;
+    remote.command = String::new();
+    remote.args = Vec::new();
+    remote.url = Some("https://mcp.example.test/rpc".to_owned());
+    remote.headers = vec![(
+        "Authorization".to_owned(),
+        EnvValue::Secret("remote-auth".to_owned()),
+    )];
+    let remote = store.create_mcp_server(remote).await.expect(CASE);
+    let dash = made_mcp(CASE, store, "a-b").await;
+    let underscore = made_mcp(CASE, store, "a_b").await;
+    assert_eq!(
+        store
+            .mcp_servers()
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>(),
+        ["a-b", "a_b", "docs", "remote"],
+        "{CASE}: name byte order (`-` before `_`), as `COLLATE \"C\"`"
+    );
+    assert_eq!(
+        store
+            .mcp_servers()
+            .await
+            .expect(CASE)
+            .into_iter()
+            .find(|row| row.id == remote.id),
+        Some(remote.clone()),
+        "{CASE}: an http row reads back whole"
+    );
+
+    constraint_exactly(
+        CASE,
+        store
+            .create_mcp_server(NewMcpServer {
+                name: "other".to_owned(),
+                ..docs.clone()
+            })
+            .await,
+        &already_exists("mcp_server", docs.id),
+        "a taken id",
+    );
+    constraint_exactly(
+        CASE,
+        store.create_mcp_server(new_mcp("docs")).await,
+        &already_exists("mcp_server", "docs"),
+        "a taken name",
+    );
+    let mut stranger = new_mcp("stranger");
+    stranger.created_by = UserId::new();
+    constraint_exactly(
+        CASE,
+        store.create_mcp_server(stranger.clone()).await,
+        &references_no_row("mcp_server.created_by", stranger.created_by, "app_user"),
+        "a created_by that names no app_user",
+    );
+    // The creator is judged before the id and the name: a request that is wrong in all three is
+    // refused with the creator sentence.
+    let mut everything_wrong = new_mcp("docs");
+    everything_wrong.id = docs.id;
+    everything_wrong.created_by = stranger.created_by;
+    constraint_exactly(
+        CASE,
+        store.create_mcp_server(everything_wrong).await,
+        &references_no_row("mcp_server.created_by", stranger.created_by, "app_user"),
+        "an unknown creator beside a taken id and a taken name",
+    );
+    assert_eq!(
+        store.mcp_servers().await.expect(CASE).len(),
+        4,
+        "{CASE}: the refusals wrote nothing"
+    );
+
+    let edited = applied(
+        CASE,
+        store
+            .update_mcp_server(
+                created.id,
+                created.updated_at,
+                McpServerPatch {
+                    description: Some("Reads more docs.".to_owned()),
+                    args: Some(vec!["--stdio".to_owned(), "--fast".to_owned()]),
+                    env: Some(vec![(
+                        "DOCS_TOKEN".to_owned(),
+                        EnvValue::Secret("other-token".to_owned()),
+                    )]),
+                    ..McpServerPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            edited.id,
+            edited.name.as_str(),
+            edited.description.as_str(),
+            edited.args.len(),
+            edited.env.len(),
+            edited.created_at,
+        ),
+        (
+            created.id,
+            "docs",
+            "Reads more docs.",
+            2,
+            1,
+            created.created_at
+        ),
+        "{CASE}: the patched columns moved and the others stayed"
+    );
+    assert!(
+        edited.updated_at > created.updated_at,
+        "{CASE}: the edit moved the token"
+    );
+
+    let spent = stale(
+        CASE,
+        store
+            .update_mcp_server(
+                created.id,
+                created.updated_at,
+                McpServerPatch {
+                    description: Some("late".to_owned()),
+                    ..McpServerPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent, edited,
+        "{CASE}: a spent token finds the row as it is"
+    );
+    let spent_and_bad = stale(
+        CASE,
+        store
+            .update_mcp_server(
+                created.id,
+                created.updated_at,
+                McpServerPatch {
+                    name: Some("htui".to_owned()),
+                    ..McpServerPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent_and_bad, edited,
+        "{CASE}: a spent token is Stale even over bad input"
+    );
+    not_found_on(
+        CASE,
+        store
+            .update_mcp_server(
+                McpServerId::new(),
+                created.updated_at,
+                McpServerPatch::default(),
+            )
+            .await,
+        "mcp_server",
+        "an unknown id",
+    );
+
+    let patch = McpServerPatch {
+        transport: Some(McpTransport::Http),
+        ..McpServerPatch::default()
+    };
+    let refusal = mcp_server_patch_refusal(&edited, &patch)
+        .unwrap_or_else(|| panic!("{CASE}: a stdio server turned http without a url is refused"));
+    constraint_exactly(
+        CASE,
+        store
+            .update_mcp_server(edited.id, edited.updated_at, patch)
+            .await,
+        &refusal,
+        "a patch that leaves the shape broken",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .update_mcp_server(
+                edited.id,
+                edited.updated_at,
+                McpServerPatch {
+                    name: Some("remote".to_owned()),
+                    ..McpServerPatch::default()
+                },
+            )
+            .await,
+        &already_exists("mcp_server", "remote"),
+        "a rename into a taken name",
+    );
+    let renamed = applied(
+        CASE,
+        store
+            .update_mcp_server(
+                edited.id,
+                edited.updated_at,
+                McpServerPatch {
+                    name: Some("manuals".to_owned()),
+                    ..McpServerPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(renamed.name, "manuals", "{CASE}: a rename into a free name");
+    let touched = applied(
+        CASE,
+        store
+            .update_mcp_server(renamed.id, renamed.updated_at, McpServerPatch::default())
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        touched.updated_at > renamed.updated_at,
+        "{CASE}: an all-`None` patch still stamps `updated_at`"
+    );
+    let cleared = applied(
+        CASE,
+        store
+            .update_mcp_server(
+                remote.id,
+                remote.updated_at,
+                McpServerPatch {
+                    headers: Some(Vec::new()),
+                    allow: Some(vec!["fetch".to_owned()]),
+                    ..McpServerPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            cleared.headers.len(),
+            cleared.allow.as_slice(),
+            &cleared.url
+        ),
+        (0, ["fetch".to_owned()].as_slice(), &remote.url),
+        "{CASE}: a list is replaced whole and the url stays"
+    );
+
+    assert_eq!(
+        store.delete_mcp_server(dash.id).await.expect(CASE),
+        0,
+        "{CASE}: a server nothing attaches takes no binding"
+    );
+    not_found_on(
+        CASE,
+        store.delete_mcp_server(dash.id).await,
+        "mcp_server",
+        "a second delete",
+    );
+    not_found_on(
+        CASE,
+        store.delete_mcp_server(McpServerId::new()).await,
+        "mcp_server",
+        "an unknown id",
+    );
+    assert_eq!(
+        store
+            .mcp_servers()
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [underscore.id, touched.id, cleared.id],
+        "{CASE}: the other three stand, in name byte order (a_b, manuals, remote)"
+    );
+}
+
+/// MOD-127 M2 D2, D3: every rule of the record refuses with the one sentence `model::mcp` words
+/// it in and writes nothing, on create and on edit.
+async fn mcp_server_refuses_by_rule<S: WriteStore>(store: &S) {
+    const CASE: &str = "mcp_server_refuses_by_rule";
+    let literal = |text: &str| EnvValue::Literal(text.to_owned());
+    let secret = |text: &str| EnvValue::Secret(text.to_owned());
+    let http = |url: &str| NewMcpServer {
+        transport: McpTransport::Http,
+        command: String::new(),
+        args: Vec::new(),
+        url: Some(url.to_owned()),
+        ..new_mcp("remote")
+    };
+    let cases: Vec<(&str, NewMcpServer)> = vec![
+        ("an upper-case name", new_mcp("Docs")),
+        ("an empty name", new_mcp("")),
+        ("a leading digit", new_mcp("1docs")),
+        ("htui's own name", new_mcp("htui")),
+        ("a name over 32 bytes", new_mcp(&"a".repeat(33))),
+        (
+            "a stdio server with no command",
+            NewMcpServer {
+                command: " ".to_owned(),
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "a stdio server with a url",
+            NewMcpServer {
+                url: Some("https://mcp.example.test".to_owned()),
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "an http server with no url",
+            NewMcpServer {
+                url: None,
+                ..http("https://x.test")
+            },
+        ),
+        (
+            "an http server with a command",
+            NewMcpServer {
+                command: "mcp-docs".to_owned(),
+                ..http("https://x.test")
+            },
+        ),
+        ("an http url with another scheme", http("ftp://x.test")),
+        (
+            "an env name that is not a name",
+            NewMcpServer {
+                env: vec![("1BAD".to_owned(), literal("x"))],
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "an env name under the reserved prefix",
+            NewMcpServer {
+                env: vec![("htui_MODE".to_owned(), literal("x"))],
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "an env name listed twice",
+            NewMcpServer {
+                env: vec![
+                    ("A".to_owned(), literal("1")),
+                    ("A".to_owned(), literal("2")),
+                ],
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "a literal under a key that looks secret",
+            NewMcpServer {
+                env: vec![("API_TOKEN".to_owned(), literal("sentinel-not-a-secret"))],
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "a literal authorization header",
+            NewMcpServer {
+                headers: vec![("Authorization".to_owned(), literal("sentinel-not-a-secret"))],
+                ..http("https://x.test")
+            },
+        ),
+        (
+            "a url with userinfo",
+            http("https://user:sentinel-not-a-secret@x.test/rpc"),
+        ),
+        (
+            "a url query key that looks secret",
+            http("https://x.test/rpc?api_key=sentinel-not-a-secret"),
+        ),
+        (
+            "a line break in the url",
+            http("https://x.test/rpc\r\nHost: y"),
+        ),
+        (
+            "a line break in a header value",
+            NewMcpServer {
+                headers: vec![("X-Tenant".to_owned(), literal("a\r\nX-Evil: 1"))],
+                ..http("https://x.test")
+            },
+        ),
+        (
+            "a literal under a pwd key",
+            NewMcpServer {
+                env: vec![("MYSQL_PWD".to_owned(), literal("sentinel-not-a-secret"))],
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "a secret reference naming nothing",
+            NewMcpServer {
+                env: vec![("A".to_owned(), secret(" "))],
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "an allow entry that is not a tool name",
+            NewMcpServer {
+                allow: vec!["two words".to_owned()],
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "a deny entry that is empty",
+            NewMcpServer {
+                deny: vec![String::new()],
+                ..new_mcp("docs")
+            },
+        ),
+        (
+            "a NUL in the description",
+            NewMcpServer {
+                description: "a\0b".to_owned(),
+                ..new_mcp("docs")
+            },
+        ),
+    ];
+    for (what, new) in cases {
+        let sentence = new_mcp_server_refusal(&new)
+            .unwrap_or_else(|| panic!("{CASE}: the pure rule refuses {what}"));
+        constraint_exactly(CASE, store.create_mcp_server(new).await, &sentence, what);
+    }
+    assert!(
+        store.mcp_servers().await.expect(CASE).is_empty(),
+        "{CASE}: no refusal wrote a row"
+    );
+
+    let kept = made_mcp(CASE, store, "docs").await;
+    for (what, patch) in [
+        (
+            "a rename to htui's own name",
+            McpServerPatch {
+                name: Some("htui".to_owned()),
+                ..McpServerPatch::default()
+            },
+        ),
+        (
+            "a literal under a secret-looking key",
+            McpServerPatch {
+                env: Some(vec![(
+                    "DB_PASSWORD".to_owned(),
+                    literal("sentinel-not-a-secret"),
+                )]),
+                ..McpServerPatch::default()
+            },
+        ),
+        (
+            "an http turn with no url",
+            McpServerPatch {
+                transport: Some(McpTransport::Http),
+                ..McpServerPatch::default()
+            },
+        ),
+    ] {
+        let sentence = mcp_server_patch_refusal(&kept, &patch)
+            .unwrap_or_else(|| panic!("{CASE}: the pure rule refuses {what}"));
+        constraint_exactly(
+            CASE,
+            store
+                .update_mcp_server(kept.id, kept.updated_at, patch)
+                .await,
+            &sentence,
+            what,
+        );
+    }
+    assert_eq!(
+        store.mcp_servers().await.expect(CASE),
+        [kept],
+        "{CASE}: no refused edit wrote anything"
+    );
+}
+
+/// MOD-127 M2 D4: a server attaches, changes and detaches at each of the five levels under
+/// compare-and-set (`None` means "I expect no row"), each row lists at its own home, and an
+/// unknown server is `NotFound`.
+async fn mcp_binding_attach_change_detach_at_each_level<S: WriteStore>(store: &S) {
+    const CASE: &str = "mcp_binding_attach_change_detach_at_each_level";
+    let server = made_mcp(CASE, store, "docs").await;
+    let skill_rows_before = store.skill_bindings(BindingHome::Global).await.expect(CASE);
+
+    not_found_on(
+        CASE,
+        store
+            .set_skill_binding(
+                mcp_key(McpServerId::new(), None, None, None, None),
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 0)),
+            )
+            .await,
+        "mcp_server",
+        "an unknown server",
+    );
+
+    for (level, (key, home)) in mcp_levels(server.id).into_iter().enumerate() {
+        let what = format!("level {level}");
+        let row = applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    key,
+                    None,
+                    BindingChange::Attach(attachment(Activation::Always, 0)),
+                )
+                .await
+                .expect(CASE),
+        )
+        .unwrap_or_else(|| panic!("{CASE}: {what}: an attach carries its row"));
+        assert_eq!(
+            (
+                row.skill_id.as_uuid(),
+                row.workspace_id,
+                row.project_id,
+                row.item_kind_id,
+                row.phase_id,
+                row.pinned_version,
+                row.activation,
+                row.level(),
+            ),
+            (
+                server.id.as_uuid(),
+                key.workspace,
+                key.project,
+                key.item_kind,
+                key.phase,
+                None,
+                Activation::Always,
+                key.level(),
+            ),
+            "{CASE}: {what}: the row sits at its key"
+        );
+        assert_eq!(
+            mcp_rows_at(CASE, store, home, server.id).await,
+            std::slice::from_ref(&row),
+            "{CASE}: {what}: the home lists it"
+        );
+        let again = stale(
+            CASE,
+            store
+                .set_skill_binding(
+                    key,
+                    None,
+                    BindingChange::Attach(attachment(Activation::Off, 0)),
+                )
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(
+            again.as_ref(),
+            Some(&row),
+            "{CASE}: {what}: `None` finds the row"
+        );
+        let off = applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    key,
+                    Some(row.updated_at),
+                    BindingChange::Attach(attachment(Activation::Off, 0)),
+                )
+                .await
+                .expect(CASE),
+        )
+        .unwrap_or_else(|| panic!("{CASE}: {what}: a change carries its row"));
+        assert_eq!(off.id, row.id, "{CASE}: {what}: a change keeps the id");
+        assert_eq!(
+            off.activation,
+            Activation::Off,
+            "{CASE}: {what}: the change landed"
+        );
+        assert!(
+            off.updated_at > row.updated_at,
+            "{CASE}: {what}: the change moved the token"
+        );
+        let spent = stale(
+            CASE,
+            store
+                .set_skill_binding(key, Some(row.updated_at), BindingChange::Detach)
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(
+            spent.as_ref(),
+            Some(&off),
+            "{CASE}: {what}: a spent token finds the changed row"
+        );
+        assert_eq!(
+            applied(
+                CASE,
+                store
+                    .set_skill_binding(key, Some(off.updated_at), BindingChange::Detach)
+                    .await
+                    .expect(CASE),
+            ),
+            None,
+            "{CASE}: {what}: a detach carries no row"
+        );
+        assert!(
+            mcp_rows_at(CASE, store, home, server.id).await.is_empty(),
+            "{CASE}: {what}: the row is gone"
+        );
+    }
+    assert_eq!(
+        store.skill_bindings(BindingHome::Global).await.expect(CASE),
+        skill_rows_before,
+        "{CASE}: no skill row moved"
+    );
+}
+
+/// MOD-127 M2 D4: a server attachment has no versions, no `glob` activation, no globs or
+/// languages and a non-negative position; each refusal writes nothing, a spent token is `Stale`
+/// before the input is judged, and an unknown server is `NotFound`.
+async fn an_mcp_binding_refuses_pin_and_glob<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_mcp_binding_refuses_pin_and_glob";
+    let server = made_mcp(CASE, store, "docs").await;
+    let key = mcp_key(server.id, None, Some(ids::PROJECT_HTUI), None, None);
+    let home = BindingHome::Project(ids::PROJECT_HTUI);
+    for (what, attachment, sentence) in [
+        (
+            "a pin",
+            Attachment {
+                pinned_version: Some(1),
+                ..attachment(Activation::Always, 0)
+            },
+            MCP_BINDING_HAS_NO_VERSIONS,
+        ),
+        (
+            "glob activation",
+            Attachment {
+                globs: vec!["**/*.rs".to_owned()],
+                ..attachment(Activation::Glob, 0)
+            },
+            MCP_BINDING_NEVER_GLOBS,
+        ),
+        (
+            "globs under always",
+            Attachment {
+                globs: vec!["**/*.rs".to_owned()],
+                ..attachment(Activation::Always, 0)
+            },
+            MCP_BINDING_HAS_NO_GLOBS,
+        ),
+        (
+            "languages under off",
+            Attachment {
+                languages: vec!["rust".to_owned()],
+                ..attachment(Activation::Off, 0)
+            },
+            MCP_BINDING_HAS_NO_GLOBS,
+        ),
+    ] {
+        constraint_exactly(
+            CASE,
+            store
+                .set_skill_binding(key, None, BindingChange::Attach(attachment))
+                .await,
+            sentence,
+            what,
+        );
+    }
+    assert!(
+        matches!(
+            store
+                .set_skill_binding(
+                    key,
+                    None,
+                    BindingChange::Attach(attachment(Activation::Always, -1)),
+                )
+                .await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: a negative position is Constraint"
+    );
+    assert!(
+        mcp_rows_at(CASE, store, home, server.id).await.is_empty(),
+        "{CASE}: no refusal wrote a row"
+    );
+
+    let row = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                key,
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 0)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    let spent = stale(
+        CASE,
+        store
+            .set_skill_binding(
+                key,
+                None,
+                BindingChange::Attach(Attachment {
+                    pinned_version: Some(1),
+                    ..attachment(Activation::Always, 0)
+                }),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent.as_ref(),
+        Some(&row),
+        "{CASE}: a spent token is Stale before the input is judged"
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .set_skill_binding(
+                key,
+                Some(row.updated_at),
+                BindingChange::Attach(Attachment {
+                    pinned_version: Some(1),
+                    ..attachment(Activation::Always, 0)
+                }),
+            )
+            .await,
+        MCP_BINDING_HAS_NO_VERSIONS,
+        "a pin on a change",
+    );
+    assert_eq!(
+        mcp_rows_at(CASE, store, home, server.id).await,
+        [row],
+        "{CASE}: the refused change left the row"
+    );
+}
+
+/// MOD-127 M2 D3: `toolbox_binding.ref_id` has no foreign key, so deleting a server takes its own
+/// attachments at every level, reports how many, and leaves the other server's and the skills'.
+async fn deleting_a_server_takes_its_bindings<S: WriteStore>(store: &S) {
+    const CASE: &str = "deleting_a_server_takes_its_bindings";
+    let doomed = made_mcp(CASE, store, "doomed").await;
+    let other = made_mcp(CASE, store, "other").await;
+    let skill_rows_before = store.skill_bindings(BindingHome::Global).await.expect(CASE);
+    let project_rows_before = store
+        .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE);
+    for server in [doomed.id, other.id] {
+        for (key, _) in mcp_levels(server) {
+            applied(
+                CASE,
+                store
+                    .set_skill_binding(
+                        key,
+                        None,
+                        BindingChange::Attach(attachment(Activation::Always, 0)),
+                    )
+                    .await
+                    .expect(CASE),
+            );
+        }
+    }
+    assert_eq!(
+        store.delete_mcp_server(doomed.id).await.expect(CASE),
+        5,
+        "{CASE}: the five attachments went with the server"
+    );
+    for (_, home) in mcp_levels(doomed.id) {
+        assert!(
+            mcp_rows_at(CASE, store, home, doomed.id).await.is_empty(),
+            "{CASE}: nothing names the deleted server at {home:?}"
+        );
+    }
+    for (_, home) in mcp_levels(other.id) {
+        assert_eq!(
+            mcp_rows_at(CASE, store, home, other.id).await.len(),
+            mcp_levels(other.id)
+                .iter()
+                .filter(|(_, level_home)| *level_home == home)
+                .count(),
+            "{CASE}: the other server keeps its rows at {home:?}"
+        );
+    }
+    let mut left_global = store.skill_bindings(BindingHome::Global).await.expect(CASE);
+    left_global.retain(|row| row.skill_id.as_uuid() != other.id.as_uuid());
+    assert_eq!(
+        left_global, skill_rows_before,
+        "{CASE}: the skill rows stand"
+    );
+    let mut left_project = store
+        .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE);
+    left_project.retain(|row| row.skill_id.as_uuid() != other.id.as_uuid());
+    assert_eq!(
+        left_project, project_rows_before,
+        "{CASE}: a project's skill rows stand"
+    );
+
+    let revived = store
+        .create_mcp_server(NewMcpServer {
+            id: doomed.id,
+            ..new_mcp("doomed")
+        })
+        .await
+        .expect(CASE);
+    applied(
+        CASE,
+        store
+            .set_skill_binding(
+                mcp_key(revived.id, None, None, None, None),
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 0)),
+            )
+            .await
+            .expect(CASE),
+    );
+}
+
+/// MOD-127 M2 D1: `kind` is part of the attachment's key, so a skill and a server that share a
+/// name are two entries with their own rows, and neither's delete or detach touches the other's.
+/// Review R1: a binding row holds a skill's or a server's id in one column, so the two id spaces
+/// are disjoint: a server may not take a skill's id, nor a skill a server's.
+async fn a_skill_and_a_server_of_one_name_do_not_collide<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_skill_and_a_server_of_one_name_do_not_collide";
+    let (skill, _) = store
+        .create_skill(new_skill("docs", "Read the docs."))
+        .await
+        .expect(CASE);
+    let server = made_mcp(CASE, store, "docs").await;
+    let global = BindingHome::Global;
+    let skill_key = key(skill.id, None, None);
+    let server_key = mcp_key(server.id, None, None, None, None);
+    let attach = |key: BindingKey| async move {
+        applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    key,
+                    None,
+                    BindingChange::Attach(attachment(Activation::Always, 0)),
+                )
+                .await
+                .expect(CASE),
+        )
+        .expect("an attach carries its row")
+    };
+    let listed = |row: &Binding| {
+        let row = row.clone();
+        async move {
+            store
+                .skill_bindings(global)
+                .await
+                .expect(CASE)
+                .contains(&row)
+        }
+    };
+    let skill_row = attach(skill_key).await;
+    let server_row = attach(server_key).await;
+    assert_ne!(skill_row.id, server_row.id, "{CASE}: two rows");
+    assert!(
+        listed(&skill_row).await && listed(&server_row).await,
+        "{CASE}: both list"
+    );
+
+    let counts = (
+        store.skills().await.expect(CASE).len(),
+        store.mcp_servers().await.expect(CASE).len(),
+    );
+
+    // One id is one kind.
+    constraint_exactly(
+        CASE,
+        store
+            .create_mcp_server(NewMcpServer {
+                id: McpServerId::from_uuid(skill.id.as_uuid()),
+                ..new_mcp("other")
+            })
+            .await,
+        &already_exists("skill", skill.id),
+        "a server that takes a skill's id",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_skill(NewSkill {
+                id: SkillId::from_uuid(server.id.as_uuid()),
+                ..new_skill("other", "Other.")
+            })
+            .await,
+        &already_exists("mcp_server", server.id),
+        "a skill that takes a server's id",
+    );
+    assert_eq!(
+        (
+            store.skills().await.expect(CASE).len(),
+            store.mcp_servers().await.expect(CASE).len()
+        ),
+        counts,
+        "{CASE}: the refusals wrote nothing"
+    );
+
+    // Detaching one kind's row leaves the other's.
+    assert_eq!(
+        applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    server_key,
+                    Some(server_row.updated_at),
+                    BindingChange::Detach
+                )
+                .await
+                .expect(CASE),
+        ),
+        None,
+        "{CASE}: the server's row detaches"
+    );
+    assert!(
+        listed(&skill_row).await && !listed(&server_row).await,
+        "{CASE}: detaching the server's row left the skill's"
+    );
+    let server_row = attach(server_key).await;
+    assert_eq!(
+        applied(
+            CASE,
+            store
+                .set_skill_binding(skill_key, Some(skill_row.updated_at), BindingChange::Detach)
+                .await
+                .expect(CASE),
+        ),
+        None,
+        "{CASE}: the skill's row detaches"
+    );
+    assert!(
+        listed(&server_row).await && !listed(&skill_row).await,
+        "{CASE}: detaching the skill's row left the server's"
+    );
+    let skill_row = attach(skill_key).await;
+
+    // Deleting the server takes its own attachment and not the skill's.
+    assert_eq!(
+        store.delete_mcp_server(server.id).await.expect(CASE),
+        1,
+        "{CASE}: the server took its own attachment"
+    );
+    let rows = store.skill_bindings(global).await.expect(CASE);
+    assert!(
+        rows.contains(&skill_row) && !rows.iter().any(|row| row.id == server_row.id),
+        "{CASE}: the skill's row stands and the server's is gone"
+    );
+    assert!(
+        store
+            .skills()
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == skill.id),
+        "{CASE}: the skill stands"
     );
 }
 
@@ -19968,6 +21110,7 @@ async fn a_finished_snapshot_defaults_a_verdict_to_concluded<S: WriteStore>(stor
         palette: false,
         plan_scope: None,
         divide: None,
+        mcp: Vec::new(),
     };
     let mut snapshot = run_snapshot();
     snapshot.phases = vec![
@@ -31366,7 +32509,7 @@ async fn replace_graph_keeps_bindings_of_kept_phases<S: WriteStore>(store: &S) {
                 .expect(CASE),
         );
     }
-    let bound = |rows: Vec<SkillBinding>| -> Vec<PhaseId> {
+    let bound = |rows: Vec<Binding>| -> Vec<PhaseId> {
         let mut phases: Vec<PhaseId> = rows
             .into_iter()
             .filter_map(|row| row.phase_id)
@@ -36233,7 +37376,7 @@ async fn run_memory_refuses_evidence_outside_the_run<S: WriteStore>(store: &S) {
 /// `trim_record` as the assembler writes it when the prompt showed `shown` (MOD-163 D17).
 fn trim_showing(shown: &[Value]) -> Value {
     json!({
-        "v": 5,
+        "v": 6,
         "sections": [],
         "memory": { "shown": shown, "total": 3 },
     })

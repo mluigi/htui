@@ -3,7 +3,7 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            2 waiting ·  ?  keys
-╭─ attachments · rust-style ──────────────────────────────────────────────────── Skills  Templates ╮
+╭─ attachments · rust-style ─────────────────────────────────────── Skills  Templates  MCP servers ╮
 │▌  global                       —                                                                 ┃
 │ * workspace Platform           always · latest · pos 3                                           ┃
 │ * htui                         always · latest · pos 1                                           ┃

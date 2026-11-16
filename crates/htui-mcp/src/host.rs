@@ -450,6 +450,7 @@ impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
                 (ENV_ADDR.to_owned(), address.as_str().to_owned()),
                 (ENV_TOKEN.to_owned(), token.as_str().to_owned()),
             ]),
+            ..McpServerSpec::default()
         };
         // MOD-11 R1 M2: the advertised names, which the engine and the chat pre-approve.
         let advertised = session

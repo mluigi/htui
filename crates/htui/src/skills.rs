@@ -19,8 +19,9 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    ItemKind, NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillBinding,
-    SkillBindingKey, SkillId, SkillVersion, StepGraph, StepGraphPhase, WorkspaceId,
+    Binding, BindingKey, BindingRef, EnvValue, ItemKind, McpServer, McpServerId, McpTransport,
+    NewMcpServer, NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillId,
+    SkillVersion, StepGraph, StepGraphPhase, WorkspaceId,
 };
 use htui_core::store::{BindingHome, CasOutcome, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
@@ -37,8 +38,12 @@ use crate::store_worker::{StoreReply, StoreRequest, WriteOutcome};
 pub struct SkillsSnapshot {
     /// The library in `name` byte order, each skill with every version.
     pub skills: Vec<SkillEntry>,
+    /// The MCP servers in `name` byte order (MOD-127 M2 D2). Their attachments are rows of
+    /// [`global`](Self::global), [`workspaces`](Self::workspaces) and
+    /// [`projects`](Self::projects) whose [`mcp_server_of`](Self::mcp_server_of) answers `Some`.
+    pub mcp_servers: Vec<McpServer>,
     /// The global attachments (`skill_bindings(BindingHome::Global)`), in D91 order.
-    pub global: Vec<SkillBinding>,
+    pub global: Vec<Binding>,
     /// One entry per workspace the view attaches at: the scope's workspace
     /// (`skill_bindings(BindingHome::Workspace(w))`, D91 order).
     pub workspaces: Vec<WorkspaceSkills>,
@@ -54,7 +59,7 @@ pub struct WorkspaceSkills {
     /// `workspace.name`, for the row's label; the id's first eight chars when the row is gone.
     pub name: String,
     /// Its attachments, in D91 order.
-    pub bindings: Vec<SkillBinding>,
+    pub bindings: Vec<Binding>,
 }
 
 /// One skill and its versions.
@@ -75,7 +80,7 @@ pub struct ProjectSkills {
     pub project: ProjectId,
     /// Its project, item-kind and phase attachments, `(skill_id, item_kind_id, phase_id)` byte
     /// order with the project row first (D91, MOD-127 D6).
-    pub bindings: Vec<SkillBinding>,
+    pub bindings: Vec<Binding>,
     /// Its item kinds, by `position` (the store's order): the rows an item-kind attachment sits
     /// under.
     pub item_kinds: Vec<ItemKind>,
@@ -135,18 +140,48 @@ impl SkillsSnapshot {
             .find(|entry| entry.workspace == workspace)
     }
 
+    /// One MCP server; `None` when none has that id.
+    #[must_use]
+    pub fn mcp_server(&self, id: McpServerId) -> Option<&McpServer> {
+        self.mcp_servers.iter().find(|server| server.id == id)
+    }
+
+    /// The MCP server named `name`.
+    #[must_use]
+    pub fn mcp_by_name(&self, name: &str) -> Option<&McpServer> {
+        self.mcp_servers.iter().find(|server| server.name == name)
+    }
+
+    /// The server a stored attachment row attaches; `None` for a skill's row. A row carries the
+    /// target's id only (`Binding::skill_id`), and the two id spaces are disjoint UUIDv7s, so a
+    /// row is a server's exactly when its id is a server's here.
+    #[must_use]
+    pub fn mcp_server_of(&self, row: &Binding) -> Option<&McpServer> {
+        self.mcp_server(McpServerId::from_uuid(row.skill_id.as_uuid()))
+    }
+
+    /// The key a stored row sits under, of either kind (`BindingKey::of` reads every row as a
+    /// skill's).
+    fn key_of(&self, row: &Binding) -> BindingKey {
+        let mut key = BindingKey::of(row);
+        if let Some(server) = self.mcp_server_of(row) {
+            key.target = BindingRef::McpServer(server.id);
+        }
+        key
+    }
+
     /// The row at `key`: from that workspace's `bindings` when `key.workspace` is set, from
     /// [`global`](Self::global) when `key.project` is `None`, otherwise from that project's
     /// `bindings`. `None` when no row sits there, which is also the `expected: None` a new
     /// attachment passes.
     #[must_use]
-    pub fn binding(&self, key: SkillBindingKey) -> Option<&SkillBinding> {
+    pub fn binding(&self, key: BindingKey) -> Option<&Binding> {
         let rows = match (key.workspace, key.project) {
             (Some(workspace), _) => &self.workspace(workspace)?.bindings,
             (None, None) => &self.global,
             (None, Some(project)) => &self.project(project)?.bindings,
         };
-        rows.iter().find(|row| SkillBindingKey::of(row) == key)
+        rows.iter().find(|row| self.key_of(row) == key)
     }
 }
 
@@ -160,7 +195,10 @@ pub enum StaleWhat {
     Version(SkillId),
     /// [`StoreRequest::SetSkillBinding`]: the row at the key changed, appeared or went, or its
     /// skill, workspace, project, item kind or phase is gone.
-    Binding(SkillBindingKey),
+    Binding(BindingKey),
+    /// [`StoreRequest::EditMcpServer`] or [`StoreRequest::DeleteMcpServer`]: the server changed
+    /// since the form opened, or is gone.
+    McpServer(McpServerId),
 }
 
 /// One read (D81, D97), through the writer: `skill_bindings(BindingHome::Global)`; the scope
@@ -236,8 +274,12 @@ pub async fn snapshot(
         let versions = writer.skill_versions(skill.id).await?;
         skills.push(SkillEntry { skill, versions });
     }
+    // After the attachments, as the skills are: a server created in between is attached by no
+    // row read above, never the other way round.
+    let mcp_servers = writer.mcp_servers().await?;
     Ok(SkillsSnapshot {
         skills,
+        mcp_servers,
         global,
         workspaces,
         projects,
@@ -261,6 +303,77 @@ pub const REQUEST_NAMES: [&str; 6] = [
 /// The **read**'s name: a refused read leaves the view with no library, where a refused write
 /// leaves the form or editor over its text.
 pub const READ_NAME: &str = REQUEST_NAMES[0];
+
+/// The three MCP server request names, in [`StoreRequest`] order (MOD-127 M2 T7). Apart from
+/// [`REQUEST_NAMES`], which stays the skills six; `request_names_match_the_name_arms`'s sibling
+/// pins them to [`StoreRequest::name`].
+pub const MCP_REQUEST_NAMES: [&str; 3] =
+    ["create_mcp_server", "edit_mcp_server", "delete_mcp_server"];
+
+/// What a new MCP server is made of: [`NewMcpServer`] without the two fields the worker fills,
+/// the id it mints and `created_by` (`R-NF-3`). The store's own refusals word the bad shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerDraft {
+    /// `mcp_server.name`.
+    pub name: String,
+    /// `mcp_server.description`.
+    pub description: String,
+    /// `mcp_server.transport`.
+    pub transport: McpTransport,
+    /// `mcp_server.command` (`Stdio`).
+    pub command: String,
+    /// `mcp_server.args` (`Stdio`).
+    pub args: Vec<String>,
+    /// `mcp_server.url` (`Http`).
+    pub url: Option<String>,
+    /// `mcp_server.headers`: secrets by name ([`EnvValue::Secret`]), never by value.
+    pub headers: Vec<(String, EnvValue)>,
+    /// `mcp_server.env`: secrets by name, never by value.
+    pub env: Vec<(String, EnvValue)>,
+    /// `mcp_server.allow`.
+    pub allow: Vec<String>,
+    /// `mcp_server.deny`.
+    pub deny: Vec<String>,
+}
+
+/// What one MCP server write did, carried by [`StoreReply::McpServerWritten`] beside the snapshot
+/// re-read. Ids, names and counts only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServerWrite {
+    /// [`StoreRequest::CreateMcpServer`]: the server landed.
+    Created {
+        /// The id the worker minted.
+        server: McpServerId,
+        /// The name, as stored.
+        name: String,
+    },
+    /// [`StoreRequest::EditMcpServer`]: the patch applied.
+    Edited {
+        /// Which server.
+        server: McpServerId,
+        /// The name, as stored.
+        name: String,
+    },
+    /// [`StoreRequest::DeleteMcpServer`]: the server and its attachments are gone.
+    Deleted {
+        /// Which server.
+        server: McpServerId,
+        /// How many attachment rows went with it.
+        bindings: u64,
+    },
+}
+
+impl McpServerWrite {
+    /// The [`StoreRequest::name`] of the write this answers (what the view's `busy` holds).
+    #[must_use]
+    pub const fn request_name(&self) -> &'static str {
+        match self {
+            Self::Created { .. } => MCP_REQUEST_NAMES[0],
+            Self::Edited { .. } => MCP_REQUEST_NAMES[1],
+            Self::Deleted { .. } => MCP_REQUEST_NAMES[2],
+        }
+    }
+}
 
 /// What one skill write did (MOD-59 D2), carried by [`StoreReply::SkillWritten`] beside the
 /// snapshot re-read. Ids, names, keys and tokens only: a body stays in the snapshot.
@@ -290,7 +403,7 @@ pub enum SkillWrite {
     /// [`StoreRequest::SetSkillBinding`] with an attach: the row at `key` is the one sent.
     Attached {
         /// The attachment's key.
-        key: SkillBindingKey,
+        key: BindingKey,
         /// The landed row's `updated_at`: the token a kept edit saves over (MOD-59 DV-1), not the
         /// re-read's row, which another session may already have written over.
         updated_at: DateTime<Utc>,
@@ -298,7 +411,7 @@ pub enum SkillWrite {
     /// [`StoreRequest::SetSkillBinding`] with a detach: no row at `key`.
     Detached {
         /// The attachment's key.
-        key: SkillBindingKey,
+        key: BindingKey,
     },
 }
 
@@ -439,12 +552,79 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 }
                 Ok(CasOutcome::Stale(_))
                 | Err(StoreError::NotFound {
-                    entity: "skill" | "project" | "step_graph_phase" | "workspace" | "item_kind",
+                    entity:
+                        "skill" | "mcp_server" | "project" | "step_graph_phase" | "workspace"
+                        | "item_kind",
                     ..
                 }) => WriteOutcome::Stale(StaleWhat::Binding(*key)),
                 Err(other) => return Err(other),
             };
             answer(backend, &writer, scope, landed).await
+        }
+        StoreRequest::CreateMcpServer { scope, draft } => {
+            let writer = write_access(backend)?;
+            let created_by = backend.this_user().await?;
+            // As a skill create: a refusal has no token to have spent, so it is `Failed`.
+            let server = writer
+                .create_mcp_server(NewMcpServer {
+                    id: McpServerId::new(),
+                    name: draft.name.clone(),
+                    description: draft.description.clone(),
+                    transport: draft.transport,
+                    command: draft.command.clone(),
+                    args: draft.args.clone(),
+                    url: draft.url.clone(),
+                    headers: draft.headers.clone(),
+                    env: draft.env.clone(),
+                    allow: draft.allow.clone(),
+                    deny: draft.deny.clone(),
+                    created_by,
+                })
+                .await?;
+            let landed = WriteOutcome::Applied(McpServerWrite::Created {
+                server: server.id,
+                name: server.name,
+            });
+            answer_mcp(backend, &writer, scope, landed).await
+        }
+        StoreRequest::EditMcpServer {
+            scope,
+            id,
+            expected,
+            patch,
+        } => {
+            let writer = write_access(backend)?;
+            let landed = match writer
+                .update_mcp_server(*id, *expected, (**patch).clone())
+                .await
+            {
+                Ok(CasOutcome::Applied(row)) => WriteOutcome::Applied(McpServerWrite::Edited {
+                    server: row.id,
+                    name: row.name,
+                }),
+                Ok(CasOutcome::Stale(_))
+                | Err(StoreError::NotFound {
+                    entity: "mcp_server",
+                    ..
+                }) => WriteOutcome::Stale(StaleWhat::McpServer(*id)),
+                Err(other) => return Err(other),
+            };
+            answer_mcp(backend, &writer, scope, landed).await
+        }
+        StoreRequest::DeleteMcpServer { scope, id } => {
+            let writer = write_access(backend)?;
+            let landed = match writer.delete_mcp_server(*id).await {
+                Ok(bindings) => WriteOutcome::Applied(McpServerWrite::Deleted {
+                    server: *id,
+                    bindings,
+                }),
+                Err(StoreError::NotFound {
+                    entity: "mcp_server",
+                    ..
+                }) => WriteOutcome::Stale(StaleWhat::McpServer(*id)),
+                Err(other) => return Err(other),
+            };
+            answer_mcp(backend, &writer, scope, landed).await
         }
         StoreRequest::ImportSkills { scope, paths } => {
             // The filesystem is read here and not in the view (`R-NF-3`): the walk is unbounded
@@ -506,6 +686,27 @@ async fn answer(
     })
 }
 
+/// [`answer`] for an MCP server write: `McpServerWritten`, or `SkillsStale` naming the server.
+async fn answer_mcp(
+    backend: &Backend,
+    writer: &Writer,
+    scope: &Scope,
+    landed: WriteOutcome<McpServerWrite, StaleWhat>,
+) -> Result<StoreReply> {
+    let fresh = reread(backend, writer, scope).await;
+    landed.answer(
+        fresh,
+        |snapshot, outcome| StoreReply::McpServerWritten {
+            snapshot: snapshot.map(Box::new).map_err(|err| err.to_string()),
+            outcome,
+        },
+        |snapshot, what| StoreReply::SkillsStale {
+            snapshot: Box::new(snapshot),
+            what,
+        },
+    )
+}
+
 /// The snapshot after a write. Its callers are past `write_access`, so this box's paths are read
 /// here (MOD-9 D131).
 async fn reread(backend: &Backend, writer: &Writer, scope: &Scope) -> Result<SkillsSnapshot> {
@@ -526,14 +727,18 @@ fn written(reread: Result<SkillsSnapshot>, outcome: SkillWrite) -> StoreReply {
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat, serve, written};
+    use super::{
+        MCP_REQUEST_NAMES, McpServerDraft, McpServerWrite, READ_NAME, REQUEST_NAMES, SkillWrite,
+        SkillsSnapshot, StaleWhat, serve, written,
+    };
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use crate::templates::TemplateBody;
     use chrono::{DateTime, Duration, Utc};
     use htui_core::fixtures::{self, ids};
     use htui_core::model::{
-        Activation, Attachment, BindingChange, NewRepo, PhaseId, RepoBoxPath, RepoId, Scope,
-        SkillBindingKey, SkillId, SkillPatch, StepGraph, StepGraphId,
+        Activation, Attachment, BindingChange, BindingKey, EnvValue, McpServerId, McpServerPatch,
+        McpTransport, NewRepo, PhaseId, RepoBoxPath, RepoId, Scope, SkillId, SkillPatch, StepGraph,
+        StepGraphId,
     };
     use htui_core::store::{MemStore, StoreError, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY};
@@ -637,7 +842,7 @@ mod tests {
 
     fn bind(
         scope: &Scope,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
     ) -> StoreRequest {
@@ -650,8 +855,8 @@ mod tests {
     }
 
     /// The demo's phase-level attachment: `rust-style` on `htui`'s `implement` phase.
-    fn demo_phase_key() -> SkillBindingKey {
-        SkillBindingKey::phase(
+    fn demo_phase_key() -> BindingKey {
+        BindingKey::phase(
             ids::SKILL_RUST_STYLE,
             ids::PROJECT_HTUI,
             ids::PHASE_HTUI_IMPLEMENT,
@@ -787,7 +992,7 @@ mod tests {
             Some(ids::BINDING_HTUI_IMPLEMENT_RUST_STYLE)
         );
         assert_eq!(
-            snapshot.binding(SkillBindingKey {
+            snapshot.binding(BindingKey {
                 project: None,
                 phase: None,
                 ..demo_phase_key()
@@ -829,7 +1034,7 @@ mod tests {
             "the project's kinds, the store's order"
         );
 
-        let ws_key = SkillBindingKey::workspace(ids::SKILL_TESTS, scope.workspace_id);
+        let ws_key = BindingKey::workspace(ids::SKILL_TESTS, scope.workspace_id);
         let (after, wrote) = applied(
             &backend,
             &bind(&scope, ws_key, None, BindingChange::Attach(always())),
@@ -843,7 +1048,7 @@ mod tests {
         );
         assert!(after.global.is_empty(), "and is not a global row");
 
-        let kind_key = SkillBindingKey::item_kind(ids::SKILL_TESTS, ids::PROJECT_HTUI, kind.id);
+        let kind_key = BindingKey::item_kind(ids::SKILL_TESTS, ids::PROJECT_HTUI, kind.id);
         let (after, _) = applied(
             &backend,
             &bind(&scope, kind_key, None, BindingChange::Attach(always())),
@@ -856,24 +1061,20 @@ mod tests {
         );
         assert_eq!(
             after
-                .binding(SkillBindingKey::project(
-                    ids::SKILL_TESTS,
-                    ids::PROJECT_HTUI
-                ))
+                .binding(BindingKey::project(ids::SKILL_TESTS, ids::PROJECT_HTUI))
                 .map(|row| (row.id, row.item_kind_id)),
             Some((ids::BINDING_HTUI_TESTS, None)),
             "the demo's project row is another key, untouched"
         );
 
-        let gone =
-            SkillBindingKey::workspace(ids::SKILL_TESTS, htui_core::model::WorkspaceId::new());
+        let gone = BindingKey::workspace(ids::SKILL_TESTS, htui_core::model::WorkspaceId::new());
         let (_, what) = stale(
             &backend,
             &bind(&scope, gone, None, BindingChange::Attach(always())),
         )
         .await;
         assert_eq!(what, StaleWhat::Binding(gone), "a vanished workspace");
-        let gone = SkillBindingKey::item_kind(
+        let gone = BindingKey::item_kind(
             ids::SKILL_TESTS,
             ids::PROJECT_HTUI,
             htui_core::model::ItemKindId::new(),
@@ -1005,7 +1206,7 @@ mod tests {
             }
         );
 
-        let key = SkillBindingKey::global(id);
+        let key = BindingKey::global(id);
         let (attached, outcome) = applied(
             &backend,
             &bind(&scope, key, None, BindingChange::Attach(always())),
@@ -1089,7 +1290,7 @@ mod tests {
         assert_eq!(what, StaleWhat::Version(gone));
         assert_eq!(fresh, before);
 
-        let no_phase = SkillBindingKey {
+        let no_phase = BindingKey {
             phase: Some(PhaseId::new()),
             ..key
         };
@@ -1330,6 +1531,254 @@ mod tests {
             scope.project_ids,
             "and of the request's scope"
         );
+    }
+
+    fn mcp_draft(name: &str) -> McpServerDraft {
+        McpServerDraft {
+            name: name.to_owned(),
+            description: format!("{name}, briefly"),
+            transport: McpTransport::Stdio,
+            command: "mcp-docs".to_owned(),
+            args: vec!["--stdio".to_owned()],
+            url: None,
+            headers: Vec::new(),
+            env: vec![("DOCS_TOKEN".to_owned(), EnvValue::Secret("docs".to_owned()))],
+            allow: vec!["search".to_owned()],
+            deny: Vec::new(),
+        }
+    }
+
+    fn create_mcp(scope: &Scope, name: &str) -> StoreRequest {
+        StoreRequest::CreateMcpServer {
+            scope: scope.clone(),
+            draft: Box::new(mcp_draft(name)),
+        }
+    }
+
+    fn edit_mcp(
+        scope: &Scope,
+        id: McpServerId,
+        expected: DateTime<Utc>,
+        description: &str,
+    ) -> StoreRequest {
+        StoreRequest::EditMcpServer {
+            scope: scope.clone(),
+            id,
+            expected,
+            patch: Box::new(McpServerPatch {
+                description: Some(description.to_owned()),
+                ..McpServerPatch::default()
+            }),
+        }
+    }
+
+    fn delete_mcp(scope: &Scope, id: McpServerId) -> StoreRequest {
+        StoreRequest::DeleteMcpServer {
+            scope: scope.clone(),
+            id,
+        }
+    }
+
+    /// The snapshot and outcome of a `McpServerWritten` reply whose re-read succeeded.
+    async fn applied_mcp(
+        backend: &Backend,
+        request: &StoreRequest,
+    ) -> (SkillsSnapshot, McpServerWrite) {
+        match serve(backend, request).await {
+            Ok(StoreReply::McpServerWritten {
+                snapshot: Ok(snapshot),
+                outcome,
+            }) => (*snapshot, outcome),
+            other => panic!("{} answered {other:?}", request.name()),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_edit_delete_an_mcp_server() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+
+        let (snapshot, outcome) = applied_mcp(&backend, &create_mcp(&scope, "docs")).await;
+        let McpServerWrite::Created { server, name } = outcome else {
+            panic!("a create answers `Created`, not {outcome:?}")
+        };
+        assert_eq!(name, "docs");
+        let row = snapshot.mcp_server(server).expect("the re-read holds it");
+        assert_eq!(row.command, "mcp-docs");
+        assert_eq!(
+            row.created_by,
+            backend.this_user().await.expect("this user"),
+            "the worker fills `created_by`"
+        );
+        assert_eq!(snapshot.mcp_by_name("docs").map(|row| row.id), Some(server));
+
+        let token = row.updated_at;
+        let (snapshot, outcome) =
+            applied_mcp(&backend, &edit_mcp(&scope, server, token, "Docs lookup")).await;
+        assert_eq!(
+            outcome,
+            McpServerWrite::Edited {
+                server,
+                name: "docs".to_owned()
+            }
+        );
+        let row = snapshot.mcp_server(server).expect("still there");
+        assert_eq!(row.description, "Docs lookup");
+        assert!(row.updated_at > token, "the store stamped the edit");
+
+        let (snapshot, outcome) = applied_mcp(&backend, &delete_mcp(&scope, server)).await;
+        assert_eq!(
+            outcome,
+            McpServerWrite::Deleted {
+                server,
+                bindings: 0
+            }
+        );
+        assert!(snapshot.mcp_servers.is_empty());
+    }
+
+    /// A refusal that is no lost token (a bad name, a taken name) stays an error: `Failed`.
+    #[tokio::test]
+    async fn an_mcp_refusal_is_an_error_not_a_stale() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        applied_mcp(&backend, &create_mcp(&scope, "docs")).await;
+
+        for bad in ["docs", "Docs", "htui"] {
+            let err = serve(&backend, &create_mcp(&scope, bad))
+                .await
+                .expect_err("refused");
+            assert!(matches!(err, StoreError::Constraint(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_edit_answers_stale() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let (snapshot, outcome) = applied_mcp(&backend, &create_mcp(&scope, "docs")).await;
+        let McpServerWrite::Created { server, .. } = outcome else {
+            panic!("{outcome:?}")
+        };
+        let token = snapshot.mcp_server(server).expect("created").updated_at;
+        applied_mcp(&backend, &edit_mcp(&scope, server, token, "first")).await;
+
+        // The spent token: stale, the snapshot is the fresh one, the other writer's text stands.
+        let (snapshot, what) = stale(&backend, &edit_mcp(&scope, server, token, "second")).await;
+        assert_eq!(what, StaleWhat::McpServer(server));
+        assert_eq!(
+            snapshot.mcp_server(server).expect("kept").description,
+            "first"
+        );
+
+        // A server that is gone: edit and delete both answer stale for it.
+        let gone = McpServerId::new();
+        for request in [edit_mcp(&scope, gone, token, "x"), delete_mcp(&scope, gone)] {
+            let (_, what) = stale(&backend, &request).await;
+            assert_eq!(what, StaleWhat::McpServer(gone), "{}", request.name());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_lists_servers_and_their_bindings() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        assert!(
+            read(&backend, &scope).await.mcp_servers.is_empty(),
+            "the demo holds no server"
+        );
+        let (_, outcome) = applied_mcp(&backend, &create_mcp(&scope, "docs")).await;
+        let McpServerWrite::Created { server, .. } = outcome else {
+            panic!("{outcome:?}")
+        };
+        applied_mcp(&backend, &create_mcp(&scope, "build")).await;
+
+        let key = BindingKey::global(server);
+        let (snapshot, _) = applied(
+            &backend,
+            &bind(&scope, key, None, BindingChange::Attach(always())),
+        )
+        .await;
+
+        let names: Vec<&str> = snapshot
+            .mcp_servers
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(names, ["build", "docs"], "name byte order");
+        let row = snapshot.binding(key).expect("the global binding is listed");
+        assert_eq!(row.activation, Activation::Always);
+        assert!(
+            snapshot.mcp_server_of(row).is_some_and(|s| s.id == server),
+            "the row says which server it attaches"
+        );
+        assert!(
+            snapshot
+                .binding(BindingKey::global(ids::SKILL_TESTS))
+                .is_none(),
+            "a skill key does not find the server's row"
+        );
+        assert_eq!(snapshot.global.len(), 1);
+
+        // Deleting the server takes its bindings with it, and says how many.
+        let (snapshot, outcome) = applied_mcp(&backend, &delete_mcp(&scope, server)).await;
+        assert_eq!(
+            outcome,
+            McpServerWrite::Deleted {
+                server,
+                bindings: 1
+            }
+        );
+        assert!(snapshot.global.is_empty());
+    }
+
+    #[tokio::test]
+    async fn offline_mcp_writes_are_refused() {
+        let (_dir, backend) = offline().await;
+        let scope = htui_scope();
+        let id = McpServerId::new();
+        for write in [
+            create_mcp(&scope, "docs"),
+            edit_mcp(&scope, id, DateTime::UNIX_EPOCH, "x"),
+            delete_mcp(&scope, id),
+        ] {
+            assert_eq!(
+                serve(&backend, &write).await.err(),
+                Some(StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned())),
+                "{}",
+                write.name()
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_request_names_match_the_name_arms() {
+        let scope = htui_scope();
+        let id = McpServerId::new();
+        let samples = [
+            create_mcp(&scope, "docs"),
+            edit_mcp(&scope, id, DateTime::UNIX_EPOCH, ""),
+            delete_mcp(&scope, id),
+        ];
+        let names: Vec<&str> = samples.iter().map(StoreRequest::name).collect();
+        assert_eq!(names, MCP_REQUEST_NAMES);
+        let outcomes = [
+            McpServerWrite::Created {
+                server: id,
+                name: String::new(),
+            },
+            McpServerWrite::Edited {
+                server: id,
+                name: String::new(),
+            },
+            McpServerWrite::Deleted {
+                server: id,
+                bindings: 0,
+            },
+        ];
+        for (outcome, request) in outcomes.iter().zip(&samples) {
+            assert_eq!(outcome.request_name(), request.name(), "{outcome:?}");
+        }
     }
 
     /// A request that is not one of the six is refused by name rather than served.

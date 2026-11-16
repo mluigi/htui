@@ -18,6 +18,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use htui_core::model::mcp::McpTransport;
 use htui_core::model::{AgentId, StepId};
 use serde::{Deserialize, Serialize};
 
@@ -244,21 +245,66 @@ pub struct ToolExposure {
     pub no_tools: bool,
 }
 
-/// One MCP server handed to the agent at `session/new` (`R-MCP-1`).
+/// One MCP server handed to the agent at `session/new` (`R-MCP-1`): `htui`'s own, and since
+/// MOD-127 M2 (D8) the toolbox's.
 ///
-/// A plain record with no reader in milestones 1–2: MOD-11 fills it (plan D16). `Debug` is hand
-/// written for the same reason as [`SessionSpec`]'s.
+/// Neutral: a stdio server is `command`, `args` and `env`; an http one is `url` and `headers`
+/// (`command` and `args` stay empty). [`McpTransport::Stdio`] is the default, so a spec written
+/// before `transport` existed decodes unchanged. `env` and `headers` hold resolved values and may
+/// carry secrets, so `Debug` is hand written for the same reason as [`SessionSpec`]'s.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerSpec {
     /// The name the agent sees.
     pub name: String,
-    /// The server's executable.
+    /// The server's executable. Empty for an http server.
     pub command: String,
     /// Its arguments.
     pub args: Vec<String>,
     /// Its environment. Values may be secrets, so they never reach `Debug`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// How the agent reaches the server.
+    #[serde(default = "stdio")]
+    pub transport: McpTransport,
+    /// The endpoint of an http server; `None` for a stdio one.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// An http server's request headers. Values may be secrets, so they never reach `Debug`.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// `#[serde(default = ..)]` for [`McpServerSpec::transport`].
+const fn stdio() -> McpTransport {
+    McpTransport::Stdio
+}
+
+impl McpServerSpec {
+    /// A stdio server: the shape every spec had before MOD-127.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            args,
+            env,
+            transport: McpTransport::Stdio,
+            url: None,
+            headers: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for McpServerSpec {
+    /// An empty stdio server: a base for `..` over the fields a caller sets.
+    fn default() -> Self {
+        Self::new("", "", Vec::new(), BTreeMap::new())
+    }
 }
 
 impl core::fmt::Debug for McpServerSpec {
@@ -268,6 +314,9 @@ impl core::fmt::Debug for McpServerSpec {
             .field("command", &self.command)
             .field("args", &self.args)
             .field("env", &RedactedEnv(&self.env))
+            .field("transport", &self.transport)
+            .field("url", &self.url)
+            .field("headers", &RedactedEnv(&self.headers))
             .finish()
     }
 }
@@ -391,6 +440,11 @@ pub struct DriverCaps {
     /// The Settings section refuses `a` on a row whose profile says `false` before a request is
     /// spent.
     pub authenticate: bool,
+    /// The agent can start a stdio MCP server from a [`McpServerSpec`] (MOD-127 M2 D7).
+    pub mcp_stdio: bool,
+    /// The agent can reach an http MCP server from a [`McpServerSpec`] (MOD-127 M2 D7). `false`
+    /// on ACP until `initialize`'s `mcp_capabilities.http` is read.
+    pub mcp_http: bool,
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -1018,8 +1018,8 @@ fn to_value_is_byte_stable_and_carries_the_documented_keys() {
     );
     assert_eq!(
         first["v"],
-        serde_json::json!(5),
-        "MOD-163 D17 bumped the record to v 5"
+        serde_json::json!(6),
+        "MOD-127 M2 D10 bumped the record to v 6"
     );
     assert_eq!(
         first["undigested"],
@@ -1724,7 +1724,7 @@ fn the_record_graph_holds_no_map_that_could_break_the_null_argument() {
     // graph": `serde_json::to_value` fails on a map whose keys are not strings, and a `HashMap`
     // field is the one way to introduce that. `the_prompt_module_reads_no_clock` bans the type for
     // `crates/htui-core/src/prompt/`'s nine files, but the record graph reaches past them — into
-    // `model/skill.rs` for `SkillChoice`/`SkillLevel`/`Activation` and `model/ids.rs` for
+    // `model/skill.rs` for `SkillChoice`/`BindingLevel`/`Activation` and `model/ids.rs` for
     // `SkillId` — so that guard was narrower than the claim it was cited for. This is the guard
     // that covers the whole graph, and it is deliberately not folded into the clock test: "reads no
     // clock" and "serialises to an object" are different invariants with different blast radii.
@@ -1750,4 +1750,41 @@ fn the_record_graph_holds_no_map_that_could_break_the_null_argument() {
             );
         }
     }
+}
+
+/// MOD-127 M2 D10: `mcp_choices` joins the record only when the step bound a server, as names and
+/// words, and the whole-record scrub reaches it (a credential-shaped name stops the write).
+#[test]
+fn the_mcp_choices_key_is_present_only_with_a_server_and_is_scrubbed() {
+    use htui_core::model::ids::McpServerId;
+    use htui_core::model::skill::{Activation, BindingLevel};
+    use htui_core::prompt::{McpChoice, McpOutcome, SkipReason};
+
+    let mut prompt = ok(&fixtures::phase_implement_attempt2());
+    let bare = prompt.trim.to_value(&scrubber()).expect("plain data");
+    assert!(bare.get("mcp_choices").is_none(), "{bare}");
+
+    prompt.trim.mcp_choices = vec![McpChoice {
+        server: McpServerId::new(),
+        name: "docs".to_owned(),
+        level: BindingLevel::Project,
+        activation: Activation::Always,
+        active: true,
+        outcome: McpOutcome::Skipped(SkipReason::SecretMissing("DOCS_KEY".to_owned())),
+    }];
+    let with = prompt.trim.to_value(&scrubber()).expect("plain data");
+    assert_eq!(with["mcp_choices"][0]["name"], serde_json::json!("docs"));
+    assert_eq!(
+        with["mcp_choices"][0]["outcome"],
+        serde_json::json!({"skipped": {"secret_missing": "DOCS_KEY"}})
+    );
+
+    // A resolved secret that shows up in a choice is masked by the same pass.
+    let masking = MinimalScrubber::new(["sentinel-docs-secret-value".to_owned()]);
+    prompt.trim.mcp_choices[0].name = "sentinel-docs-secret-value".to_owned();
+    let masked = prompt.trim.to_value(&masking).expect("masks");
+    assert!(
+        !masked.to_string().contains("sentinel-docs-secret-value"),
+        "{masked}"
+    );
 }

@@ -1079,7 +1079,7 @@ async fn a_rebound_diff_default_diffs_and_capital_d_is_inert() {
 async fn a_templates_switch_view_rebind_is_templates_only() {
     let mut harness = open_with_keys(
         MemStore::demo(),
-        "[skills.templates]\nswitch_view = [\"f6\"]\n",
+        "[skills.templates]\nswitch_view = [\"f6\"]\nprev_view = [\"f5\"]\n",
     )
     .await;
     let on_library = |frame: &str| hint(frame).contains("I import");
@@ -1099,15 +1099,27 @@ async fn a_templates_switch_view_rebind_is_templates_only() {
             "`{key}` no longer leaves Templates: {frame}"
         );
     }
+    // MOD-127 M2 T8, R3: the switch is forward only (`skills.prev_view` is its own act), so
+    // `F6` leaves Templates for the MCP servers view, where it is no switch; `l` goes on to the
+    // Library.
     harness.key("f6");
     harness.settle().await;
     let frame = harness.render();
-    assert!(on_library(&frame), "`F6` leaves Templates: {frame}");
-
+    assert!(
+        frame.contains("no MCP servers") && !frame.contains("vulkan-tutorials"),
+        "`F6` leaves Templates: {frame}"
+    );
     harness.key("f6");
     harness.settle().await;
     let frame = harness.render();
-    assert!(on_library(&frame), "`F6` is Templates' alone: {frame}");
+    assert!(
+        frame.contains("no MCP servers"),
+        "`F6` is Templates' alone: {frame}"
+    );
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(on_library(&frame), "`l` goes on to the Library: {frame}");
     harness.key("l");
     harness.settle().await;
     let frame = harness.render();
@@ -1637,8 +1649,8 @@ async fn the_templates_view_at_80_columns() {
     select(&mut harness, "implement");
     let frame = harness.render();
     assert!(
-        frame.contains(" Skills  Templates "),
-        "the view chips: {frame}"
+        frame.contains(" Templates  MCP servers "),
+        "the view chips: the active one and its neighbours: {frame}"
     );
     assert!(
         titled(&frame, "implement v1 (head v1)"),

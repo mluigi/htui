@@ -28,7 +28,7 @@ use htui_store::testkit as common;
 
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Activation, Attachment, BindingChange, NewSkillVersion, SkillBindingId, SkillBindingKey,
+    Activation, Attachment, BindingChange, BindingKey, NewSkillVersion, SkillBindingId,
 };
 use htui_core::store::{BindingHome, CasOutcome, WriteStore as _};
 use serde_json::json;
@@ -137,7 +137,7 @@ async fn two_attaches_of_one_key_write_one_row() {
     let Some(db) = common::demo_db().await else {
         return; // `common` printed the skip line already (plan D13).
     };
-    let key = SkillBindingKey::global(ids::SKILL_TESTS);
+    let key = BindingKey::global(ids::SKILL_TESTS);
 
     // The winner: a global attachment of `tests`, not committed yet.
     let winner_id = SkillBindingId::new();

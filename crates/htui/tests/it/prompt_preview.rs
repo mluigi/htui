@@ -22,8 +22,8 @@ use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Activation, ChoiceReason, ItemId, ItemPatch, NewRepo, RepoBoxPath, RepoId, Scope, SkillChoice,
-    SkillLevel, WorkspaceSummary,
+    Activation, BindingLevel, ChoiceReason, ItemId, ItemPatch, NewRepo, RepoBoxPath, RepoId, Scope,
+    SkillChoice, WorkspaceSummary,
 };
 use htui_core::prompt::excerpt::RootSource;
 use htui_core::store::{MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
@@ -340,7 +340,7 @@ async fn a_repo_path_row_puts_its_files_in_the_preview() {
 async fn the_preview_fires_a_glob_skill_over_repo_box_path() {
     // MOD-9 D124: the preview runs the engine's pass over this box's `repo_box_path` checkout, so a
     // project `glob` attachment matching a file there renders, with no previous attempt.
-    use htui_core::model::{Attachment, BindingChange, NewSkill, SkillBindingKey, SkillId};
+    use htui_core::model::{Attachment, BindingChange, BindingKey, NewSkill, SkillId};
     use htui_core::store::CasOutcome;
 
     let (store, _dir) = a_project_with_a_checkout().await;
@@ -357,7 +357,7 @@ async fn the_preview_fires_a_glob_skill_over_repo_box_path() {
         .expect("a new skill");
     let outcome = store
         .set_skill_binding(
-            SkillBindingKey::project(skill.id, ids::PROJECT_HTUI),
+            BindingKey::project(skill.id, ids::PROJECT_HTUI),
             None,
             BindingChange::Attach(Attachment {
                 pinned_version: None,
@@ -580,7 +580,7 @@ fn active(
     skill: htui_core::model::SkillId,
     name: &str,
     version: i32,
-    level: SkillLevel,
+    level: BindingLevel,
 ) -> SkillChoice {
     SkillChoice {
         skill,
@@ -618,8 +618,8 @@ async fn the_preview_carries_the_phase_skills_of_the_matching_phase() {
     assert_eq!(
         assembled.trim.skill_choices,
         vec![
-            active(ids::SKILL_TESTS, "tests", 1, SkillLevel::Project),
-            active(ids::SKILL_RUST_STYLE, "rust-style", 1, SkillLevel::Phase),
+            active(ids::SKILL_TESTS, "tests", 1, BindingLevel::Project),
+            active(ids::SKILL_RUST_STYLE, "rust-style", 1, BindingLevel::Phase),
         ],
         "D45: the phase-level binding wins over the project one"
     );
@@ -638,7 +638,7 @@ async fn the_preview_carries_the_phase_skills_of_the_matching_phase() {
 async fn attach_always(
     store: &MemStore,
     name: &str,
-    key: impl FnOnce(htui_core::model::SkillId) -> htui_core::model::SkillBindingKey,
+    key: impl FnOnce(htui_core::model::SkillId) -> htui_core::model::BindingKey,
 ) {
     use htui_core::model::{Attachment, BindingChange, NewSkill, SkillId};
     use htui_core::store::CasOutcome;
@@ -679,7 +679,7 @@ async fn implement_levels(
     backend: &Backend,
     item: &str,
     scope: &Scope,
-) -> Vec<(String, SkillLevel)> {
+) -> Vec<(String, BindingLevel)> {
     let preview = preview::build(backend, item_id(item).await, Some("implement"), scope)
         .await
         .expect("the demo store answers every prompt read");
@@ -698,15 +698,15 @@ async fn preview_resolves_item_kind_and_workspace_levels() {
     // it shows what a run started from here would get.
     let store = MemStore::demo();
     attach_always(&store, "platform-style", |skill| {
-        htui_core::model::SkillBindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
+        htui_core::model::BindingKey::workspace(skill, ids::WORKSPACE_PLATFORM)
     })
     .await;
     attach_always(&store, "graphics-style", |skill| {
-        htui_core::model::SkillBindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
+        htui_core::model::BindingKey::workspace(skill, ids::WORKSPACE_GRAPHICS)
     })
     .await;
     attach_always(&store, "feat-style", |skill| {
-        htui_core::model::SkillBindingKey::item_kind(skill, ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT)
+        htui_core::model::BindingKey::item_kind(skill, ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT)
     })
     .await;
     let backend = Backend::memory(store);
@@ -714,11 +714,11 @@ async fn preview_resolves_item_kind_and_workspace_levels() {
 
     let feat = implement_levels(&backend, "FEAT-1", &scope).await;
     assert!(
-        feat.contains(&("platform-style".to_owned(), SkillLevel::Workspace)),
+        feat.contains(&("platform-style".to_owned(), BindingLevel::Workspace)),
         "the open workspace's attachment reaches the preview: {feat:?}"
     );
     assert!(
-        feat.contains(&("feat-style".to_owned(), SkillLevel::ItemKind)),
+        feat.contains(&("feat-style".to_owned(), BindingLevel::ItemKind)),
         "a `feat` item takes the `feat` kind's attachment: {feat:?}"
     );
     assert!(
@@ -754,8 +754,13 @@ async fn a_template_no_phase_uses_is_noted_and_shows_project_skills() {
     assert_eq!(
         assembled.trim.skill_choices,
         vec![
-            active(ids::SKILL_TESTS, "tests", 1, SkillLevel::Project),
-            active(ids::SKILL_RUST_STYLE, "rust-style", 2, SkillLevel::Project),
+            active(ids::SKILL_TESTS, "tests", 1, BindingLevel::Project),
+            active(
+                ids::SKILL_RUST_STYLE,
+                "rust-style",
+                2,
+                BindingLevel::Project
+            ),
         ],
         "no phase, so the project binding (unpinned, v2) is the one in force"
     );

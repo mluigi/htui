@@ -1,0 +1,91 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT b.ref_id       AS \"server_id: McpServerId\",\n                   b.workspace_id AS \"workspace_id?: WorkspaceId\",\n                   b.project_id   AS \"project_id?: ProjectId\",\n                   b.item_kind_id AS \"item_kind_id?: ItemKindId\",\n                   b.phase_id     AS \"phase_id?: PhaseId\",\n                   b.activation   AS \"activation: Activation\"\n              FROM toolbox_binding b\n             WHERE b.kind = 'mcp_server'\n               AND (   (b.workspace_id IS NULL AND b.project_id IS NULL\n                        AND b.item_kind_id IS NULL AND b.phase_id IS NULL)\n                    OR b.workspace_id = $1\n                    OR (b.project_id = $2 AND b.item_kind_id IS NULL AND b.phase_id IS NULL)\n                    OR (b.project_id = $2 AND b.item_kind_id = $3)\n                    OR (b.project_id = $2 AND b.phase_id = $4))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "server_id: McpServerId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "ref_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id?: WorkspaceId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id?: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "item_kind_id?: ItemKindId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "item_kind_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "phase_id?: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "activation: Activation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "toolbox_binding",
+            "name": "activation"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "7b1ec96fb92a219f1dff0b7d5c65ce928246f3533d8bf8eca51626a38cc3a82c"
+}

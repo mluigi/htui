@@ -1033,8 +1033,23 @@ items it follows are done.
   the item's kind; the Skills tab attaches at the two new levels. Deliberately left for M2: the Rust `BindingKind` type
   (the schema has `kind`, only `skill` exists) and the run's frozen tool set (skills stay live-resolved at each step).
   The migration number renumbers at `scripts/hr collect` if a sibling lands first, which moves the count pins.
-  Owed on the host: the merged-tree Postgres gate. Open: M2 (MCP server kind, renderers, secrets by reference, frozen
-  set) and M3 (command and env-preset kinds).
+  **Phase M2 landed (`319696ae`..`a1a1d5c1`, 2026-11-16, on `hr/MOD-127`):** plan
+  `.claude/plans/mod-127-toolbox-binding-m2.plan.md` (fact-checked; briefs and the three-area review fix round beside
+  it). Migration `0042_mcp_server` adds `mcp_server` and widens `toolbox_binding.kind`; `BindingLevel`, `Binding`,
+  `BindingKey`, `BindingRef` and `BindingKind` replace the skill-named types (the `set_skill_binding` seam names
+  stay); one `resolve_mcp` serves both stores. A run's MCP set is frozen at run start in `GraphSnapshot.toolbox` and
+  `SnapshotPhase.mcp` (built in `resolve_with`; resume never re-freezes; a pre-M2 snapshot launches htui's own server
+  only). Each step plans its launch with `plan_mcp` by `DriverCaps.{mcp_stdio, mcp_http}` (Claude CLI stdio and http,
+  ACP stdio) and records every server in `mcp_choices` of the trim record (v 6); secrets are project secret names
+  resolved only into the agent environment; the Skills tab gains an MCP servers view and a configurable
+  `skills.prev_view` act. Known gaps, not silent: chat sessions get no bound servers (plan D11); `Binding` still
+  carries no kind field (a server row holds its id in `skill_id`, ids are kept disjoint, consumers tell kinds by
+  lookup: a tidy for M3 or its own item); the MCP view shares the Library's key context; the prompt preview shows no
+  mcp rows; delete-reach counts include server rows; a failed binding write is taken by whichever view is busy. Owed
+  on the host: the merged-tree Postgres gate (the migration renumbers at collect if a sibling lands first, which moves
+  the count pins) and one real Claude CLI run with a stdio server. The gate here was green except
+  `cache::the_spawned_refresher_passes_and_follows_the_scope`, the known load flake (passes alone). Open: M3 (command
+  and env-preset kinds, the htui agent adding entries unasked).
 - [ ] **MOD-128 - Toolbox bundle entries with linked parts and probe status** (from ANA-40, §8 P4). `R-LATER-7`,
   `R-AGT-10`, `R-BOX-2`, `R-TUI-7`. A bundle record (Gortex, Headroom, Serena, Graphify) is one `tools` entry with
   linked parts, each toggleable alone, default-on for coding projects and switchable off per project; the box

@@ -307,6 +307,7 @@ impl Scratch {
                 self.mcp_log.to_string_lossy().into_owned(),
             ],
             env: BTreeMap::new(),
+            ..McpServerSpec::default()
         }
     }
 

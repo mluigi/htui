@@ -30,28 +30,28 @@ use htui_core::model::link::{
 use htui_core::model::split_qualified;
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchClose, BatchId,
-    BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
-    CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, FollowUpRequest, FollowUpSettle, GateOutcome,
-    Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
-    ItemRevision, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision,
-    MemoryState, MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument,
-    NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument,
-    PendingStop, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
-    Project, ProjectId, ProjectPatch, ProjectType, PromptTemplate, PromptTemplateId, QueueBatch,
-    QueueEntry, QueueMove, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
-    canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
+    Binding, BindingChange, BindingKey, BindingRef, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
+    BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
+    CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor,
+    FollowUpRequest, FollowUpSettle, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, MemoryBody, MemoryEntry,
+    MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState, MemorySubject,
+    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
+    NewMemoryEntry, NewNote, NewOwnerDocument, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, OwnerDocument, PendingStop, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PersonaPermission,
+    PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch,
+    ProjectType, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueSetting,
+    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
+    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBindingId, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, UserId, VerifyOutcome,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop, canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::model::{ArtifactLinkId, DocumentId};
 use htui_core::model::{
@@ -60,6 +60,10 @@ use htui_core::model::{
 };
 use htui_core::model::{COMMAND_LOG_STORE_MAX, CommandLog, StoredCommandLog};
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
+use htui_core::model::{
+    EnvValue, McpServer, McpServerId, McpServerPatch, McpTransport, NewMcpServer,
+    mcp_server_patch_refusal, new_mcp_server_refusal,
+};
 use htui_core::model::{IntegrateMode, Integration, IntegrationState, LandOutcome};
 use htui_core::model::{NewRunPlan, PlanAdmission, PlanStatus, PlanToAdmit, RunPlan, RunPlanId};
 use htui_core::prompt::DEFAULT_TEMPLATES;
@@ -125,7 +129,7 @@ use uuid::Uuid;
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
 use crate::pg::read::{StepGraphRow, graph_body_on, graph_edges_on, phase_parts_on, phase_rows_on};
-use crate::pg::rows::{MemoryEntryRow, PersonaRow};
+use crate::pg::rows::{McpServerRow, MemoryEntryRow, PersonaRow};
 use htui_core::model::{
     CAPTURE_KEY, MEMORY_RUN_WRITE_CAP, MemoryEvidence, MemorySource, NewRunMemory, RunMemoryWrite,
 };
@@ -2204,6 +2208,28 @@ async fn target_name_held(
     .map_err(map_sqlx)
 }
 
+/// MOD-127 M2 D2: `mcp_server_name_key`'s `23505` in `MemStore`'s sentence; anything else through
+/// [`map_sqlx`].
+fn mcp_name_taken(err: sqlx::Error, name: &str) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("mcp_server_name_key") => {
+            StoreError::Constraint(already_exists("mcp_server", name))
+        }
+        _ => map_sqlx(err),
+    }
+}
+
+/// `create_mcp_server`'s refusals in `MemStore`'s order: `mcp_server_pkey` is the id, then the
+/// name.
+fn mcp_insert_refused(err: sqlx::Error, new: &NewMcpServer) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("mcp_server_pkey") => {
+            StoreError::Constraint(already_exists("mcp_server", new.id))
+        }
+        _ => mcp_name_taken(err, &new.name),
+    }
+}
+
 /// MOD-26 D4: `uq_persona_name`'s `23505` in `MemStore`'s sentence; anything else through
 /// [`map_sqlx`].
 fn persona_name_taken(err: sqlx::Error, name: &str) -> StoreError {
@@ -2752,6 +2778,22 @@ fn skill_insert_refused(err: sqlx::Error, new: &NewSkill) -> StoreError {
         }
         _ => skill_name_taken(err, &new.name),
     }
+}
+
+/// MOD-127 M2 R1: a skill and an `mcp_server` never share an id, because a `toolbox_binding` row
+/// holds either one in `ref_id` and the binding reads (`Binding.skill_id`) tell the kinds apart
+/// only by lookup. No constraint spans the two tables, so each create takes this transaction-scoped
+/// lock on the id (the same key on both sides) and then reads the other table: two creates of one
+/// id in two kinds serialise, and the second sees the first.
+async fn lock_shared_id(conn: &mut PgConnection, id: Uuid) -> Result<()> {
+    sqlx::query_scalar!(
+        r#"SELECT 1 AS "locked!" FROM (SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))) AS l"#,
+        id.to_string(),
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
 }
 
 /// `MemStore`'s refusal of a `created_by` that names no `app_user`, the nil UUID worded apart.
@@ -6619,7 +6661,7 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<SkillBinding>> {
+    async fn skill_bindings(&self, home: BindingHome) -> Result<Vec<Binding>> {
         self.skill_binding_rows(home).await
     }
 
@@ -6646,6 +6688,17 @@ impl WriteStore for PgStore {
                 "skill.created_by",
                 new.created_by,
             )));
+        }
+        lock_shared_id(&mut tx, new.id.as_uuid()).await?;
+        let server_holds_id = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM mcp_server WHERE id = $1) AS "held!""#,
+            new.id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if server_holds_id {
+            return Err(StoreError::Constraint(already_exists("mcp_server", new.id)));
         }
         let skill = sqlx::query_as!(
             Skill,
@@ -6797,21 +6850,37 @@ impl WriteStore for PgStore {
     /// `23503`, a `Constraint`.
     async fn set_skill_binding(
         &self,
-        key: SkillBindingKey,
+        key: BindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
-    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+    ) -> Result<CasOutcome<Option<Binding>>> {
         let current = self.skill_binding_row(key).await?;
         if current.as_ref().map(|row| row.updated_at) != expected {
             return Ok(CasOutcome::Stale(current));
         }
-        let skill = self
-            .skill_row(key.skill)
-            .await?
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "skill",
-                id: key.skill.to_string(),
-            })?;
+        // The target's own facts; an `mcp_server` attachment has no name to quote and no versions
+        // (MOD-127 M2 D4), and its row keeps the server's id in `skill_id`.
+        let (skill_id, skill_name) = match key.target {
+            BindingRef::Skill(skill_id) => (
+                skill_id,
+                self.skill_row(skill_id)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "skill",
+                        id: skill_id.to_string(),
+                    })?
+                    .name,
+            ),
+            BindingRef::McpServer(server) => {
+                if self.mcp_server_row(server).await?.is_none() {
+                    return Err(StoreError::NotFound {
+                        entity: "mcp_server",
+                        id: server.to_string(),
+                    });
+                }
+                (SkillId::from_uuid(server.as_uuid()), String::new())
+            }
+        };
         let project_slug = match key.project {
             Some(id) => {
                 self.project(id)
@@ -6890,12 +6959,15 @@ impl WriteStore for PgStore {
             }
             BindingChange::Attach(attachment) => attachment,
         };
-        let versions: Vec<i32> = self
-            .skill_version_rows(key.skill)
-            .await?
-            .iter()
-            .map(|row| row.version)
-            .collect();
+        let versions: Vec<i32> = match key.target {
+            BindingRef::Skill(_) => self
+                .skill_version_rows(skill_id)
+                .await?
+                .iter()
+                .map(|row| row.version)
+                .collect(),
+            BindingRef::McpServer(_) => Vec::new(),
+        };
         let repos: Vec<String> = match key.project {
             Some(id) => self
                 .repo_rows(id)
@@ -6911,23 +6983,46 @@ impl WriteStore for PgStore {
                 phase_project,
                 workspace_exists,
                 kind_project,
-                skill_name: &skill.name,
+                skill_name: &skill_name,
                 versions: &versions,
                 repos: &repos,
                 project_slug: &project_slug,
+                target_exists: true,
             },
             &attachment,
         )
         .map_err(StoreError::Constraint)?;
 
         let written = match &current {
-            None => sqlx::query_as!(
-                SkillBinding,
-                r#"
+            None => {
+                // MOD-127 M2 R1: an `mcp_server` binding row has no foreign key, so the check
+                // that its server exists and the INSERT are one transaction under a key-share
+                // lock on the server row. `delete_mcp_server` deletes the server first and the
+                // bindings second, so a delete in flight makes this wait, then refuse; one that
+                // commits after this commit removes the row this wrote.
+                let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+                if let BindingRef::McpServer(server) = key.target {
+                    let held = sqlx::query_scalar!(
+                        "SELECT id FROM mcp_server WHERE id = $1 FOR KEY SHARE",
+                        server.as_uuid(),
+                    )
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?;
+                    if held.is_none() {
+                        return Err(StoreError::NotFound {
+                            entity: "mcp_server",
+                            id: server.to_string(),
+                        });
+                    }
+                }
+                let inserted = sqlx::query_as!(
+                    Binding,
+                    r#"
                 INSERT INTO toolbox_binding
                        (id, kind, ref_id, workspace_id, project_id, item_kind_id, phase_id,
                         pinned_version, position, activation, globs, languages)
-                VALUES ($1, 'skill', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $12, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (kind, ref_id, workspace_id, project_id, item_kind_id, phase_id)
                 DO NOTHING
                 RETURNING id             AS "id: SkillBindingId",
@@ -6943,23 +7038,27 @@ impl WriteStore for PgStore {
                           languages,
                           updated_at
                 "#,
-                SkillBindingId::new().as_uuid(),
-                key.skill.as_uuid(),
-                key.workspace.map(WorkspaceId::as_uuid),
-                key.project.map(ProjectId::as_uuid),
-                key.item_kind.map(ItemKindId::as_uuid),
-                key.phase.map(PhaseId::as_uuid),
-                attachment.pinned_version,
-                attachment.position,
-                attachment.activation.as_str(),
-                &stored.globs[..],
-                &stored.languages[..],
-            )
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?,
+                    SkillBindingId::new().as_uuid(),
+                    skill_id.as_uuid(),
+                    key.workspace.map(WorkspaceId::as_uuid),
+                    key.project.map(ProjectId::as_uuid),
+                    key.item_kind.map(ItemKindId::as_uuid),
+                    key.phase.map(PhaseId::as_uuid),
+                    attachment.pinned_version,
+                    attachment.position,
+                    attachment.activation.as_str(),
+                    &stored.globs[..],
+                    &stored.languages[..],
+                    key.target.kind().as_str(),
+                )
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+                tx.commit().await.map_err(map_sqlx)?;
+                inserted
+            }
             Some(row) => sqlx::query_as!(
-                SkillBinding,
+                Binding,
                 r#"
                 UPDATE toolbox_binding SET
                     pinned_version = $3,
@@ -7040,6 +7139,200 @@ impl WriteStore for PgStore {
         .await
         .map(Persona::from)
         .map_err(|err| persona_insert_refused(err, &new))
+    }
+
+    // mcp_server (MOD-127 M2 D2)
+
+    /// Every server in `name` byte order.
+    async fn mcp_servers(&self) -> Result<Vec<McpServer>> {
+        self.mcp_server_rows().await
+    }
+
+    /// `create_skill`'s order: `new_mcp_server_refusal`, then `created_by` read before the insert
+    /// (the foreign key is checked only after the unique indexes and would lose to a taken name),
+    /// then `mcp_server_pkey` and `mcp_server_name_key`, both `23505`s worded as `MemStore`
+    /// words them. Both stamps are the columns' `now()` defaults.
+    async fn create_mcp_server(&self, new: NewMcpServer) -> Result<McpServer> {
+        if let Some(refusal) = new_mcp_server_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let known = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM app_user WHERE id = $1) AS "known!""#,
+            new.created_by.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if !known {
+            return Err(StoreError::Constraint(unknown_author(
+                "mcp_server.created_by",
+                new.created_by,
+            )));
+        }
+        let headers = persona_json("mcp_server.headers", &new.headers)?;
+        let env = persona_json("mcp_server.env", &new.env)?;
+        lock_shared_id(&mut tx, new.id.as_uuid()).await?;
+        let skill_holds_id = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM skill WHERE id = $1) AS "held!""#,
+            new.id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if skill_holds_id {
+            return Err(StoreError::Constraint(already_exists("skill", new.id)));
+        }
+        let server = sqlx::query_as!(
+            McpServerRow,
+            r#"
+            INSERT INTO mcp_server
+                   (id, name, description, transport, command, args, url, headers, env,
+                    allow, deny, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING id          AS "id: McpServerId",
+                      name,
+                      description,
+                      transport   AS "transport: McpTransport",
+                      command,
+                      args,
+                      url,
+                      headers     AS "headers: Json<Vec<(String, EnvValue)>>",
+                      env         AS "env: Json<Vec<(String, EnvValue)>>",
+                      allow,
+                      deny,
+                      created_by  AS "created_by: UserId",
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.name,
+            new.description,
+            new.transport.as_str(),
+            new.command,
+            &new.args[..],
+            new.url,
+            headers,
+            env,
+            &new.allow[..],
+            &new.deny[..],
+            new.created_by.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map(McpServer::from)
+        .map_err(|err| mcp_insert_refused(err, &new))?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(server)
+    }
+
+    /// `update_skill`'s order, which `MemStore` keeps: the row is read first (`NotFound`, then
+    /// `Stale` for a spent token, then the patch's refusal over the row with the patch applied),
+    /// then one `UPDATE ... WHERE id AND updated_at` writes the whole result. A write that loses
+    /// to a concurrent edit matches no row and is re-read as `Stale`; a rename into a taken name
+    /// is `mcp_server_name_key`'s `23505`. `trg_mcp_server_updated_at` stamps `updated_at`, an
+    /// all-`None` patch included.
+    async fn update_mcp_server(
+        &self,
+        id: McpServerId,
+        expected: DateTime<Utc>,
+        patch: McpServerPatch,
+    ) -> Result<CasOutcome<McpServer>> {
+        let Some(current) = self.mcp_server_row(id).await? else {
+            return Err(StoreError::NotFound {
+                entity: "mcp_server",
+                id: id.to_string(),
+            });
+        };
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(refusal) = mcp_server_patch_refusal(&current, &patch) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let mut next = current.clone();
+        patch.apply(&mut next);
+        let headers = persona_json("mcp_server.headers", &next.headers)?;
+        let env = persona_json("mcp_server.env", &next.env)?;
+        let updated = sqlx::query_as!(
+            McpServerRow,
+            r#"
+            UPDATE mcp_server SET
+                name        = $3,
+                description = $4,
+                transport   = $5,
+                command     = $6,
+                args        = $7,
+                url         = $8,
+                headers     = $9,
+                env         = $10,
+                allow       = $11,
+                deny        = $12
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id          AS "id: McpServerId",
+                      name,
+                      description,
+                      transport   AS "transport: McpTransport",
+                      command,
+                      args,
+                      url,
+                      headers     AS "headers: Json<Vec<(String, EnvValue)>>",
+                      env         AS "env: Json<Vec<(String, EnvValue)>>",
+                      allow,
+                      deny,
+                      created_by  AS "created_by: UserId",
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            next.name,
+            next.description,
+            next.transport.as_str(),
+            next.command,
+            &next.args[..],
+            next.url,
+            headers,
+            env,
+            &next.allow[..],
+            &next.deny[..],
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| mcp_name_taken(err, &next.name))?;
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row.into())),
+            None => cas_miss(self.mcp_server_row(id).await?, "mcp_server", id),
+        }
+    }
+
+    /// One transaction: the server row, then every `toolbox_binding` row that names it
+    /// (`ref_id` has no foreign key, M1 D3). The count is the second statement's.
+    async fn delete_mcp_server(&self, id: McpServerId) -> Result<u64> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let removed = sqlx::query_scalar!(
+            "DELETE FROM mcp_server WHERE id = $1 RETURNING id",
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if removed.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "mcp_server",
+                id: id.to_string(),
+            });
+        }
+        let attachments = sqlx::query!(
+            "DELETE FROM toolbox_binding WHERE kind = 'mcp_server' AND ref_id = $1",
+            id.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(attachments)
     }
 
     /// `update_skill`'s shape: bad input pays one read for `NotFound` → `Stale` → `Constraint`;

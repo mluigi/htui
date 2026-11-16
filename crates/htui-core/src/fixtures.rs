@@ -22,16 +22,15 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Activation, Agent, AppUser, BoxKind, BoxRow, BoxTool, CitationKind, Document, EdgeId,
+    Activation, Agent, AppUser, Binding, BoxKind, BoxRow, BoxTool, CitationKind, Document, EdgeId,
     EventKind, EventRole, GateOutcome, GraphSnapshot, Isolation, Item, ItemKind, ItemKindId,
     ItemLink, ItemRequirement, ItemRevision, LinkKind, NodeRole, Note, NoteId, OsFamily, Persona,
     PhaseId, Priority, Project, ProjectId, PromptTemplate, PromptTemplateId, Requirement,
     RequirementArea, RequirementAreaId, RequirementId, RequirementRevision, RequirementSpec,
     RequirementState, Resolution, Run, RunKind, RunMode, RunStatus, RunStep, RuntimeChanges,
-    SessionEvent, Skill, SkillBinding, SkillVersion, SnapshotCandidate, SnapshotGraph,
-    SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status, StepGraph, StepGraphEdge,
-    StepGraphId, StepGraphPhase, StepId, StepRole, StepStatus, Workspace, WorkspaceId,
-    WorkspaceProject,
+    SessionEvent, Skill, SkillVersion, SnapshotCandidate, SnapshotGraph, SnapshotPhase,
+    SnapshotSettings, SnapshotTemplate, Status, StepGraph, StepGraphEdge, StepGraphId,
+    StepGraphPhase, StepId, StepRole, StepStatus, Workspace, WorkspaceId, WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -413,7 +412,7 @@ pub struct DemoData {
     /// `skill_version` rows (§5.6).
     pub skill_versions: Vec<SkillVersion>,
     /// `skill_binding` rows (§5.6): project-level and one phase-level override.
-    pub skill_bindings: Vec<SkillBinding>,
+    pub skill_bindings: Vec<Binding>,
     /// `box_tool` rows (§5.2): what the prompt's `box` section lists.
     pub box_tools: Vec<BoxTool>,
     /// `item_key_counter` rows, keyed by `(project_id, prefix)` (§4.1).
@@ -614,7 +613,7 @@ fn skills() -> Vec<Skill> {
 ///
 /// Two versions of one skill is what makes a `pinned_version` observable — an unpinned binding
 /// follows v2 and the phase-level pin holds v1, so
-/// [`SkillBinding::version_in_force`](crate::model::SkillBinding::version_in_force) has something
+/// [`Binding::version_in_force`](crate::model::Binding::version_in_force) has something
 /// to resolve.
 fn skill_versions() -> Vec<SkillVersion> {
     [
@@ -644,7 +643,7 @@ fn skill_versions() -> Vec<SkillVersion> {
 /// project **and** at `htui`'s `implement` phase, so a resolution that forgot to collapse would
 /// render it twice. The positions are deliberately not the render order — `tests` sits at 0 and
 /// the phase binding at 2 — so a read that kept the project order would be caught.
-fn skill_bindings() -> Vec<SkillBinding> {
+fn skill_bindings() -> Vec<Binding> {
     [
         (
             ids::BINDING_HTUI_RUST_STYLE,
@@ -664,7 +663,7 @@ fn skill_bindings() -> Vec<SkillBinding> {
     ]
     .into_iter()
     .map(
-        |(id, skill_id, phase_id, pinned_version, position)| SkillBinding {
+        |(id, skill_id, phase_id, pinned_version, position)| Binding {
             id,
             skill_id,
             workspace_id: None,
@@ -1580,6 +1579,7 @@ fn demo_graph_snapshot() -> Value {
                 palette: false,
                 plan_scope: None,
                 divide: None,
+                mcp: Vec::new(),
             }
         })
         .collect();
@@ -1617,6 +1617,7 @@ fn demo_graph_snapshot() -> Value {
         memory: None,
         capture: None,
         integrate: std::collections::BTreeMap::new(),
+        toolbox: None,
     })
     .expect("a literal this module owns serialises")
 }

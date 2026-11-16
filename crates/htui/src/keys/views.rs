@@ -99,14 +99,18 @@ const PANE_SCROLL: Layer = Layer::only(
     ],
 );
 
-/// `skills ∩ {switch_view}`.
-const SKILLS_SWITCH: Layer = Layer::only(Context::Skills, &[Act::SkillsSwitchView]);
+/// `skills ∩ {switch_view, prev_view}`.
+const SKILLS_SWITCH: Layer = Layer::only(
+    Context::Skills,
+    &[Act::SkillsSwitchView, Act::SkillsPrevView],
+);
 
 /// `skills ∩` the verbs Library and Templates browse share.
 const SKILLS_BROWSE: Layer = Layer::only(
     Context::Skills,
     &[
         Act::SkillsSwitchView,
+        Act::SkillsPrevView,
         Act::SkillsPrevVersion,
         Act::SkillsNextVersion,
         Act::SkillsBase,
@@ -798,6 +802,37 @@ pub const LIBRARY_REPORT: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
+/// Skills > MCP servers, browsing (MOD-127 M2 T8): the view's own `attach` toggle, the switch,
+/// `new`, `edit`, `delete` and `reload`, then the list and pane keys. `delete` is not on the
+/// Library's stack: `d` is its diff there.
+pub const MCP_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SkillsLibrary, &[Act::LibraryAttach]),
+    SKILLS_SWITCH,
+    Layer::only(
+        Context::Common,
+        &[Act::New, Act::Edit, Act::Delete, Act::Reload],
+    ),
+    LIST,
+    PANE_SCROLL,
+    LAYOUT,
+    HISTORY,
+    GLOBAL,
+]);
+
+/// Skills > MCP servers, the server form (MOD-127 M2 T8): text fields, the transport's toggle and
+/// the form's own save.
+pub const MCP_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SkillsLibrary, &[]),
+    FIELD,
+    TOGGLE,
+    FORM_ALL,
+    MODAL,
+]);
+
+/// Skills > MCP servers, the delete question.
+pub const MCP_CONFIRM: Stack<'static> =
+    Stack::new(&[Layer::view(Context::SkillsLibrary, &[]), CONFIRM, MODAL]);
+
 /// Skills > Library > Attachments, browsing the pane (`a` closes it: the Library's toggle).
 pub const ATTACH_BROWSE: Stack<'static> = Stack::new(&[
     Layer::view(
@@ -1346,6 +1381,7 @@ mod tests {
         source!("ui/overlay/workspace_switcher.rs"),
         source!("ui/tabs/skills/mod.rs"),
         source!("ui/tabs/skills/library.rs"),
+        source!("ui/tabs/skills/mcp.rs"),
         source!("ui/tabs/skills/templates.rs"),
         source!("ui/tabs/skills/attach.rs"),
         source!("ui/tabs/skills/agent_help.rs"),
@@ -1481,6 +1517,9 @@ mod tests {
         LIBRARY_INFO,
         LIBRARY_EDITOR,
         LIBRARY_REPORT,
+        MCP_BROWSE,
+        MCP_FORM,
+        MCP_CONFIRM,
         ATTACH_BROWSE,
         ATTACH_FORM,
         ATTACH_PICKER,
@@ -1543,6 +1582,7 @@ mod tests {
         ("LOGGING_BROWSE", &[SETTINGS_TAB_RS]),
         ("LIBRARY_BROWSE", &[SKILLS_TAB_RS]),
         ("LIBRARY_REPORT", &[SKILLS_TAB_RS]),
+        ("MCP_BROWSE", &[SKILLS_TAB_RS]),
         ("ATTACH_BROWSE", &[SKILLS_TAB_RS]),
         ("BACKLOG_BODY", &[BACKLOG_TAB_RS, SCROLL_RS]),
         ("BACKLOG_GRAPH", &[BACKLOG_TAB_RS]),
@@ -1781,6 +1821,10 @@ mod tests {
     fn the_skills_and_requirements_stacks_resolve_as_designed() {
         assert_eq!(resolve(LIBRARY_BROWSE, "l"), [Act::SkillsSwitchView]);
         assert_eq!(resolve(TEMPLATES_BROWSE, "l"), [Act::SkillsSwitchView]);
+        // R3: the back half of the switch is its own act, on the same stacks.
+        assert_eq!(resolve(LIBRARY_BROWSE, "h"), [Act::SkillsPrevView]);
+        assert_eq!(resolve(TEMPLATES_BROWSE, "["), [Act::SkillsPrevView]);
+        assert_eq!(resolve(MCP_BROWSE, "shift-left"), [Act::SkillsPrevView]);
         for spec in ["ctrl-l", "ctrl-h", "alt-l"] {
             assert_eq!(resolve(LIBRARY_BROWSE, spec), [], "{spec}");
             assert_eq!(resolve(TEMPLATES_BROWSE, spec), [], "{spec}");
@@ -2164,6 +2208,7 @@ mod tests {
                 "LIBRARY_PROMPT",
                 "LIBRARY_INFO",
                 "LIBRARY_EDITOR",
+                "MCP_FORM",
                 "ATTACH_FORM",
                 "TEMPLATES_PROMPT",
                 "TEMPLATES_EDITOR",
@@ -2237,10 +2282,12 @@ mod tests {
             // Where a row of the act could sit: a `skills` layer, or a view layer inheriting it.
             for (index, layer) in stack.layers().iter().enumerate() {
                 let holds = layer.context() == Context::Skills || layer.inherits();
-                assert!(
-                    !(holds && stack.admits(index, Act::SkillsSwitchView)),
-                    "{phrase}: layer {index} offers skills.switch_view"
-                );
+                for act in [Act::SkillsSwitchView, Act::SkillsPrevView] {
+                    assert!(
+                        !(holds && stack.admits(index, act)),
+                        "{phrase}: layer {index} offers {act:?}"
+                    );
+                }
             }
         }
     }
@@ -2255,8 +2302,8 @@ mod tests {
         // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
         // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
         // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94; MOD-122
-        // M3 D10: the activity panel's, 95.
-        assert_eq!(views.len(), 95);
+        // M3 D10: the activity panel's, 95; MOD-127 M2 T8: the MCP servers view's three, 98.
+        assert_eq!(views.len(), 98);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

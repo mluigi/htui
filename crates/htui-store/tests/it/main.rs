@@ -3,6 +3,7 @@ mod box_identity;
 mod cache;
 mod connect;
 mod dsn;
+mod mcp_servers;
 mod migrations;
 mod pg_conformance;
 mod pg_criteria;

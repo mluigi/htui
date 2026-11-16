@@ -35,6 +35,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use htui_core::model::mcp::McpTransport;
 use htui_core::model::{Agent as AgentRow, AgentBox};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -388,7 +389,8 @@ pub fn refuse_settings_override(cli: &CliSettings, user_extensions: bool) -> Res
 }
 
 /// The MCP config JSON for `servers` (MOD-11 D8): the CLI's own
-/// `{"mcpServers":{<name>:{"type":"stdio","command","args","env"}}}`, serialised compactly.
+/// `{"mcpServers":{<name>:{"type":"stdio","command","args","env"}}}`, serialised compactly. An http
+/// server (MOD-127 M2 D8) is `{"type":"http","url","headers"}`.
 /// `None` for an empty slice, which is what keeps a session with no server on today's argv.
 ///
 /// It is written to a file ([`McpConfigFile`], MOD-79) and never put on the argv: `env` carries the
@@ -403,12 +405,19 @@ pub fn mcp_config(servers: &[McpServerSpec]) -> Option<String> {
     let servers: BTreeMap<&str, Value> = servers
         .iter()
         .map(|server| {
-            let entry = json!({
-                "type": "stdio",
-                "command": server.command,
-                "args": server.args,
-                "env": server.env,
-            });
+            let entry = match server.transport {
+                McpTransport::Stdio => json!({
+                    "type": "stdio",
+                    "command": server.command,
+                    "args": server.args,
+                    "env": server.env,
+                }),
+                McpTransport::Http => json!({
+                    "type": "http",
+                    "url": server.url,
+                    "headers": server.headers,
+                }),
+            };
             (server.name.as_str(), entry)
         })
         .collect();
@@ -2004,6 +2013,7 @@ mod tests {
                 command: "/abs/htui".to_owned(),
                 args: vec!["mcp".to_owned()],
                 env: BTreeMap::from([("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned())]),
+                ..McpServerSpec::default()
             }],
             permission: PermissionPolicy::default(),
             retain_raw: false,

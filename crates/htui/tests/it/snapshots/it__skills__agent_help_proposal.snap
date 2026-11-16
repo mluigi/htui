@@ -3,7 +3,7 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs           0 waiting ·  F1  keys
-╭─ proposal from scripted · sent → proposed ──────────────────────────────────── Skills  Templates ╮
+╭─ proposal from scripted · sent → proposed ─────────────────────── Skills  Templates  MCP servers ╮
 │--- sent                                                                                          │
 │+++ proposed                                                                                      │
 │@@ -1 +1 @@                                                                                       │

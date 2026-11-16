@@ -94,6 +94,7 @@ pub mod item_spec;
 pub mod key;
 pub mod kind;
 pub mod link;
+pub mod mcp;
 pub mod memory;
 pub mod note;
 pub mod overlap;
@@ -139,9 +140,9 @@ pub use hierarchy::{
 };
 pub use ids::{
     AgentId, ArtifactLinkId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId,
-    MemoryEntryId, NoteId, PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId,
-    RelaySessionId, RepoId, RequirementAreaId, RequirementId, RunCommandId, RunId, RunPlanId,
-    SkillBindingId, SkillId, StepGraphId, StepId, TargetId, UserId, WorkspaceId,
+    McpServerId, MemoryEntryId, NoteId, PermissionId, PersonaId, PhaseId, ProjectId,
+    PromptTemplateId, RelaySessionId, RepoId, RequirementAreaId, RequirementId, RunCommandId,
+    RunId, RunPlanId, SkillBindingId, SkillId, StepGraphId, StepId, TargetId, UserId, WorkspaceId,
 };
 pub use indexer::{
     IndexChanges, IndexCursor, IndexedCollection, IndexerLease, LeaseTake, LeaseTurn,
@@ -164,6 +165,11 @@ pub use kind::{
 pub use link::{
     ArtifactLinkKind, DocumentLink, DocumentRef, ItemArtifactLink, ItemLink, LinkEdge, LinkGraph,
     LinkKind, LinkNode, LinkedDocument, ProposeDocumentLink, UpstreamEntry, WithdrawDocumentLink,
+};
+pub use mcp::{
+    BoundMcp, EnvValue, McpCandidate, McpServer, McpServerPatch, McpTransport, NewMcpServer,
+    SERVER_NAME, invalid_mcp_name, mcp_server_patch_refusal, new_mcp_server_refusal, resolve_mcp,
+    validate_mcp_name,
 };
 pub use memory::{
     MEMORY_BODY_MAX, MEMORY_RUN_WRITE_CAP, MEMORY_SUBJECT_MAX, MemoryBody, MemoryCitation,
@@ -214,22 +220,22 @@ pub use requirement::{
 };
 pub use run::{
     CAPTURE_KEY, CAPTURE_POSITION, COMMAND_LOG_CAP, COMMAND_LOG_STORE_MAX, ChatRunSpec, CommandLog,
-    CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, IntegrateSnapshot, NewCommandRun,
-    NewRun, NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge, PlanAdmission,
-    PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind, RunMode,
-    RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, IntegrateSnapshot, McpPick,
+    NewCommandRun, NewRun, NewRunPlan, NewRunStep, NodeRole, PLAN_SUFFIX, PartMerge, PartPremerge,
+    PlanAdmission, PlanStatus, PlanToAdmit, PremergeReport, RepoPremerge, Run, RunFacts, RunKind,
+    RunMode, RunPlan, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
     RuntimeChanges, STAGE_KEYS, SnapshotCandidate, SnapshotCapture, SnapshotCaptureModel,
-    SnapshotDivide, SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase,
-    SnapshotSeat, SnapshotSettings, SnapshotSource, SnapshotTemplate, SourceHow, StepOpening,
-    StepOutcome, StepRole, StepStatus, StoredCommandLog, TIMESTAMPTZ_DIGITS, ToolCallCount,
-    VerifyOutcome, default_snapshot_edges, edge_sort_key, latest_graph_run, latest_live_graph_run,
-    prompt_summary, sort_snapshot_edges,
+    SnapshotDivide, SnapshotEdge, SnapshotGraph, SnapshotJudge, SnapshotMcpServer, SnapshotPart,
+    SnapshotPhase, SnapshotSeat, SnapshotSettings, SnapshotSource, SnapshotTemplate,
+    SnapshotToolbox, SourceHow, StepOpening, StepOutcome, StepRole, StepStatus, StoredCommandLog,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges, edge_sort_key,
+    latest_graph_run, latest_live_graph_run, prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
-    Activation, Attachment, BindingChange, BoundSkill, ChoiceReason, NewSkill, NewSkillVersion,
-    ResolveScope, Skill, SkillBinding, SkillBindingKey, SkillChoice, SkillLevel, SkillPatch,
-    SkillVersion, StepFiles, needs_files,
+    Activation, Attachment, Binding, BindingChange, BindingKey, BindingKind, BindingLevel,
+    BindingRef, BoundSkill, ChoiceReason, NewSkill, NewSkillVersion, ResolveScope, Skill,
+    SkillChoice, SkillPatch, SkillVersion, StepFiles, needs_files,
 };
 pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
