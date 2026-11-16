@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use htui::testkit::Harness;
 use htui::ui::tabs::WorkspacesTab;
-use htui_core::fixtures::ids;
+use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsTab};
+use htui_core::fixtures::{demo_data, ids};
 use htui_core::model::{
     NewTarget, NewWorkspace, TargetId, TargetKind, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
@@ -383,11 +384,12 @@ async fn a_wrong_slug_deletes_nothing() {
 }
 
 /// D10: the store refuses deleting a workspace whose runs would lose their resume (the demo's
-/// Graphics holds a stopped run; its member projects' live runs alone do not refuse, the scope
-/// row's would): its sentence in the box, back at the warning, nothing deleted and nothing on the
-/// status line.
+/// Graphics holds a stopped run): its sentence in the box, back at the warning, nothing deleted
+/// and nothing on the status line. A live run of the scope row refuses through the same sentence
+/// path; which statuses refuse is the store's, pinned for every status by the conformance case
+/// `workspace_delete_refuses_while_a_scope_row_run_is_live` (`htui-core`'s `store::conformance`).
 #[tokio::test]
-async fn a_workspace_with_live_runs_is_refused_in_the_box() {
+async fn a_workspace_with_a_stopped_run_is_refused_in_the_box() {
     let (_dir, home) = temp_home();
     let store = demo(&home).await;
     let mut harness = open_over(store.clone(), &home).await;
@@ -442,6 +444,99 @@ async fn deleting_the_open_workspace_opens_the_first_left() {
         row_with(&frame, "\u{25be} Graphics").contains("\u{25cf} open"),
         "{frame}"
     );
+}
+
+/// D10 (R1b B3): the last workspace deleted leaves nothing to open: no scope move, the tab's
+/// empty state naming `N`, and Settings › Hierarchy says there is no workspace, its `e` and `n`
+/// sending nothing.
+#[tokio::test]
+async fn deleting_the_last_workspace_leaves_the_empty_state() {
+    let (_dir, home) = temp_home();
+    let store = only_workspace();
+    let solo = store
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "solo".to_owned(),
+            name: "Solo".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("a workspace is created");
+    folder_row(&store, &home, solo.id, "solo").await;
+    let home_text = home.display().to_string();
+    let mut harness = Harness::over(store.clone())
+        .size(100, 30)
+        .with_tab(Box::new(WorkspacesTab::new().with_home(Some(&home))))
+        .with_tab(Box::new(SettingsTab::with_sections(vec![
+            Box::new(AgentsSection::new()),
+            Box::new(HierarchySection::new().with_home(Some(&home_text))),
+        ])));
+    harness.settle().await;
+    assert_eq!(harness.app().scope.workspace_id, solo.id);
+    assert_eq!(harness.app().top_bar.workspace, "Solo");
+
+    harness.key("d");
+    harness.settle().await;
+    harness.key("y");
+    type_text(&mut harness, "solo");
+    harness.key("enter");
+    harness.settle().await;
+    assert_eq!(store.workspace(solo.id).await.expect("a read"), None);
+    assert!(home.join("solo").is_dir(), "its folder stays on disk");
+    // No workspace is left to open: the scope is not moved.
+    assert_eq!(harness.app().scope.workspace_id, solo.id);
+    assert_eq!(harness.app().status, None);
+    let frame = harness.render();
+    let panes: String = frame.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert!(!panes.contains("Solo"), "no longer listed:\n{frame}");
+    assert!(!frame.contains("This deletes"), "the box closed:\n{frame}");
+    assert!(frame.contains("No workspaces yet."), "{frame}");
+    assert!(frame.contains("`N` creates one"), "{frame}");
+
+    harness.key("2");
+    harness.settle().await;
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("`N` on the Workspaces tab creates one"),
+        "{frame}"
+    );
+    for key in ["e", "n"] {
+        harness.key(key);
+        assert_eq!(harness.queued(), 0, "`{key}` sends nothing");
+        let frame = harness.render();
+        assert!(
+            frame.contains("no workspace \u{2014} `N` on the Workspaces tab creates one"),
+            "`{key}`:\n{frame}"
+        );
+        harness.key("esc");
+    }
+}
+
+/// The demo's user and box, and no workspace or anything in one.
+fn only_workspace() -> MemStore {
+    let mut data = demo_data();
+    data.workspaces.clear();
+    data.workspace_projects.clear();
+    data.projects.clear();
+    data.item_key_counter.clear();
+    data.items.clear();
+    data.revisions.clear();
+    data.links.clear();
+    data.notes.clear();
+    data.documents.clear();
+    data.runs.clear();
+    data.steps.clear();
+    data.events.clear();
+    data.requirement_specs.clear();
+    data.requirement_areas.clear();
+    data.requirement_key_counter.clear();
+    data.requirements.clear();
+    data.requirement_revisions.clear();
+    data.item_requirements.clear();
+    MemStore::from_demo(data)
 }
 
 /// D12: `e` and `d` on a project row say where projects are edited.

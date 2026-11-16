@@ -12,7 +12,8 @@
 //!
 //! Paths are shown under `~` and sent absolute (D3): [`shown`] writes a path under the tab's home
 //! as `~/…`, [`expanded`] turns a typed leading `~` back into it, and a path that is neither
-//! absolute nor under `~` is refused on the form. The forms read no disk (`R-NF-3`): the worker
+//! absolute nor under `~` is refused on the form; so is a git URL with no scheme that is not
+//! `host:path`, which is a local path too. The forms read no disk (`R-NF-3`): the worker
 //! decides what a folder is.
 //!
 //! Keys go through [`views::WORKSPACES_FORM`]: the focused text field first (so `q`, `l` and the
@@ -43,6 +44,10 @@ use crate::workspace_setup::ProjectSource;
 
 /// What a relative typed folder is told (D3).
 pub(super) const NOT_ABSOLUTE: &str = "the folder must be an absolute path or start with ~";
+
+/// What a URL with no scheme that is not `host:path` is told: it is a local path (D3).
+const NOT_ABSOLUTE_URL: &str =
+    "a URL with no scheme is a local path: it must be absolute or start with ~";
 
 /// The workspace preview's folder line.
 const FOLDER_NOTE: &str = "created now; an existing folder is used as it is";
@@ -348,20 +353,24 @@ impl WorkspaceForm {
             .field(Field::new("description", Value::Text(&self.description)))
             .focus(self.focus)
             .editing(self.busy.is_none());
+        assemble(
+            form.lines(width, ctx.accent(), ctx.theme),
+            self.error.as_deref(),
+            self.busy_text(),
+            &self.preview(),
+            width,
+            ctx.theme,
+        )
+    }
+
+    /// The busy line as drawn, its seconds counted (D7); `None` while no request is out.
+    fn busy_text(&self) -> Option<String> {
         let doing = if self.edit.is_some() {
             "saving the workspace\u{2026}"
         } else {
             "creating the workspace\u{2026}"
         };
-        let busy = self.busy.map(|seconds| counted(doing.to_owned(), seconds));
-        assemble(
-            form.lines(width, ctx.accent(), ctx.theme),
-            self.error.as_deref(),
-            busy,
-            &self.preview(),
-            width,
-            ctx.theme,
-        )
+        self.busy.map(|seconds| counted(doing.to_owned(), seconds))
     }
 
     /// The preview's lines, as a small tree (leading blanks indent): the folder and its
@@ -372,25 +381,29 @@ impl WorkspaceForm {
         if self.edit.is_some() {
             return vec![OLD_FOLDER_STAYS.to_owned()];
         }
-        let folder = text(&self.folder).trim().trim_end_matches('/');
+        let typed = text(&self.folder).trim();
+        let home = self.home.as_deref();
         let mut lines = Vec::new();
-        if folder.is_empty() {
+        if typed.is_empty() {
             // Nothing to follow yet: say where the folder goes once there is a slug.
-            let follows = self
-                .home
-                .as_deref()
+            let follows = home
                 .filter(|_| !self.folder_edited)
                 .map(|home| shown(&home.join(WORKSPACES_DIR), Some(home)));
             lines.push(follows.map_or_else(
                 || TYPE_A_FOLDER.to_owned(),
                 |base| format!("the folder follows the slug: {base}/<slug>"),
             ));
-        } else {
-            lines.push(format!("{folder}/"));
+        } else if let Some(folder) = expanded(typed, home) {
+            // R1b B6: what the submit sends, shown under `~` again; a relative path previews
+            // nothing, as `Enter` refuses it.
+            let folder = shown(&folder, home);
+            lines.push(format!("{}/", folder.trim_end_matches('/')));
             lines.push(format!("  {FOLDER_NOTE}"));
             lines.push(format!("  {}/", htui_core::model::PROJECTS_DIR));
             lines.push(format!("    {PROJECTS_NOTE}"));
             lines.push(COMPONENTS_NOTE.to_owned());
+        } else {
+            lines.push(TYPE_A_FOLDER.to_owned());
         }
         lines.push(String::new());
         lines.push(STARTS_STOPPED.to_owned());
@@ -522,6 +535,11 @@ impl ProjectForm {
         self.workspace
     }
 
+    /// Whether the source choice has the focus (its `h`/`l` act only there, R1b B1).
+    pub(super) fn on_source(&self) -> bool {
+        self.focused() == ProjectField::Source
+    }
+
     /// The workspace's name.
     pub(super) fn workspace_name(&self) -> &str {
         &self.workspace_name
@@ -648,7 +666,8 @@ impl ProjectForm {
         )
     }
 
-    /// `Enter`: name and slug required, the folder absolute or under `~`, the URL non-empty.
+    /// `Enter`: name and slug required, the folder absolute or under `~`, the URL a remote or a
+    /// local path absolute or under `~` ([`clone_url`]).
     fn submit(&mut self) -> FormOutcome {
         let mut required = vec![("name", &self.name), ("slug", &self.slug)];
         match self.source {
@@ -670,8 +689,9 @@ impl ProjectForm {
                 },
                 None => return self.refuse(NOT_ABSOLUTE.to_owned()),
             },
-            SourceKind::Url => ProjectSource::Clone {
-                url: text(&self.location).trim().to_owned(),
+            SourceKind::Url => match clone_url(text(&self.location), self.home.as_deref()) {
+                Some(url) => ProjectSource::Clone { url },
+                None => return self.refuse(NOT_ABSOLUTE_URL.to_owned()),
             },
             SourceKind::NewRepo => ProjectSource::NewRepo,
         };
@@ -732,15 +752,19 @@ impl ProjectForm {
         let form = form
             .focus(self.focus)
             .editing(self.busy.is_none() && self.focused() != ProjectField::Source);
-        let busy = self.busy.map(|seconds| counted(self.busy_line(), seconds));
         assemble(
             form.lines(width, ctx.accent(), ctx.theme),
             self.error.as_deref(),
-            busy,
+            self.busy_text(),
             &self.preview(),
             width,
             ctx.theme,
         )
+    }
+
+    /// The busy line as drawn, its seconds counted (D7); `None` while no request is out.
+    fn busy_text(&self) -> Option<String> {
+        self.busy.map(|seconds| counted(self.busy_line(), seconds))
     }
 
     /// D7: what the request out is doing.
@@ -753,11 +777,15 @@ impl ProjectForm {
                 );
                 format!("registering {path}\u{2026}")
             }
-            SourceKind::Url => format!(
-                "cloning {} into {}\u{2026}",
-                redact_remote(text(&self.location).trim()),
-                self.destination_shown()
-            ),
+            SourceKind::Url => {
+                // A local path under `~` again (R1b B7); a remote without its userinfo.
+                let typed = text(&self.location).trim();
+                let url = expanded(typed, self.home.as_deref()).map_or_else(
+                    || redact_remote(typed),
+                    |path| shown(&path, self.home.as_deref()),
+                );
+                format!("cloning {url} into {}\u{2026}", self.destination_shown())
+            }
             SourceKind::NewRepo => {
                 format!(
                     "creating {} with git init\u{2026}",
@@ -773,9 +801,12 @@ impl ProjectForm {
             SourceKind::Existing => {
                 let typed = text(&self.location).trim();
                 let path = if typed.is_empty() {
-                    "the folder"
+                    "the folder".to_owned()
+                } else if let Some(path) = expanded(typed, self.home.as_deref()) {
+                    shown(&path, self.home.as_deref())
                 } else {
-                    typed
+                    // R1b B6: `Enter` refuses a relative folder, so it previews nothing.
+                    return vec![TYPE_A_FOLDER.to_owned()];
                 };
                 format!(
                     "registers {path} as it is; htui writes nothing in it; plain folders come \
@@ -800,6 +831,21 @@ impl ProjectForm {
     fn name(&self) -> &str {
         text(&self.name)
     }
+}
+
+/// The URL field's `typed` as git is handed it (D3, R1b B7): a URL with a scheme (`…://`) or in
+/// the scp form (`host:path`, no `/` before the first `:`) as it is; anything else is a local
+/// path, `~` expanded under `home`, absolute; `None` for a relative one, which git would resolve
+/// against the clone's working directory.
+fn clone_url(typed: &str, home: Option<&Path>) -> Option<String> {
+    let typed = typed.trim();
+    if let Some(path) = expanded(typed, home) {
+        return Some(path.display().to_string());
+    }
+    let scp = typed
+        .split_once(':')
+        .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'));
+    (typed.contains("://") || scp).then(|| typed.to_owned())
 }
 
 /// What a text field holds (the forms mask nothing).
@@ -1235,14 +1281,160 @@ mod tests {
                 }
             )
         ));
+        assert_eq!(
+            form.busy_text().as_deref(),
+            Some("cloning https://example.com/app.git into ~/graphics/projects/app\u{2026}")
+        );
         form.tick();
         form.tick();
         assert_eq!(
-            super::counted(form.busy_line(), 2),
-            "cloning https://example.com/app.git into ~/graphics/projects/app\u{2026} \u{b7} 2 s"
+            form.busy_text().as_deref(),
+            Some(
+                "cloning https://example.com/app.git into ~/graphics/projects/app\u{2026} \u{b7} 2 s"
+            )
         );
         form.refused("git clone: fatal");
         assert!(!form.is_busy());
+        assert_eq!(form.busy_text(), None);
         assert_eq!(form.error.as_deref(), Some("git clone: fatal"));
+    }
+
+    /// The workspace form's busy line counts its seconds too.
+    #[test]
+    fn a_workspace_s_busy_line_counts_seconds() {
+        let mut form = WorkspaceForm::new(Some(Path::new(HOME)));
+        type_into_workspace(&mut form, "Web");
+        assert_eq!(form.busy_text(), None);
+        assert!(matches!(
+            workspace_key(&mut form, "enter"),
+            FormOutcome::Submit(_)
+        ));
+        form.tick();
+        form.tick();
+        assert_eq!(
+            form.busy_text().as_deref(),
+            Some("creating the workspace\u{2026} \u{b7} 2 s")
+        );
+    }
+
+    /// R1b B6: the preview says only what the submit would send: a relative folder previews the
+    /// line asking for one, a folder under `~` or absolute previews it (shown under `~`).
+    #[test]
+    fn a_relative_folder_previews_no_folder() {
+        let mut form = WorkspaceForm::new(Some(Path::new(HOME)));
+        type_into_workspace(&mut form, "Web");
+        let _ = workspace_key(&mut form, "tab");
+        let _ = workspace_key(&mut form, "tab");
+        for _ in 0.."~/workspaces/web".len() {
+            let _ = workspace_key(&mut form, "backspace");
+        }
+        type_into_workspace(&mut form, "rel/web");
+        assert_eq!(
+            form.preview()[0],
+            super::TYPE_A_FOLDER,
+            "{:?}",
+            form.preview()
+        );
+        assert!(
+            !form.preview().iter().any(|line| line.contains("rel/web")),
+            "{:?}",
+            form.preview()
+        );
+        for _ in 0.."rel/web".len() {
+            let _ = workspace_key(&mut form, "backspace");
+        }
+        type_into_workspace(&mut form, "/home/u/srv/web/");
+        assert_eq!(form.preview()[0], "~/srv/web/", "{:?}", form.preview());
+
+        // A project's existing folder alike.
+        let mut form = ProjectForm::new(
+            ids::WORKSPACE_GRAPHICS,
+            "Graphics",
+            Some(PathBuf::from("/home/u/graphics")),
+            Some(Path::new(HOME)),
+        );
+        type_into_project(&mut form, "App");
+        for _ in 0..4 {
+            let _ = project_key(&mut form, "tab");
+        }
+        type_into_project(&mut form, "rel/app");
+        assert_eq!(form.preview(), [super::TYPE_A_FOLDER]);
+        assert!(matches!(
+            project_key(&mut form, "enter"),
+            FormOutcome::Refused
+        ));
+    }
+
+    /// `Enter` on a project form whose source is a git URL and whose URL field holds `url`.
+    fn clone_of(url: &str) -> (FormOutcome, ProjectForm) {
+        let mut form = ProjectForm::new(
+            ids::WORKSPACE_GRAPHICS,
+            "Graphics",
+            Some(PathBuf::from("/home/u/graphics")),
+            Some(Path::new(HOME)),
+        );
+        type_into_project(&mut form, "App");
+        for _ in 0..3 {
+            let _ = project_key(&mut form, "tab");
+        }
+        let _ = project_key(&mut form, "l");
+        let _ = project_key(&mut form, "tab");
+        form.on_paste(url);
+        (project_key(&mut form, "enter"), form)
+    }
+
+    /// R1b B7 (D3): a URL with no scheme that is not `host:path` is a local path: `~` expands with
+    /// the tab's home and a relative one is refused on the form; a URL with a scheme and the scp
+    /// form reach git as typed.
+    #[test]
+    fn a_url_with_no_scheme_is_a_local_path() {
+        for (typed, sent) in [
+            ("~/src/x.git", "/home/u/src/x.git"),
+            ("~", "/home/u"),
+            ("/srv/x.git", "/srv/x.git"),
+            (" https://example.com/x.git ", "https://example.com/x.git"),
+            ("file:///srv/x.git", "file:///srv/x.git"),
+            ("git@example.com:team/x.git", "git@example.com:team/x.git"),
+            ("example.com:x.git", "example.com:x.git"),
+        ] {
+            let (outcome, _) = clone_of(typed);
+            let FormOutcome::Submit(request) = outcome else {
+                panic!("`{typed}` is sent: {outcome:?}");
+            };
+            let StoreRequest::NewProject {
+                source: ProjectSource::Clone { url },
+                ..
+            } = *request
+            else {
+                panic!("`{typed}` is a clone");
+            };
+            assert_eq!(url, sent, "`{typed}`");
+        }
+        for typed in [
+            "../../remote.git",
+            "rel/x.git",
+            "x.git",
+            "./a:b",
+            "~other/x.git",
+        ] {
+            let (outcome, form) = clone_of(typed);
+            assert!(
+                matches!(outcome, FormOutcome::Refused),
+                "`{typed}`: {outcome:?}"
+            );
+            assert_eq!(
+                form.error.as_deref(),
+                Some(super::NOT_ABSOLUTE_URL),
+                "`{typed}`"
+            );
+            assert!(!form.is_busy());
+        }
+
+        // The busy line shows a local path under `~`.
+        let (_, form) = clone_of("/home/u/remote.git");
+        assert_eq!(
+            form.busy_text().as_deref(),
+            Some("cloning ~/remote.git into ~/graphics/projects/app\u{2026}")
+        );
     }
 }

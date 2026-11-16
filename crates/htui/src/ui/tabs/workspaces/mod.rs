@@ -82,7 +82,7 @@ use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::modal::{Ask, modal_rest};
-use crate::ui::kit::pane::{Focus, Pane};
+use crate::ui::kit::pane::{self, Focus, Pane};
 use crate::ui::kit::scroll::{Scroll, Step, window};
 use crate::ui::shell::{PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
@@ -167,13 +167,26 @@ const EDIT_FORM_HINT: HintSpec = &[
     Hint::One(Act::FormNextField, "field"),
 ];
 
-/// The project form's keys on its pane's border: the workspace form's and the source choice's.
+/// The project form's keys on its pane's border: the workspace form's.
 const PROJECT_FORM_HINT: HintSpec = &[
     Hint::One(Act::FieldSubmit, "create"),
     Hint::One(Act::FieldCancel, "cancel"),
     Hint::One(Act::FormNextField, "field"),
-    Hint::Pair(Act::ChoicePrev, Act::ChoiceNext, "source"),
 ];
+
+/// The project form's keys on the source choice (R1b B1): its own keys first, so the pane's cut
+/// keeps the keys that act on the focused field (as Requirements' priority field does), written
+/// as a choice's are (`←/→ source` under the defaults, whose second chords are `h`/`l`).
+const SOURCE_FORM_HINT: HintSpec = &[
+    Hint::Glyphs(Act::ChoicePrev, Act::ChoiceNext, "source"),
+    Hint::One(Act::FieldSubmit, "create"),
+    Hint::One(Act::FieldCancel, "cancel"),
+    Hint::One(Act::FormNextField, "field"),
+];
+
+/// A form's keys while its request is out (D7, R1b B5): every key but `Esc` is swallowed, and
+/// `Esc` only closes the form (nothing out is cancelled).
+const BUSY_FORM_HINT: HintSpec = &[Hint::One(Act::FieldCancel, "close")];
 
 /// The hint row of a workspace with nothing to stop or resume (M1's).
 const HINT_IDLE: HintSpec = &[
@@ -1462,7 +1475,8 @@ impl WorkspacesTab {
     /// cursor lands on its group. It is not opened, unless the shell's scope names no workspace
     /// the tab lists (a first start), so the shell is never left without one.
     fn workspace_created(&mut self, workspace: &WorkspaceSummary, ctx: &Ctx<'_>) {
-        if matches!(self.mode, Mode::Workspace(_)) {
+        // R1b B4: only the form waiting on it; one opened since the first was closed stays.
+        if matches!(&self.mode, Mode::Workspace(form) if form.is_busy()) {
             self.mode = Mode::Browse;
         }
         self.land_on = Some(Entry::Workspace(workspace.workspace_id));
@@ -1573,12 +1587,16 @@ impl WorkspacesTab {
         }
     }
 
-    /// MOD-116 M3: the open form's keys, through [`views::WORKSPACES_FORM`]; none without one or
-    /// while a question is up.
+    /// MOD-116 M3: the open form's keys, through [`views::WORKSPACES_FORM`]: the source choice's
+    /// own first while it has the focus, `Esc close` alone while the request is out (R1b B1, B5);
+    /// none without a form or while a question is up.
     fn form_hints(&self, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         let spec = match (&self.question, &self.mode) {
+            (None, Mode::Workspace(form) | Mode::Editing(form)) if form.is_busy() => BUSY_FORM_HINT,
+            (None, Mode::Project(form)) if form.is_busy() => BUSY_FORM_HINT,
             (None, Mode::Workspace(_)) => WORKSPACE_FORM_HINT,
             (None, Mode::Editing(_)) => EDIT_FORM_HINT,
+            (None, Mode::Project(form)) if form.on_source() => SOURCE_FORM_HINT,
             (None, Mode::Project(_)) => PROJECT_FORM_HINT,
             _ => return None,
         };
@@ -2018,27 +2036,37 @@ impl Tab for WorkspacesTab {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let areas = ctx.split(area, WORKSPACES_LAYOUT);
         let form = self.mode.has_form();
-        // A form's keys go on whichever of the tab's panes is focused, as the browse keys do.
-        let hints = if form {
-            self.form_hints(ctx)
-        } else {
-            self.browse_hints(ctx)
-        };
         let detail = !areas.detail.is_empty();
-        if let Some(list) = areas.list.filter(|rect| !rect.is_empty()) {
-            let focus = ctx.pane_focus(PaneId::List);
-            if form && !detail {
-                self.render_form(frame, list, focus, hints.as_ref(), ctx);
+        // R1b B1: a form holds the keys, so its pane is drawn as the focused one and carries
+        // its keys on its own border (the list beside it is not focused); browsing, the keys go
+        // on whichever of the tab's panes is focused.
+        let activity = areas.activity.is_some_and(|rect| !rect.is_empty());
+        let (list_focus, detail_focus, hints) = if form {
+            let holder = pane::holder(ctx, activity);
+            if detail {
+                (Focus::Unfocused, holder, self.form_hints(ctx))
             } else {
-                self.render_list(frame, list, focus, hints.as_ref(), ctx);
+                (holder, Focus::Unfocused, self.form_hints(ctx))
+            }
+        } else {
+            (
+                ctx.pane_focus(PaneId::List),
+                ctx.pane_focus(PaneId::Detail),
+                self.browse_hints(ctx),
+            )
+        };
+        if let Some(list) = areas.list.filter(|rect| !rect.is_empty()) {
+            if form && !detail {
+                self.render_form(frame, list, list_focus, hints.as_ref(), ctx);
+            } else {
+                self.render_list(frame, list, list_focus, hints.as_ref(), ctx);
             }
         }
         if detail {
-            let focus = ctx.pane_focus(PaneId::Detail);
             if form {
-                self.render_form(frame, areas.detail, focus, hints.as_ref(), ctx);
+                self.render_form(frame, areas.detail, detail_focus, hints.as_ref(), ctx);
             } else {
-                self.render_detail(frame, areas.detail, focus, hints.as_ref(), ctx);
+                self.render_detail(frame, areas.detail, detail_focus, hints.as_ref(), ctx);
             }
         }
         match &self.mode {

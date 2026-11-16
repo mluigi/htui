@@ -8,9 +8,10 @@
 //! workspace with no folder row under the real home, so no case creates a project in one. The
 //! tab shows paths under `~`, so the frames do not depend on where the temp dir is.
 //!
-//! The git cases (`skip_without_git!`) clone from a local bare repository, by a path relative to
-//! the clone's working directory (`<home>/graphics/projects`), so its frames are stable too; no
-//! case reaches the network.
+//! The git cases (`skip_without_git!`) clone from a local bare repository at `<home>/remote.git`,
+//! typed under `~` (R1b B7: a URL with no scheme is a local path, `~` expanded with the tab's home)
+//! so its frames are stable too, or absolute where no frame is snapshotted; no case reaches the
+//! network.
 #![cfg(feature = "testkit")]
 
 use std::ffi::OsStr;
@@ -114,6 +115,19 @@ fn row_with(frame: &str, needle: &str) -> String {
         .to_owned()
 }
 
+/// The detail pane's words, one space between each (a long line wraps there).
+fn detail_text(frame: &str) -> String {
+    let words: Vec<&str> = frame
+        .lines()
+        .filter_map(|line| {
+            line.split_once("\u{2502}\u{2502}")
+                .map(|(_, detail)| detail)
+        })
+        .flat_map(|detail| detail.trim_end_matches('\u{2502}').split_whitespace())
+        .collect();
+    words.join(" ")
+}
+
 /// The list's selected row (the cursor's `▌` in the list's first column).
 fn selected(frame: &str) -> String {
     frame
@@ -121,6 +135,36 @@ fn selected(frame: &str) -> String {
         .find(|line| line.starts_with("\u{2502}\u{258c}"))
         .unwrap_or_else(|| panic!("no row is selected:\n{frame}"))
         .to_owned()
+}
+
+/// The rows of the `New` chooser's box, between its borders, trailing blanks dropped.
+fn chooser_rows(frame: &str) -> Vec<String> {
+    let lines: Vec<Vec<char>> = frame.lines().map(|line| line.chars().collect()).collect();
+    let (top, left) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(y, line)| {
+            let text: String = line.iter().collect();
+            text.find("\u{256d} New ")
+                .map(|at| (y, text[..at].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("no chooser box:\n{frame}"));
+    let right = lines[top][left..]
+        .iter()
+        .position(|c| *c == '\u{256e}')
+        .map(|at| left + at)
+        .unwrap_or_else(|| panic!("the chooser box has no right corner:\n{frame}"));
+    lines[top + 1..]
+        .iter()
+        .take_while(|line| line.get(left) != Some(&'\u{2570}'))
+        .map(|line| {
+            line[left + 1..right]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
 }
 
 /// `N`, then the chooser's second row (`project in <name>`): the project form.
@@ -149,9 +193,8 @@ async fn git_ok(git: &Cli, cwd: &Path, args: &[&str]) {
     assert!(exited.ok(), "git {args:?} failed: {}", exited.stderr);
 }
 
-/// A bare repository `<home>/remote.git` holding one commit on `main`; the URL a clone into
-/// `<home>/graphics/projects/<slug>` reaches it by, relative to that clone's working directory.
-async fn bare_remote(git: &Cli, home: &Path) -> &'static str {
+/// A bare repository `<home>/remote.git` holding one commit on `main`; its absolute path.
+async fn bare_remote(git: &Cli, home: &Path) -> PathBuf {
     let source = home.join("source");
     std::fs::create_dir(&source).expect("the source dir");
     let _ = repo_with_one_commit(&source);
@@ -181,7 +224,7 @@ async fn bare_remote(git: &Cli, home: &Path) -> &'static str {
         ],
     )
     .await;
-    "../../remote.git"
+    remote
 }
 
 /// D1: `N` offers a workspace, or a project in the selected row's workspace (Graphics, open).
@@ -192,11 +235,11 @@ async fn n_offers_a_workspace_or_a_project_in_the_selected_workspace() {
     harness.key("N");
     let frame = harness.render();
     assert!(frame.contains(" New "), "{frame}");
-    assert!(
-        row_with(&frame, "workspace ").contains("workspace"),
+    assert_eq!(
+        chooser_rows(&frame),
+        ["\u{258c}workspace", " project in Graphics"],
         "{frame}"
     );
-    assert!(frame.contains("project in Graphics"), "{frame}");
     insta::assert_snapshot!("chooser_100", frame);
 
     // `n` closes it; `j`, `y` choose the project.
@@ -313,19 +356,48 @@ async fn a_taken_slug_keeps_the_form_and_says_so() {
     assert!(frame.contains("graphics"), "{frame}");
     assert_eq!(harness.app().status, None);
     assert!(!home.join("workspaces").join("graphics").exists());
-    let message = frame
-        .lines()
-        .skip_while(|line| !line.contains("description"))
-        .nth(2)
-        .unwrap_or_default()
-        .to_owned();
+    // R1b B2: the store's refusal under the form, and the busy line gone.
     assert!(
-        message
-            .trim_matches(|c: char| c == '\u{2502}' || c.is_whitespace())
-            .len()
-            > 3,
-        "a message under the form:\n{frame}"
+        !frame.contains("creating the workspace"),
+        "no longer busy:\n{frame}"
     );
+    assert!(
+        detail_text(&frame).contains(
+            "description constraint violated: workspace.slug `graphics` is taken ~/workspaces/"
+        ),
+        "the store's words right under the fields:\n{frame}"
+    );
+}
+
+/// R1b B4: a create's reply closes only the form that sent it: submitted, closed while out, and
+/// a new form opened and typed in, the first reply leaves the new form as it is.
+#[tokio::test]
+async fn a_create_reply_leaves_a_later_form_open() {
+    let (_dir, home) = temp_home();
+    let mut harness = open_over(demo(&home).await, &home).await;
+    harness.key("N");
+    harness.key("enter");
+    type_text(&mut harness, "Mobile App");
+    harness.key("enter");
+    harness.key("esc");
+    harness.key("N");
+    harness.key("enter");
+    type_text(&mut harness, "Web");
+    harness.settle().await;
+
+    assert!(home.join("workspaces").join("mobile-app").is_dir());
+    let frame = harness.render();
+    assert!(frame.contains("New workspace"), "the form stays:\n{frame}");
+    assert!(row_with(&frame, "name").contains("Web"), "{frame}");
+    assert!(
+        row_with(&frame, "\u{25be} Mobile App").contains("\u{25cb} stopped"),
+        "the first create landed:\n{frame}"
+    );
+    harness.key("enter");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(!frame.contains("New workspace"), "{frame}");
+    assert!(home.join("workspaces").join("web").is_dir());
 }
 
 /// `Esc` closes the form and nothing is written.
@@ -388,16 +460,17 @@ async fn a_git_url_project_shows_its_progress_then_lands() {
         return;
     };
     let (_dir, home) = temp_home();
-    let url = bare_remote(&git, &home).await;
+    let _ = bare_remote(&git, &home).await;
     let mut harness = open_over(demo(&home).await, &home).await;
     open_project_form(&mut harness);
     name_and_source(&mut harness, "Shaders", 1);
     harness.key("tab");
-    type_text(&mut harness, url);
+    // R1b B7: `~` is expanded with the tab's (temp) home before git sees it.
+    type_text(&mut harness, "~/remote.git");
     harness.key("enter");
     let frame = harness.render();
     assert!(
-        frame.contains("cloning ../../remote.git into") && frame.contains("shaders\u{2026}"),
+        frame.contains("cloning ~/remote.git into") && frame.contains("shaders\u{2026}"),
         "{frame}"
     );
     insta::assert_snapshot!("project_progress_100", frame);
@@ -442,12 +515,12 @@ async fn esc_while_cloning_closes_the_form_and_the_outcome_is_told() {
         return;
     };
     let (_dir, home) = temp_home();
-    let url = bare_remote(&git, &home).await;
+    let remote = bare_remote(&git, &home).await;
     let mut harness = open_over(demo(&home).await, &home).await;
     open_project_form(&mut harness);
     name_and_source(&mut harness, "Shaders", 1);
     harness.key("tab");
-    type_text(&mut harness, url);
+    harness.paste(&remote.display().to_string());
     harness.key("enter");
     harness.key("esc");
     let frame = harness.render();
