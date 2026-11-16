@@ -9,9 +9,9 @@
 use htui_agent::event::{PlanEntryStatus, StopReason, ToolKind};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    Activation, Billing, BindingLevel, CitationKind, CommandQueue, Gate, GateOutcome, Isolation,
-    LinkKind, OsFamily, Priority, RequirementState, Resolution, RunKind, RunMode, RunStatus,
-    StepStatus, Transport,
+    Activation, Billing, BindingKind, BindingLevel, CitationKind, CommandQueue, Gate, GateOutcome,
+    Isolation, LinkKind, McpTransport, OsFamily, Priority, RequirementState, Resolution, RunKind,
+    RunMode, RunStatus, StepStatus, Transport,
 };
 use htui_core::prompt::BudgetSource;
 use ratatui::style::Style;
@@ -345,6 +345,24 @@ pub const fn skill_level(level: BindingLevel) -> &'static str {
     }
 }
 
+/// What an attachment attaches (MOD-127 M2 D1).
+#[must_use]
+pub const fn binding_kind(kind: BindingKind) -> &'static str {
+    match kind {
+        BindingKind::Skill => "skill",
+        BindingKind::McpServer => "MCP server",
+    }
+}
+
+/// How an agent reaches an MCP server (MOD-127 M2 D2).
+#[must_use]
+pub const fn mcp_transport(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Http => "http",
+    }
+}
+
 /// A count with its noun: `1 option`, `0 options`, `3 options`. Never `option(s)`.
 #[must_use]
 pub fn plural(count: usize, one: &str, many: &str) -> String {
@@ -399,6 +417,28 @@ mod tests {
             BindingLevel::ItemKind => Some(BindingLevel::Phase),
             BindingLevel::Phase => None,
         }
+    }
+
+    /// `BindingKind` is a plain enum without a generated `ALL`: by hand, checked against
+    /// [`binding_kind_after`] as [`SKILL_LEVELS`] is.
+    const BINDING_KINDS: [BindingKind; 2] = [BindingKind::Skill, BindingKind::McpServer];
+
+    /// The kind after `kind`; a new variant needs an arm here.
+    const fn binding_kind_after(kind: BindingKind) -> Option<BindingKind> {
+        match kind {
+            BindingKind::Skill => Some(BindingKind::McpServer),
+            BindingKind::McpServer => None,
+        }
+    }
+
+    #[test]
+    fn the_binding_kind_hand_list_is_complete() {
+        let mut chain = vec![BindingKind::Skill];
+        while let Some(next) = chain.last().copied().and_then(binding_kind_after) {
+            assert!(!chain.contains(&next), "the chain loops at {next:?}");
+            chain.push(next);
+        }
+        assert_eq!(BINDING_KINDS.as_slice(), chain.as_slice());
     }
 
     #[test]
@@ -491,6 +531,14 @@ mod tests {
             (
                 "BindingLevel",
                 words(&SKILL_LEVELS, BindingLevel::as_str, skill_level),
+            ),
+            (
+                "BindingKind",
+                words(&BINDING_KINDS, BindingKind::as_str, binding_kind),
+            ),
+            (
+                "McpTransport",
+                words(McpTransport::ALL, McpTransport::as_str, mcp_transport),
             ),
         ]
     }
@@ -841,6 +889,14 @@ mod tests {
         assert_eq!(
             labels(&words(&SKILL_LEVELS, BindingLevel::as_str, skill_level)),
             ["global", "workspace", "project", "item kind", "phase"]
+        );
+        assert_eq!(
+            labels(&words(&BINDING_KINDS, BindingKind::as_str, binding_kind)),
+            ["skill", "MCP server"]
+        );
+        assert_eq!(
+            words(McpTransport::ALL, McpTransport::as_str, mcp_transport),
+            [("stdio", "stdio"), ("http", "http")]
         );
     }
 

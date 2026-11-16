@@ -612,7 +612,7 @@ pub enum Act {
     SwitcherSwitch,
     /// `waiting.open`: open the selected waiting step.
     WaitingOpen,
-    /// `skills.switch_view`: toggle between the Library and Templates views.
+    /// `skills.switch_view`: cycle through the Skills tab's views (Skills, Templates, MCP servers).
     SkillsSwitchView,
     /// `skills.prev_version`: move the version cursor to the older version.
     SkillsPrevVersion,
@@ -1810,7 +1810,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::WaitingOpen, Waiting, "open", &["enter"], "open step"),
     // [skills]: the verbs Library and Templates share (MOD-67 M4 D2), one row each, so
     // `[skills.library]` and `[skills.templates]` may override them per view.
-    // skills/mod.rs:111-118: one toggle between two views (D2), so no next/prev pair.
+    // skills/mod.rs: one cycle through the views (D2, MOD-127 M2 T8), so no next/prev pair.
     // MOD-115 M2 T6: the shift arrows, as on `pane.next_subtab`.
     row(
         Act::SkillsSwitchView,

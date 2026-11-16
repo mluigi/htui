@@ -2654,7 +2654,9 @@ mod tests {
 
         // RV3 (review M1): each view's cursor moves off the row first, so a restore that put
         // back only the view would leave it there.
-        tab.on_key(key('h'), &mut bench.ctx());
+        // (MOD-127 M2 T8: the switch cycles through the MCP servers view.)
+        tab.on_key(key('l'), &mut bench.ctx());
+        tab.on_key(key('l'), &mut bench.ctx());
         tab.on_key(key('j'), &mut bench.ctx());
         assert_eq!(tab.location().subtab, Some("library"));
         assert_ne!(tab.location(), library, "the library's cursor moved");

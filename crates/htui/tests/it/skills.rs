@@ -31,8 +31,8 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
-    Activation, Attachment, Binding, BindingChange, BindingKey, NewRepo, NewSkillVersion,
-    RepoBoxPath, RepoId, SkillVersion,
+    Activation, Attachment, Binding, BindingChange, BindingKey, EnvValue, McpServerId,
+    McpTransport, NewMcpServer, NewRepo, NewSkillVersion, RepoBoxPath, RepoId, SkillVersion,
 };
 use htui_core::model::{Agent, AgentBox, AgentId, Billing, EventKind, Scope, Transport};
 use htui_core::store::{
@@ -2134,7 +2134,9 @@ async fn the_pane_takes_motion_and_back_returns_to_the_skill_left() {
     );
     // RV3 (review M1): back on the library, its cursor moves off `tests`, so the Back that
     // returns there has to put the row back, not only the view.
-    harness.key("h");
+    // (MOD-127 M2 T8: around the cycle through the MCP servers view.)
+    harness.key("l");
+    harness.key("l");
     harness.key("k");
     harness.settle().await;
     let frame = harness.render();
@@ -2142,6 +2144,7 @@ async fn the_pane_takes_motion_and_back_returns_to_the_skill_left() {
         !titled(&frame, "tests v"),
         "the cursor left `tests`:\n{frame}"
     );
+    harness.key("backspace");
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();
@@ -2182,7 +2185,8 @@ async fn back_lands_on_the_skill_left_after_a_create_moved_its_row() {
     select(&mut harness, "tests");
     // To the Templates view and back: the library's place is in the history.
     harness.key("l");
-    harness.key("h");
+    harness.key("l");
+    harness.key("l");
     harness.settle().await;
     harness.key("n");
     type_text(&mut harness, "aaa-docs");
@@ -2197,11 +2201,11 @@ async fn back_lands_on_the_skill_left_after_a_create_moved_its_row() {
         titled(&frame, "aaa-docs v1 (head v1)"),
         "the new skill, first in the library, is under the cursor:\n{frame}"
     );
-    harness.key("backspace");
-    harness.settle().await;
-    harness.render();
-    harness.key("backspace");
-    harness.settle().await;
+    for _ in 0..3 {
+        harness.key("backspace");
+        harness.settle().await;
+        harness.render();
+    }
     let frame = harness.render();
     assert!(titled(&frame, "tests v"), "back on `tests`:\n{frame}");
 }
@@ -2236,4 +2240,359 @@ async fn the_library_at_80_columns() {
         "the list's keys: {frame}"
     );
     insta::assert_snapshot!("library_80", frame);
+}
+
+// --- the MCP servers view (MOD-127 M2 T8) -------------------------------------------------------
+
+/// Switches the open Skills tab to the MCP servers view: `skills.switch_view` twice, past
+/// Templates.
+fn to_servers(harness: &mut Harness) {
+    harness.key("l");
+    harness.key("l");
+}
+
+/// One stdio server named `name`, straight into the store, as another session would.
+async fn add_server(store: &MemStore, name: &str) -> McpServerId {
+    let id = McpServerId::new();
+    store
+        .create_mcp_server(NewMcpServer {
+            id,
+            name: name.to_owned(),
+            description: format!("the {name} tools"),
+            transport: McpTransport::Stdio,
+            command: format!("mcp-{name}"),
+            args: vec!["--stdio".to_owned()],
+            url: None,
+            headers: Vec::new(),
+            env: vec![
+                ("LOG".to_owned(), EnvValue::Literal("info".to_owned())),
+                (
+                    "DOCS_KEY".to_owned(),
+                    EnvValue::Secret("DOCS_API_KEY".to_owned()),
+                ),
+            ],
+            allow: vec!["search".to_owned()],
+            deny: vec!["delete".to_owned()],
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the server write");
+    id
+}
+
+/// The servers the store holds, by name.
+async fn servers(store: &MemStore) -> Vec<htui_core::model::McpServer> {
+    store.mcp_servers().await.expect("the servers read")
+}
+
+/// MOD-127 M2 T8: `n` opens the form, its fields take the record's columns (env entries as
+/// `NAME=value`, a secret as `NAME=@SECRET`), and `Ctrl+S` creates the server.
+#[tokio::test]
+async fn create_a_stdio_server_through_the_form() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    to_servers(&mut harness);
+    let frame = harness.render();
+    assert!(
+        frame.contains("no MCP servers"),
+        "the empty state says so: {frame}"
+    );
+    harness.key("n");
+    let frame = harness.render();
+    assert!(
+        titled(&frame, "new MCP server"),
+        "the form's title: {frame}"
+    );
+    type_text(&mut harness, "docs");
+    harness.key("tab");
+    type_text(&mut harness, "Docs lookup");
+    harness.key("tab"); // the transport: stdio stays
+    harness.key("tab");
+    type_text(&mut harness, "mcp-docs");
+    harness.key("tab");
+    type_text(&mut harness, "--stdio --root \"/srv/my docs\"");
+    harness.key("tab");
+    type_text(&mut harness, "LOG=info DOCS_KEY=@DOCS_API_KEY");
+    harness.key("tab");
+    type_text(&mut harness, "search fetch");
+    harness.key("tab");
+    type_text(&mut harness, "delete");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let rows = servers(&store).await;
+    assert_eq!(rows.len(), 1, "one server: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.name, "docs");
+    assert_eq!(row.description, "Docs lookup");
+    assert_eq!(row.transport, McpTransport::Stdio);
+    assert_eq!(row.command, "mcp-docs");
+    assert_eq!(row.args, ["--stdio", "--root", "/srv/my docs"]);
+    assert_eq!(row.url, None);
+    assert_eq!(
+        row.env,
+        vec![
+            ("LOG".to_owned(), EnvValue::Literal("info".to_owned())),
+            (
+                "DOCS_KEY".to_owned(),
+                EnvValue::Secret("DOCS_API_KEY".to_owned())
+            ),
+        ]
+    );
+    assert_eq!(row.allow, ["search", "fetch"]);
+    assert_eq!(row.deny, ["delete"]);
+    let frame = harness.render();
+    assert!(notice(&frame).contains("created `docs`"), "{frame}");
+    assert!(
+        !frame.contains("transport   \u{2039}"),
+        "the form closed on landing: {frame}"
+    );
+    assert!(line_with(&frame, "docs").contains("stdio"), "{frame}");
+    assert!(frame.contains("mcp-docs --stdio"), "the command: {frame}");
+    assert!(
+        frame.contains("DOCS_KEY=@DOCS_API_KEY"),
+        "the secret by name: {frame}"
+    );
+}
+
+/// MOD-127 M2 T8: a literal value under a key that looks secret is refused on the form, in the
+/// store's own sentence, before anything is sent; the same entry as a reference saves.
+#[tokio::test]
+async fn a_literal_secret_is_refused_inline() {
+    const SENTINEL: &str = "sentinel-value-0451";
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    to_servers(&mut harness);
+    harness.key("n");
+    type_text(&mut harness, "wiki");
+    harness.key("tab");
+    harness.key("tab");
+    harness.key("tab");
+    type_text(&mut harness, "mcp-wiki");
+    harness.key("tab");
+    harness.key("tab");
+    type_text(&mut harness, &format!("API_TOKEN={SENTINEL}"));
+    let frame = harness.render();
+    assert!(
+        frame.contains("looks like a secret") && frame.contains("secret reference"),
+        "the refusal is on the form while typing: {frame}"
+    );
+    harness.key("ctrl-s");
+    harness.settle().await;
+    assert!(servers(&store).await.is_empty(), "nothing was written");
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("looks like a secret"),
+        "the notice repeats it: {frame}"
+    );
+    // The entry as a reference: the field holds the name and the form saves.
+    for _ in 0..(SENTINEL.len()) {
+        harness.key("backspace");
+    }
+    type_text(&mut harness, "@WIKI_TOKEN");
+    let frame = harness.render();
+    assert!(
+        !frame.contains("looks like a secret"),
+        "a reference is no refusal: {frame}"
+    );
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let rows = servers(&store).await;
+    assert_eq!(
+        rows.iter().map(|row| row.env.clone()).collect::<Vec<_>>(),
+        vec![vec![(
+            "API_TOKEN".to_owned(),
+            EnvValue::Secret("WIKI_TOKEN".to_owned())
+        )]]
+    );
+    let stored = format!("{rows:?}");
+    assert!(!stored.contains(SENTINEL), "no value anywhere: {stored}");
+    let frame = harness.render();
+    assert!(!frame.contains(SENTINEL), "no value on screen: {frame}");
+}
+
+/// MOD-127 M2 T8: the attachments pane over a server: a workspace row and an item-kind row write
+/// keys of the `mcp_server` kind; the activation cycles `always` and `off` and never `glob`; no
+/// pin, position or glob is asked.
+#[tokio::test]
+async fn attach_a_server_at_workspace_and_item_kind_level() {
+    let store = MemStore::demo();
+    let server = add_server(&store, "docs").await;
+    let mut harness = open_platform_over(store.clone()).await;
+    to_servers(&mut harness);
+    harness.key("a");
+    let frame = harness.render();
+    assert!(
+        frame.contains("attachments \u{b7} docs"),
+        "the pane's title: {frame}"
+    );
+    for label in ["global", "workspace Platform", "htui", "item kind ANA"] {
+        assert!(frame.contains(label), "row `{label}`: {frame}");
+    }
+    harness.key("j");
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        frame.contains("attach docs \u{b7} workspace Platform"),
+        "the form's title: {frame}"
+    );
+    assert!(
+        !frame.contains("pin") && !frame.contains("globs") && !frame.contains("position"),
+        "a server has no pin, position or globs: {frame}"
+    );
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let rows = store
+        .skill_bindings(BindingHome::Workspace(ids::WORKSPACE_PLATFORM))
+        .await
+        .expect("the workspace rows");
+    assert_eq!(rows.len(), 1, "one workspace row: {rows:?}");
+    assert_eq!(rows[0].skill_id.as_uuid(), server.as_uuid());
+    assert_eq!(
+        (rows[0].activation, rows[0].pinned_version, rows[0].position),
+        (Activation::Always, None, 0)
+    );
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("attached to workspace Platform"),
+        "{frame}"
+    );
+    assert!(
+        line_with(&frame, "workspace Platform").contains("always"),
+        "{frame}"
+    );
+
+    // The item-kind row: `Space` cycles always, off, always, never glob.
+    harness.key("j");
+    harness.key("j");
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        frame.contains("attach docs \u{b7} htui item kind ANA"),
+        "{frame}"
+    );
+    harness.key("space");
+    let frame = harness.render();
+    assert!(
+        line_has(&frame, &["activation", "off"]) && !frame.contains("by glob"),
+        "off after always: {frame}"
+    );
+    harness.key("space");
+    let frame = harness.render();
+    assert!(
+        line_has(&frame, &["activation", "always"]) && !frame.contains("by glob"),
+        "back to always, never by glob: {frame}"
+    );
+    harness.key("space");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let rows = store
+        .skill_bindings(BindingHome::Project(ids::PROJECT_HTUI))
+        .await
+        .expect("the project rows");
+    let row = rows
+        .iter()
+        .find(|row| row.item_kind_id == Some(ids::KIND_HTUI_ANA))
+        .unwrap_or_else(|| panic!("the item-kind row: {rows:?}"));
+    assert_eq!(row.activation, Activation::Off);
+    assert_eq!(row.skill_id.as_uuid(), server.as_uuid());
+    let frame = harness.render();
+    assert!(
+        line_with(&frame, "item kind ANA").contains("off"),
+        "the row says off: {frame}"
+    );
+}
+
+/// MOD-127 M2 T8: `d` asks first and names how many attachments the delete takes with it; any
+/// other key keeps the server, `y` deletes it and them.
+#[tokio::test]
+async fn deleting_a_server_names_its_bindings() {
+    let store = MemStore::demo();
+    let server = add_server(&store, "docs").await;
+    let other = add_server(&store, "build").await;
+    for key in [
+        BindingKey::global(server),
+        BindingKey::workspace(server, ids::WORKSPACE_PLATFORM),
+        BindingKey::global(other),
+    ] {
+        set_binding(&store, key, None, BindingChange::Attach(always())).await;
+    }
+    let mut harness = open_platform_over(store.clone()).await;
+    to_servers(&mut harness);
+    // `build` sorts before `docs`.
+    harness.key("j");
+    harness.key("d");
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("delete `docs`") && notice(&frame).contains("2 attachments"),
+        "the question names the count: {frame}"
+    );
+    harness.key("n");
+    harness.settle().await;
+    assert_eq!(servers(&store).await.len(), 2, "any other key keeps it");
+    assert!(notice(&harness.render()).contains("kept"));
+    harness.key("d");
+    harness.key("y");
+    harness.settle().await;
+    let rows = servers(&store).await;
+    assert_eq!(
+        rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+        ["build"]
+    );
+    let global = store
+        .skill_bindings(BindingHome::Global)
+        .await
+        .expect("the global rows");
+    assert_eq!(
+        global
+            .iter()
+            .map(|row| row.skill_id.as_uuid())
+            .collect::<Vec<_>>(),
+        [other.as_uuid()],
+        "only the other server's row is left"
+    );
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("deleted `docs`") && notice(&frame).contains("2 attachments"),
+        "{frame}"
+    );
+}
+
+/// MOD-127 M2 T8: the list, and the record beside it: a stdio server with a secret by name, an
+/// http server with a header.
+#[tokio::test]
+async fn mcp_servers() {
+    let store = MemStore::demo();
+    add_server(&store, "docs").await;
+    store
+        .create_mcp_server(NewMcpServer {
+            id: McpServerId::new(),
+            name: "wiki".to_owned(),
+            description: String::new(),
+            transport: McpTransport::Http,
+            command: String::new(),
+            args: Vec::new(),
+            url: Some("https://wiki.example.test/mcp".to_owned()),
+            headers: vec![(
+                "Authorization".to_owned(),
+                EnvValue::Secret("WIKI_TOKEN".to_owned()),
+            )],
+            env: Vec::new(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the http server");
+    let mut harness = open_over(store).await;
+    to_servers(&mut harness);
+    let frame = harness.render();
+    assert!(titled(&frame, "docs \u{b7} stdio"), "{frame}");
+    insta::assert_snapshot!("mcp_servers", frame);
+    harness.key("j");
+    let frame = harness.render();
+    assert!(titled(&frame, "wiki \u{b7} http"), "{frame}");
+    assert!(
+        frame.contains("Authorization=@WIKI_TOKEN"),
+        "the header's secret by name: {frame}"
+    );
 }

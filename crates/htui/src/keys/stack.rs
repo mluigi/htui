@@ -382,6 +382,9 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     // MOD-122 M3 D10: the shell's activity panel, appended so every first-reported phrase is
     // unchanged.
     ("in the activity panel", views::ACTIVITY_BROWSE),
+    ("in Skills > MCP servers", views::MCP_BROWSE),
+    ("in the MCP server form", views::MCP_FORM),
+    ("in the MCP server delete question", views::MCP_CONFIRM),
 ];
 
 impl Keys {
@@ -475,11 +478,16 @@ mod tests {
         // MOD-115 M2 T6: the quit question's entry went with it; MOD-122 D5 adds Settings >
         // Logging's before it.
         // MOD-141 D12: the graph editor's six; M2 D14: its part form's.
-        // MOD-147 M3 D9: the owner documents pane's three; MOD-122 M3 D10: the activity panel.
-        assert_eq!(DECLARED.len(), 102);
+        // MOD-147 M3 D9: the owner documents pane's three; MOD-122 M3 D10: the activity panel;
+        // MOD-127 M2 T8: the MCP servers view's three.
+        assert_eq!(DECLARED.len(), 105);
         assert_eq!(
             DECLARED[101],
             ("in the activity panel", views::ACTIVITY_BROWSE)
+        );
+        assert_eq!(
+            DECLARED[102],
+            ("in Skills > MCP servers", views::MCP_BROWSE)
         );
         assert_eq!(DECLARED[83], ("in the leave dialog", views::LEAVE));
         // MOD-122 D4: the Logs tab, appended after it.

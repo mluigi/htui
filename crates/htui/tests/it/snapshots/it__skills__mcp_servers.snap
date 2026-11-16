@@ -1,0 +1,33 @@
+---
+source: crates/htui/tests/skills.rs
+expression: frame
+---
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            0 waiting ·  ?  keys
+╭─────‹ Templates  MCP servers ╮╭─ docs · stdio ───────────────────────────────────────────────────╮
+│▌  docs                  stdio││the docs tools                                                    │
+│   wiki                  http ││                                                                  │
+│                              ││command  mcp-docs --stdio                                         │
+│                              ││env      LOG=info                                                 │
+│                              ││         DOCS_KEY=@DOCS_API_KEY                                   │
+│                              ││allow    search                                                   │
+│                              ││deny     delete                                                   │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+╰─j/k · n new──────────────────╯╰──────────────────────────────────────────────────────────────────╯

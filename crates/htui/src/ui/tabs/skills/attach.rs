@@ -19,13 +19,15 @@
 //! still the only source of what a save writes.
 
 use chrono::{DateTime, Utc};
+use htui_core::model::McpServer;
+use htui_core::model::mcp::{McpCandidate, resolve_mcp};
 use htui_core::model::skill::resolve;
 use htui_core::model::skill_glob::{SkillGlobs, canonical_globs, split_list};
 use htui_core::model::skill_import::prefill_from_source;
 use htui_core::model::skill_language;
 use htui_core::model::{
-    Activation, Attachment, Binding, BindingChange, BindingKey, BindingLevel, ItemKindId, PhaseId,
-    ProjectId, SkillGlob, SkillId, WorkspaceId,
+    Activation, Attachment, Binding, BindingChange, BindingKey, BindingKind, BindingLevel,
+    BindingRef, ItemKindId, PhaseId, ProjectId, SkillGlob, WorkspaceId,
 };
 use htui_core::store::{
     glob_names_unknown_repo, global_glob_names_a_repo, workspace_glob_names_a_repo,
@@ -40,7 +42,7 @@ use super::{framed, holder, view_chips};
 use crate::app::{Ctx, Handled};
 use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
-use crate::skills::{ProjectSkills, SkillsSnapshot, WorkspaceSkills};
+use crate::skills::{ProjectSkills, SkillEntry, SkillsSnapshot, WorkspaceSkills};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
 use crate::ui::kit::chips::key_line;
@@ -84,6 +86,13 @@ const BAD_PIN: &str = "pin is `latest` or a version number";
 /// A position the form cannot read.
 const BAD_POSITION: &str = "position is a whole number, 0 or more";
 
+/// `Ctrl+R` on a server's form: a server is not matched against paths.
+const SERVER_HAS_NO_GLOBS: &str = "an MCP server has no globs: it is always on or off";
+
+/// The server form's last line, in the place of the globs' help.
+const SERVER_HELP: &str = "an attached server starts in every step it applies to; `off` hides \
+                           one a broader level attached";
+
 /// `x` on a row with no attachment.
 const NOTHING_ATTACHED: &str = "nothing attached here";
 
@@ -109,6 +118,14 @@ const FORM_HINT: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
+/// The hint row on a server's form (MOD-127 M2 T8): the activation is its one input, so there is
+/// no field to move to and no repo to pick.
+const SERVER_FORM_HINT: HintSpec = &[
+    Hint::One(Act::ChoiceToggle, "activation"),
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+];
+
 /// The activation row's own label in the form body ([`activation_label`]).
 const ACTIVATION_HINT: HintSpec = &[Hint::One(Act::ChoiceToggle, "cycles")];
 
@@ -125,11 +142,12 @@ const CONFIRM_HINT: HintSpec = &[
     Hint::Text("any other key keeps it"),
 ];
 
-/// The attachments of one skill (D83). Holds no snapshot; every method takes the view's.
+/// The attachments of one skill or one MCP server (D83, MOD-127 M2 D12). Holds no snapshot; every
+/// method takes the view's.
 #[derive(Debug)]
 pub(super) struct AttachPane {
     /// Whose attachments.
-    skill: SkillId,
+    target: BindingRef,
     /// The highlighted row, an index into [`rows`].
     cursor: usize,
     /// Browsing, the form, the picker, or the detach question.
@@ -228,7 +246,7 @@ enum FormField {
 }
 
 impl FormField {
-    /// Tab order.
+    /// A skill's fields, in tab order.
     const ALL: [Self; 5] = [
         Self::Activation,
         Self::Pin,
@@ -237,14 +255,23 @@ impl FormField {
         Self::Globs,
     ];
 
-    /// The next (or previous) field, wrapping.
-    fn step(self, forward: bool) -> Self {
-        let at = Self::ALL
-            .iter()
-            .position(|field| *field == self)
-            .unwrap_or(0);
-        let len = Self::ALL.len();
-        Self::ALL[if forward {
+    /// A server's: the activation alone (MOD-127 M2 D4: no pin, position or globs).
+    const SERVER: [Self; 1] = [Self::Activation];
+
+    /// The fields of a form over `kind`, in tab order.
+    const fn of(kind: BindingKind) -> &'static [Self] {
+        match kind {
+            BindingKind::Skill => &Self::ALL,
+            BindingKind::McpServer => &Self::SERVER,
+        }
+    }
+
+    /// The next (or previous) field of a form over `kind`, wrapping.
+    fn step(self, forward: bool, kind: BindingKind) -> Self {
+        let fields = Self::of(kind);
+        let at = fields.iter().position(|field| *field == self).unwrap_or(0);
+        let len = fields.len();
+        fields[if forward {
             (at + 1) % len
         } else {
             (at + len - 1) % len
@@ -283,7 +310,8 @@ impl From<Handled> for AttachOutcome {
 }
 
 /// A key on the form's activation, which is not typed (a choice field, MOD-67 M4 D10; MOD-115
-/// M2 D7): `choice.toggle` (`Space`) through `stack` cycles `always \u{2192} glob \u{2192} off`,
+/// M2 D7): `choice.toggle` (`Space`) through `stack` cycles `always \u{2192} glob \u{2192} off`
+/// (`always \u{2192} off` for a server),
 /// and the canonical `Enter`/`Esc` (`field.submit`/`field.cancel` after the shell's translation,
 /// [`FieldEvent::of`]) submit and cancel as a text field's do; anything else passes to the form's
 /// stack. The toggle resolves from `pressed`, the chord the user pressed (`Ctx::pressed`,
@@ -297,7 +325,10 @@ fn activation_key(
     stack: Stack<'_>,
 ) -> FieldOutcome {
     if keys.actions(stack, pressed).contains(&Act::ChoiceToggle) {
+        // A server is never matched against paths: it cycles `always` and `off` only.
+        let server = form.key.target.kind() == BindingKind::McpServer;
         form.activation = match form.activation {
+            Activation::Always if server => Activation::Off,
             Activation::Always => Activation::Glob,
             Activation::Glob => Activation::Off,
             Activation::Off => Activation::Always,
@@ -312,18 +343,22 @@ fn activation_key(
 }
 
 impl AttachPane {
-    /// The pane over `skill`, cursor on the `global` row.
-    pub(super) fn new(skill: SkillId) -> Self {
+    /// The pane over `target`, cursor on the `global` row.
+    pub(super) fn new(target: impl Into<BindingRef>) -> Self {
         Self {
-            skill,
+            target: target.into(),
             cursor: 0,
             mode: AttachMode::Browse,
         }
     }
 
-    /// Whose attachments the pane shows.
-    pub(super) fn skill(&self) -> SkillId {
-        self.skill
+    /// Whether what the pane shows is still in `snapshot`: its skill in the library, its server
+    /// among the servers.
+    pub(super) fn exists(&self, snapshot: &SkillsSnapshot) -> bool {
+        match self.target {
+            BindingRef::Skill(skill) => snapshot.entry(skill).is_some(),
+            BindingRef::McpServer(server) => snapshot.mcp_server(server).is_some(),
+        }
     }
 
     /// A bracketed paste into the form's focused text field (MOD-22 review M-1); `false` when the
@@ -495,7 +530,7 @@ impl AttachPane {
             return AttachOutcome::Notice(Notice::Info(NOTHING_ATTACHED.to_owned()));
         };
         let target = target(*row, snapshot, ctx);
-        let name = skill_name(snapshot, self.skill);
+        let name = target_name(snapshot, self.target);
         let yes = ctx.keys().label(views::ATTACH_CONFIRM, Act::ConfirmYes);
         let question = detach_question(&name, &target, yes.as_deref());
         self.mode = AttachMode::ConfirmDetach {
@@ -525,10 +560,14 @@ impl AttachPane {
         let key = self.key_of(row, snapshot);
         let target = target(row, snapshot, ctx);
         let Some(stored) = snapshot.binding(key) else {
-            let prefill = snapshot
-                .head(self.skill)
-                .map(|head| prefill_from_source(&head.source))
-                .unwrap_or_default();
+            // Only a skill's head carries an imported `source` to prefill from.
+            let prefill = match self.target {
+                BindingRef::Skill(skill) => snapshot
+                    .head(skill)
+                    .map(|head| prefill_from_source(&head.source))
+                    .unwrap_or_default(),
+                BindingRef::McpServer(_) => Default::default(),
+            };
             let form = Form {
                 key,
                 target,
@@ -600,8 +639,12 @@ impl AttachPane {
                 match ctx.keys().actions(stack, chord).first() {
                     Some(Act::AttachRepo) => return self.open_picker(form, snapshot, ctx),
                     Some(Act::FormSave) => return self.save(form, ctx),
-                    Some(Act::FormNextField) => form.focus = form.focus.step(true),
-                    Some(Act::FormPrevField) => form.focus = form.focus.step(false),
+                    Some(Act::FormNextField) => {
+                        form.focus = form.focus.step(true, form.key.target.kind());
+                    }
+                    Some(Act::FormPrevField) => {
+                        form.focus = form.focus.step(false, form.key.target.kind());
+                    }
                     _ => {
                         self.mode = AttachMode::Form(form);
                         return modal_rest(stack, chord).into();
@@ -621,6 +664,9 @@ impl AttachPane {
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
         let refusal = match form.key.project {
+            _ if form.key.target.kind() == BindingKind::McpServer => {
+                Some(SERVER_HAS_NO_GLOBS.to_owned())
+            }
             None if form.key.workspace.is_some() => Some(WORKSPACE_HAS_NO_REPOS.to_owned()),
             None => Some(GLOBAL_HAS_NO_REPOS.to_owned()),
             Some(project) => snapshot
@@ -756,15 +802,15 @@ impl AttachPane {
 
     /// The key a row writes under.
     fn key_of(&self, row: ARow, snapshot: &SkillsSnapshot) -> BindingKey {
-        let global = BindingKey::global(self.skill);
+        let global = BindingKey::global(self.target);
         match row {
             ARow::Global => global,
-            ARow::Workspace(workspace) => BindingKey::workspace(self.skill, workspace),
+            ARow::Workspace(workspace) => BindingKey::workspace(self.target, workspace),
             ARow::Project { p } => BindingKey {
                 project: snapshot.projects.get(p).map(|entry| entry.project),
                 ..global
             },
-            ARow::ItemKind(project, kind) => BindingKey::item_kind(self.skill, project, kind),
+            ARow::ItemKind(project, kind) => BindingKey::item_kind(self.target, project, kind),
             ARow::Phase { p, g, i } => {
                 let entry = snapshot.projects.get(p);
                 BindingKey {
@@ -803,7 +849,7 @@ impl AttachPane {
             Some(_) => (Focus::Unfocused, None),
             None => (focus, hints.clone()),
         };
-        let title = format!("attachments \u{b7} {}", skill_name(snapshot, self.skill));
+        let title = format!("attachments \u{b7} {}", target_name(snapshot, self.target));
         let pane = framed(
             view_chips(Pane::new(&title), 0),
             rows_focus,
@@ -820,7 +866,7 @@ impl AttachPane {
                 };
                 let title = format!(
                     "{verb} {} \u{b7} {}",
-                    skill_name(snapshot, self.skill),
+                    target_name(snapshot, self.target),
                     form.target
                 );
                 let pane = framed(Pane::new(&title), focus, hints, ctx);
@@ -841,6 +887,9 @@ impl AttachPane {
     /// of the hints, drawn on the pane that holds the keyboard (MOD-115 M4 C4).
     pub(super) fn hint(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
+            AttachMode::Form(form) if form.key.target.kind() == BindingKind::McpServer => {
+                SERVER_FORM_HINT
+            }
             AttachMode::Form(_) => FORM_HINT,
             AttachMode::Picker { .. } => PICKER_HINT,
             AttachMode::ConfirmDetach { .. } => CONFIRM_HINT,
@@ -903,6 +952,10 @@ impl AttachPane {
         let Some(stored) = snapshot.binding(self.key_of(row, snapshot)) else {
             return NO_ROW.to_owned();
         };
+        // A server has neither a pin, a position nor globs: its row says only on or off.
+        if self.target.kind() == BindingKind::McpServer {
+            return label::activation(stored.activation).to_owned();
+        }
         let mut parts = vec![
             label::activation(stored.activation).to_owned(),
             stored
@@ -948,11 +1001,18 @@ impl AttachPane {
     /// that wins, which is the row the run would record. An `off` winner counts: it is what hides
     /// the broader attachment.
     fn winners(&self, snapshot: &SkillsSnapshot) -> Vec<ARow> {
-        let Some(entry) = snapshot.entry(self.skill) else {
+        let subject = match self.target {
+            BindingRef::Skill(skill) => snapshot.entry(skill).map(Subject::Skill),
+            BindingRef::McpServer(server) => snapshot.mcp_server(server).map(Subject::Server),
+        };
+        let Some(subject) = subject else {
             return Vec::new();
         };
-        let name = entry.skill.name.clone();
-        let mine = |row: &&Binding| row.skill_id == self.skill;
+        let target = match self.target {
+            BindingRef::Skill(skill) => skill.as_uuid(),
+            BindingRef::McpServer(server) => server.as_uuid(),
+        };
+        let mine = |row: &&Binding| row.skill_id.as_uuid() == target;
         let workspaces: Vec<Option<&WorkspaceSkills>> = if snapshot.workspaces.is_empty() {
             vec![None]
         } else {
@@ -982,7 +1042,7 @@ impl AttachPane {
                 for at in phases {
                     let phase = at.map(|(_, _, id)| id);
                     for kind in &kinds {
-                        let applies: Vec<(Binding, String)> = snapshot
+                        let applies: Vec<Binding> = snapshot
                             .global
                             .iter()
                             .filter(mine)
@@ -996,13 +1056,12 @@ impl AttachPane {
                                 (row.phase_id.is_none() || row.phase_id == phase)
                                     && (row.item_kind_id.is_none() || row.item_kind_id == *kind)
                             }))
-                            .map(|row| (row.clone(), name.clone()))
+                            .cloned()
                             .collect();
-                        let Some(winner) = resolve(applies, &entry.versions).into_iter().next()
-                        else {
+                        let Some(level) = subject.winning_level(applies) else {
                             continue;
                         };
-                        let row = match (winner.level, at, kind, workspace) {
+                        let row = match (level, at, kind, workspace) {
                             (BindingLevel::Global, ..) => ARow::Global,
                             (BindingLevel::Workspace, _, _, Some(entry)) => {
                                 ARow::Workspace(entry.workspace)
@@ -1023,6 +1082,46 @@ impl AttachPane {
             }
         }
         winners
+    }
+}
+
+/// What a pane's attachments attach, as the snapshot holds it.
+enum Subject<'a> {
+    /// A skill and its versions.
+    Skill(&'a SkillEntry),
+    /// An MCP server.
+    Server(&'a McpServer),
+}
+
+impl Subject<'_> {
+    /// The level whose attachment wins among `applies`, the rows that apply at one place: the
+    /// skill's [`resolve`] or the server's [`resolve_mcp`] (D104, MOD-127 M2 D5).
+    fn winning_level(&self, applies: Vec<Binding>) -> Option<BindingLevel> {
+        match self {
+            Self::Skill(entry) => resolve(
+                applies
+                    .into_iter()
+                    .map(|row| (row, entry.skill.name.clone()))
+                    .collect(),
+                &entry.versions,
+            )
+            .into_iter()
+            .next()
+            .map(|winner| winner.level),
+            Self::Server(server) => resolve_mcp(
+                &applies
+                    .iter()
+                    .map(|row| McpCandidate {
+                        server: (*server).clone(),
+                        level: row.level(),
+                        activation: row.activation,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .next()
+            .map(|winner| winner.level),
+        }
     }
 }
 
@@ -1137,12 +1236,19 @@ fn graph_phase(snapshot: &SkillsSnapshot, p: usize, g: usize, i: usize) -> Strin
         .unwrap_or_default()
 }
 
-/// A skill's name from the snapshot, else its id (a skill never leaves the library, but a reply
-/// can race the pane).
-fn skill_name(snapshot: &SkillsSnapshot, skill: SkillId) -> String {
-    snapshot
-        .entry(skill)
-        .map_or_else(|| skill.to_string(), |entry| entry.skill.name.clone())
+/// A skill's or a server's name from the snapshot, else its id (a skill never leaves the library,
+/// but a reply can race the pane, and a server can be deleted under it).
+fn target_name(snapshot: &SkillsSnapshot, target: BindingRef) -> String {
+    match target {
+        BindingRef::Skill(skill) => snapshot
+            .entry(skill)
+            .map(|entry| entry.skill.name.clone())
+            .unwrap_or_else(|| skill.to_string()),
+        BindingRef::McpServer(server) => snapshot
+            .mcp_server(server)
+            .map(|row| row.name.clone())
+            .unwrap_or_else(|| server.to_string()),
+    }
 }
 
 /// A project's slug from the scope's projects, else the id's first eight chars (the Templates
@@ -1181,6 +1287,16 @@ fn first_qualified(globs: &[String]) -> Option<(String, String)> {
 
 /// The form's attachment, or the first sentence refusing it.
 fn build(form: &Form) -> Result<Attachment, String> {
+    // A server has no pin, position or globs (MOD-127 M2 D4): the activation is all it holds.
+    if form.key.target.kind() == BindingKind::McpServer {
+        return Ok(Attachment {
+            pinned_version: None,
+            position: 0,
+            activation: form.activation,
+            globs: Vec::new(),
+            languages: Vec::new(),
+        });
+    }
     let pin = form.pin.text().unwrap_or_default().trim();
     let pinned_version = match pin {
         "" | "latest" => None,
@@ -1250,6 +1366,23 @@ fn render_form(
         Span::styled(" \u{203a}", theme.dim),
         Span::styled(activation_label(ctx.keys()), theme.dim),
     ])]);
+    // A server's form is its activation and a help line: no pin, position or globs (D4).
+    if form.key.target.kind() == BindingKind::McpServer {
+        let rows = FormRows::new()
+            .field(Field::new("activation", activation))
+            .focus(0)
+            .editing(false)
+            .label_width(FORM_LABEL);
+        let inner = Pane::inner(area);
+        let mut lines = rows.lines(inner.width, ctx.accent(), theme);
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(SERVER_HELP, theme.dim),
+        ]));
+        frame.render_widget(Paragraph::new(lines), inner);
+        pane.render(frame, area, theme);
+        return;
+    }
     let typed = split_list(form.globs.text().unwrap_or_default());
     let languages = split_list(form.languages.text().unwrap_or_default());
     let effective = canonical_globs(&typed, &languages);
@@ -1358,7 +1491,7 @@ fn detach_question(name: &str, target: &str, yes: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::ui::cells::cell_width;
-    use htui_core::model::BindingRef;
+    use htui_core::model::SkillId;
 
     /// MOD-67 M6 D4: the detach question names the answer in force through `ATTACH_CONFIRM`, and
     /// asks alone when none is bound.
@@ -1560,7 +1693,7 @@ mod tests {
             &emit,
         );
         let pane = AttachPane {
-            skill,
+            target: BindingRef::Skill(skill),
             cursor: 0,
             mode,
         };
@@ -1847,7 +1980,7 @@ mod tests {
         let (snapshot, _) = with_levels();
         let skill = SkillId::new();
         let mut pane = AttachPane {
-            skill,
+            target: BindingRef::Skill(skill),
             cursor: 0,
             mode: AttachMode::Browse,
         };
@@ -1873,7 +2006,7 @@ mod tests {
         let (snapshot, kind) = with_levels();
         let skill = SkillId::new();
         let mut pane = AttachPane {
-            skill,
+            target: BindingRef::Skill(skill),
             cursor: 0,
             mode: AttachMode::Browse,
         };

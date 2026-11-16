@@ -3,7 +3,7 @@ source: crates/htui/tests/templates.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?  keys
-╭─────────── Skills  Templates ╮╭─ implement v1 (head v1) ─────────────────────╮
+╭─────‹ Templates  MCP servers ╮╭─ implement v1 (head v1) ─────────────────────╮
 │ vulkan-tutorials             ││You are running the `implement` phase for     ┃
 │   fix           v1   phase   ││{{item_key}}, attempt {{attempt}}.            ┃
 │   handoff       v1   handoff ││                                              ┃

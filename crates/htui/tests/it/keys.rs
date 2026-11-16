@@ -478,10 +478,14 @@ async fn ctrl_l_and_ctrl_h_do_not_switch_skills_views() {
         assert!(!on_library(&frame), "`{forward}` showed Templates: {frame}");
         // MOD-115 M4 Q2: the tree shows its own keys; `D default` is the body's.
         assert!(frame.contains("implement"), "the Templates tree: {frame}");
-        harness.key(back);
-        harness.drive_to_end().await;
+        // MOD-127 M2 T8: the switch cycles Skills, Templates, MCP servers: back on the Library
+        // is the cycle's third key from there.
+        for _ in 0..2 {
+            harness.key(back);
+            harness.drive_to_end().await;
+        }
         let frame = harness.render();
-        assert!(on_library(&frame), "`{back}` went back: {frame}");
+        assert!(on_library(&frame), "`{back}` went around: {frame}");
     }
 }
 

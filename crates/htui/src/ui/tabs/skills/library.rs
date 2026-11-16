@@ -61,7 +61,7 @@ use crate::ui::{FieldOutcome, TextArea, TextField, diff};
 use crossterm::event::KeyEvent;
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
-const NOTICE_LINES: usize = 2;
+pub(super) const NOTICE_LINES: usize = 2;
 
 /// The `StoreRequest::ImportSkills` name: what `busy` holds while a walk is in flight. The slice
 /// index rather than a literal, so the two cannot drift (`request_names_match_the_name_arms`).
@@ -118,7 +118,7 @@ const IMPORT_HELP: &str = "a SKILL.md or rules file, or a directory: its */SKILL
 const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
 
 /// A write went out.
-const SAVING: &str = "saving\u{2026}";
+pub(super) const SAVING: &str = "saving\u{2026}";
 
 /// A `SkillsStale` for a skill the library no longer holds.
 const SKILL_GONE: &str = "the skill is gone";
@@ -191,7 +191,7 @@ const DETAIL_HINT: HintSpec = &[
 /// The pane's keys while its lines overflow it, through `LIBRARY_BROWSE` whatever the mode:
 /// they close the detail pane's hints when it is focused, after the view's own keys, so they are
 /// the first a narrow pane drops (MOD-115 M4 E5, T3; MOD-82 carried: no key literal in a title).
-const SCROLL_HINT: HintSpec = &[
+pub(super) const SCROLL_HINT: HintSpec = &[
     Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
 ];
@@ -268,14 +268,14 @@ fn version_changed_elsewhere(head: i32, save: Option<&str>) -> String {
 }
 
 /// A key while a write is in flight: one at a time (`settings/prompt.rs`' rule).
-fn in_flight(busy: &str) -> String {
+pub(super) fn in_flight(busy: &str) -> String {
     format!("`{busy}` is still in flight")
 }
 
 /// MOD-59 D5: a write that applied although its re-read failed. It landed; the view still draws
 /// what it held, and `reload` (`Reload`'s label through `LIBRARY_BROWSE`, MOD-67 M6 D4) reads
 /// again; with none bound the clause goes.
-fn landed_unread(landed: &str, why: &str, reload: Option<&str>) -> String {
+pub(super) fn landed_unread(landed: &str, why: &str, reload: Option<&str>) -> String {
     match reload {
         Some(reload) => format!("{landed} \u{2014} the re-read failed, {reload} reloads: {why}"),
         None => format!("{landed} \u{2014} the re-read failed: {why}"),
@@ -1812,7 +1812,7 @@ impl LibraryView {
         };
         self.cursor = self.cursor.min(snapshot.skills.len().saturating_sub(1));
         if let Some(pane) = &mut self.attach {
-            if snapshot.entry(pane.skill()).is_some() {
+            if pane.exists(snapshot) {
                 pane.clamp(snapshot);
             } else {
                 self.attach = None;
@@ -2162,7 +2162,7 @@ fn snapshot_name(snapshot: Option<&SkillsSnapshot>, skill: SkillId) -> String {
 
 /// Whether a snapshot answers the scope the view is in now: a write's reply that crossed a scope
 /// change belongs to the workspace that was left.
-fn in_scope(snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> bool {
+pub(super) fn in_scope(snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> bool {
     snapshot
         .projects
         .iter()
