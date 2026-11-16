@@ -19,7 +19,8 @@ use core::cell::Cell;
 use chrono::{DateTime, Utc};
 use htui_core::model::mcp::{McpServerPatch, new_mcp_server_refusal};
 use htui_core::model::{
-    BindingChange, EnvValue, McpServer, McpServerId, McpTransport, NewMcpServer, UserId,
+    BindingChange, BindingKind, EnvValue, McpServer, McpServerId, McpTransport, NewMcpServer,
+    UserId,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -444,8 +445,12 @@ fn draft_refusal(draft: &McpServerDraft) -> Option<String> {
     })
 }
 
-/// The input a store refusal is about, by the words it uses; `fallback` when it names none.
+/// The input a store refusal is about, by the words it leads with; `fallback` when it names none.
+/// Only the text before the first backtick counts: the core's sentences quote what the user typed
+/// (`the header `x-command-token` looks like a secret`) between backticks, and a typed key must
+/// not decide the field.
 fn blamed(sentence: &str, fallback: SField) -> SField {
+    let lead = sentence.split('`').next().unwrap_or(sentence);
     let table = [
         ("mcp_server.name", SField::Name),
         ("htui's own server", SField::Name),
@@ -459,7 +464,7 @@ fn blamed(sentence: &str, fallback: SField) -> SField {
     ];
     table
         .into_iter()
-        .find(|(word, _)| sentence.contains(word))
+        .find(|(word, _)| lead.contains(word))
         .map_or(fallback, |(_, field)| field)
 }
 
@@ -561,14 +566,18 @@ fn words(args: &[String]) -> String {
 /// Env or header entries from `NAME=value` words: `NAME=@SECRET` is the project secret `SECRET`,
 /// `NAME=@@text` the literal `@text`, anything else a literal.
 fn parse_pairs(text: &str) -> Result<Vec<(String, EnvValue)>, String> {
+    // An error names the entry's place, never the word: a value typed without its `NAME=` may be
+    // a secret, and the notice would show it.
     split_words(text)?
         .into_iter()
-        .map(|word| {
+        .enumerate()
+        .map(|(index, word)| {
+            let place = index + 1;
             let Some((key, value)) = word.split_once('=') else {
-                return Err(format!("`{word}` needs the form NAME=value"));
+                return Err(format!("entry {place} needs the form NAME=value"));
             };
             if key.is_empty() {
-                return Err(format!("`{word}` has no name before the `=`"));
+                return Err(format!("entry {place} has no name before the `=`"));
             }
             let value = match value.strip_prefix('@') {
                 Some(literal) if literal.starts_with('@') => EnvValue::Literal(literal.to_owned()),
@@ -608,14 +617,16 @@ fn tool_names(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The delete question over `name`, its answer `yes` (`ConfirmYes`'s label through `MCP_CONFIRM`);
-/// with none bound the question stands alone.
+/// The delete question over `name`, its answer `yes` (`ConfirmYes`'s label through `MCP_CONFIRM`).
+/// `bindings` counts the attachments the snapshot shows, the scope's own: the delete takes every
+/// one the store holds, so the question says there may be more in other workspaces or projects,
+/// and the notice after it names the store's exact count.
 fn delete_question(name: &str, bindings: usize, yes: Option<&str>) -> String {
     let goes = if bindings == 0 {
-        String::new()
+        " and any attachments in other workspaces or projects".to_owned()
     } else {
         format!(
-            " and its {}",
+            " and its {} here, and any in other workspaces or projects",
             label::plural(bindings, "attachment", "attachments")
         )
     };
@@ -764,7 +775,10 @@ impl McpView {
                         self.clamp();
                     }
                 }
-                Err(why) if self.busy == Some(outcome.request_name()) => {
+                Err(why)
+                    if self.busy == Some(outcome.request_name())
+                        && super::write_kind(outcome) == BindingKind::McpServer =>
+                {
                     self.land_binding(outcome, Some(why), ctx.keys());
                 }
                 Err(_) => {}
@@ -785,7 +799,10 @@ impl McpView {
                 if !self.take(snapshot, ctx) {
                     return;
                 }
-                if self.busy.take().is_some() {
+                // A skill's write shares `set_skill_binding`'s name: only a server's own reply
+                // frees what this view has in flight (MOD-127 M2 R3).
+                if super::stale_kind(*what) == BindingKind::McpServer && self.busy.take().is_some()
+                {
                     let detach = matches!(
                         self.sent.take(),
                         Some(Sent::Binding {
@@ -873,7 +890,9 @@ impl McpView {
 
     /// The attachment write in flight landed: the pane's form closes, or keeps later edits.
     fn land_binding(&mut self, outcome: &SkillWrite, unread: Option<&str>, keys: &Keys) {
-        if self.busy != Some(outcome.request_name()) {
+        if self.busy != Some(outcome.request_name())
+            || super::write_kind(outcome) != BindingKind::McpServer
+        {
             return;
         }
         let landed = match (outcome, self.sent.take()) {
@@ -1566,7 +1585,97 @@ fn browse_row(server: &McpServer) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use htui_core::model::BindingRef;
+    use crate::app::{Emit, TopBarState};
+    use crate::store_worker::Origin;
+    use crate::ui::Theme;
+    use crate::ui::tabs::SkillsTab;
+    use chrono::Utc;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{BindingKey, BindingRef, Scope, SkillId};
+
+    fn empty_snapshot() -> Box<SkillsSnapshot> {
+        Box::new(SkillsSnapshot {
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
+            global: Vec::new(),
+            workspaces: Vec::new(),
+            projects: Vec::new(),
+        })
+    }
+
+    /// MOD-127 M2 R3: an MCP attach in flight is this view's own; the replies of a skill's write
+    /// (a skill detach in flight in the Library) never free it, whichever arrives first, and its
+    /// own reply still does.
+    #[test]
+    fn a_skills_replies_leave_a_server_attach_in_flight_alone() {
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            project_ids: Vec::new(),
+        };
+        let (top_bar, theme, emit) = (TopBarState::default(), Theme::default(), Emit::default());
+        let mut ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            Keys::compiled(),
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let skill = BindingKey::global(SkillId::new());
+        let server = BindingKey::global(McpServerId::new());
+        let mut view = McpView {
+            busy: Some(REQUEST_NAMES[4]),
+            sent: Some(Sent::Binding {
+                change: BindingChange::Detach,
+                target: "global".to_owned(),
+            }),
+            ..McpView::default()
+        };
+        let foreign = [
+            StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::Skill(SkillId::new()),
+            },
+            StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::Version(SkillId::new()),
+            },
+            StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::Binding(skill),
+            },
+            StoreReply::SkillWritten {
+                snapshot: Ok(empty_snapshot()),
+                outcome: SkillWrite::Detached { key: skill },
+            },
+            StoreReply::SkillWritten {
+                snapshot: Ok(empty_snapshot()),
+                outcome: SkillWrite::Attached {
+                    key: skill,
+                    updated_at: Utc::now(),
+                },
+            },
+            StoreReply::SkillWritten {
+                snapshot: Err("store unreachable: gone".to_owned()),
+                outcome: SkillWrite::Detached { key: skill },
+            },
+        ];
+        for reply in &foreign {
+            view.on_reply(reply, &mut ctx);
+            assert_eq!(view.busy, Some(REQUEST_NAMES[4]), "{reply:?}");
+            assert!(view.sent.is_some(), "{reply:?}");
+        }
+        view.on_reply(
+            &StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::Binding(server),
+            },
+            &mut ctx,
+        );
+        assert_eq!(view.busy, None, "its own stale reply frees it");
+        assert!(view.sent.is_none());
+    }
 
     #[test]
     fn words_split_like_a_shell_and_read_back() {
@@ -1644,17 +1753,101 @@ mod tests {
         assert_eq!(blamed("something else", SField::Deny), SField::Deny);
     }
 
+    /// MOD-127 M2 R3: a refusal is blamed on the field its lead words name, the text before the
+    /// first backtick; a key or value the user typed, which the core's sentence quotes, never
+    /// moves it. The sentences are the core's own.
     #[test]
-    fn the_delete_question_names_the_count() {
+    fn a_refusal_is_blamed_by_its_lead_words_not_by_a_typed_key() {
+        let draft = |transport, headers, env| McpServerDraft {
+            name: "docs".to_owned(),
+            description: String::new(),
+            transport,
+            command: match transport {
+                McpTransport::Stdio => "mcp-docs".to_owned(),
+                McpTransport::Http => String::new(),
+            },
+            args: Vec::new(),
+            url: (transport == McpTransport::Http).then(|| "https://docs.example.test".to_owned()),
+            headers,
+            env,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        };
+        let literal = |key: &str| vec![(key.to_owned(), EnvValue::Literal("v".to_owned()))];
+        for (draft, field) in [
+            (
+                draft(McpTransport::Http, literal("x-command-token"), Vec::new()),
+                SField::Headers,
+            ),
+            (
+                draft(McpTransport::Http, literal("x-url-token"), Vec::new()),
+                SField::Headers,
+            ),
+            (
+                draft(McpTransport::Stdio, Vec::new(), literal("my_command_token")),
+                SField::Env,
+            ),
+            (
+                draft(McpTransport::Stdio, Vec::new(), literal("URL_TOKEN")),
+                SField::Env,
+            ),
+            (
+                draft(McpTransport::Stdio, Vec::new(), literal("bad key")),
+                SField::Env,
+            ),
+        ] {
+            let sentence = draft_refusal(&draft).expect("the core refuses it");
+            assert_eq!(blamed(&sentence, SField::Name), field, "{sentence}");
+        }
+        // The shape sentences, which name no typed value, keep their fields.
+        let mut stdio = draft(McpTransport::Stdio, Vec::new(), Vec::new());
+        stdio.command.clear();
+        let sentence = draft_refusal(&stdio).expect("no command");
+        assert_eq!(
+            blamed(&sentence, SField::Name),
+            SField::Command,
+            "{sentence}"
+        );
+        let mut http = draft(McpTransport::Http, Vec::new(), Vec::new());
+        http.url = Some("ftp://docs.example.test".to_owned());
+        let sentence = draft_refusal(&http).expect("a wrong scheme");
+        assert_eq!(blamed(&sentence, SField::Name), SField::Url, "{sentence}");
+    }
+
+    /// MOD-127 M2 R3: a parse error names the entry's place and, at most, its key; the typed
+    /// word, which may be a pasted secret, is never echoed.
+    #[test]
+    fn a_pair_error_never_echoes_a_typed_word() {
+        const SENTINEL: &str = "sentinel-secret-0451";
+        let text = format!("A=1 {SENTINEL}");
+        let why = parse_pairs(&text).expect_err("no `=`");
+        assert!(why.contains("entry 2"), "{why}");
+        assert!(!why.contains(SENTINEL), "{why}");
+        let text = format!("A=1 B=2 ={SENTINEL}");
+        let why = parse_pairs(&text).expect_err("no name");
+        assert!(why.contains("entry 3"), "{why}");
+        assert!(!why.contains(SENTINEL), "{why}");
+        assert_eq!(
+            parse_pairs("A=1 B=@").expect_err("no secret name"),
+            "`B=@` names no secret after the `@`"
+        );
+    }
+
+    #[test]
+    fn the_delete_question_names_the_count_seen_here() {
         assert_eq!(
             delete_question("docs", 2, Some("y")),
-            "delete `docs` and its 2 attachments? y deletes, any other key keeps it"
+            "delete `docs` and its 2 attachments here, and any in other workspaces or projects? \
+             y deletes, any other key keeps it"
         );
         assert_eq!(
             delete_question("docs", 1, None),
-            "delete `docs` and its 1 attachment?"
+            "delete `docs` and its 1 attachment here, and any in other workspaces or projects?"
         );
-        assert_eq!(delete_question("docs", 0, None), "delete `docs`?");
+        assert_eq!(
+            delete_question("docs", 0, None),
+            "delete `docs` and any attachments in other workspaces or projects?"
+        );
     }
 
     #[test]

@@ -225,13 +225,14 @@ no  = ["n", "N"]  # no; Esc always
 open = ["enter"]  # open step
 
 [skills]
-switch_view     = ["h", "l", "[", "]", "shift-left", "shift-right"]  # switch view
-prev_version    = [","]                                              # older version
-next_version    = ["."]                                              # newer version
-base            = ["b"]                                              # diff base
-diff            = ["d"]                                              # diff
-edit_externally = ["E"]                                              # edit in $EDITOR
-ask_agent       = ["ctrl-g"]                                         # ask agent
+switch_view     = ["l", "]", "shift-right"]  # next view
+prev_view       = ["h", "[", "shift-left"]   # previous view
+prev_version    = [","]                      # older version
+next_version    = ["."]                      # newer version
+base            = ["b"]                      # diff base
+diff            = ["d"]                      # diff
+edit_externally = ["E"]                      # edit in $EDITOR
+ask_agent       = ["ctrl-g"]                 # ask agent
 
 [skills.library]
 import     = ["I"]              # import

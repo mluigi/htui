@@ -2519,8 +2519,10 @@ async fn deleting_a_server_names_its_bindings() {
     harness.key("d");
     let frame = harness.render();
     assert!(
-        notice(&frame).contains("delete `docs`") && notice(&frame).contains("2 attachments"),
-        "the question names the count: {frame}"
+        notice(&frame).contains("delete `docs`")
+            && notice(&frame).contains("2 attachments here")
+            && notice(&frame).contains("other workspaces or projects"),
+        "the question names the count seen here and that others may exist: {frame}"
     );
     harness.key("n");
     harness.settle().await;

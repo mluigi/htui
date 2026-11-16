@@ -25,7 +25,8 @@ use core::cell::Cell;
 use chrono::{DateTime, Utc};
 use htui_core::model::skill::validate_name;
 use htui_core::model::{
-    Activation, BindingChange, BindingLevel, BoundSkill, SkillId, SkillPatch, SkillVersion,
+    Activation, BindingChange, BindingKind, BindingLevel, BoundSkill, SkillId, SkillPatch,
+    SkillVersion,
 };
 use htui_core::prompt::edit_help::HelpTarget;
 use htui_core::prompt::{TokenEstimator, render};
@@ -727,7 +728,10 @@ impl LibraryView {
                 }
                 // No snapshot to check the scope by: only the write in flight owns this reply, and
                 // a scope change has already forgotten that (`on_scope_change`).
-                Err(why) if self.busy == Some(outcome.request_name()) => {
+                Err(why)
+                    if self.busy == Some(outcome.request_name())
+                        && super::write_kind(outcome) == BindingKind::Skill =>
+                {
                     if self.snapshot.is_none() {
                         self.unavailable = Some(why.clone());
                     }
@@ -741,7 +745,9 @@ impl LibraryView {
                 }
                 self.snapshot = Some((**snapshot).clone());
                 self.unavailable = None;
-                if self.busy.take().is_some() {
+                // A server's write shares `set_skill_binding`'s name: only a skill's own reply
+                // frees what this view has in flight (MOD-127 M2 R3).
+                if super::stale_kind(*what) == BindingKind::Skill && self.busy.take().is_some() {
                     let detach = matches!(
                         self.sent.take(),
                         Some(Sent::Binding {
@@ -1502,7 +1508,9 @@ impl LibraryView {
     /// `Skills` read, leaves the draft, the token and `busy` alone. `unread` is the re-read's
     /// failure (D5): the write landed, and the notice says the library drawn is the one held.
     fn land(&mut self, outcome: &SkillWrite, unread: Option<&str>, keys: &Keys) {
-        if self.busy != Some(outcome.request_name()) {
+        if self.busy != Some(outcome.request_name())
+            || super::write_kind(outcome) != BindingKind::Skill
+        {
             return;
         }
         let landed = match (outcome, self.sent.take()) {
@@ -2199,6 +2207,7 @@ mod tests {
     use crate::ui::tabs::registry::Tab as _;
     use crate::ui::tabs::skills::agent_help::fixtures as agent_fixtures;
     use htui_agent::event::StopReason;
+    use htui_core::model::McpServerId;
 
     /// MOD-60 D1: the name is fitted in cells, so a wide name never pushes the version right.
     #[test]
@@ -2330,6 +2339,73 @@ mod tests {
             }
             (written, read) => panic!("not a write and a read: {written:?}, {read:?}"),
         }
+    }
+
+    /// MOD-127 M2 R3: an empty snapshot answering a scope with no project.
+    fn empty_snapshot() -> Box<SkillsSnapshot> {
+        Box::new(SkillsSnapshot {
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
+            global: Vec::new(),
+            workspaces: Vec::new(),
+            projects: Vec::new(),
+        })
+    }
+
+    /// MOD-127 M2 R3: a skill detach in flight is the Library's own; the replies of a server's
+    /// write (an MCP attach in flight in the other view) never free it, whichever arrives first,
+    /// and its own reply still does.
+    #[test]
+    fn a_servers_replies_leave_a_skill_detach_in_flight_alone() {
+        let mut bench = Bench::new();
+        bench.scope.project_ids.clear();
+        let mut ctx = bench.ctx();
+        let server = BindingKey::global(McpServerId::new());
+        let skill = BindingKey::global(SkillId::new());
+        let mut view = LibraryView {
+            busy: Some(REQUEST_NAMES[4]),
+            sent: Some(Sent::Binding {
+                change: BindingChange::Detach,
+                target: "global".to_owned(),
+            }),
+            ..LibraryView::default()
+        };
+        let foreign = [
+            StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::McpServer(McpServerId::new()),
+            },
+            StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::Binding(server),
+            },
+            StoreReply::SkillWritten {
+                snapshot: Ok(empty_snapshot()),
+                outcome: SkillWrite::Detached { key: server },
+            },
+            StoreReply::SkillWritten {
+                snapshot: Ok(empty_snapshot()),
+                outcome: SkillWrite::Attached {
+                    key: server,
+                    updated_at: Utc::now(),
+                },
+            },
+            unread(SkillWrite::Detached { key: server }),
+        ];
+        for reply in &foreign {
+            view.on_reply(reply, &mut ctx);
+            assert_eq!(view.busy, Some(REQUEST_NAMES[4]), "{reply:?}");
+            assert!(view.sent.is_some(), "{reply:?}");
+        }
+        view.on_reply(
+            &StoreReply::SkillsStale {
+                snapshot: empty_snapshot(),
+                what: StaleWhat::Binding(skill),
+            },
+            &mut ctx,
+        );
+        assert_eq!(view.busy, None, "its own stale reply frees it");
+        assert!(view.sent.is_none());
     }
 
     /// MOD-59 D5: the reply to a write that applied although its re-read failed.

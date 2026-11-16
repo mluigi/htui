@@ -21,7 +21,7 @@ mod library;
 mod mcp;
 mod templates;
 
-use htui_core::model::Scope;
+use htui_core::model::{BindingKind, Scope};
 use std::cell::Cell;
 
 use ratatui::Frame;
@@ -32,6 +32,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, HintSpec, KeyChord, Stack};
+use crate::skills::{SkillWrite, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
@@ -71,6 +72,28 @@ enum View {
     Templates,
     /// The toolbox's MCP servers (MOD-127 M2 T8).
     McpServers,
+}
+
+/// The kind of toolbox row a skill-write reply is about: a skill's own writes are
+/// [`BindingKind::Skill`], an attach or detach by its key's target. The Library and the MCP
+/// servers view share the `set_skill_binding` request name, so a reply is the view's only when
+/// its kind is (MOD-127 M2 R3).
+const fn write_kind(outcome: &SkillWrite) -> BindingKind {
+    match outcome {
+        SkillWrite::Created { .. } | SkillWrite::Versioned { .. } | SkillWrite::Edited { .. } => {
+            BindingKind::Skill
+        }
+        SkillWrite::Attached { key, .. } | SkillWrite::Detached { key } => key.target.kind(),
+    }
+}
+
+/// The kind of row a stale reply is about: see [`write_kind`].
+const fn stale_kind(what: StaleWhat) -> BindingKind {
+    match what {
+        StaleWhat::Skill(_) | StaleWhat::Version(_) => BindingKind::Skill,
+        StaleWhat::Binding(key) => key.target.kind(),
+        StaleWhat::McpServer(_) => BindingKind::McpServer,
+    }
 }
 
 impl View {
