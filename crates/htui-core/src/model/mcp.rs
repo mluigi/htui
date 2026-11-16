@@ -208,11 +208,13 @@ pub fn invalid_mcp_name(name: &str) -> String {
 }
 
 /// Words in a key that say its value is a secret (MOD-127 M2 D3), compared in lower case.
-const SECRET_WORDS: [&str; 7] = [
+const SECRET_WORDS: [&str; 9] = [
     "token",
     "secret",
     "password",
     "passwd",
+    "pwd",
+    "credential",
     "key",
     "authorization",
     "cookie",
@@ -223,6 +225,36 @@ const SECRET_WORDS: [&str; 7] = [
 fn looks_secret(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_WORDS.iter().any(|word| lower.contains(word))
+}
+
+/// The refusal of an http `url` that carries a credential: userinfo (`user:pass@host`) or a
+/// query key that [`looks_secret`]. The sentences name the rule, never the value.
+fn url_credential_refusal(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    if after_scheme[..authority_end].contains('@') {
+        return Some(
+            "the url of an http mcp_server must not carry userinfo (`user:password@`): \
+             put the credential in a header as a secret reference (`secret`)"
+                .to_owned(),
+        );
+    }
+    let query = after_scheme[authority_end..]
+        .split_once('?')
+        .map_or("", |(_, rest)| rest.split('#').next().unwrap_or(""));
+    for pair in query.split(['&', ';']) {
+        let key = pair.split('=').next().unwrap_or("");
+        if looks_secret(key) {
+            return Some(format!(
+                "the url query key `{}` of an http mcp_server looks like a secret: send it in a \
+                 header as a secret reference (`secret`), not in the url",
+                key.escape_debug()
+            ));
+        }
+    }
+    None
 }
 
 /// Whether `key` is a valid environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -276,6 +308,11 @@ fn pairs_refusal(
             EnvValue::Literal(text) => {
                 if text.contains('\0') {
                     return Some(has_nul(&format!("mcp_server {what} `{key}`")));
+                }
+                if what == "header" && text.chars().any(|c| c.is_ascii_control()) {
+                    return Some(format!(
+                        "the header `{key}` of an mcp_server holds a control character"
+                    ));
                 }
                 if looks_secret(key) {
                     return Some(format!(
@@ -356,6 +393,12 @@ fn refusal(fields: &Fields<'_>) -> Option<String> {
             }
             if url.contains('\0') {
                 return Some(has_nul("mcp_server.url"));
+            }
+            if url.chars().any(|c| c.is_ascii_control()) {
+                return Some("mcp_server.url holds a control character".to_owned());
+            }
+            if let Some(sentence) = url_credential_refusal(url) {
+                return Some(sentence);
             }
             if !fields.command.is_empty() || !fields.args.is_empty() {
                 return Some("an http mcp_server has no command or args".to_owned());
@@ -707,6 +750,123 @@ mod tests {
             )];
             assert!(new_mcp_server_refusal(&http).is_some(), "{key}");
         }
+    }
+
+    #[test]
+    fn pwd_and_credential_keys_are_secret_looking() {
+        for key in ["MYSQL_PWD", "API_CREDENTIALS", "mysql_pwd", "Credential"] {
+            let mut server = new_server("a");
+            server.env = vec![(
+                key.to_owned(),
+                EnvValue::Literal("sentinel-value".to_owned()),
+            )];
+            let sentence = new_mcp_server_refusal(&server)
+                .unwrap_or_else(|| panic!("`{key}` must be refused as an env literal"));
+            assert!(sentence.contains("secret reference"), "{sentence}");
+            assert!(!sentence.contains("sentinel-value"), "{sentence}");
+        }
+    }
+
+    #[test]
+    fn a_url_with_userinfo_is_refused() {
+        for url in [
+            "https://user:sentinel-pass@host.test/rpc",
+            "http://sentinel-token@host.test/",
+            "https://host.test@evil.test/",
+        ] {
+            let mut http = http_server("a");
+            http.url = Some(url.to_owned());
+            let sentence =
+                new_mcp_server_refusal(&http).unwrap_or_else(|| panic!("`{url}` must be refused"));
+            assert!(sentence.contains("userinfo"), "{sentence}");
+            assert!(sentence.contains("secret reference"), "{sentence}");
+            assert!(!sentence.contains("sentinel"), "{sentence}");
+        }
+        // An `@` past the authority is not userinfo.
+        let mut http = http_server("a");
+        http.url = Some("https://host.test/a@b?x=1#c@d".to_owned());
+        assert_eq!(new_mcp_server_refusal(&http), None);
+    }
+
+    #[test]
+    fn a_url_query_with_a_secret_looking_key_is_refused() {
+        for query in [
+            "token=sentinel-value",
+            "x=1&api_key=sentinel-value",
+            "apikey=sentinel-value",
+            "ACCESS_TOKEN=sentinel-value",
+            "Secret=sentinel-value",
+            "password=sentinel-value",
+            "passwd=sentinel-value",
+            "pwd=sentinel-value",
+            "credential=sentinel-value",
+            "authorization=sentinel-value",
+            "cookie=sentinel-value",
+            "key",
+        ] {
+            let mut http = http_server("a");
+            http.url = Some(format!("https://host.test/rpc?{query}"));
+            let sentence = new_mcp_server_refusal(&http)
+                .unwrap_or_else(|| panic!("`{query}` must be refused"));
+            assert!(sentence.contains("query"), "{sentence}");
+            assert!(sentence.contains("secret reference"), "{sentence}");
+            assert!(!sentence.contains("sentinel"), "{sentence}");
+        }
+        // A key word in a value, a path or a fragment is not a query key.
+        for url in [
+            "https://host.test/rpc?x=token",
+            "https://host.test/token/key?x=1",
+            "https://host.test/rpc?x=1#token=1",
+        ] {
+            let mut http = http_server("a");
+            http.url = Some(url.to_owned());
+            assert_eq!(new_mcp_server_refusal(&http), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_plain_url_is_accepted() {
+        for url in [
+            "https://host/path?x=1",
+            "http://host.test:8080/rpc",
+            "https://host.test",
+        ] {
+            let mut http = http_server("a");
+            http.url = Some(url.to_owned());
+            assert_eq!(new_mcp_server_refusal(&http), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn control_characters_are_refused_in_a_url_and_in_headers() {
+        for control in ['\r', '\n', '\0', '\u{1b}', '\t', '\u{7f}'] {
+            let mut http = http_server("a");
+            http.url = Some(format!("https://host.test/a{control}b"));
+            assert!(new_mcp_server_refusal(&http).is_some(), "url {control:?}");
+            let mut http = http_server("a");
+            http.headers = vec![(
+                "X-Tenant".to_owned(),
+                EnvValue::Literal(format!("a{control}b: c")),
+            )];
+            assert!(
+                new_mcp_server_refusal(&http).is_some(),
+                "header value {control:?}"
+            );
+            let mut http = http_server("a");
+            http.headers = vec![(
+                format!("X-Te{control}nant"),
+                EnvValue::Literal("a".to_owned()),
+            )];
+            assert!(
+                new_mcp_server_refusal(&http).is_some(),
+                "header name {control:?}"
+            );
+        }
+        // Surrounding whitespace in a url is also a control character when it is one.
+        let mut http = http_server("a");
+        http.url = Some("https://host.test/\r\nHost: evil".to_owned());
+        let sentence = new_mcp_server_refusal(&http).expect("refused");
+        assert!(sentence.contains("control"), "{sentence}");
     }
 
     #[test]

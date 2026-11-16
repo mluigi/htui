@@ -10048,6 +10048,18 @@ async fn migration_0042_adds_mcp_server_and_the_second_kind() {
         .expect_err("refused");
         assert_refused_by(err, "toolbox_binding_mcp_shape", what);
     }
+    assert_refused_by(
+        sqlx::query(
+            "INSERT INTO toolbox_binding (kind, ref_id, activation, languages) \
+             VALUES ('mcp_server', $1, 'always', ARRAY['rust'])",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .execute(pool)
+        .await
+        .expect_err("refused"),
+        "toolbox_binding_mcp_shape",
+        "languages under always",
+    );
 
     let comment: Option<String> = sqlx::query_scalar(
         "SELECT col_description('run_step'::regclass, \

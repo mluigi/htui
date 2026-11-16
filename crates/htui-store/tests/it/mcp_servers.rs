@@ -490,6 +490,19 @@ async fn the_checks_refuse_what_the_rules_refuse() {
             "{what}"
         );
     }
+    assert_eq!(
+        constraint(
+            sqlx::query(
+                "INSERT INTO toolbox_binding (kind, ref_id, activation, languages) \
+                 VALUES ('mcp_server', $1, 'always', ARRAY['rust'])",
+            )
+            .bind(server)
+            .execute(pool)
+            .await
+        ),
+        "toolbox_binding_mcp_shape",
+        "languages under always"
+    );
     plant_binding(pool, "mcp_server", server, None, "off", none)
         .await
         .expect("an off server inserts");

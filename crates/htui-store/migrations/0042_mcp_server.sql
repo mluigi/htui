@@ -10,7 +10,7 @@
 -- toolbox_binding takes the second kind. Its ref_id has no foreign key (0041), so the write path
 -- checks the server exists and delete_mcp_server removes its attachments in the same transaction.
 -- An mcp_server attachment has no versions and no globs: pinned_version stays NULL, activation is
--- always or off, and globs is empty (toolbox_binding_mcp_shape).
+-- always or off, and globs and languages are empty (toolbox_binding_mcp_shape).
 --
 -- run_step.trim_record is restated for record v 6, which gains mcp_choices[]. Neither table is
 -- mirrored (skills are not). One forward step, run before the new binary uses the tables.
@@ -48,7 +48,8 @@ ALTER TABLE toolbox_binding
         kind <> 'mcp_server'
         OR (pinned_version IS NULL
             AND activation IN ('always', 'off')
-            AND cardinality(globs) = 0)
+            AND cardinality(globs) = 0
+            AND cardinality(languages) = 0)
     );
 
 COMMENT ON TABLE mcp_server IS
