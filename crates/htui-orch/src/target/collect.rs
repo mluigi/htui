@@ -36,7 +36,7 @@ use crate::isolate::git::{
 };
 use crate::target::bundle::{BundleRefusal, is_full_hash, read_header};
 use crate::target::seed::{bad_run_branch, bad_target_dir, target_git_failed};
-use crate::target::util::{Quarantine, escape_controls, git_in, last_stderr_line};
+use crate::target::util::{Quarantine, ScratchDir, escape_controls, git_in, last_stderr_line};
 use htui_agent::target_channel::{
     ChannelError, ExecOutput, ExecSpec, StdinFrom, StdoutTo, TargetChannel,
 };
@@ -529,6 +529,9 @@ async fn collect_with(
         req,
         bundle: scratch.path(),
         objects: scratch.dir().expect("a collect scratch has a directory"),
+        hold: scratch
+            .dir_hold()
+            .expect("a collect scratch has a directory"),
     }
     .run(before_cas)
     .await
@@ -575,6 +578,9 @@ struct Collect<'a> {
     bundle: &'a Path,
     /// The object quarantine directory in the scratch, made by [`Collect::check`].
     objects: &'a Path,
+    /// A holder of [`objects`](Self::objects), moved into the pack migration's blocking task so
+    /// a dropped collect cannot remove the directory mid-migration.
+    hold: std::sync::Arc<ScratchDir>,
 }
 
 impl Collect<'_> {
@@ -707,10 +713,12 @@ impl Collect<'_> {
         }
 
         let quarantine = {
+            // Made here, not in the blocking task (R1b verifier L1): a detached task could make
+            // them after a dropped collect's guard had already run.
+            private_dir(self.objects)?;
+            private_dir(&self.objects.join("pack"))?;
             let (repo, dir) = (req.repo.clone(), self.objects.to_path_buf());
             blocking(move || {
-                private_dir(&dir)?;
-                private_dir(&dir.join("pack"))?;
                 Ok(ObjectQuarantine {
                     dir,
                     objects: git::objects_dir(&repo)?,
@@ -805,8 +813,12 @@ impl Collect<'_> {
 
         before_cas();
         {
-            let quarantine = quarantine.clone();
-            blocking(move || git::migrate_quarantine(&quarantine)).await?;
+            let (quarantine, hold) = (quarantine.clone(), std::sync::Arc::clone(&self.hold));
+            blocking(move || {
+                let _hold = hold;
+                git::migrate_quarantine(&quarantine)
+            })
+            .await?;
         }
         let swapped = {
             let (repo, branch, local, tip) =
