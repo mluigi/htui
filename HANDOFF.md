@@ -15,21 +15,20 @@
   Also refresh "Parallel runs" below: drop the closed ID and promote what it unblocked.
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-16):** **MOD-116 is done** (`docs/decisions/mod/mod-116.md`; merged on main, to
-collect): Workspaces is tab 1 with every workspace's derived state (open, background, stopping, stopped; no column),
+**Current status (2026-11-16):** **MOD-116 is done** (`docs/decisions/mod/mod-116.md`; merged on main): Workspaces is tab 1 with every workspace's derived state (open, background, stopping, stopped; no column),
 overviews, `o` to open without stopping another, `s`/`s`/`r` to stop, force and resume (the words `htui stop` prints),
 `N` to create a workspace or a project (existing git folder, git URL clone, new repo), `e`/`d`/`T` to edit, delete
 and set the default target; the leave dialog lists every live workspace and `S` stops them first; the `w` switcher
 is gone and Settings › Hierarchy keeps projects and repos only. No migration; conformance `CASES` 370. Owed on the
-host: `scripts/hr collect MOD-116`, the merged-tree Postgres gate, the live-Qdrant suites, real use and the Windows
+host: the merged-tree Postgres gate, the live-Qdrant suites, real use and the Windows
 build (the write-up lists them). MOD-117 and MOD-118 are unblocked.
-**MOD-130 is done** (`docs/decisions/mod/mod-130.md`; merged on main, to collect): an item runs where its target says. A `target` record names the kind and the box; the item,
+**MOD-130 is done** (`docs/decisions/mod/mod-130.md`; merged on main): an item runs where its target says. A `target` record names the kind and the box; the item,
 its workflow, its project, its workspace and the Settings default each may set one, the first wins, and the run
 records it with the level that chose it. Only `local` runs in this build; any other kind is refused at run start with a
 sentence naming the level. The queue, claim and worker poll key on the box that drives a run, so a driven target starts
 on this box. The Runs tab says `runs on <target> · from <level>` (hidden for a plain local run), the queue overlay names
 the driving box, and Settings › Boxes lists a container under its machine. M3 and M4 add no migration. Owed on the host:
-`scripts/hr collect MOD-130`, the merged-tree Postgres gate (`CASES` 359) and the Windows build. MOD-132 no longer
+the merged-tree Postgres gate (`CASES` 359) and the Windows build. MOD-132 no longer
 waits; MOD-131 waits on MOD-44 only.
 **MOD-159 is done** (`docs/decisions/mod/mod-159.md`; M1 and M2 merged on main, M3
 on `hr/MOD-159`, to collect): each Qdrant collection has one indexer, the holder of its `indexer_lease` row (worker or
