@@ -2630,7 +2630,8 @@ async fn the_report_notice_names_what_was_not_inferred() {
                 truncated: false,
                 repos: vec![],
             },
-            "no root on this box for this workspace \u{2014} e on the Workspaces tab sets its folder"
+            "no root on this box for this workspace \u{2014} e on the Workspaces tab sets its \
+             folder, then i here"
                 .to_owned(),
         ),
         (
@@ -2706,6 +2707,43 @@ async fn the_report_notice_names_what_was_not_inferred() {
         // The section's last row: the notice alone, the keys being the shell's (MOD-67 M6 T2).
         let notice = frame.lines().nth(29).unwrap_or_default().trim_end();
         assert_eq!(notice, expected, "{report:?} reads `{expected}`: {frame}");
+    }
+}
+
+/// R1b B9: the "no root" notice follows the keys in force: the Workspaces tab's `edit` and this
+/// section's `infer`, rebound, are named as rebound; `infer` unbound drops the step it would take.
+#[tokio::test]
+async fn the_no_root_notice_follows_the_keys_in_force() {
+    let rootless = InferReport {
+        root: None,
+        truncated: false,
+        repos: vec![],
+    };
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    for (file, expected) in [
+        (
+            "[workspaces]\nedit = \"E\"\n[settings.hierarchy]\ninfer = \"I\"\n",
+            "no root on this box for this workspace \u{2014} E on the Workspaces tab sets its \
+             folder, then I here",
+        ),
+        (
+            "[settings.hierarchy]\ninfer = []\n",
+            "no root on this box for this workspace \u{2014} e on the Workspaces tab sets its folder",
+        ),
+    ] {
+        let bench = SectionBench::new().await.with_keys(keys_from(file));
+        let mut section = homed();
+        bench.reply(
+            &mut section,
+            &StoreReply::RepoPathsInferred {
+                tree: Box::new(tree.clone()),
+                report: rootless.clone(),
+            },
+        );
+        let frame = bench.render_section(&section, 250);
+        let notice = frame.lines().nth(29).unwrap_or_default().trim_end();
+        assert_eq!(notice, expected, "{file}: {frame}");
     }
 }
 

@@ -358,10 +358,12 @@ enum Mode {
     Browse,
     /// One row being typed into.
     Editing(Editor),
-    /// One row being deleted, behind PRD D13's two confirmations.
+    /// One project being deleted, behind PRD D13's two confirmations. A workspace is deleted on
+    /// the Workspaces tab (MOD-116 M3 D17), so a project is all this mode can name (R1b B10): no
+    /// workspace delete's reply, which goes to that tab, is ever waited on here.
     Deleting {
-        /// What the two `Delete*` requests would name.
-        target: DeleteTarget,
+        /// The project `DeleteReach` and `DeleteProject` name.
+        target: ProjectId,
         /// The slug the second confirmation asks to be typed.
         slug: String,
         /// How far the confirmation has got.
@@ -587,7 +589,7 @@ impl HierarchySection {
                 target,
                 slug,
                 stage,
-            } => delete_pane(*target, slug, stage, width, theme),
+            } => delete_pane(slug, stage, width, theme),
         }
     }
 
@@ -1079,10 +1081,7 @@ impl HierarchySection {
                 let Some(entry) = snapshot.projects.get(index) else {
                     return;
                 };
-                (
-                    DeleteTarget::Project(entry.project.id),
-                    entry.project.slug.clone(),
-                )
+                (entry.project.id, entry.project.slug.clone())
             }
             // A repo is removed by deleting its project or not at all: `delete_repo` is not on the
             // seam and this milestone adds no method to it.
@@ -1097,7 +1096,10 @@ impl HierarchySection {
             slug,
             stage: DeleteStage::Counting,
         };
-        self.send(StoreRequest::DeleteReach(target), ctx);
+        self.send(
+            StoreRequest::DeleteReach(DeleteTarget::Project(target)),
+            ctx,
+        );
     }
 
     /// One key while a delete is being confirmed (D9, flag B).
@@ -1143,13 +1145,9 @@ impl HierarchySection {
             DeleteStage::Typed { reach, field } => match field.on_key(key) {
                 FieldOutcome::Submit => {
                     if field.text() == Some(slug.as_str()) {
-                        let request = match target {
-                            DeleteTarget::Workspace(id) => StoreRequest::DeleteWorkspace(id),
-                            DeleteTarget::Project(id) => StoreRequest::DeleteProject(id),
-                        };
                         *stage = DeleteStage::InFlight(reach.clone());
                         self.notice = None;
-                        self.send(request, ctx);
+                        self.send(StoreRequest::DeleteProject(target), ctx);
                     } else {
                         field.clear();
                         self.notice = Some(WRONG_SLUG.to_owned());
@@ -1714,7 +1712,11 @@ impl SettingsSection for HierarchySection {
                     .keys()
                     .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
                 let edit = ctx.keys().label(views::WORKSPACES_BROWSE, Act::Edit);
-                let report = inferred_notice(report, choose.as_deref(), edit.as_deref());
+                let infer = ctx
+                    .keys()
+                    .label(views::HIERARCHY_BROWSE, Act::HierarchyInfer);
+                let report =
+                    inferred_notice(report, choose.as_deref(), edit.as_deref(), infer.as_deref());
                 self.notice = Some(match before {
                     Some(before) => format!("{before} \u{b7} {report}"),
                     None => report,
@@ -2010,24 +2012,23 @@ pub fn joined_notice(project: &str, workspace: &str, prefixes: &[String]) -> Str
 /// repo is named, not explained: its sentence may name a path, and the notice is one line.
 ///
 /// `choose` is the label of `settings.hierarchy.choose_path` (MOD-67 M6 D4), the key the notice
-/// sends the user to on a repo row (`b` under the defaults), and `edit` the Workspaces tab's
-/// `edit`, whose form sets the workspace's folder (MOD-116 M3 D17); unbound, the notice names no
-/// key.
+/// sends the user to on a repo row (`b` under the defaults), `edit` the Workspaces tab's `edit`,
+/// whose form sets the workspace's folder (MOD-116 M3 D17), and `infer` the label of
+/// `settings.hierarchy.infer`, which runs the pass once the folder is set: that edit runs none
+/// (R1b B9). Unbound, the notice names no key; `infer` unbound drops its step.
 pub(crate) fn inferred_notice(
     report: &InferReport,
     choose: Option<&str>,
     edit: Option<&str>,
+    infer: Option<&str>,
 ) -> String {
     if report.root.is_none() {
-        return match edit {
-            Some(edit) => format!(
-                "no root on this box for this workspace \u{2014} {edit} on {WORKSPACES_TAB} sets \
-                 its folder"
-            ),
-            None => format!(
-                "no root on this box for this workspace \u{2014} set its folder on {WORKSPACES_TAB}"
-            ),
+        let set = match edit {
+            Some(edit) => format!("{edit} on {WORKSPACES_TAB} sets its folder"),
+            None => format!("set its folder on {WORKSPACES_TAB}"),
         };
+        let then = infer.map_or_else(String::new, |infer| format!(", then {infer} here"));
+        return format!("no root on this box for this workspace \u{2014} {set}{then}");
     }
     if report.truncated {
         return format!(
@@ -2125,17 +2126,11 @@ fn repo_at(owner: &ProjectEntry, index: usize) -> Option<(ProjectId, &RepoEntry)
     owner.repos.get(index).map(|repo| (owner.project.id, repo))
 }
 
-/// The pane of a delete, every warning line in `theme.error` (D9).
+/// The pane of a project's delete, every warning line in `theme.error` (D9).
 ///
 /// The counts are the store's own, in [`DeleteReach`]'s field order and with the zeros left out:
 /// the pane lists what a delete takes, and "0 runs" is not something being taken.
-fn delete_pane(
-    target: DeleteTarget,
-    slug: &str,
-    stage: &DeleteStage,
-    width: u16,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+fn delete_pane(slug: &str, stage: &DeleteStage, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let reach = match stage {
         DeleteStage::Counting => {
             return vec![notice("counting rows\u{2026}", Tone::Info, theme)];
@@ -2150,18 +2145,14 @@ fn delete_pane(
         DeleteStage::Warn(reach) | DeleteStage::Typed { reach, .. } => reach,
     };
 
-    let headline = match target {
-        DeleteTarget::Project(_) => {
-            let parts = reach_parts(reach);
-            let taken = if parts.is_empty() {
-                "no other rows".to_owned()
-            } else {
-                parts.join(", ")
-            };
-            format!("This deletes project `{slug}` and its entire history. Gone for good: {taken}.")
-        }
-        DeleteTarget::Workspace(_) => crate::hierarchy::workspace_delete_warning(slug, reach),
+    let parts = reach_parts(reach);
+    let taken = if parts.is_empty() {
+        "no other rows".to_owned()
+    } else {
+        parts.join(", ")
     };
+    let headline =
+        format!("This deletes project `{slug}` and its entire history. Gone for good: {taken}.");
 
     let room = usize::from(width).max(1);
     let mut lines: Vec<Line<'static>> = wrapped(&headline, room)
@@ -2219,13 +2210,7 @@ mod tests {
             field: TextField::with_text(&"x".repeat(60)),
         };
 
-        let lines = delete_pane(
-            DeleteTarget::Project(ProjectId::new()),
-            &"\u{6f22}".repeat(8),
-            &stage,
-            width,
-            &Theme::default(),
-        );
+        let lines = delete_pane(&"\u{6f22}".repeat(8), &stage, width, &Theme::default());
 
         let last = lines.last().expect("the confirm line");
         let prompt = format!("Type `{}` to confirm: ", "\u{6f22}".repeat(8));
@@ -2366,11 +2351,11 @@ mod tests {
             }],
         };
         assert_eq!(
-            inferred_notice(&unmatched, Some("B"), Some("E")),
+            inferred_notice(&unmatched, Some("B"), Some("E"), Some("I")),
             "inferred 0 of 1 \u{b7} no checkout: docs \u{2014} B on a repo sets it by hand"
         );
         assert_eq!(
-            inferred_notice(&unmatched, None, None),
+            inferred_notice(&unmatched, None, None, None),
             "inferred 0 of 1 \u{b7} no checkout: docs \u{2014} set it by hand on a repo row"
         );
 
@@ -2379,12 +2364,23 @@ mod tests {
             truncated: false,
             repos: Vec::new(),
         };
+        // R1b B9: the folder set, `infer` here runs the pass (the tab's edit runs none).
         assert_eq!(
-            inferred_notice(&rootless, Some("B"), Some("E")),
+            inferred_notice(&rootless, Some("B"), Some("E"), Some("I")),
+            "no root on this box for this workspace \u{2014} E on the Workspaces tab sets its \
+             folder, then I here"
+        );
+        assert_eq!(
+            inferred_notice(&rootless, None, None, Some("I")),
+            "no root on this box for this workspace \u{2014} set its folder on the Workspaces tab, \
+             then I here"
+        );
+        assert_eq!(
+            inferred_notice(&rootless, Some("B"), Some("E"), None),
             "no root on this box for this workspace \u{2014} E on the Workspaces tab sets its folder"
         );
         assert_eq!(
-            inferred_notice(&rootless, None, None),
+            inferred_notice(&rootless, None, None, None),
             "no root on this box for this workspace \u{2014} set its folder on the Workspaces tab"
         );
     }

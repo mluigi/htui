@@ -179,16 +179,17 @@ line (the pop-up that asked closes; nothing else changes):
   or the waiting list, which opens it in Backlog, while the edit is in Backlog. A result that
   opens in another tab opens as usual.
 
-**The Workspaces tab's and Settings › Hierarchy's own scope changes are refused too, and not
-retried.** On the Workspaces tab, creating the first workspace (htui opens it), deleting the
-workspace htui is in (htui opens the first one left) or creating a project in it normally moves
-htui's scope with it; in Settings › Hierarchy, creating or deleting a project does. (Renaming the
-workspace htui is in moves no scope: the header takes the new name from the list.)
-During an edit that move is refused with the same sentence, and nothing repeats it when the edit
-ends: htui stays on the old scope (the other tabs keep the old project list, or the deleted
-workspace) until the tab that asked next re-reads what it shows or you pick a workspace. After the
-edit, press `w`, select the workspace you are in (or, after deleting it, another one) and press
-`o`: every tab reloads.
+**The Workspaces tab's and Settings › Hierarchy's own scope changes are refused too.** On the
+Workspaces tab, creating the first workspace (htui opens it), deleting the workspace htui is in
+(htui opens the first one left) or creating a project in it normally moves htui's scope with it;
+in Settings › Hierarchy, creating or deleting a project does. (Renaming the workspace htui is in
+moves no scope: the header takes the new name from the list.)
+During an edit that move is refused with the same sentence. A project's move is asked again the
+next time its tab re-reads what it shows (the Workspaces tab its list, Settings › Hierarchy its
+tree), so the other tabs keep the old project list until then. Creating the first workspace and
+deleting the one htui is in move once, and nothing repeats them: htui stays on the old scope (no
+workspace, or the deleted one) until you pick a workspace. After the edit, press `w`, select the
+workspace you are in (or, after deleting it, another one) and press `o`: every tab reloads.
 
 **A modal pop-up over the editor's tab** takes htui's keys, whether a reply opened it (a migration
 prompt, say), you did (find, the queue, the waiting list), or it is one of
