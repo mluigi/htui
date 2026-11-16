@@ -2,33 +2,33 @@
 source: crates/htui/src/testkit.rs
 expression: harness.render()
 ---
-no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs        0 waiting ·  ?  keys
-╭─ Backlog (0) ───────────────────────────────────────╮╭─ Detail ─ Body  Runs  Graph  Docs  Notes ›╮
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│             No items in this workspace.             ││             No item selected.             │
-│         Settings › Hierarchy adds a project         ││         a chosen item shows here          │
-│                                                     ││                                           │
-│                            ╭ Workspaces ────────────────────────────╮                            │
-│                            │             no workspaces              │                            │
-│                            │`N` in Settings › Hierarchy creates one │                            │
-│                            ╰ j/k move · Enter switch · Esc close ───╯                            │
-│                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
-╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
-╭─ Activity · all workspaces ──────────────────────────────────────────────────────────────────────╮
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                         No activity yet.                                         │
-│                            events appear as runs start, wait and fail                            │
-│                                                                                                  │
-│                                                                                                  │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+no workspace   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings         0 waiting ·  ?  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ Overview ─────────────────────────── overview ╮
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│               No workspaces yet.               ││               No workspaces yet.               │
+│                 `N` creates one                ││                 `N` creates one                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰─o open · N new · j/k move · Enter fold─────────╯╰────────────────────────────────────────────────╯

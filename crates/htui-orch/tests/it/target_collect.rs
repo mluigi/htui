@@ -1182,7 +1182,21 @@ async fn a_tip_that_is_not_a_commit_is_refused() {
     };
     let clone = world.clone_dir();
     let commit = world.commit_in_clone(&[("a.txt", "a\n")], "a");
-    world.stdout(&clone, &["tag", "-a", "-m", "a tag", "t1", &commit]);
+    world.stdout(
+        &clone,
+        &[
+            "-c",
+            "user.name=Agent",
+            "-c",
+            "user.email=agent@localhost",
+            "tag",
+            "-a",
+            "-m",
+            "a tag",
+            "t1",
+            &commit,
+        ],
+    );
     let tag = world.stdout(&clone, &["rev-parse", "refs/tags/t1"]);
     let tree = world.stdout(&clone, &["rev-parse", &format!("{commit}^{{tree}}")]);
     let base_ref = format!("^{}", world.base);

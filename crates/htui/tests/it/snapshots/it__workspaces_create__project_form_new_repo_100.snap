@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_create.rs
+expression: frame
+---
+Graphics   ¹Workspaces         0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ New project in Graphics ──────────────────────╮
+│▌▾ Graphics  ● open                             ││ name          Mobile App                       │
+│     overview                                   ││ slug          mobile-app                       │
+│     Vulkan Tutorials                           ││ description                                    │
+│ ▾ Platform  ◐ background · 1 running           ││▌source        ‹ new repo ›                     │
+│     overview                                   ││                                                │
+│     htui                                       ││creates ~/graphics/projects/mobile-app with git │
+│     agy                                        ││init and one empty commit on main               │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰────────────────────────────────────────────────╯╰─←/→ source · Enter create · Esc cancel …───────╯

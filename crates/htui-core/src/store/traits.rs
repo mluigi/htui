@@ -90,7 +90,7 @@ use crate::model::{
     SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
     StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, ToolCallCount,
     UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceRunCounts, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::model::{Integration, LandOutcome};
@@ -1793,6 +1793,15 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// The backend's own failures only.
     async fn workspace_live_runs(&self, workspace: WorkspaceId) -> Result<Vec<Run>>;
+
+    /// MOD-116 M1 D3: one row per workspace, zeros included, in workspace-id byte order: its runs
+    /// counted by non-terminal status (`queued`, `running`, `awaiting_approval`, `stopped`) and its
+    /// `workspace_stop` row. Runs without a workspace never count. One query on Postgres, served
+    /// by `idx_run_workspace_status` (`0019_stop_runs.sql`) or one scan of `run`.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn workspace_run_counts(&self) -> Result<Vec<WorkspaceRunCounts>>;
 
     /// MOD-125 D7: a compare-and-set `running -> stopped` on a run whose `lease_owner` is `owner`.
     /// In one transaction every `running` step of the run moves to `stopped` and the lease is

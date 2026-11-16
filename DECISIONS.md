@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-116](docs/decisions/mod/mod-116.md)** - Workspaces tab and workspace lifecycle (done, 2026-11-16)
 - **[MOD-130](docs/decisions/mod/mod-130.md)** - Execution targets: target record, child boxes, target cascade (done, 2026-11-15)
 - **[MOD-133](docs/decisions/mod/mod-133.md)** - Integration records and modes (local, push, pull_request) (done, 2026-11-15)
 - **[MOD-159](docs/decisions/mod/mod-159.md)** - One knowledge indexer per collection: lease, freshness, coverage (done, 2026-11-15)

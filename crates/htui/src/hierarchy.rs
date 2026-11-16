@@ -335,34 +335,18 @@ pub async fn serve_with_home(
             description,
         } => {
             let created_by = backend.this_user().await?;
-            let project = writer
-                .create_project(NewProject {
+            let project = create_linked_project(
+                &writer,
+                *workspace,
+                NewProject {
                     id: ProjectId::new(),
                     slug: slug.clone(),
                     name: name.clone(),
                     description: description.clone(),
                     created_by,
-                })
-                .await?;
-            // Two seam calls rather than one transaction: `upsert_workspace_project` is the seam's
-            // linker and this milestone adds no seam method, so a failure between them leaves an
-            // unlinked project the editor's `Failed` reports and `r` does not show.
-            let links = writer.workspace_projects(*workspace).await?;
-            // One past the highest, not the count: a middle project that was deleted leaves
-            // `[0, 2]`, where `links.len()` is `2` and `workspace_project` has no unique on
-            // `position` to catch the collision (`0001_init.sql:161-166`).
-            let position = links
-                .iter()
-                .map(|link| link.position)
-                .max()
-                .map_or(0, |highest| highest.saturating_add(1));
-            writer
-                .upsert_workspace_project(&WorkspaceProject {
-                    workspace_id: *workspace,
-                    project_id: project.id,
-                    position,
-                })
-                .await?;
+                },
+            )
+            .await?;
             // MOD-147 D6: a prefix the new project shares with the workspace's own kinds is a
             // notice, not a refusal (ANA-35 §7.5): keys then print qualified.
             let shared_prefixes = prefixes_shared_with(&writer, *workspace, project.id).await?;
@@ -488,6 +472,39 @@ pub async fn serve_with_home(
     }
 }
 
+/// `new`, created and linked into `workspace` one past its highest position (factored out of
+/// `CreateProject`'s arm for MOD-116 M3 D6, which registers a project the same way).
+///
+/// # Errors
+/// Whatever the seam reports. Two seam calls rather than one transaction:
+/// `upsert_workspace_project` is the seam's linker and this milestone adds no seam method, so a
+/// failure between them leaves an unlinked project; a caller that must not keep it deletes
+/// `new.id` (MOD-116 M3 does).
+pub(crate) async fn create_linked_project(
+    writer: &Writer,
+    workspace: WorkspaceId,
+    new: NewProject,
+) -> Result<Project> {
+    let project = writer.create_project(new).await?;
+    let links = writer.workspace_projects(workspace).await?;
+    // One past the highest, not the count: a middle project that was deleted leaves `[0, 2]`,
+    // where `links.len()` is `2` and `workspace_project` has no unique on `position` to catch the
+    // collision (`0001_init.sql:161-166`).
+    let position = links
+        .iter()
+        .map(|link| link.position)
+        .max()
+        .map_or(0, |highest| highest.saturating_add(1));
+    writer
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace,
+            project_id: project.id,
+            position,
+        })
+        .await?;
+    Ok(project)
+}
+
 /// MOD-147 D6: `project`'s kind prefixes that a kind of `workspace`'s scope row also uses, in
 /// `project`'s kind order; empty when the workspace has no scope row.
 async fn prefixes_shared_with(
@@ -557,7 +574,7 @@ async fn fresh_tree(
 }
 
 /// This box's id, or the refusal a path write gets on a box with no row.
-fn box_id(this_box: Option<BoxId>) -> Result<BoxId> {
+pub(crate) fn box_id(this_box: Option<BoxId>) -> Result<BoxId> {
     this_box.ok_or_else(|| StoreError::NotFound {
         entity: "box",
         id: "(this box)".to_owned(),
@@ -574,7 +591,7 @@ fn box_id(this_box: Option<BoxId>) -> Result<BoxId> {
 /// `to_string_lossy` that stores a string naming nothing on disk. What was typed is a `String` and
 /// so always UTF-8; only what a link resolves to can get here, and the sentence names the path as
 /// typed — never the target (`R-BOX-4`).
-async fn canonical(path: &str) -> Result<String> {
+pub(crate) async fn canonical(path: &str) -> Result<String> {
     let typed = path.to_owned();
     let resolved = tokio::task::spawn_blocking({
         let typed = typed.clone();
@@ -594,7 +611,7 @@ async fn canonical(path: &str) -> Result<String> {
 ///
 /// The rows are gone before this runs, so a failed rebuild is reported *inside* a successful
 /// reply rather than turning the delete into a `Failed` that claims nothing happened.
-async fn rebuild_mirror(backend: &Backend) -> MirrorAfterDelete {
+pub(crate) async fn rebuild_mirror(backend: &Backend) -> MirrorAfterDelete {
     match backend.cache() {
         Some(cache) => match cache.rebuild().await {
             Ok(()) => MirrorAfterDelete::Rebuilt,
@@ -933,6 +950,39 @@ pub fn reach_parts(reach: &DeleteReach) -> Vec<String> {
         .collect()
 }
 
+/// The headline of a workspace delete's warning (MOD-147 A1; MOD-116 M3 D10 moved it here so the
+/// Workspaces tab and Settings › Hierarchy say the same words): its project links and box root
+/// paths, then everything else the delete takes with it, named as a project delete names them.
+#[must_use]
+pub fn workspace_delete_warning(slug: &str, reach: &DeleteReach) -> String {
+    let mut headline = format!(
+        "This deletes workspace `{slug}`: {} and {}. Its projects survive and stay reachable from other workspaces.",
+        plural(
+            usize::try_from(reach.workspace_links).unwrap_or(usize::MAX),
+            "project link",
+            "project links"
+        ),
+        plural(
+            usize::try_from(reach.workspace_box_paths).unwrap_or(usize::MAX),
+            "box root path",
+            "box root paths"
+        ),
+    );
+    // MOD-147 A1: the rest of the reach goes with the workspace, named as a project delete
+    // names them: everything its scope row owns, summed with the workspace's own
+    // workspace-scoped graphs (their step graphs, phases and phase agents). Only the two
+    // counts above are left out here, rather than said twice.
+    let owned = reach_parts(&DeleteReach {
+        workspace_links: 0,
+        workspace_box_paths: 0,
+        ..*reach
+    });
+    if !owned.is_empty() {
+        headline.push_str(&format!(" Gone for good with it: {}.", owned.join(", ")));
+    }
+    headline
+}
+
 /// `(rows, tables)`: the sum of every count and how many of them are non-zero.
 #[must_use]
 pub fn reach_totals(reach: &DeleteReach) -> (u64, usize) {
@@ -957,7 +1007,7 @@ mod tests {
 
     use super::{
         InferOutcome, box_id, infer_one, labelled, reach_parts, reach_totals, snapshot,
-        workspace_root,
+        workspace_delete_warning, workspace_root,
     };
     use crate::store_worker::{StoreRequest, serve};
 
@@ -1215,5 +1265,38 @@ mod tests {
         };
         assert_eq!(reach_totals(&reach), (29, 3));
         assert_eq!(reach_totals(&DeleteReach::default()), (0, 0));
+    }
+
+    /// MOD-116 M3 D10: the headline Settings › Hierarchy drew is the one the Workspaces tab
+    /// draws, word for word (`a_workspace_delete_names_what_its_scope_row_takes` pins it on
+    /// screen).
+    #[test]
+    fn the_workspace_delete_warning_reads_as_before() {
+        let reach = DeleteReach {
+            workspace_links: 1,
+            items: 1,
+            item_kinds: 1,
+            step_graphs: 1,
+            phases: 2,
+            prompt_templates: 10,
+            documents: 1,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            workspace_delete_warning("graphics", &reach),
+            "This deletes workspace `graphics`: 1 project link and 0 box root paths. Its projects \
+             survive and stay reachable from other workspaces. Gone for good with it: 1 item, 1 \
+             kind, 1 graph, 2 phases, 10 templates, 1 document."
+        );
+        let bare = DeleteReach {
+            workspace_links: 2,
+            workspace_box_paths: 1,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            workspace_delete_warning("graphics", &bare),
+            "This deletes workspace `graphics`: 2 project links and 1 box root path. Its projects \
+             survive and stay reachable from other workspaces."
+        );
     }
 }

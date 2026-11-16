@@ -93,7 +93,7 @@ async fn a_skill_created_edited_and_attached_in_the_tui_lands_on_postgres() {
         return;
     };
     let harness = &mut stack.harness;
-    harness.key("2");
+    harness.key("3");
     harness.settle().await;
 
     // Create: name, an empty description, then v1's body.
@@ -185,7 +185,7 @@ async fn a_skill_with_no_version_is_edited_into_v1_on_postgres() {
         .await
         .expect("plant a skill with no version");
     let harness = &mut stack.harness;
-    harness.key("2");
+    harness.key("3");
     harness.settle().await;
     // Name order puts `bare-skill` first, under the cursor.
     let frame = harness.render();

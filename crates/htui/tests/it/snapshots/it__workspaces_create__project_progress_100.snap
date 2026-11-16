@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_create.rs
+expression: frame
+---
+Graphics   ¹Workspaces         0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ New project in Graphics ──────────────────────╮
+│▌▾ Graphics  ● open                             ││ name          Shaders                          │
+│     overview                                   ││ slug          shaders                          │
+│     Vulkan Tutorials                           ││ description                                    │
+│ ▾ Platform  ◐ background · 1 running           ││ source        ‹ git URL ›                      │
+│     overview                                   ││▌URL           ~/remote.git                     │
+│     htui                                       ││                                                │
+│     agy                                        ││cloning ~/remote.git into                       │
+│                                                ││~/graphics/projects/shaders…                    │
+│                                                ││                                                │
+│                                                ││clones it into ~/graphics/projects/shaders with │
+│                                                ││this machine's git (its ssh agent and credential│
+│                                                ││helper; htui never prompts)                     │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰────────────────────────────────────────────────╯╰─Esc close──────────────────────────────────────╯

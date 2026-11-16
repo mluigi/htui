@@ -1,0 +1,90 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT w.id AS \"workspace_id!: WorkspaceId\",\n                   COUNT(r.id) FILTER (WHERE r.status = 'queued')            AS \"queued!\",\n                   COUNT(r.id) FILTER (WHERE r.status = 'running')           AS \"running!\",\n                   COUNT(r.id) FILTER (WHERE r.status = 'awaiting_approval') AS \"awaiting_approval!\",\n                   COUNT(r.id) FILTER (WHERE r.status = 'stopped')           AS \"stopped!\",\n                   s.mode         AS \"mode?: StopMode\",\n                   s.requested_by AS \"requested_by?: UserId\",\n                   s.requested_at AS \"requested_at?\"\n              FROM workspace w\n              LEFT JOIN run r ON r.workspace_id = w.id\n                             AND r.status IN ('queued', 'running', 'awaiting_approval', 'stopped')\n              LEFT JOIN workspace_stop s ON s.workspace_id = w.id\n             GROUP BY w.id, s.workspace_id\n             ORDER BY w.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id!: WorkspaceId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "workspace",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "queued!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "running!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "awaiting_approval!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "stopped!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "mode?: StopMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workspace_stop",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "requested_by?: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "workspace_stop",
+            "name": "requested_by"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "requested_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "workspace_stop",
+            "name": "requested_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null,
+      null,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "49d2edeca7a979b1b8a1086eb5b9dd639371d76b55e45021a74890e3f59ddd3d"
+}

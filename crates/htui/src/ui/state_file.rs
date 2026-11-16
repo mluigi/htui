@@ -13,6 +13,9 @@
 //! filter = "info"             # an EnvFilter directive, checked when it is applied
 //! file = "/home/me/htui.log"
 //!
+//! [workspace]                 # MOD-116 M1 D12: the workspace entered last
+//! last = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+//!
 //! [layout.backlog]            # the tab's id
 //! preset = "ide"              # Preset::name
 //! list_percent = 55           # exactly one of list_percent / list_cells
@@ -37,6 +40,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
+use htui_core::model::WorkspaceId;
+
 use crate::logging::LoggingPrefs;
 use crate::ui::shell::{ListSize, Preset, TabLayout};
 
@@ -58,6 +63,9 @@ pub struct UiState {
     pub modals: BTreeMap<String, (u16, u16)>,
     /// MOD-122 D5: `[logging]`; `None` = nothing saved.
     pub logging: Option<LoggingPrefs>,
+    /// MOD-116 M1 D12: `[workspace] last`, the workspace entered last, reopened at startup when
+    /// the store still holds it; `None` = nothing saved.
+    pub last_workspace: Option<WorkspaceId>,
 }
 
 /// The file as TOML: the tables [`parse`] reads after the version and [`render`] writes.
@@ -69,6 +77,9 @@ struct FileDto {
     // Between `about` and `layout`, so a file without it still renders byte for byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     logging: Option<LoggingDto>,
+    // MOD-116 M1 D12: between `logging` and `layout`, skipped when `None`, for the same reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<WorkspaceDto>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     layout: BTreeMap<String, LayoutDto>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -114,6 +125,14 @@ impl LoggingDto {
         };
         (!prefs.is_empty()).then_some(prefs)
     }
+}
+
+/// `[workspace]` (MOD-116 M1 D12). An id that is not a UUID fails the file, as any bad table
+/// does.
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last: Option<WorkspaceId>,
 }
 
 /// `[layout.<tab>]`.
@@ -175,6 +194,10 @@ pub fn parse(text: &str) -> Result<UiState, String> {
         let logging: LoggingDto = shaped("logging", logging)?;
         state.logging = logging.into_prefs();
     }
+    if let Some(workspace) = table.get("workspace") {
+        let workspace: WorkspaceDto = shaped("workspace", workspace)?;
+        state.last_workspace = workspace.last;
+    }
     for (name, value) in tables(&table, "layout")? {
         let at = format!("layout.{name}");
         let layout: LayoutDto = shaped(&at, value)?;
@@ -206,6 +229,9 @@ pub fn render(state: &UiState) -> String {
             .as_ref()
             .filter(|prefs| !prefs.is_empty())
             .map(LoggingDto::of),
+        workspace: state
+            .last_workspace
+            .map(|last| WorkspaceDto { last: Some(last) }),
         layout: state
             .layouts
             .iter()
@@ -614,6 +640,8 @@ fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
 mod tests {
     use std::path::PathBuf;
 
+    use htui_core::model::WorkspaceId;
+
     use super::{FILE_NAME, UiState, parse, render};
     use crate::logging::LoggingPrefs;
     use crate::ui::shell::{ListSize, Preset, TabLayout};
@@ -972,6 +1000,58 @@ cap = 50
         assert_eq!(
             reason("version = 1\nlogging = 3\n").split(':').next(),
             Some("logging")
+        );
+    }
+
+    /// MOD-116 M1 D12: `[workspace] last` round-trips, written after `[logging]`, before the
+    /// layouts.
+    #[test]
+    fn the_last_workspace_round_trips() {
+        let id: WorkspaceId = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+            .parse()
+            .expect("a uuid");
+        let state = UiState {
+            last_workspace: Some(id),
+            ..full()
+        };
+        let text = render(&state);
+        assert_eq!(parse(&text), Ok(state));
+        let logging = text.find("[logging]").expect("[logging] is written");
+        let workspace = text.find("[workspace]").expect("[workspace] is written");
+        let layout = text.find("[layout.backlog]").expect("a layout is written");
+        assert!(logging < workspace && workspace < layout, "{text}");
+        let alone = UiState {
+            last_workspace: Some(id),
+            ..UiState::default()
+        };
+        assert_eq!(
+            render(&alone),
+            "version = 1\n\n[workspace]\nlast = \"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\"\n"
+        );
+        assert_eq!(parse(&render(&alone)), Ok(alone));
+    }
+
+    /// D12: without a last workspace the file is the one M2 wrote, byte for byte.
+    #[test]
+    fn a_file_without_it_renders_byte_for_byte_as_before() {
+        let state = parse(BACKLOG_FILE).expect("the blueprint's file reads");
+        assert_eq!(state.last_workspace, None);
+        assert_eq!(render(&state), BACKLOG_FILE);
+        assert_eq!(
+            parse("version = 1\n[workspace]\n").map(|s| s.last_workspace),
+            Ok(None)
+        );
+    }
+
+    /// D12: an id that does not parse fails the file as any bad table does, naming the table.
+    #[test]
+    fn a_last_workspace_that_is_not_an_id_is_refused_with_its_table() {
+        let why = reason("version = 1\n[workspace]\nlast = \"platform\"\n");
+        assert!(why.starts_with("workspace: "), "{why}");
+        assert!(!why.contains('\n'), "one line for the notice: {why}");
+        assert_eq!(
+            reason("version = 1\nworkspace = 3\n").split(':').next(),
+            Some("workspace")
         );
     }
 

@@ -57,6 +57,24 @@ impl KeysError {
     }
 }
 
+/// MOD-116 M1 D10 (MOD-115 MD4: existing overrides keep loading): the tables htui no longer has,
+/// with the notice a file that still holds one loads with. Their entries are ignored unchecked.
+const RETIRED: &[(&str, &str)] = &[(
+    "switcher",
+    "[switcher]: the workspace switcher is gone; w opens the Workspaces tab (its key is \
+     [workspaces] open)",
+)];
+
+/// MOD-116 M3 D14 (MOD-115 MD4): the actions htui no longer has in a table that lives on, as
+/// `(table, name, notice)`. An entry naming one loads with the notice on its line, whatever its
+/// value; nothing is read from it.
+const RETIRED_ACTIONS: &[(&str, &str, &str)] = &[(
+    "settings.hierarchy",
+    "new_workspace",
+    "[settings.hierarchy] new_workspace: new workspaces are created on the Workspaces tab (its \
+     key is [workspaces] new)",
+)];
+
 /// The report's last line, after every error (ANA-26 §7.5).
 const HINT: &str = "Fix the file, or run `htui --default-keys` to start with the default keys.";
 
@@ -359,6 +377,15 @@ impl Loader<'_> {
     /// tables extend it with `.` (D1). A path that is no context and holds a value, or nothing,
     /// is reported once.
     fn walk_table(&mut self, path: &str, line: usize, table: &DeTable<'_>) {
+        // MOD-116 M1 D10: a retired table (and any table under it) loads with one notice on its
+        // line, and nothing in it is read: a file written for the old view keeps loading.
+        if let Some((_, notice)) = RETIRED.iter().find(|(name, _)| *name == path) {
+            self.keys.retired.push(KeyFileError {
+                line,
+                message: (*notice).to_owned(),
+            });
+            return;
+        }
         let context = context_named(path);
         let has_values = table
             .values()
@@ -407,6 +434,17 @@ impl Loader<'_> {
             .find(|spec| spec.context == context && spec.name == name)
             .or_else(|| overridable(context).find(|spec| spec.name == name))
         else {
+            // MOD-116 M3 D14: a retired action is a notice on its line, never a refusal.
+            if let Some((_, _, notice)) = RETIRED_ACTIONS
+                .iter()
+                .find(|(retired, action, _)| *retired == table && *action == name)
+            {
+                self.keys.retired.push(KeyFileError {
+                    line: key_line,
+                    message: (*notice).to_owned(),
+                });
+                return;
+            }
             let names = CATALOGUE
                 .iter()
                 .filter(|spec| spec.context == context)
@@ -511,7 +549,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{ESC_REFUSED, FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
-    use crate::keys::{Act, CATALOGUE, CTRL_C, Context, KeyChord, Keys, views};
+    use crate::keys::{Act, CATALOGUE, CTRL_C, Context, KeyChord, Keys, Stack, views};
 
     /// The full error vector of `src`, as `(line, message)`.
     fn errors(src: &str) -> Vec<(usize, String)> {
@@ -542,7 +580,7 @@ mod tests {
                           settings.personas, settings.secrets, settings.queue, \
                           settings.project_types, settings.logging, settings.memory, \
                           settings.documents, graph_editor, \
-                          graph_editor.links, concepts, switcher, migration, \
+                          graph_editor.links, concepts, workspaces, migration, \
                           waiting, skills, skills.library, \
                           skills.templates, skills.attach, skills.help, requirements, backlog, \
                           backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
@@ -1454,10 +1492,12 @@ quit = ["x", "shift-a"]
             )
         );
         assert_eq!(
-            errors("[switcher]\nclose = \"f2\"\n"),
+            errors("[workspaces]\nclose = \"f2\"\n"),
             one(
                 2,
-                "[switcher] close: no such action; [switcher] has switch, and may override down, up"
+                "[workspaces] close: no such action; [workspaces] has open, stop, resume, new, \
+                 target, and may override down, up, top, bottom, fold, scroll_down, scroll_up, \
+                 page_down, page_up, yes, no, next_field, prev_field, edit, delete"
             )
         );
         assert_eq!(
@@ -1468,6 +1508,91 @@ quit = ["x", "shift-a"]
                  up, edit, reload, dismiss, next_section, prev_section"
             )
         );
+    }
+
+    /// The notice a retired `[switcher]` table loads with (MOD-116 M1 D10).
+    const SWITCHER_RETIRED: &str = "[switcher]: the workspace switcher is gone; w opens the Workspaces tab (its key is \
+         [workspaces] open)";
+
+    /// MOD-116 M1 D10 (MOD-115 MD4: existing overrides keep loading): a `[switcher]` table, the
+    /// retired workspace switcher's, loads whatever it holds, even an entry that names no action,
+    /// with one notice on the table's line; a nested `[switcher.x]` is no refusal either.
+    #[test]
+    fn the_retired_switcher_table_loads_with_one_notice() {
+        let keys = load_str(
+            "version = 2\n[global]\nquit = \"ctrl-y\"\n\n[switcher]\nswitch = [\"enter\"]\n\
+             close = \"f2\"\nnonsense = 3\n",
+        )
+        .expect("a retired table loads");
+        assert_eq!(
+            keys.notices(),
+            [KeyFileError {
+                line: 5,
+                message: SWITCHER_RETIRED.to_owned(),
+            }]
+        );
+        assert_eq!(
+            keys.actions(views::WORKSPACES_BROWSE, chord("o")),
+            [Act::WorkspacesOpen]
+        );
+        assert_eq!(keys.actions(Stack::BASE, chord("ctrl-y")), [Act::Quit]);
+        let nested = load_str("[switcher.x]\nswitch = \"enter\"\n").expect("loads");
+        assert_eq!(
+            nested.notices(),
+            [KeyFileError {
+                line: 1,
+                message: SWITCHER_RETIRED.to_owned(),
+            }]
+        );
+        let empty = load_str("[switcher]\n").expect("loads");
+        assert_eq!(empty.notices().len(), 1);
+        assert_eq!(empty, Keys::defaults(), "the notice is no binding");
+    }
+
+    /// The notice a retired `[settings.hierarchy] new_workspace` loads with (MOD-116 M3 D14).
+    const NEW_WORKSPACE_RETIRED: &str = "[settings.hierarchy] new_workspace: new workspaces are \
+         created on the Workspaces tab (its key is [workspaces] new)";
+
+    /// MOD-116 M3 D14 (MOD-115 MD4: existing overrides keep loading): `new_workspace`, retired
+    /// from a table that lives on, loads whatever it holds, even a chord that does not parse or a
+    /// value that is no chord, with one notice on its line and nothing bound; the table's "no
+    /// such action" list no longer names it.
+    #[test]
+    fn the_retired_new_workspace_key_loads_with_one_notice() {
+        for value in [
+            "\"ctrl-n\"",
+            "[\"N\", \"ctrl-n\"]",
+            "\"ctrl-nope-x\"",
+            "3",
+            "[]",
+        ] {
+            let keys = load_str(&format!("[settings.hierarchy]\nnew_workspace = {value}\n"))
+                .unwrap_or_else(|err| panic!("{value}: a retired action loads: {err:?}"));
+            assert_eq!(
+                keys.notices(),
+                [KeyFileError {
+                    line: 2,
+                    message: NEW_WORKSPACE_RETIRED.to_owned(),
+                }],
+                "{value}"
+            );
+            assert_eq!(keys, Keys::defaults(), "{value}: the notice is no binding");
+            assert_eq!(
+                keys.actions(views::HIERARCHY_BROWSE, chord("ctrl-n")),
+                [],
+                "{value}"
+            );
+        }
+        let refused = errors("[settings.hierarchy]\nnew_project = \"x\"\n");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].1.starts_with(
+                "[settings.hierarchy] new_project: no such action; [settings.hierarchy] has \
+                 primary, "
+            ),
+            "{refused:?}"
+        );
+        assert!(!refused[0].1.contains("new_workspace"), "{refused:?}");
     }
 
     /// MOD-67 M5 §3.1: `[backlog.runs]` overrides a `[backlog]` verb in the Runs pane alone,

@@ -2703,6 +2703,8 @@ async fn the_hierarchy_section_adopts_a_secrets_tree_without_taking_it_as_its_wr
     bench.reply(&mut hierarchy_section, &tree_reply(&tree));
     let _ = bench.drained();
 
+    // A project's editor: the workspace row's `e` names the Workspaces tab (MOD-116 M3 D17).
+    bench.key(&mut hierarchy_section, "j");
     bench.key(&mut hierarchy_section, "e");
     for c in "-2".chars() {
         bench.key(&mut hierarchy_section, &c.to_string());
@@ -2712,7 +2714,7 @@ async fn the_hierarchy_section_adopts_a_secrets_tree_without_taking_it_as_its_wr
     assert!(
         matches!(
             sent.as_slice(),
-            [Action::Store(StoreRequest::UpdateWorkspace { .. })]
+            [Action::Store(StoreRequest::UpdateProject { .. })]
         ),
         "{sent:?}"
     );
@@ -2845,7 +2847,7 @@ async fn the_product_registers_secrets_last() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
     harness.settle().await;
-    harness.key("4");
+    harness.key("5");
     harness.settle().await;
     for _ in 0..8 {
         harness.key("l");
@@ -3007,7 +3009,7 @@ async fn a_rebound_check_runs_on_its_new_chord_only() {
     let mut harness = Harness::demo().with_keys(keys);
     htui::app::register_all(harness.app());
     harness.settle().await;
-    harness.key("4");
+    harness.key("5");
     harness.settle().await;
     for _ in 0..8 {
         harness.key("l");

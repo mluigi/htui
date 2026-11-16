@@ -46,7 +46,7 @@ async fn open_over(store: MemStore) -> Harness {
     let mut harness = Harness::over(store);
     register_all(harness.app());
     harness.settle().await;
-    harness.key("2");
+    harness.key("3");
     harness.settle().await;
     harness
 }
@@ -63,11 +63,15 @@ async fn open_platform_over(store: MemStore) -> Harness {
     harness.settle().await;
     harness.key("w");
     harness.settle().await;
-    harness.key("j");
-    harness.key("enter");
+    // MOD-116 M1: the Workspaces tab lists Graphics, its overview, Vulkan Tutorials, then
+    // Platform; `o` opens the row's workspace and the focus stays on the tab.
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("o");
     harness.settle().await;
     assert_eq!(harness.app().top_bar.workspace, "Platform");
-    harness.key("2");
+    harness.key("3");
     harness.settle().await;
     harness
 }
@@ -1124,7 +1128,7 @@ async fn tab_and_digits_still_switch_tabs_with_a_draft_open() {
         Some("requirements"),
         "`Ctrl+PgDn` passes to the shell, and Requirements follows Skills"
     );
-    harness.key("2");
+    harness.key("3");
     harness.settle().await;
     assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
     let frame = harness.render();
@@ -1138,7 +1142,8 @@ async fn the_strip_text_is_unchanged() {
     let frame = harness.render();
     assert!(
         frame.contains(
-            " \u{b9}Backlog  \u{b2}Skills  \u{b3}Requirements  \u{2074}Settings  \u{2075}Chat"
+            " \u{b9}Workspaces  \u{b2}Backlog  \u{b3}Skills  \u{2074}Requirements  \u{2075}Settings  \
+             \u{2076}Chat"
         ),
         "{frame}"
     );
@@ -1674,7 +1679,7 @@ async fn open_with_agent(script: Script) -> (Harness, MemStore) {
         .with_agent_runtime(AgentRuntime::new(factory).with_grace(Duration::from_millis(0)));
     register_all(harness.app());
     harness.drive().await;
-    harness.key("2");
+    harness.key("3");
     harness.drive().await;
     (harness, store)
 }
@@ -1823,7 +1828,7 @@ async fn open_with_keys(store: MemStore, keys: &str) -> Harness {
     let mut harness = Harness::over(store).with_keys(keys);
     register_all(harness.app());
     harness.settle().await;
-    harness.key("2");
+    harness.key("3");
     harness.settle().await;
     harness
 }
@@ -2215,7 +2220,7 @@ async fn the_library_at_80_columns() {
     let mut harness = Harness::over(MemStore::demo()).size(80, 24);
     register_all(harness.app());
     harness.settle().await;
-    harness.key("2");
+    harness.key("3");
     harness.settle().await;
     select(&mut harness, "rust-style");
     let frame = harness.render();

@@ -61,8 +61,14 @@ async fn platform(store: &MemStore) -> Harness {
     let mut harness = graphics(store).await;
     harness.key("w");
     harness.drive_to_end().await;
-    harness.key("j");
-    harness.key("enter");
+    // MOD-116 M1: the Workspaces tab lists Graphics, its overview, Vulkan Tutorials, then
+    // Platform; `o` opens the row's workspace and the focus stays on the tab.
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("o");
+    harness.drive_to_end().await;
+    harness.key("2");
     harness.drive_to_end().await;
     assert_eq!(harness.app().top_bar.workspace, "Platform");
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));

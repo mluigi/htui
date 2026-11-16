@@ -114,14 +114,13 @@ next_field     = ["tab", "down"]    # next field
 prev_field     = ["backtab", "up"]  # previous field
 
 [settings.hierarchy]
-new_workspace = ["N"]              # new workspace
-primary       = ["p"]              # make primary
-choose_path   = ["b"]              # choose path
-infer         = ["i"]              # infer paths
-memory        = ["m"]              # memory
-documents     = ["o"]              # documents
-next_field    = ["tab", "down"]    # next field
-prev_field    = ["backtab", "up"]  # previous field
+primary     = ["p"]              # make primary
+choose_path = ["b"]              # choose path
+infer       = ["i"]              # infer paths
+memory      = ["m"]              # memory
+documents   = ["o"]              # documents
+next_field  = ["tab", "down"]    # next field
+prev_field  = ["backtab", "up"]  # previous field
 
 [settings.kinds]
 new_graph  = ["N"]              # new graph
@@ -214,8 +213,15 @@ up        = ["up"]      # previous hit
 down      = ["down"]    # next hit
 why       = ["ctrl-e"]  # why search is unavailable
 
-[switcher]
-switch = ["enter"]  # switch workspace
+[workspaces]
+open       = ["o"]              # open workspace
+stop       = ["s"]              # stop runs
+resume     = ["r"]              # resume runs
+new        = ["N"]              # new workspace or project
+target     = ["T"]              # default target
+yes        = ["y", "enter"]     # yes
+next_field = ["tab", "down"]    # next field
+prev_field = ["backtab", "up"]  # previous field
 
 [migration]
 yes = ["y", "Y"]  # yes
@@ -395,6 +401,7 @@ forward = ["alt-right"]              # forward
 [leave]
 confirm = ["enter", "ctrl-c"]  # leave
 stay    = ["n"]                # stay; Esc always
+stop    = ["S"]                # stop gracefully first
 
 [field]
 submit         = ["enter"]      # submit

@@ -16,12 +16,16 @@
 //!   failure is one line of stderr ([`Exited::message`]). `diff` is the one verb whose stdout
 //!   *is* the product: it is handed on verbatim, head-capped, and never parsed either.
 //!
+//! MOD-116 M3 adds the two verbs a workspace's new project is set up with: `clone`
+//! ([`Cli::clone_repo`]), and `init` plus one empty `commit` for a new repository
+//! ([`Cli::init_with_empty_commit`]); [`repo_facts`] reads what registering a repository needs.
+//!
 //! `git worktree prune` is never spawned (plan D46): our entries are created `--lock`ed and prune
 //! refuses locked entries, so the verb's only reachable effect is on worktrees this orchestrator
 //! did not create. A stale entry is reported instead.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -30,6 +34,7 @@ use std::time::Duration;
 use htui_core::model::{RunId, StepId};
 use tokio::io::AsyncReadExt as _;
 
+use crate::infer::redact_urls;
 use crate::isolate::IsolateError;
 
 /// The oldest `git` that has everything the six verbs use: `worktree add --lock --reason` and
@@ -48,6 +53,9 @@ pub const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `index-pack`s — taken through [`Cli::with_transfer_budget`]: 15 minutes.
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// MOD-116 M3 D8: a clone's wall-clock budget; on expiry the group is killed.
+pub const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// MOD-133 F2 M1: the ssh options both network verbs append: never prompt, and give up on a host
 /// that does not answer the connect within 20 s (ssh has no connect timeout of its own).
 pub const SSH_OPTIONS: &str = "-o BatchMode=yes -o ConnectTimeout=20";
@@ -55,10 +63,23 @@ pub const SSH_OPTIONS: &str = "-o BatchMode=yes -o ConnectTimeout=20";
 /// MOD-133 F2 M1: the environment both network verbs run under besides `GIT_SSH_COMMAND`: an
 /// http transfer slower than 1000 bytes a second for 30 s is aborted rather than left to the
 /// verb's budget.
-pub const NETWORK_ENV: [(&str, &str); 2] = [
+///
+/// MOD-116 M3 R1a A1: an empty `GIT_ASKPASS` as well. `GIT_TERMINAL_PROMPT=0` only closes the
+/// tty; before it git asks `GIT_ASKPASS`, then `core.askPass`, then `SSH_ASKPASS`, and a desktop
+/// that sets the last opens a credential dialog the verb then waits on. A set but empty
+/// `GIT_ASKPASS` ends that chain with no program, so a remote that wants credentials fails at once
+/// (D7: htui never prompts).
+pub const NETWORK_ENV: [(&str, &str); 3] = [
     ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
     ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+    ("GIT_ASKPASS", ""),
 ];
+
+/// MOD-116 M3 R1a A5: the transports a clone may use, as `GIT_ALLOW_PROTOCOL`. An inherited
+/// `GIT_ALLOW_PROTOCOL` replaces every `protocol.<name>.allow` setting, the `-c
+/// protocol.ext.allow=never` of [`clone_args`] included, so the clone sets its own: a local path
+/// (`file`), `git`, `http`, `https` and `ssh` (scp-like `host:path` too), never `ext`.
+pub const CLONE_PROTOCOLS: &str = "file:git:http:https:ssh";
 
 /// The bound on `git --version` inside [`Cli::probe`], which runs synchronously inside
 /// `GixIsolator::new`, on a blocking thread when the run runtime builds its isolator (MOD-4 plan
@@ -1456,7 +1477,7 @@ impl Cli {
 
 /// The `GIT_ALTERNATE_OBJECT_DIRECTORIES` entry naming `dir`: as it is, unless it holds the list
 /// separator or starts with `"`, in which case it is C-quoted, as `git` reads such an entry.
-fn alternate_entry(dir: &Path) -> std::ffi::OsString {
+fn alternate_entry(dir: &Path) -> OsString {
     let separator = if cfg!(windows) { ';' } else { ':' };
     match dir.to_str() {
         Some(text) if text.contains(separator) || text.starts_with('"') => {
@@ -1537,7 +1558,7 @@ pub fn migrate_quarantine(quarantine: &ObjectQuarantine) -> Result<(), IsolateEr
         if std::fs::rename(&file, &dest).is_ok() {
             continue;
         }
-        let mut staged_name = std::ffi::OsString::from("tmp_htui_");
+        let mut staged_name = OsString::from("tmp_htui_");
         staged_name.push(name);
         let staged = to.join(staged_name);
         std::fs::copy(&file, &staged)
@@ -1675,6 +1696,54 @@ pub fn push_args(remote: &str, tip: &str, target: &str) -> Vec<String> {
         remote.to_owned(),
         format!("{tip}:refs/heads/{target}"),
     ]
+}
+
+/// MOD-116 M3 D8: `git clone`'s argv: `-c protocol.ext.allow=never clone --quiet -- <url>
+/// <dest>`. The `ext::` transport runs a command, so it is refused whatever the configuration
+/// says; `--` keeps a URL spelled like an option a URL.
+#[must_use]
+pub fn clone_args(url: &str, dest: &Path) -> Vec<OsString> {
+    vec![
+        "-c".into(),
+        "protocol.ext.allow=never".into(),
+        "clone".into(),
+        "--quiet".into(),
+        "--".into(),
+        url.into(),
+        dest.as_os_str().to_owned(),
+    ]
+}
+
+/// MOD-116 M3 D8: `git init`'s argv for a new repository whose unborn `HEAD` names `branch`.
+#[must_use]
+pub fn init_args(branch: &str) -> Vec<OsString> {
+    vec![
+        "init".into(),
+        "--quiet".into(),
+        format!("--initial-branch={branch}").into(),
+    ]
+}
+
+/// MOD-116 M3 D8: the argv of a new repository's one empty commit. `core.hooksPath=/dev/null`
+/// runs no hook at all (`--no-verify` alone still runs `prepare-commit-msg` and `post-commit`
+/// from a global hooks path or a template), and `commit.gpgsign=false` never asks to sign.
+#[must_use]
+pub fn commit_args() -> Vec<OsString> {
+    [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "--no-verify",
+        "--quiet",
+        "-m",
+        "Initial commit",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect()
 }
 
 /// What one [`Cli::push`] answered.
@@ -1911,6 +1980,91 @@ impl Cli {
         } else {
             Pushed::Failed(network_failure(&exited))
         })
+    }
+}
+
+impl Cli {
+    /// MOD-116 M3 D8: [`CLONE_TIMEOUT`], or this `git`'s own budget when a test shortened it below
+    /// [`VERB_TIMEOUT`]. Not [`ls_remote_budget`](Cli::ls_remote_budget)'s `min`: production's
+    /// budget is [`VERB_TIMEOUT`], and a clone gets longer than that.
+    fn clone_budget(&self) -> Duration {
+        if self.budget < VERB_TIMEOUT {
+            self.budget
+        } else {
+            CLONE_TIMEOUT
+        }
+    }
+
+    /// MOD-116 M3 D8: [`clone_args`] in `dest`'s parent, under [`network_env`],
+    /// [`CLONE_PROTOCOLS`] and [`CLONE_TIMEOUT`]: `url` cloned into `dest`, which git creates (or
+    /// which exists and is empty). Nothing is parsed; the
+    /// caller reads the clone back with [`repo_facts`] (an empty remote clones with exit 0 and an
+    /// unborn `HEAD`). A relative `dest` is taken against this process's working directory.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with `git clone: <git's line, every URL's userinfo dropped>` on
+    /// a non-zero exit, or when `dest` has no parent; [`IsolateError::Git`] when the verb cannot
+    /// be spawned or outlives its budget.
+    pub async fn clone_repo(&self, url: &str, dest: &Path) -> Result<(), IsolateError> {
+        let dest = std::path::absolute(dest).map_err(|err| {
+            IsolateError::Refused(format!(
+                "git clone: cannot resolve {}: {err}",
+                dest.display()
+            ))
+        })?;
+        let Some(parent) = dest.parent() else {
+            return Err(IsolateError::Refused(format!(
+                "git clone: {} has no parent folder",
+                dest.display()
+            )));
+        };
+        let args = clone_args(url, &dest);
+        let args: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+        let ssh = self.network_ssh(parent).await;
+        let bounded = Self {
+            budget: self.clone_budget(),
+            ..self.clone()
+        };
+        let mut env = network_env(ssh.as_deref());
+        env.push(("GIT_ALLOW_PROTOCOL", CLONE_PROTOCOLS));
+        let exited = bounded.run("clone", parent, &args, &env).await?;
+        if exited.ok() {
+            Ok(())
+        } else {
+            Err(IsolateError::Refused(format!(
+                "git clone: {}",
+                redact_urls(&network_failure(&exited))
+            )))
+        }
+    }
+
+    /// MOD-116 M3 D8: a new repository in `dir` (which exists and is empty) whose `HEAD` names
+    /// `branch` and holds one empty commit by htui ([`IDENTITY_ENV`]), with no hook run and no
+    /// signature asked for ([`commit_args`]). Nothing but `.git` is written. Answers the commit's
+    /// hex, read back with `gix`.
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] when either verb cannot run, outlives its budget or exits non-zero,
+    /// or `HEAD` does not read back.
+    pub async fn init_with_empty_commit(
+        &self,
+        dir: &Path,
+        branch: &str,
+    ) -> Result<String, IsolateError> {
+        let init = init_args(branch);
+        let init: Vec<&OsStr> = init.iter().map(OsString::as_os_str).collect();
+        let exited = self.run("init", dir, &init, &[]).await?;
+        if !exited.ok() {
+            return Err(exited.failure("init"));
+        }
+        let commit = commit_args();
+        let commit: Vec<&OsStr> = commit.iter().map(OsString::as_os_str).collect();
+        let exited = self.run("commit", dir, &commit, &IDENTITY_ENV).await?;
+        if !exited.ok() {
+            return Err(exited.failure("commit"));
+        }
+        let dir = dir.to_path_buf();
+        blocking(move || head(&dir)).await
     }
 }
 
@@ -2389,6 +2543,103 @@ fn head_in(repo: &gix::Repository, path: &Path) -> Result<String, IsolateError> 
         IsolateError::Git(format!("cannot peel HEAD of {}: {err}", path.display()))
     })?;
     Ok(id.detach().to_hex().to_string())
+}
+
+/// MOD-116 M3 D8: what registering an existing repository needs. Never a redacted URL: the
+/// caller redacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoFacts {
+    /// The short name of the branch `HEAD` names, born or not; `None` when `HEAD` is detached.
+    pub branch: Option<String>,
+    /// `origin`'s fetch URL as configured, userinfo and all; `None` without an `origin`.
+    pub origin: Option<String>,
+    /// `HEAD`'s peeled commit as hex; `None` when `HEAD` is unborn.
+    pub head: Option<String>,
+    /// Whether the repository has no work tree.
+    pub bare: bool,
+    /// MOD-116 M3 R1a A8: the repository's work tree as `gix` resolves it, whichever of its
+    /// folders was opened (its top, its `.git`, a linked worktree's git directory); `None` when
+    /// bare. Not canonical: the caller resolves it.
+    pub workdir: Option<PathBuf>,
+}
+
+/// MOD-116 M3 D8: [`RepoFacts`] of the repository at `path`. `None` when no repository is at
+/// `path`: `gix::open` does not discover upward, so a folder inside a repository is `None` too.
+///
+/// # Errors
+/// [`IsolateError::Git`] when a repository is there but cannot be opened or read.
+pub fn repo_facts(path: &Path) -> Result<Option<RepoFacts>, IsolateError> {
+    let repo = match gix::open(path) {
+        Ok(repo) => repo,
+        Err(gix::open::Error::NotARepository { .. }) => return Ok(None),
+        Err(err) => {
+            return Err(IsolateError::Git(format!(
+                "cannot open {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let branch = repo
+        .head_name()
+        .map_err(|err| IsolateError::Git(format!("cannot read HEAD of {}: {err}", path.display())))?
+        .map(|name| name.shorten().to_string());
+    let head = repo.head().map_err(|err| {
+        IsolateError::Git(format!("cannot read HEAD of {}: {err}", path.display()))
+    })?;
+    let head = if head.is_unborn() {
+        None
+    } else {
+        let id = head.into_peeled_id().map_err(|err| {
+            IsolateError::Git(format!("cannot peel HEAD of {}: {err}", path.display()))
+        })?;
+        Some(id.detach().to_hex().to_string())
+    };
+    let origin = match repo.try_find_remote("origin") {
+        None => None,
+        Some(Ok(remote)) => remote
+            .url(gix::remote::Direction::Fetch)
+            .map(|url| url.to_bstring().to_string()),
+        Some(Err(err)) => {
+            return Err(IsolateError::Git(format!(
+                "cannot read the origin of {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let workdir = repo.workdir().map(Path::to_path_buf);
+    Ok(Some(RepoFacts {
+        branch,
+        origin,
+        head,
+        bare: workdir.is_none(),
+        workdir,
+    }))
+}
+
+/// MOD-116 M3 R1a A3 (`R-ID-4`): the nearest **proper** ancestor of `path` that opens as a git
+/// repository (a work tree's top, a `.git` directory, a bare repository), as that ancestor's
+/// path; `None` when no ancestor does. Beside [`repo_facts`], which never discovers upward: this
+/// is the walk a folder htui writes into is refused by when it lies inside a repository. `path`
+/// itself is not asked; pass a canonical path so `..` and links cannot hide an ancestor.
+///
+/// # Errors
+/// [`IsolateError::Git`] when an ancestor looks like a repository but cannot be opened.
+pub fn enclosing_repository(path: &Path) -> Result<Option<PathBuf>, IsolateError> {
+    // A relative path's last ancestor is the empty path, which would open the working directory.
+    let ancestors = path.ancestors().skip(1);
+    for ancestor in ancestors.filter(|ancestor| !ancestor.as_os_str().is_empty()) {
+        match gix::open(ancestor) {
+            Ok(_) => return Ok(Some(ancestor.to_path_buf())),
+            Err(gix::open::Error::NotARepository { .. }) => {}
+            Err(err) => {
+                return Err(IsolateError::Git(format!(
+                    "cannot open {}: {err}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Whether `path`'s object database holds `hex` as a commit (MOD-4 milestone 4 A-3, plan D74).
@@ -5863,6 +6114,7 @@ mod tests {
             [
                 ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
                 ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+                ("GIT_ASKPASS", ""),
                 ("GIT_SSH_COMMAND", "ssh -o BatchMode=yes"),
             ]
         );
@@ -5871,6 +6123,7 @@ mod tests {
             [
                 ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
                 ("GIT_HTTP_LOW_SPEED_TIME", "30"),
+                ("GIT_ASKPASS", ""),
             ]
         );
     }
@@ -6047,5 +6300,96 @@ mod tests {
             let binary = fake_git(dir.path(), "any-git", "echo 'git version 2.43.0'; exit 0");
             Cli::probe(binary).expect("the script answers --version")
         })
+    }
+
+    /// The argv as text, for comparing against string literals.
+    fn texts(args: &[std::ffi::OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// MOD-116 M3 D8: a clone forbids the `ext::` transport (it runs a command) and puts the URL
+    /// and the destination after `--`, so a URL spelled like an option stays a URL.
+    #[test]
+    fn the_clone_argv_forbids_ext_and_ends_with_the_url_and_dest() {
+        let dest = PathBuf::from("/w/projects/api");
+        assert_eq!(
+            texts(&super::clone_args("https://h/x.git", &dest)),
+            [
+                "-c",
+                "protocol.ext.allow=never",
+                "clone",
+                "--quiet",
+                "--",
+                "https://h/x.git",
+                "/w/projects/api",
+            ]
+        );
+        let args = texts(&super::clone_args("--upload-pack=x", &dest));
+        let dashes = args.iter().position(|arg| arg == "--").expect("a `--`");
+        let url = args
+            .iter()
+            .position(|arg| arg == "--upload-pack=x")
+            .expect("the URL is passed");
+        assert!(
+            url > dashes,
+            "the option-like URL comes after `--`: {args:?}"
+        );
+    }
+
+    /// MOD-116 M3 D8: a clone gets ten minutes, not the two of every other verb; a test that
+    /// shortened this `git`'s budget keeps its shorter one.
+    #[test]
+    fn the_clone_budget_is_ten_minutes_unless_a_test_shortened_it() {
+        let cli = Cli {
+            binary: PathBuf::from("git"),
+            version: MIN_GIT,
+            budget: super::VERB_TIMEOUT,
+            quarantine: None,
+        };
+        assert_eq!(super::CLONE_TIMEOUT, Duration::from_secs(600));
+        assert_eq!(cli.clone_budget(), Duration::from_secs(600));
+        let short = cli.with_budget(Duration::from_millis(200));
+        assert_eq!(short.clone_budget(), Duration::from_millis(200));
+    }
+
+    /// MOD-116 M3 D8 (fact-check): a new repository's first commit runs no hook of any kind
+    /// (`--no-verify` alone still runs `prepare-commit-msg` and `post-commit`) and never asks to
+    /// sign, whatever the person's global configuration says.
+    #[test]
+    fn the_init_and_commit_argv_never_sign_and_never_run_hooks() {
+        assert_eq!(
+            texts(&super::init_args("main")),
+            ["init", "--quiet", "--initial-branch=main"]
+        );
+        let commit = texts(&super::commit_args());
+        let pairs: Vec<(&str, &str)> = commit
+            .windows(2)
+            .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+            .collect();
+        assert!(
+            pairs.contains(&("-c", "core.hooksPath=/dev/null")),
+            "{commit:?}"
+        );
+        assert!(
+            pairs.contains(&("-c", "commit.gpgsign=false")),
+            "{commit:?}"
+        );
+        let verb = commit
+            .iter()
+            .position(|arg| arg == "commit")
+            .expect("the verb is `commit`");
+        assert!(
+            commit[..verb].iter().filter(|arg| *arg == "-c").count() == 2,
+            "both overrides come before the verb: {commit:?}"
+        );
+        for flag in ["--allow-empty", "--no-verify", "--quiet"] {
+            assert!(
+                commit[verb..].iter().any(|arg| arg == flag),
+                "{flag} in {commit:?}"
+            );
+        }
+        assert_eq!(&commit[commit.len() - 2..], ["-m", "Initial commit"]);
     }
 }

@@ -1081,6 +1081,9 @@ impl WriteStore for SpyStore {
     async fn workspace_live_runs(&self, workspace: WorkspaceId) -> StoreResult<Vec<Run>> {
         self.inner.workspace_live_runs(workspace).await
     }
+    async fn workspace_run_counts(&self) -> StoreResult<Vec<htui_core::model::WorkspaceRunCounts>> {
+        self.inner.workspace_run_counts().await
+    }
     async fn stop_run(&self, run: RunId, owner: Uuid) -> StoreResult<bool> {
         self.inner.stop_run(run, owner).await
     }

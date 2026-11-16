@@ -59,8 +59,8 @@ use crate::model::{
     StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
     StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
     WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop, WorkspaceSummary, canonical_declared_tags, memory_subject_key,
-    missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
+    WorkspaceRunCounts, WorkspaceStop, WorkspaceSummary, canonical_declared_tags,
+    memory_subject_key, missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::model::{
     AttachedBox, BoxKind, NewChildBox, NewTarget, Target, TargetEdit, TargetId, TargetKind,
@@ -12956,6 +12956,28 @@ impl WriteStore for MemStore {
                 .cloned()
                 .collect();
             rows.sort_unstable_by_key(|row| (row.queued_at, row.id));
+            rows
+        }))
+    }
+
+    async fn workspace_run_counts(&self) -> Result<Vec<WorkspaceRunCounts>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<WorkspaceRunCounts> = state
+                .workspaces
+                .keys()
+                .map(|&workspace| {
+                    WorkspaceRunCounts::tally(
+                        workspace,
+                        state
+                            .runs
+                            .values()
+                            .filter(|run| run.workspace_id == Some(workspace))
+                            .map(|run| run.status),
+                        state.workspace_stops.get(&workspace).cloned(),
+                    )
+                })
+                .collect();
+            rows.sort_unstable_by_key(|row| row.workspace_id);
             rows
         }))
     }

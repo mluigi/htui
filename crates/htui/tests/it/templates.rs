@@ -41,7 +41,7 @@ async fn open_over(store: MemStore) -> Harness {
     let mut harness = Harness::over(store);
     register_all(harness.app());
     harness.settle().await;
-    harness.key("2");
+    harness.key("3");
     harness.key("l");
     harness.settle().await;
     harness
@@ -60,7 +60,7 @@ async fn open_with_keys(store: MemStore, toml: &str) -> Harness {
     let mut harness = Harness::over(store).with_keys(keys);
     register_all(harness.app());
     harness.settle().await;
-    harness.key("2");
+    harness.key("3");
     harness.key("l");
     harness.settle().await;
     harness
@@ -590,7 +590,7 @@ async fn another_session_s_version_is_not_taken_for_the_save() {
     type_text(&mut harness, "MINE ");
     // `Tab` away and `2` back queues a `Templates` read ahead of the save.
     harness.key("ctrl-pgdn");
-    harness.key("2");
+    harness.key("3");
     harness.key("ctrl-s");
     // Another session appends v2 before either request is served.
     let elsewhere = store
@@ -1005,7 +1005,7 @@ async fn tab_and_digits_while_editing() {
         Some("requirements"),
         "`Ctrl+PgDn` passes to the shell, and Requirements follows Skills"
     );
-    harness.key("2");
+    harness.key("3");
     harness.settle().await;
     assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
     let frame = harness.render();
@@ -1250,7 +1250,7 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
         Some("requirements"),
         "the prompt passes `Ctrl+PgDn`"
     );
-    harness.key("2");
+    harness.key("3");
     harness.drive().await;
     assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
     let frame = harness.render();
@@ -1272,7 +1272,7 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
         Some("requirements"),
         "the help passes `Ctrl+PgDn`"
     );
-    harness.key("2");
+    harness.key("3");
     harness.drive().await;
     assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
     let frame = harness.render();
@@ -1292,7 +1292,8 @@ async fn the_strip_text_is_unchanged() {
     let frame = harness.render();
     assert!(
         frame.contains(
-            " \u{b9}Backlog  \u{b2}Skills  \u{b3}Requirements  \u{2074}Settings  \u{2075}Chat"
+            " \u{b9}Workspaces  \u{b2}Backlog  \u{b3}Skills  \u{2074}Requirements  \u{2075}Settings  \
+             \u{2076}Chat"
         ),
         "{frame}"
     );
@@ -1355,7 +1356,7 @@ async fn open_with_agent(script: Script) -> (Harness, MemStore) {
         .with_agent_runtime(AgentRuntime::new(factory).with_grace(Duration::from_millis(0)));
     register_all(harness.app());
     harness.drive().await;
-    harness.key("2");
+    harness.key("3");
     harness.key("l");
     harness.drive().await;
     (harness, store)
@@ -1643,7 +1644,7 @@ async fn the_templates_view_at_80_columns() {
     let mut harness = Harness::over(MemStore::demo()).size(80, 24);
     register_all(harness.app());
     harness.settle().await;
-    harness.key("2");
+    harness.key("3");
     harness.key("l");
     harness.settle().await;
     select(&mut harness, "implement");

@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_tab.rs
+expression: frame
+---
+Graphics   ¹Workspaces         0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ Platform ─────────────────────────── overview ╮
+│ ▾ Graphics  ● open                             ││◐ background · 1 running                        │
+│     overview                                   ││                                                │
+│     Vulkan Tutorials                           ││folder on this box  /srv/platform               │
+│▌▾ Platform  ◐ background · 1 running           ││default target      inherits the Settings       │
+│     overview                                   ││                    default (this box)          │
+│     htui                                       ││held runs           none                        │
+│     agy                                        ││                                                │
+│                                                ││Runs                                            │
+│            ╭ Stop the runs in Platform? ─────────────────────────────────────────────╮           │
+│            │Each agent step stops at its turn boundary, checks stop at once; nothing │           │
+│            │new starts until it is resumed.                                          │           │
+│            │                                                                         │           │
+│            │FEAT-3  queued                                                           │           │
+│            │  starts when the workspace is resumed                                   │           │
+│            │FEAT-1  running                                                          │           │
+│            │  stops before its next step                                             │           │
+│            │TOOL-1  awaiting approval                                                │           │
+│            │  its gate can be answered once resumed                                  │           │
+│            ╰ y stop · n cancel ──────────────────────────────────────────────────────╯           │
+│                                                ││Projects                                        │
+│                                                ││htui  no repos yet                              │
+│                                                ││  8 items · 1 running · 2 waiting               │
+│                                                ││agy   no repos yet                              │
+│                                                ││  3 items · 0 running · 0 waiting               │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰────────────────────────────────────────────────╯╰────────────────────────────────────────────────╯

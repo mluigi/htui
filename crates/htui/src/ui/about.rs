@@ -93,8 +93,22 @@ const LOGS: About = About {
     ],
 };
 
-/// The about text of `tab`, if it has one: the six main tabs do, anything else (a test double,
-/// the reserved workspaces tab before it exists) does not.
+/// The Workspaces tab (MOD-116 M1; M2 D6 stops and resumes; M3 D1 creates, D9 sets the default
+/// target).
+const WORKSPACES: About = About {
+    purpose: "Every workspace and what it is doing: open one; the others keep running in the background.",
+    actions: &[
+        (Act::WorkspacesOpen, "open"),
+        (Act::WorkspacesStop, "stop"),
+        (Act::WorkspacesResume, "resume"),
+        (Act::WorkspacesNew, "new"),
+        (Act::WorkspacesTarget, "target"),
+        (Act::ListFold, "fold"),
+    ],
+};
+
+/// The about text of `tab`, if it has one: the seven main tabs do, anything else (a test double)
+/// does not.
 #[must_use]
 pub fn about_for(tab: TabId) -> Option<&'static About> {
     match tab.0 {
@@ -104,6 +118,7 @@ pub fn about_for(tab: TabId) -> Option<&'static About> {
         "settings" => Some(&SETTINGS),
         "requirements" => Some(&REQUIREMENTS),
         "logs" => Some(&LOGS),
+        "workspaces" => Some(&WORKSPACES),
         _ => None,
     }
 }
@@ -153,7 +168,8 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier};
 
-    const TABS: [&str; 6] = [
+    const TABS: [&str; 7] = [
+        "workspaces",
         "backlog",
         "chat",
         "skills",
@@ -204,7 +220,11 @@ mod tests {
             );
         }
         assert_eq!(about_for(TabId("no-such-tab")), None);
-        assert_eq!(about_for(TabId("workspaces")), None, "reserved, not built");
+        assert_eq!(
+            about_for(TabId("workspaces")).map(|about| cells::cell_width(about.purpose)),
+            Some(90),
+            "MOD-116 M1: built, and its purpose fills the limit exactly"
+        );
     }
 
     #[test]

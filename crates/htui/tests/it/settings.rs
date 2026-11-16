@@ -1076,7 +1076,7 @@ async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
     let form = harness.render();
     harness
         .app()
-        .push_overlay(Box::new(htui::ui::overlay::WorkspaceSwitcher::new()));
+        .push_overlay(Box::new(htui::ui::overlay::WaitingList::new()));
     harness.settle().await;
     assert_ne!(harness.render(), form, "the overlay is up");
 
@@ -1131,7 +1131,7 @@ async fn under_an_overlay_the_settings_pane_carries_no_section_hint() {
 
     harness
         .app()
-        .push_overlay(Box::new(htui::ui::overlay::WorkspaceSwitcher::new()));
+        .push_overlay(Box::new(htui::ui::overlay::WaitingList::new()));
     harness.settle().await;
     let frame = harness.render();
     let bottom = settings_bottom_border(&frame);

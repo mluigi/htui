@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_create.rs
+expression: frame
+---
+Graphics   ¹Workspaces         0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ New workspace ────────────────────────────────╮
+│▌▾ Graphics  ● open                             ││▌name          Mobile App                       │
+│     overview                                   ││ slug          mobile-app                       │
+│     Vulkan Tutorials                           ││ folder        ~/workspaces/mobile-app          │
+│ ▾ Platform  ◐ background · 1 running           ││ description                                    │
+│     overview                                   ││                                                │
+│     htui                                       ││~/workspaces/mobile-app/                        │
+│     agy                                        ││  created now; an existing folder is used as it │
+│                                                ││  is                                            │
+│                                                ││  projects/                                     │
+│                                                ││    projects cloned from a URL or started here  │
+│                                                ││the compose and env files land here once        │
+│                                                ││components arrive (MOD-117)                     │
+│                                                ││                                                │
+│                                                ││A new workspace starts stopped.                 │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰────────────────────────────────────────────────╯╰─Enter create · Esc cancel · Tab field──────────╯

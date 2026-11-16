@@ -2,8 +2,8 @@
 source: crates/htui/tests/it/hierarchy.rs
 expression: "bench.render_section(&section, 100)"
 ---
-▌Graphics, renamed (graphics) — folder on this box: ~/workspaces/graphics (default)
-   vulkan-tutorials  Vulkan Tutorials
+ Graphics (graphics) — folder on this box: ~/workspaces/graphics (default)
+▌  vulkan-tutorials  Vulkan, renamed
 
 
 
@@ -27,8 +27,8 @@ expression: "bench.render_section(&section, 100)"
 
 
 
-▌slug                 graphics-2
- name                 Graphics
- description          Rendering experiments
- folder on this box   ~/workspaces/graphics (default) · `b` on the workspace row picks another
+
+▌slug          vulkan-tutorials-2
+ name          Vulkan Tutorials
+ description   Renderer walkthroughs
 changed elsewhere since you opened it — reloaded; Enter retries against the current row

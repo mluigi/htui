@@ -81,15 +81,16 @@ use htui_store::testkit as common;
 /// and MOD-133 M3's five pushed `pull_request` record cases (plan D5) make it 358,
 /// and MOD-127 M1's four workspace and item-kind attachment cases (D2, D3, D6) make it 362,
 /// and MOD-130 M4 T1's Runs-read target case (D7, P2) makes it 363,
-/// and MOD-127 M2 T3's six MCP server and attachment cases (D2-D4) make it 369.
-const EXPECTED_CASES: usize = 369;
+/// and MOD-127 M2 T3's six MCP server and attachment cases (D2-D4) make it 369,
+/// and MOD-116 M1's `workspace_run_counts` case (plan D3) makes it 370.
+const EXPECTED_CASES: usize = 370;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (369 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (370 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
@@ -114,7 +115,8 @@ fn case_list_matches_mem_store() {
              MOD-130 M3 T1's driving-box case, and MOD-130 M3 T2's three driver-keyed claim \
              cases, and MOD-133 M3's five pushed `pull_request` record cases, and MOD-127 M1's four \
              attachment level cases, and MOD-130 M4 T1's one Runs-read target case, and MOD-127 \
-             M2 T3's six MCP server and attachment cases)"
+             M2 T3's six MCP server and attachment cases, and MOD-116 M1's \
+             `workspace_run_counts` case)"
     );
 }
 

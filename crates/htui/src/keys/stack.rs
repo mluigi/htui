@@ -272,7 +272,9 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in Settings > Project types", views::PROJECT_TYPES_BROWSE),
     ("in Settings > Logging", views::LOGGING_BROWSE),
     ("in the concepts search", views::CONCEPTS_QUERY),
-    ("in the workspace switcher", views::SWITCHER),
+    // MOD-116 M1 D10: the Workspaces tab, in the retired workspace switcher's slot, so no other
+    // first-reported phrase moved.
+    ("in Workspaces", views::WORKSPACES_BROWSE),
     ("in the migration prompt", views::MIGRATION),
     ("in the waiting list", views::WAITING_LIST),
     ("in Skills > Library", views::LIBRARY_BROWSE),
@@ -385,6 +387,13 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in Skills > MCP servers", views::MCP_BROWSE),
     ("in the MCP server form", views::MCP_FORM),
     ("in the MCP server delete question", views::MCP_CONFIRM),
+    // MOD-116 M2 D6: the Workspaces tab's stop or resume question, appended so every
+    // first-reported phrase is unchanged.
+    ("in a Workspaces question", views::WORKSPACES_CONFIRM),
+    // MOD-116 M3 D14: the Workspaces tab's chooser and forms, appended so every first-reported
+    // phrase is unchanged.
+    ("in a Workspaces picker", views::WORKSPACES_PICK),
+    ("in a Workspaces form", views::WORKSPACES_FORM),
 ];
 
 impl Keys {
@@ -479,8 +488,11 @@ mod tests {
         // Logging's before it.
         // MOD-141 D12: the graph editor's six; M2 D14: its part form's.
         // MOD-147 M3 D9: the owner documents pane's three; MOD-122 M3 D10: the activity panel;
-        // MOD-127 M2 T8: the MCP servers view's three.
-        assert_eq!(DECLARED.len(), 105);
+        // MOD-127 M2 T8: the MCP servers view's three, 105.
+        // MOD-116 M1 D10: the Workspaces tab's took the retired switcher's slot.
+        // MOD-116 M2 D6: the Workspaces tab's question, 106.
+        // MOD-116 M3 D14: its chooser and forms, 108.
+        assert_eq!(DECLARED.len(), 108);
         assert_eq!(
             DECLARED[101],
             ("in the activity panel", views::ACTIVITY_BROWSE)
@@ -488,6 +500,25 @@ mod tests {
         assert_eq!(
             DECLARED[102],
             ("in Skills > MCP servers", views::MCP_BROWSE)
+        );
+        assert_eq!(
+            DECLARED[105],
+            ("in a Workspaces question", views::WORKSPACES_CONFIRM)
+        );
+        assert_eq!(
+            DECLARED[106],
+            ("in a Workspaces picker", views::WORKSPACES_PICK)
+        );
+        assert_eq!(
+            DECLARED[107],
+            ("in a Workspaces form", views::WORKSPACES_FORM)
+        );
+        assert_eq!(
+            DECLARED
+                .iter()
+                .position(|(phrase, _)| *phrase == "in the concepts search")
+                .map(|at| DECLARED[at + 1]),
+            Some(("in Workspaces", views::WORKSPACES_BROWSE))
         );
         assert_eq!(DECLARED[83], ("in the leave dialog", views::LEAVE));
         // MOD-122 D4: the Logs tab, appended after it.

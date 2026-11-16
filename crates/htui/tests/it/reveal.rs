@@ -20,16 +20,22 @@ use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{ItemId, RequirementId};
 
-/// The demo shell, moved to Platform with the switcher's last key pressed and nothing served
-/// since: the scope change has cleared the Backlog and its `Items` read is still queued.
+/// The demo shell, moved to Platform through the Workspaces tab and back on the Backlog, nothing
+/// served since `o`: the scope change has cleared the Backlog and its `Items` read is still
+/// queued.
 async fn platform_unserved() -> Harness {
     let mut harness = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
     register_all(harness.app());
     harness.drive_to_end().await;
     harness.key("w");
     harness.drive_to_end().await;
-    harness.key("j");
-    harness.key("enter");
+    // MOD-116 M1: the Workspaces tab lists Graphics, its overview, Vulkan Tutorials, then
+    // Platform; `o` opens the row's workspace and the focus stays on the tab.
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("o");
+    harness.key("2");
     harness
 }
 
@@ -101,7 +107,7 @@ fn type_text(harness: &mut Harness, text: &str) {
 #[tokio::test]
 async fn revealing_a_loaded_item_focuses_the_backlog_and_selects_it() {
     let mut harness = platform().await;
-    harness.key("3");
+    harness.key("4");
     harness.drive_to_end().await;
     assert_eq!(harness.app().tabs.active_id(), Some(RequirementsTab::ID));
 
@@ -183,7 +189,7 @@ async fn revealing_a_requirement_focuses_the_requirements_tab_and_opens_it() {
 #[tokio::test]
 async fn revealing_a_requirement_the_filter_hides_clears_the_filter() {
     let mut harness = platform().await;
-    harness.key("3");
+    harness.key("4");
     harness.drive_to_end().await;
     harness.key("/");
     type_text(&mut harness, "priority");
@@ -205,7 +211,7 @@ async fn revealing_a_requirement_the_filter_hides_clears_the_filter() {
 #[tokio::test]
 async fn revealing_an_unknown_requirement_says_so_on_the_tab() {
     let mut harness = platform().await;
-    harness.key("3");
+    harness.key("4");
     harness.drive_to_end().await;
 
     reveal(
@@ -227,7 +233,7 @@ async fn revealing_an_unknown_requirement_says_so_on_the_tab() {
 #[tokio::test]
 async fn a_reveal_over_an_open_form_keeps_the_form() {
     let mut harness = platform().await;
-    harness.key("3");
+    harness.key("4");
     harness.drive_to_end().await;
     // Up from R-ENT-1 onto its area, ENT.
     harness.key("k");

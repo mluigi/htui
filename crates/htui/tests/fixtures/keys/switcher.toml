@@ -1,0 +1,9 @@
+# MOD-116 M1 D10 fixture: a file written for the workspace switcher, which is gone. The retired
+# [switcher] table loads with a notice and its entries are ignored; the rest of the file applies.
+version = 1
+
+[global]
+quit = ["ctrl-y"]
+
+[switcher]
+switch = ["enter"]

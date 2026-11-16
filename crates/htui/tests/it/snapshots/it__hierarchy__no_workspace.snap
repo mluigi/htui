@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/hierarchy.rs
+source: crates/htui/tests/it/hierarchy.rs
 expression: harness.render()
 ---
 no workspace   ¹Settings     0 working · 0 waiting · memory · no box ·  F9  about   ?  keys · ⌫ back
@@ -17,7 +17,7 @@ no workspace   ¹Settings     0 working · 0 waiting · memory · no box ·  F9 
 │                                                                                                  │
 │                                                                                                  │
 │                                           no workspace                                           │
-│                                          `N` creates one                                         │
+│                               `N` on the Workspaces tab creates one                              │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +31,4 @@ no workspace   ¹Settings     0 working · 0 waiting · memory · no box ·  F9 
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-╰─N workspace · r reload───────────────────────────────────────────────────────────────────────────╯
+╰─r reload─────────────────────────────────────────────────────────────────────────────────────────╯

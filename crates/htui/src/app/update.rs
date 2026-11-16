@@ -3,7 +3,7 @@
 //! Everything else in the crate produces [`Action`]s; this file is the only consumer. Adding a
 //! feature adds an arm here and a file under `ui/`, never an arm in the event loop.
 
-use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
+use htui_core::model::{InBackground, RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_core::qdrant::KNOWLEDGE_SEARCH_UNAVAILABLE;
 use htui_orch::Command;
 
@@ -391,6 +391,12 @@ impl App {
                 let scope = self.scope.clone();
                 self.dispatch(Origin::App, StoreRequest::Waiting { scope });
             }
+            // MOD-116 M1 D5: every workspace's counts, for the header's background chip and the
+            // Workspaces tab, which never polls them itself; M3 D16: once the scope names a
+            // workspace, with a project or not (a new workspace starts with none).
+            if self.scope.workspace_id != WorkspaceId::default() {
+                self.dispatch(Origin::App, StoreRequest::WorkspaceRunCounts);
+            }
             self.poll_activity();
             self.sweep_retention();
             self.refresh_active_tab();
@@ -436,6 +442,12 @@ impl App {
 
     /// Enters a workspace: the only path that changes the scope (plan D10).
     fn set_scope(&mut self, workspace: WorkspaceSummary) {
+        // MOD-116 M1 D12: the workspace entered last, saved when it moved, for the next start
+        // (never under `--demo`, R1 F5). The startup scope has set it already, unsaved (R1 F4).
+        if self.remembers_workspace && self.ui.last_workspace != Some(workspace.workspace_id) {
+            self.ui.last_workspace = Some(workspace.workspace_id);
+            self.save_ui_state();
+        }
         self.scope = Scope::from_workspace(&workspace);
         let mut projects = workspace.projects;
         projects.sort_by_key(|p| p.position);
@@ -450,7 +462,18 @@ impl App {
         self.activate_tab();
         // MOD-69 blueprint E9, H-10: the old workspace's rows never show under the new name.
         self.top_bar.waiting = None;
+        // MOD-116 M1 D5: the rows are every workspace's, so they stay; only which one is open
+        // moved, and the chip is recounted from them at once, before the fresh read lands.
+        self.recount_background();
         self.dispatch(Origin::App, StoreRequest::Waiting { scope });
+        self.dispatch(Origin::App, StoreRequest::WorkspaceRunCounts);
+    }
+
+    /// MOD-116 M1 D4: the header's background chip from the cached run counts and the scope.
+    fn recount_background(&mut self) {
+        if let Some(rows) = &self.top_bar.workspace_runs {
+            self.top_bar.background = InBackground::of(self.scope.workspace_id, rows);
+        }
     }
 
     /// Reopens a past step: focus the replay tab, then ask for its rows on that tab's behalf
@@ -565,7 +588,8 @@ impl App {
     }
 
     /// Whether the tab a refused `request` was issued from draws it itself
-    /// ([`Tab::absorbs_failure`]). The shell's and an overlay's refusals are always the line's.
+    /// ([`Tab::absorbs_failure`]). The shell's and an overlay's refusals are the line's, but for
+    /// the polls below.
     ///
     /// One shell request is not the line's either: the launch's old-URL check (MOD-158 R1, C-L7),
     /// which the user never asked for. Its refusal is logged at `debug` instead.
@@ -582,9 +606,20 @@ impl App {
             // MOD-122 M3 D6, D8: the panel's poll and the retention sweep go on their own, once
             // a second and once an hour; a database that is down must not fill the line. The
             // panel keeps its rows (`on_app_reply` lets the next read go).
+            // MOD-116 M1 D5: so does the counts read, once a second; the top bar keeps the last
+            // rows.
             Origin::App
                 if request == StoreRequest::Activity { after: None }.name()
-                    || request == StoreRequest::SweepRetention.name() =>
+                    || request == StoreRequest::SweepRetention.name()
+                    || request == StoreRequest::WorkspaceRunCounts.name() =>
+            {
+                true
+            }
+            // MOD-116 M2 R1 F8: so does the leave dialog's own counts read while its stops
+            // settle, once a second; it keeps the last rows and its bound still runs.
+            Origin::Overlay(id)
+                if *id == crate::ui::overlay::LeaveDialog::ID
+                    && request == StoreRequest::WorkspaceRunCounts.name() =>
             {
                 true
             }
@@ -604,6 +639,12 @@ impl App {
                 }
             }
             StoreReply::BoxInfo(Some(info)) => self.top_bar.box_name = info.hostname.clone(),
+            // MOD-116 M1 D5: whatever its origin, as `Waiting`; the rows are every workspace's,
+            // so no scope check: the chip is counted against the scope in force now.
+            StoreReply::WorkspaceRunCounts(rows) => {
+                self.top_bar.workspace_runs = Some(rows.clone());
+                self.recount_background();
+            }
             // Review M1: the old scope's queued reply lands after `set_scope` (blueprint H-10). The
             // whole scope is compared, not its workspace: Settings re-scopes the same workspace
             // when a project is created, deleted or reordered (R2).
@@ -710,10 +751,12 @@ impl App {
     /// Replies the shell asked for itself.
     ///
     /// The first workspace list picks the startup scope, which is what makes `--demo` open
-    /// inside a workspace instead of an empty shell. An empty list opens `startup_overlay`
-    /// (the switcher, once registered) over the bare shell instead of leaving it blank
-    /// (blueprint D, "Startup"). Nothing is opened before that reply, so the first frame is
-    /// always the shell itself.
+    /// inside a workspace instead of an empty shell: the workspace entered last when the list
+    /// still holds it, else the first (MOD-116 M1 D12; the first under `--demo`, R1 F5), set in
+    /// memory and not saved (R1 F4). An empty list lands on `empty_tab` (the
+    /// Workspaces tab, once registered) instead of leaving the shell blank (blueprint D,
+    /// "Startup"; MOD-116 M1 D11). Nothing moves before that reply, so the first frame is always
+    /// the shell itself.
     fn on_app_reply(&mut self, reply: StoreReply) {
         // MOD-122 M3 D8 (blueprint F9): the activity panel's read, after the freshness gate,
         // taken by value (review L2: it comes once a second). A refusal lets the next read go
@@ -744,15 +787,30 @@ impl App {
         if let StoreReply::Workspaces(workspaces) = reply
             && !self.has_scope()
         {
-            match workspaces.first() {
-                Some(first) => self.update(Action::SetScope {
-                    workspace: first.clone(),
-                }),
+            let last = self
+                .ui
+                .last_workspace
+                .filter(|_| self.remembers_workspace)
+                .and_then(|last| {
+                    workspaces
+                        .iter()
+                        .find(|workspace| workspace.workspace_id == last)
+                });
+            match last.or_else(|| workspaces.first()) {
+                Some(open) => {
+                    // R1 F4: the startup scope is no change of the user's: it is remembered in
+                    // memory, so `set_scope` saves nothing, and a `ui-state.toml` that failed to
+                    // load is left alone until the user changes something (MOD-115 M2 D1).
+                    if self.remembers_workspace {
+                        self.ui.last_workspace = Some(open.workspace_id);
+                    }
+                    self.update(Action::SetScope {
+                        workspace: open.clone(),
+                    });
+                }
                 None => {
-                    if let Some(id) = self.startup_overlay
-                        && !self.overlays.iter().any(|o| o.id() == id)
-                    {
-                        self.update(Action::Overlay(OverlayAction::Open(id)));
+                    if let Some(id) = self.empty_tab {
+                        self.land_on(id);
                     }
                 }
             }
@@ -840,7 +898,8 @@ mod tests {
     };
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        ItemFilter, ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef, Status,
+        InBackground, ItemFilter, ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef,
+        RunStatus, Status, WorkspaceRunCounts,
     };
     use htui_orch::Command;
     use htui_worker::WaitingView;
@@ -983,6 +1042,196 @@ mod tests {
         envelope.origin = Origin::Tab(TabId("someone-else"));
         app.update(Action::Reply(envelope));
         assert!(seen.borrow().is_empty());
+    }
+
+    /// A tab that only shows: for a second registered tab (MOD-116 M1 D11's empty tab).
+    #[derive(Debug)]
+    struct Plain(TabId);
+
+    impl Tab for Plain {
+        fn id(&self) -> TabId {
+            self.0
+        }
+        fn title(&self) -> &str {
+            "Plain"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    /// A workspace named `name` with id `id` and no projects.
+    fn named(id: WorkspaceId, name: &str) -> WorkspaceSummary {
+        WorkspaceSummary {
+            workspace_id: id,
+            slug: name.to_lowercase(),
+            name: name.to_owned(),
+            projects: Vec::new(),
+        }
+    }
+
+    /// `app.start()`, then the first `Workspaces` reply answered with `rows`.
+    fn first_list(
+        app: &mut App,
+        rx: &mut UnboundedReceiver<RequestEnvelope>,
+        rows: Vec<WorkspaceSummary>,
+    ) {
+        app.start();
+        let seq = loop {
+            let envelope = rx.try_recv().expect("start dispatched its requests");
+            if matches!(envelope.request, StoreRequest::Workspaces) {
+                break envelope.seq;
+            }
+        };
+        app.update(Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::Workspaces(rows),
+        }));
+    }
+
+    /// MOD-116 M1 D12: the UI state's last workspace, still in the list, is the one entered.
+    #[test]
+    fn the_first_workspace_list_reopens_the_last_workspace() {
+        let (mut app, mut rx, _seen) = shell();
+        let graphics = WorkspaceId::new();
+        app.ui.last_workspace = Some(graphics);
+        first_list(
+            &mut app,
+            &mut rx,
+            vec![
+                named(WorkspaceId::new(), "Platform"),
+                named(graphics, "Graphics"),
+            ],
+        );
+        assert_eq!(app.top_bar.workspace, "Graphics");
+        assert_eq!(app.scope.workspace_id, graphics);
+    }
+
+    /// D12: a last workspace the list no longer holds opens the first, as a first launch does.
+    #[test]
+    fn a_last_workspace_that_is_gone_opens_the_first() {
+        let (mut app, mut rx, _seen) = shell();
+        app.ui.last_workspace = Some(WorkspaceId::new());
+        let platform = WorkspaceId::new();
+        first_list(
+            &mut app,
+            &mut rx,
+            vec![
+                named(platform, "Platform"),
+                named(WorkspaceId::new(), "Graphics"),
+            ],
+        );
+        assert_eq!(app.top_bar.workspace, "Platform");
+        assert_eq!(
+            app.ui.last_workspace,
+            Some(platform),
+            "the first is now the last"
+        );
+    }
+
+    /// MOD-116 M1 D11: an empty first list lands on the empty tab: no overlay opens and no
+    /// history place is recorded.
+    #[test]
+    fn an_empty_first_list_lands_on_the_empty_tab() {
+        const EMPTY: TabId = TabId("empty");
+        let (mut app, mut rx, _seen) = shell();
+        app.register_tab(Box::new(Plain(EMPTY)));
+        app.empty_tab = Some(EMPTY);
+        assert_eq!(app.tabs.active_id(), Some(Recorder::ID));
+        first_list(&mut app, &mut rx, Vec::new());
+        assert_eq!(app.tabs.active_id(), Some(EMPTY));
+        assert!(app.overlays.is_empty(), "no overlay opened");
+        assert!(app.history.peek_back().is_none(), "no history place");
+        assert!(!app.has_scope());
+    }
+
+    /// D12: a scope change saves the last workspace when it moved, and only then.
+    #[test]
+    fn a_scope_change_saves_the_last_workspace_once() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::ui::state_file::UiStore;
+
+        let (mut app, _rx, _seen) = shell();
+        let text = Arc::new(Mutex::new(None));
+        app.ui_store = UiStore::Memory(Arc::clone(&text));
+        let platform = WorkspaceId::new();
+        app.update(Action::SetScope {
+            workspace: named(platform, "Platform"),
+        });
+        let saved = text
+            .lock()
+            .expect("the lock")
+            .take()
+            .expect("the first entry saves");
+        assert!(saved.contains(&format!("last = \"{platform}\"")), "{saved}");
+        app.update(Action::SetScope {
+            workspace: named(platform, "Platform"),
+        });
+        assert_eq!(
+            *text.lock().expect("the lock"),
+            None,
+            "re-entering saves nothing"
+        );
+        app.update(Action::SetScope {
+            workspace: named(WorkspaceId::new(), "Graphics"),
+        });
+        assert!(
+            text.lock().expect("the lock").is_some(),
+            "another workspace saves"
+        );
+    }
+
+    /// MOD-116 M1 R1 F5: a shell that does not remember the workspace (`--demo`) neither reads
+    /// nor saves it: the first list opens the first workspace, a scope change saves nothing, and
+    /// a later save writes the file's last workspace back as it was read.
+    #[test]
+    fn a_shell_that_does_not_remember_the_workspace_neither_reads_nor_saves_it() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::ui::state_file::UiStore;
+
+        let (mut app, mut rx, _seen) = shell();
+        let text = Arc::new(Mutex::new(None));
+        app.ui_store = UiStore::Memory(Arc::clone(&text));
+        app.remembers_workspace = false;
+        let (platform, graphics) = (WorkspaceId::new(), WorkspaceId::new());
+        app.ui.last_workspace = Some(graphics);
+        first_list(
+            &mut app,
+            &mut rx,
+            vec![named(platform, "Platform"), named(graphics, "Graphics")],
+        );
+        assert_eq!(
+            app.scope.workspace_id, platform,
+            "the first, not the saved one"
+        );
+        app.update(Action::SetScope {
+            workspace: named(graphics, "Graphics"),
+        });
+        app.update(Action::SetScope {
+            workspace: named(WorkspaceId::new(), "Other"),
+        });
+        assert_eq!(
+            *text.lock().expect("the lock"),
+            None,
+            "no scope change saved"
+        );
+        assert_eq!(app.ui.last_workspace, Some(graphics));
+        app.update(Action::ToggleAbout);
+        let saved = text
+            .lock()
+            .expect("the lock")
+            .take()
+            .expect("the about toggle saves");
+        assert!(saved.contains(&format!("last = \"{graphics}\"")), "{saved}");
     }
 
     #[test]
@@ -1196,10 +1445,191 @@ mod tests {
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         // MOD-122 M3 D6: the first refresh also sweeps a store that is up; `activity_tests`
         // pins its schedule.
-        assert_eq!(requests.len(), 3, "one refresh per second, not per tick");
+        assert_eq!(requests.len(), 4, "one refresh per second, not per tick");
         assert!(matches!(requests[0].request, StoreRequest::StoreState));
         assert!(matches!(requests[1].request, StoreRequest::Waiting { .. }));
+        assert!(matches!(
+            requests[2].request,
+            StoreRequest::WorkspaceRunCounts
+        ));
+        assert!(matches!(requests[3].request, StoreRequest::SweepRetention));
+    }
+
+    /// MOD-116 M3 D16: a workspace with no project (every one the Workspaces tab creates starts
+    /// so) still reads its counts once a second, or its state and the background chip would
+    /// freeze; `Waiting` keeps its project gate.
+    #[test]
+    fn a_workspace_with_no_project_still_reads_its_counts() {
+        let (mut app, mut rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: WorkspaceSummary {
+                projects: Vec::new(),
+                ..workspace("Mobile App")
+            },
+        });
+        assert!(app.scope.is_empty(), "a scope with no project");
+        app.top_bar.store = "online".to_owned();
+        while rx.try_recv().is_ok() {}
+        for _ in 0..TICKS_PER_REFRESH {
+            app.update(Action::Tick);
+        }
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(matches!(requests[0].request, StoreRequest::StoreState));
+        assert!(matches!(
+            requests[1].request,
+            StoreRequest::WorkspaceRunCounts
+        ));
         assert!(matches!(requests[2].request, StoreRequest::SweepRetention));
+    }
+
+    /// `workspace`'s counts with `running` running runs and nothing else.
+    fn running_in(workspace: WorkspaceId, running: usize) -> WorkspaceRunCounts {
+        WorkspaceRunCounts::tally(workspace, vec![RunStatus::Running; running], None)
+    }
+
+    /// `name`'s summary under `workspace_id`, with [`workspace`]'s one project.
+    fn workspace_at(name: &str, workspace_id: WorkspaceId) -> WorkspaceSummary {
+        WorkspaceSummary {
+            workspace_id,
+            ..workspace(name)
+        }
+    }
+
+    /// MOD-116 M1 D5: the run counts reach the top bar whoever they are addressed to, as
+    /// `Waiting` does: an overlay's reply and an unsolicited one both set them.
+    #[test]
+    fn a_run_counts_reply_sets_the_background_whatever_its_origin() {
+        let (mut app, _rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace_at("Platform", ids::WORKSPACE_PLATFORM),
+        });
+        let rows = vec![
+            running_in(ids::WORKSPACE_PLATFORM, 1),
+            running_in(ids::WORKSPACE_GRAPHICS, 2),
+        ];
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::Overlay(WaitingList::ID),
+            reply: StoreReply::WorkspaceRunCounts(rows.clone()),
+        }));
+        assert_eq!(app.top_bar.workspace_runs.as_ref(), Some(&rows));
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 2
+            }
+        );
+
+        let fewer = vec![
+            running_in(ids::WORKSPACE_PLATFORM, 1),
+            running_in(ids::WORKSPACE_GRAPHICS, 3),
+        ];
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::App,
+            reply: StoreReply::WorkspaceRunCounts(fewer.clone()),
+        }));
+        assert_eq!(app.top_bar.workspace_runs, Some(fewer));
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 3
+            }
+        );
+    }
+
+    /// MOD-116 M1 D5: entering another workspace recounts the chip from the cached rows at once
+    /// (the one left becomes background, the one entered stops being so) and asks again.
+    #[test]
+    fn a_scope_change_recounts_the_background_and_rereads() {
+        let (mut app, mut rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace_at("Platform", ids::WORKSPACE_PLATFORM),
+        });
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::App,
+            reply: StoreReply::WorkspaceRunCounts(vec![
+                running_in(ids::WORKSPACE_PLATFORM, 1),
+                running_in(ids::WORKSPACE_GRAPHICS, 2),
+            ]),
+        }));
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 2
+            }
+        );
+        while rx.try_recv().is_ok() {}
+
+        app.update(Action::SetScope {
+            workspace: workspace_at("Graphics", ids::WORKSPACE_GRAPHICS),
+        });
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 1
+            },
+            "recounted before any reply"
+        );
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|envelope| envelope.request)
+            .collect();
+        let waiting = requests
+            .iter()
+            .position(|request| matches!(request, StoreRequest::Waiting { .. }))
+            .expect("the waiting list is re-read");
+        let counts = requests
+            .iter()
+            .position(|request| matches!(request, StoreRequest::WorkspaceRunCounts))
+            .expect("the counts are re-read");
+        assert!(waiting < counts, "after `Waiting`: {requests:?}");
+    }
+
+    /// MOD-116 M1 D5: the shell's once-a-second counts read goes on its own, so a database that
+    /// is down must not fill the status line; the last rows are kept.
+    #[test]
+    fn a_refused_run_counts_read_stays_off_the_status_line() {
+        let (mut app, mut rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace_at("Platform", ids::WORKSPACE_PLATFORM),
+        });
+        let rows = vec![running_in(ids::WORKSPACE_GRAPHICS, 2)];
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::App,
+            reply: StoreReply::WorkspaceRunCounts(rows.clone()),
+        }));
+        while rx.try_recv().is_ok() {}
+        for _ in 0..TICKS_PER_REFRESH {
+            app.update(Action::Tick);
+        }
+        let seq = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|envelope| matches!(envelope.request, StoreRequest::WorkspaceRunCounts))
+            .expect("the tick asked")
+            .seq;
+        app.update(Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::Failed {
+                request: StoreRequest::WorkspaceRunCounts.name(),
+                message: htui_store::DATABASE_UNREACHABLE.to_owned(),
+            },
+        }));
+        assert_eq!(app.status, None, "{:?}", app.status);
+        assert_eq!(app.top_bar.workspace_runs, Some(rows), "the last rows stay");
+        assert_eq!(
+            app.top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 2
+            }
+        );
     }
 
     /// An overlay that counts the refresh ticks it is handed (MOD-12 M3 D9).

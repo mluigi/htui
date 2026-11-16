@@ -1,0 +1,24 @@
+---
+source: crates/htui/src/ui/overlay/leave.rs
+expression: frame
+---
+
+
+
+
+
+
+
+
+
+
+
+             ╭ Leave htui? ────────────────────────────────────────────────────────────╮
+             │ Leaving closes htui. Work it is running stops with it:                  │
+             │   ◐ 1 working · ⚠ 0 waiting   Platform                                  │
+             │                                                                         │
+             │ S stops them gracefully first, waits up to 20 s for their runs to stop, │
+             │ then leaves; each resumes later.                                        │
+             │                                                                         │
+             │  Enter  leave   Esc  stay   S  stop first                               │
+             ╰─────────────────────────────────────────────────────────────────────────╯

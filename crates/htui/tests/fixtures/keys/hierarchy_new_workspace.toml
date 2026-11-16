@@ -1,0 +1,9 @@
+# MOD-116 M3 D14 fixture: a file written when Settings > Hierarchy created workspaces. Its
+# retired new_workspace entry loads with a notice and binds nothing; the rest of the file applies.
+version = 2
+
+[global]
+quit = ["ctrl-y"]
+
+[settings.hierarchy]
+new_workspace = ["ctrl-n"]

@@ -86,6 +86,8 @@ pub struct Harness {
     /// The `HTUI_QDRANT_*` overrides the Settings > Qdrant requests are served under: none unless
     /// a test hands some in (blueprint P-13), never this process's.
     qdrant_env: QdrantEnv,
+    /// While [`Harness::settle_refusing`] runs: the request name it refuses and the message.
+    refusing: Option<(&'static str, String)>,
 }
 
 impl core::fmt::Debug for Harness {
@@ -155,6 +157,7 @@ impl Harness {
             term: terminal(width, height),
             pending: VecDeque::new(),
             qdrant_env: QdrantEnv::default(),
+            refusing: None,
         }
     }
 
@@ -606,29 +609,7 @@ impl Harness {
     pub async fn settle(&mut self) {
         for _ in 0..SETTLE_ROUNDS {
             let mut served = false;
-            while let Ok(envelope) = self.rx.try_recv() {
-                let reply = match (&envelope.request, &self.store_state) {
-                    (StoreRequest::StoreState, Some((label, migrations_pending))) => {
-                        StoreReply::StoreState {
-                            label: label.clone(),
-                            migrations_pending: *migrations_pending,
-                            below_target: None,
-                        }
-                    }
-                    (request, _) => {
-                        store_worker::serve_with_qdrant_env(
-                            &self.backend,
-                            request,
-                            &self.qdrant_env,
-                        )
-                        .await
-                    }
-                };
-                self.app.update(Action::Reply(ReplyEnvelope {
-                    seq: envelope.seq,
-                    origin: envelope.origin,
-                    reply,
-                }));
+            while self.serve_next().await {
                 served = true;
             }
             if served {
@@ -640,6 +621,62 @@ impl Harness {
             }
         }
         panic!("the shell never settled: a view is issuing a request for every reply");
+    }
+
+    /// Serves the oldest queued request alone and hands the shell its reply, as
+    /// [`settle`](Self::settle) does for each: how a case draws the frame between two replies
+    /// (MOD-116 M1 R1: a list that has landed before the overview it asked for). `false` when
+    /// nothing is queued.
+    pub async fn serve_next(&mut self) -> bool {
+        let Ok(envelope) = self.rx.try_recv() else {
+            return false;
+        };
+        let reply = match (&envelope.request, &self.store_state, &self.refusing) {
+            (request, _, Some((name, message))) if request.name() == *name => StoreReply::Failed {
+                request: name,
+                message: message.clone(),
+            },
+            (StoreRequest::StoreState, Some((label, migrations_pending)), _) => {
+                StoreReply::StoreState {
+                    label: label.clone(),
+                    migrations_pending: *migrations_pending,
+                    below_target: None,
+                }
+            }
+            (request, ..) => {
+                store_worker::serve_with_qdrant_env(&self.backend, request, &self.qdrant_env).await
+            }
+        };
+        self.app.update(Action::Reply(ReplyEnvelope {
+            seq: envelope.seq,
+            origin: envelope.origin,
+            reply,
+        }));
+        true
+    }
+
+    /// [`settle`](Self::settle), with every request named `request` ([`StoreRequest::name`])
+    /// refused with `message`, as a store that cannot answer it refuses it (MOD-116 M1 R1: an
+    /// overview refused once, then answered).
+    pub async fn settle_refusing(&mut self, request: &'static str, message: &str) {
+        self.refusing = Some((request, message.to_owned()));
+        self.settle().await;
+        self.refusing = None;
+    }
+
+    /// Registers every view in `run`'s order (MOD-116 M1 R1): [`register_all`] first, then
+    /// [`App::start`], so the tabs' first requests are queued before the shell's, as they are in
+    /// the binary. The constructor's own `start` requests are withdrawn unserved and asked again,
+    /// so call it before anything else queues a request (after `with_ui_store`, before
+    /// `with_tab`).
+    ///
+    /// [`register_all`]: crate::app::register_all
+    #[must_use]
+    pub fn registered_as_run(mut self) -> Self {
+        while self.rx.try_recv().is_ok() {}
+        crate::app::register_all(&mut self.app);
+        self.app.start();
+        self
     }
 
     /// Feeds one key, written the way [`KeyChord::parse`] reads it: `"j"`, `"Enter"`,
@@ -894,11 +931,19 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::widgets::Paragraph;
 
+    /// MOD-116 M1 D11: an empty store lands on the Workspaces tab, which says there are no
+    /// workspaces and how to make one; no overlay opens and no way back is offered.
     #[tokio::test]
-    async fn an_empty_store_renders_the_shell_with_the_switcher_over_it() {
+    async fn an_empty_store_lands_on_the_workspaces_tab() {
         let mut harness = Harness::empty();
         crate::app::register_all(harness.app());
         harness.drive_to_end().await;
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("workspaces")
+        );
+        assert!(harness.app().overlays.is_empty(), "no overlay opened");
+        assert!(harness.app().history.peek_back().is_none());
         insta::assert_snapshot!("shell_empty", harness.render());
     }
 
@@ -923,6 +968,71 @@ mod tests {
             "the walk rested inside the drive"
         );
         assert_eq!(harness.app().status, None, "and nothing failed");
+    }
+
+    /// MOD-116 M1 D9: opening another workspace while a run of this one walks neither stops nor
+    /// restarts the walk (the executor is the process's, not the scope's), and the header counts
+    /// Platform, left behind, by the demo's own `running` run, `RUN_4`: the walk rests at its
+    /// approval before the counts are read, so it is not the run counted (R1 F9).
+    #[tokio::test]
+    async fn opening_another_workspace_leaves_its_runs_walking_and_the_header_counts_platform() {
+        use crate::run_worker::OrchRequest;
+        use crate::run_worker::tests::{Fixture, only_run};
+        use htui_core::fixtures::ids;
+        use htui_core::model::{InBackground, RunMode, RunStatus};
+
+        let fixture = Fixture::new().await;
+        let workspaces = fixture.store.workspaces().await.expect("a memory read");
+        let named = |slug: &str| {
+            workspaces
+                .iter()
+                .find(|workspace| workspace.slug == slug)
+                .cloned()
+                .unwrap_or_else(|| panic!("the demo holds `{slug}`"))
+        };
+        let mut harness = Harness::over(fixture.store.clone()).with_run_runtime(fixture.runtime());
+        harness.drive().await;
+        harness.app().update(Action::SetScope {
+            workspace: named("platform"),
+        });
+        harness.drive().await;
+
+        harness
+            .app()
+            .update(Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                htui_orch::Command::StartRun {
+                    item: ids::HTUI_ANA_2,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                    workspace: Some(ids::WORKSPACE_PLATFORM),
+                },
+            ))));
+        harness.app().update(Action::SetScope {
+            workspace: named("graphics"),
+        });
+        harness.drive().await;
+
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::AwaitingApproval,
+            "the walk went on across the scope change"
+        );
+        assert_eq!(harness.app().status, None, "and nothing failed");
+        assert_eq!(harness.app().top_bar.workspace, "Graphics");
+        assert_eq!(
+            harness.app().top_bar.background,
+            InBackground {
+                workspaces: 1,
+                running: 1
+            },
+            "Platform's running run, from the counts read the scope change asked for"
+        );
+        // No tab chips here: with `register_all`'s seven the chip does not fit even at 160.
+        harness.resize(140, 30);
+        let frame = harness.render();
+        let header = frame.lines().next().unwrap_or_default();
+        assert!(header.contains("+1 in background \u{25d0} 1"), "{header}");
     }
 
     /// Blueprint D183, D207: without a run runtime the stream and the verdicts still answer, so
@@ -1033,10 +1143,17 @@ mod tests {
         let mut harness = Harness::empty();
         crate::app::register_all(harness.app());
         harness.settle().await;
-        // An empty store leaves the registration's switcher up and a modal overlay swallows what
-        // it does not handle, so the tab bindings only apply once it is closed.
-        harness.key("esc");
+        // MOD-116 M1 D11: an empty store lands on the Workspaces tab, tab `1`; no overlay is up.
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("workspaces")
+        );
         // MOD-115 M2 D4: `ctrl-pgdn` is the next tab (`Tab` moves the pane focus).
+        harness.key("ctrl-pgdn");
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("backlog")
+        );
         harness.key("ctrl-pgdn");
         harness.settle().await;
         assert!(harness.render().contains("Skills"));
@@ -1044,10 +1161,15 @@ mod tests {
             harness.app().tabs.active_id().map(|id| id.0),
             Some("skills")
         );
-        harness.key("1");
+        harness.key("2");
         assert_eq!(
             harness.app().tabs.active_id().map(|id| id.0),
             Some("backlog")
+        );
+        harness.key("1");
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("workspaces")
         );
     }
 
@@ -1064,6 +1186,12 @@ mod tests {
         assert_eq!(top_bar.box_name, "DESKTOP-HTUI");
         assert_eq!(top_bar.store, "memory");
         assert_eq!(harness.app().projects.len(), 1);
+        // MOD-116 M1 D11: the shell still lands on the Backlog, tab `2`, with no way back.
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("backlog")
+        );
+        assert!(harness.app().history.peek_back().is_none());
         // `register_all` without a runtime leaves an error for the header's flash to show.
         harness.app().status = None;
         // 100 columns drop the working count and the store for the five tab chips and `? keys`.

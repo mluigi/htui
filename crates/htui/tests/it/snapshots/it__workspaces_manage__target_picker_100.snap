@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_manage.rs
+expression: frame
+---
+Graphics   ¹Workspaces         0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ Graphics ─────────────────────────── overview ╮
+│▌▾ Graphics  ● open                             ││● open                                          │
+│     overview                                   ││                                                │
+│     Vulkan Tutorials                           ││folder on this box  ~/graphics                  │
+│ ▾ Platform  ◐ background · 1 running           ││default target      inherits the Settings       │
+│     overview                                   ││                    default (this box)          │
+│     htui                                       ││held runs           1                           │
+│     agy                                        ││                                                │
+│                                                ││Runs                                            │
+│                                                ││FEAT-1  stopped, no box                         │
+│                                                ││  cannot be resumed: cancel it from the Runs    │
+│                                                ││  pane                                          │
+│                                                ││                                                │
+│                      ╭ Default target of Graphics ────────────────────────╮                      │
+│                      │▌inherit the Settings default (this box)  · current │                      │
+│                      │ this box  local                                    │                      │
+│                      ╰ j/k move · y choose · n close ─────────────────────╯                      │
+│                                                ││                                                │
+│                                                ││Projects                                        │
+│                                                ││Vulkan Tutorials  no repos yet                  │
+│                                                ││  2 items · 0 running · 0 waiting               │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰────────────────────────────────────────────────╯╰────────────────────────────────────────────────╯

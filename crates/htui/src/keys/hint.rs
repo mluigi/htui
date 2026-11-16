@@ -719,7 +719,7 @@ mod tests {
                 "Ctrl+c quit · F1 help · F9 about"
             );
         }
-        for stack in [views::SWITCHER, views::WAITING_LIST, views::MIGRATION] {
+        for stack in [views::WAITING_LIST, views::MIGRATION] {
             assert_eq!(keys.status_line(stack, all), "Ctrl+c quit · ? help");
             assert_eq!(keys.status_line(stack, bare), "Ctrl+c quit · ? help");
         }
@@ -748,13 +748,24 @@ mod tests {
                  · ?/F1 help · F9 about · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
             ]
         );
+        // MOD-116 M1 R1 F7: the Workspaces tab's box, its own verb first, as the switcher's was;
+        // M2 D6 adds stop and resume, M3 D14 new, then the default target and the common edit and
+        // delete.
         assert_eq!(
-            texts(keys.help_lines(views::SWITCHER, all)),
+            texts(keys.help_lines(views::WORKSPACES_BROWSE, all)),
             [
-                "Workspaces: Enter switch workspace",
-                "List: j/Down down · k/Up up",
-                "Overlay: Esc close",
-                "Global: Ctrl+c quit · ?/F1 help",
+                "Workspaces: o open workspace · s stop runs · r resume runs \
+                 · N new workspace or project · T default target",
+                "Common: e edit · d delete",
+                "List: j/Down down · k/Up up · g/Home top · G/End bottom · Enter fold",
+                "Pane: J scroll down · K scroll up · PgDn page down · PgUp page up",
+                "Layout: p next layout · P previous layout · > wider list · < narrower list \
+                 · }/Ctrl+Down larger activity · {/Ctrl+Up smaller activity · F2/Alt+1 \
+                 show/hide list · F3/Alt+2 show/hide activity · z zoom",
+                HISTORY_LINE,
+                "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab \
+                 · ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue \
+                 · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
             ]
         );
         assert_eq!(
@@ -979,7 +990,7 @@ mod tests {
             Some("?/F1 closes this box")
         );
         assert_eq!(
-            keys.help_closer(views::SWITCHER).as_deref(),
+            keys.help_closer(views::WAITING_LIST).as_deref(),
             Some("?/F1 closes this box")
         );
         for stack in [views::CONCEPTS_QUERY, views::CAPTURE] {

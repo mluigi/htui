@@ -2,7 +2,7 @@
 source: crates/htui/tests/it/shell.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs   0 waiting · online ·  ?  keys
+Graphics   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  ⁶Chat      0 waiting ·  ?  keys
 ╭─ Backlog (2) ───────────────────────────────────────╮╭─ FEAT-1 · Chapter 12 parity ─ Body  Runs ›╮
 │ ▾ Graphics (0)                                      ││■ stopped · gpu, vulkan · priority 0       │
 │ ▾ Vulkan Tutorials (2)                              ││version 1                                  │

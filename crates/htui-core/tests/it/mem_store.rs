@@ -62,7 +62,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        369,
+        370,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -134,7 +134,8 @@ async fn demo_store_loads_the_fixture() {
          take that skips it, its dependents and the retry (plan D5), MOD-127 M1's four for the \
          workspace and item-kind attachment levels (D2, D3, D6), MOD-130 M4 T1's one for \
          the Runs read's target name and source (D7, P2), and MOD-127 M2 T3's six for the \
-         MCP server registry and its attachments (D2-D4)"
+         MCP server registry and its attachments (D2-D4), and MOD-116 M1's `workspace_run_counts` \
+         case (plan D3)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

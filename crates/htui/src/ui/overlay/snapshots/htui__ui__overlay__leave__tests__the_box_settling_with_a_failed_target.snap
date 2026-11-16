@@ -1,0 +1,23 @@
+---
+source: crates/htui/src/ui/overlay/leave.rs
+expression: frame
+---
+
+
+
+
+
+
+
+
+
+
+
+
+                        ╭ Leave htui? ─────────────────────────────────────╮
+                        │ Stopping 2 workspaces gracefully, then leaving…  │
+                        │   waiting for 2 running runs to stop (20 s left) │
+                        │   could not stop Platform: workspace not found   │
+                        │                                                  │
+                        │  Enter  leave now   Esc  stay (the stops stand)  │
+                        ╰──────────────────────────────────────────────────╯

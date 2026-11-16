@@ -48,12 +48,15 @@ pub mod skill_import;
 pub mod skills;
 pub mod state_cmd;
 pub mod stop_cmd;
+pub mod stop_report;
 pub mod store_worker;
 pub mod templates;
 pub mod terminal;
 pub mod ui;
 pub mod worker_cmd;
 pub mod worker_log;
+pub mod workspace_setup;
+pub mod workspaces;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
@@ -298,6 +301,9 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     app.apply_ui_state(loaded.state);
     // RV2 H1: saved through a latest-wins writer thread, so no write or fsync runs on the loop.
     app.ui_store = ui_store.background();
+    // MOD-116 M1 R1 F5: `--demo`'s workspaces are not the store's, so the file's last workspace
+    // is neither used nor moved (a save of anything else writes it back as read).
+    app.remembers_workspace = !args.demo;
     app.status = loaded.notice.or(logging_notice);
     app::register_all(&mut app);
     app.start();

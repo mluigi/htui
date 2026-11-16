@@ -24,13 +24,16 @@
 //! 3. the inactive tab chips, nearest the active one first (the farthest are dropped first; of
 //!    two as far, the later one goes first);
 //! 4. what is left over, in this order: the full key chips (`? keys` grows to `F9 about ? keys`),
-//!    the store label, the working count, the box name.
+//!    the store label, the working count, the box name, the shell's chips, and last the
+//!    background chip.
 //!
-//! In other words the right side loses, as the row narrows: the shell's chips first (MOD-115 M2
-//! §8: `Alt→ forward`, the layout name, then `⌫ back to <place>`, which collapses to `⌫ back`
-//! before it goes), the box name, the working count, the store label, then `F9 about` (the chips
-//! collapse to `? keys`), then `? keys` itself, and last the waiting count. The shell's chips
-//! are drawn after the key chips, so no other part moves when they appear.
+//! In other words the right side loses, as the row narrows: the background chip first (MOD-116
+//! M1 D4: `+N in background ◐ n`, drawn after the waiting count only while another workspace
+//! has a running run and the store is not offline, R1 F6), then the shell's chips (MOD-115 M2 §8: `Alt→ forward`, the layout name,
+//! then `⌫ back to <place>`, which collapses to `⌫ back` before it goes), the box name, the
+//! working count, the store label, then `F9 about` (the chips collapse to `? keys`), then
+//! `? keys` itself, and last the waiting count. The shell's chips are drawn after the key chips,
+//! so no other part moves when they appear.
 //!
 //! With a flash the tab chips (the active one too) give way to it first: the flash is the thing
 //! the person must read.
@@ -95,6 +98,9 @@ pub struct ShellChips {
 const RANK_BACK: u8 = 6;
 const RANK_LAYOUT: u8 = 7;
 const RANK_FORWARD: u8 = 8;
+
+/// MOD-116 M1 D4: the rank of `+N in background ◐ n`, the first right-side part to go.
+const RANK_BACKGROUND: u8 = 9;
 
 /// Where the header's clickable parts landed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -199,9 +205,9 @@ impl Part {
     }
 }
 
-/// The right side's parts in display order: `N working`, `M waiting`, store, box, key chips,
-/// then the shell's chips (back, layout, forward). The chords are labelled through `stack`, the
-/// one that holds the keyboard.
+/// The right side's parts in display order: `N working`, `M waiting`, `+N in background ◐ n`
+/// (only while another workspace runs), store, box, key chips, then the shell's chips (back,
+/// layout, forward). The chords are labelled through `stack`, the one that holds the keyboard.
 fn right_parts(
     state: &TopBarState,
     keys: &Keys,
@@ -229,6 +235,18 @@ fn right_parts(
         Part::text(4, format!("{working} working"), theme.base),
         Part::text(RANK_WAITING, format!("{waiting} waiting"), waiting_style),
     ];
+    // MOD-116 M1 R1 F6 (D8 over D5): offline the counts are the last ones read, not current.
+    let background = state.background;
+    if background.workspaces > 0 && !state.offline() {
+        parts.push(Part::text(
+            RANK_BACKGROUND,
+            format!(
+                "+{} in background \u{25d0} {}",
+                background.workspaces, background.running
+            ),
+            theme.base,
+        ));
+    }
     if !state.store.is_empty() {
         parts.push(Part::text(
             3,
@@ -532,6 +550,7 @@ mod tests {
                 permissions_known: true,
                 offline: false,
             }),
+            ..TopBarState::default()
         }
     }
 
@@ -819,7 +838,7 @@ mod tests {
     }
 
     /// An overlay's stack labels the chips: `F9 about` is gone under the waiting list, the
-    /// switcher, the migration prompt and the leave dialog, `? keys` stays; under a tab's
+    /// migration prompt and the leave dialog, `? keys` stays; under a tab's
     /// modal form `F9 about` stays and help is `F1`.
     #[test]
     fn the_chips_follow_the_active_key_stack() {
@@ -828,12 +847,7 @@ mod tests {
         let at = |stack: Stack<'_>| {
             line(&draw_full(120, &tabs, &state(), None, Keys::compiled(), stack, &theme).0)
         };
-        for stack in [
-            views::WAITING_LIST,
-            views::SWITCHER,
-            views::MIGRATION,
-            views::LEAVE,
-        ] {
+        for stack in [views::WAITING_LIST, views::MIGRATION, views::LEAVE] {
             let text = at(stack);
             assert!(!text.contains("about") && !text.contains("F9"), "{text}");
             assert!(text.ends_with(" ?  keys"), "{text}");
@@ -1158,6 +1172,16 @@ mod tests {
 
     /// The header drawn `width` wide with the shell's `chips`, under the base stack.
     fn draw_chips(width: u16, chips: &ShellChips, theme: &Theme) -> Buffer {
+        draw_chips_over(width, &state(), chips, theme)
+    }
+
+    /// [`draw_chips`] over `state`.
+    fn draw_chips_over(
+        width: u16,
+        state: &TopBarState,
+        chips: &ShellChips,
+        theme: &Theme,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("a test terminal");
         let tabs = registry();
         terminal
@@ -1165,7 +1189,7 @@ mod tests {
                 let _ = render(
                     frame,
                     frame.area(),
-                    &state(),
+                    state,
                     &tabs,
                     None,
                     Keys::compiled(),
@@ -1243,6 +1267,75 @@ mod tests {
             }
         }
         assert_eq!(seen, [0, 1, 2, 3, 4], "{full}\n{bare}");
+    }
+
+    /// [`state`] with `workspaces` other workspaces running `running` runs between them.
+    fn in_background(workspaces: u32, running: u32) -> TopBarState {
+        TopBarState {
+            background: htui_core::model::InBackground {
+                workspaces,
+                running,
+            },
+            ..state()
+        }
+    }
+
+    /// MOD-116 M1 D4: with room, `+N in background ◐ n` follows the waiting count.
+    #[test]
+    fn the_background_chip_follows_the_waiting_count() {
+        let (buffer, _) = draw(200, &in_background(1, 2));
+        let text = line(&buffer);
+        assert!(
+            text.contains(
+                "1 working \u{b7} 0 waiting \u{b7} +1 in background \u{25d0} 2 \u{b7} memory"
+            ),
+            "{text}"
+        );
+    }
+
+    /// MOD-116 M1 D4: the chip is the first right-side part to go, before the shell's chips.
+    #[test]
+    fn the_background_chip_is_the_first_part_to_go() {
+        let theme = Theme::default();
+        let state = in_background(2, 3);
+        let full = line(&draw_chips_over(220, &state, &chips(), &theme));
+        assert!(full.contains("+2 in background \u{25d0} 3"), "{full}");
+        let gone = (40..=220)
+            .rev()
+            .find(|width| {
+                !line(&draw_chips_over(*width, &state, &chips(), &theme)).contains("in background")
+            })
+            .expect("the chip goes at some width");
+        let text = line(&draw_chips_over(gone, &state, &chips(), &theme));
+        for kept in ["back to Backlog", "list+detail", "forward", "DESKTOP-HTUI"] {
+            assert!(text.contains(kept), "{gone}: {kept} is still drawn: {text}");
+        }
+    }
+
+    /// MOD-116 M1 D4: no other workspace running, no chip.
+    #[test]
+    fn no_background_chip_without_another_running_workspace() {
+        let text = line(&draw(200, &state()).0);
+        assert!(!text.contains("background"), "{text}");
+        assert!(text.contains("0 waiting \u{b7} memory"), "{text}");
+    }
+
+    /// MOD-116 M1 R1 F6 (D8 over D5): offline the counts are the last ones read, not current,
+    /// so the chip is not drawn; it comes back with the store.
+    #[test]
+    fn no_background_chip_while_offline() {
+        let offline = TopBarState {
+            store: "offline \u{b7} 3m".to_owned(),
+            ..in_background(1, 2)
+        };
+        let text = line(&draw(200, &offline).0);
+        assert!(!text.contains("background"), "{text}");
+        assert!(
+            text.contains("0 waiting \u{b7} offline \u{b7} 3m"),
+            "{text}"
+        );
+        let text = line(&draw(200, &in_background(1, 2)).0);
+        assert!(text.contains("+1 in background \u{25d0} 2"), "{text}");
     }
 
     /// The shell's chips are dim, in colour and in monochrome.

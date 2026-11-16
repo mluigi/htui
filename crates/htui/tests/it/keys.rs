@@ -5,8 +5,8 @@
 //!   arm ignores modifiers (Connection, Qdrant) no longer eats it, and no modal overlay swallows it.
 //! - `?` and `F1` toggle help (D12), over a modal overlay too, for a key the overlay passed (D6
 //!   step 2). A field that types `?` keeps it as text, and `F1` still reaches help.
-//! - A modal overlay swallows what it and the overlay stack passed (D6 step 3): under the switcher
-//!   a digit or `w` reaches neither the tab strip nor a second switcher.
+//! - A modal overlay swallows what it and the overlay stack passed (D6 step 3): under the waiting
+//!   list a digit or `w` reaches neither the tab strip nor the Workspaces tab (MOD-116 M1).
 //! - `w`, `Ctrl+F`, `Ctrl+W` and `Ctrl+Q` are offered by `register_all` (D5): without it they are
 //!   inert and absent from the status line and the `?` box.
 //! - The status line is byte-identical to the one the snapshots pin (D7); the `?` box follows D8.
@@ -30,7 +30,6 @@ use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::overlay::{
     ConceptsSearch, MigrationPrompt, Overlay, OverlayId, QueueOverlay, WaitingList,
-    WorkspaceSwitcher,
 };
 use htui::ui::tabs::settings::{
     BoxesSection, ConnectionSection, PersonasSection, QdrantSection, SectionId, SettingsSection,
@@ -165,7 +164,6 @@ async fn ctrl_c_quits_from_qdrant_browse() {
 #[tokio::test]
 async fn ctrl_c_quits_over_every_modal_overlay() {
     for (opener, expected) in [
-        ("w", WorkspaceSwitcher::ID),
         ("ctrl-f", ConceptsSearch::ID),
         ("ctrl-w", WaitingList::ID),
         ("ctrl-q", QueueOverlay::ID),
@@ -218,22 +216,18 @@ async fn f1_opens_and_closes_help_on_the_backlog() {
 }
 
 #[tokio::test]
-async fn question_mark_and_f1_toggle_help_over_the_workspace_switcher() {
+async fn question_mark_and_f1_toggle_help_over_the_waiting_list() {
     let mut harness = shell(true).await;
-    harness.key("w");
+    harness.key("ctrl-w");
     harness.drive_to_end().await;
-    assert_eq!(top(&mut harness), Some(WorkspaceSwitcher::ID));
+    assert_eq!(top(&mut harness), Some(WaitingList::ID));
 
     harness.key("?");
     assert!(
         harness.app().help_visible,
-        "`?` opens the box over the switcher"
+        "`?` opens the box over the waiting list"
     );
-    assert_eq!(
-        top(&mut harness),
-        Some(WorkspaceSwitcher::ID),
-        "and leaves it up"
-    );
+    assert_eq!(top(&mut harness), Some(WaitingList::ID), "and leaves it up");
     harness.key("?");
     assert!(!harness.app().help_visible, "`?` closes it");
 
@@ -246,18 +240,18 @@ async fn question_mark_and_f1_toggle_help_over_the_workspace_switcher() {
     harness.key("esc");
     assert!(
         harness.app().overlays.is_empty(),
-        "`Esc` still closes the switcher"
+        "`Esc` still closes the waiting list"
     );
 }
 
 #[tokio::test]
-async fn the_modal_switcher_swallows_a_digit_and_w() {
+async fn the_modal_waiting_list_swallows_a_digit_and_w() {
     let mut harness = shell(true).await;
     let before = harness.app().tabs.active_id();
     assert!(before.is_some(), "a tab is active");
-    harness.key("w");
+    harness.key("ctrl-w");
     harness.drive_to_end().await;
-    assert_eq!(top(&mut harness), Some(WorkspaceSwitcher::ID));
+    assert_eq!(top(&mut harness), Some(WaitingList::ID));
 
     for key in ["2", "w"] {
         harness.key(key);
@@ -270,8 +264,8 @@ async fn the_modal_switcher_swallows_a_digit_and_w() {
         let open: Vec<OverlayId> = harness.app().overlays.iter().map(|o| o.id()).collect();
         assert_eq!(
             open,
-            [WorkspaceSwitcher::ID],
-            "`{key}` left only the switcher up"
+            [WaitingList::ID],
+            "`{key}` left only the waiting list up"
         );
     }
 }
@@ -310,7 +304,7 @@ async fn a_question_mark_typed_into_the_concepts_search_is_text_and_f1_is_help()
 }
 
 #[tokio::test]
-async fn w_is_inert_without_register_all_and_opens_the_switcher_with_it() {
+async fn w_is_inert_without_register_all_and_focuses_the_workspaces_tab_with_it() {
     let mut bare = shell(false).await;
     bare.key("w");
     bare.drive_to_end().await;
@@ -318,11 +312,17 @@ async fn w_is_inert_without_register_all_and_opens_the_switcher_with_it() {
         bare.app().overlays.is_empty(),
         "nobody offered `workspaces`"
     );
+    assert_eq!(bare.app().tabs.active_id(), Some(BacklogTab::ID));
 
+    // MOD-116 M1 D10: `w` focuses the Workspaces tab; no overlay opens.
     let mut full = shell(true).await;
     full.key("w");
     full.drive_to_end().await;
-    assert_eq!(top(&mut full), Some(WorkspaceSwitcher::ID));
+    assert!(full.app().overlays.is_empty());
+    assert_eq!(
+        full.app().tabs.active_id(),
+        Some(htui::ui::tabs::WorkspacesTab::ID)
+    );
 }
 
 #[tokio::test]
@@ -534,7 +534,7 @@ async fn prev_view_goes_back_and_wraps_over_three_views() {
 #[tokio::test]
 async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
     let mut harness = shell(true).await;
-    harness.key("2");
+    harness.key("3");
     harness.key("l");
     harness.drive_to_end().await;
     for _ in 0..20 {
@@ -557,7 +557,7 @@ async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
             Some("requirements"),
             "`Ctrl+PgDn` passes to the shell"
         );
-        harness.key("2");
+        harness.key("3");
         assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
     };
     skills_then_requirements(&mut harness);
@@ -758,7 +758,7 @@ async fn open_text_area_editor(editor: TextAreaEditor, keys: Option<&str>) -> Ha
         TextAreaEditor::Library | TextAreaEditor::Templates => {
             register_all(harness.app());
             harness.settle().await;
-            harness.key("2");
+            harness.key("3");
             harness.settle().await;
             if matches!(editor, TextAreaEditor::Library) {
                 select_skills_row(&mut harness, "tests");
@@ -774,10 +774,13 @@ async fn open_text_area_editor(editor: TextAreaEditor, keys: Option<&str>) -> Ha
             harness.settle().await;
             harness.key("w");
             harness.settle().await;
-            harness.key("j");
-            harness.key("enter");
+            // MOD-116 M1: Graphics, its overview, Vulkan Tutorials, then Platform; `o` opens it.
+            for _ in 0..3 {
+                harness.key("j");
+            }
+            harness.key("o");
             harness.settle().await;
-            harness.key("3");
+            harness.key("4");
             harness.settle().await;
             harness.key("n");
         }

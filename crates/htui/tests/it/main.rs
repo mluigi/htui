@@ -32,6 +32,7 @@ mod keys;
 mod keys_file;
 mod kinds;
 mod kit_chrome;
+mod leave_dialog;
 mod mcp_stdio;
 mod no_hardcoded_keys;
 mod overlays;
@@ -70,6 +71,9 @@ mod waiting;
 mod worker_crash_pg;
 mod worker_log_pg;
 mod worker_pg;
+mod workspaces_create;
+mod workspaces_manage;
+mod workspaces_tab;
 #[path = "../../../../tests/rust/write_executable.rs"]
 mod write_executable;
 

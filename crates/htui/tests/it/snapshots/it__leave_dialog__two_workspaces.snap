@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/leave_dialog.rs
+expression: frame
+---
+Graphics             0 working · 0 waiting · +1 in background ◐ 1 · memory · DESKTOP-HTUI ·  ?  keys
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│            ╭ Leave htui? ────────────────────────────────────────────────────────────╮           │
+│            │ Leaving closes htui. Work it is running stops with it:                  │           │
+│            │   ◐ 1 working · ⚠ 1 waiting · 1 queued   Platform                       │           │
+│            │                                                                         │           │
+│            │ S stops them gracefully first, waits up to 20 s for their runs to stop, │           │
+│            │ then leaves; each resumes later.                                        │           │
+│            │                                                                         │           │
+│            │  Enter  leave   Esc  stay   S  stop first                               │           │
+│            ╰─────────────────────────────────────────────────────────────────────────╯           │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

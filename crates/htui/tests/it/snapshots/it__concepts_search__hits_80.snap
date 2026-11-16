@@ -2,7 +2,7 @@
 source: crates/htui/tests/it/concepts_search.rs
 expression: frame
 ---
-Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings     2 waiting ·  F1  keys
+Platform   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements   2 waiting ·  F1  keys
 ╭─ Backlog (11) ───────────────────────────╮╭─ ANA-1 · Data model, box … Body ›╮
 │ ▾ Platform (0)                           ││Data model, box registry and sync │
 │ ▾ htui (8)                               ││topology                          │

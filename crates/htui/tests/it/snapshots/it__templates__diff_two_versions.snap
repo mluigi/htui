@@ -1,8 +1,8 @@
 ---
-source: crates/htui/tests/templates.rs
+source: crates/htui/tests/it/templates.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat  ⁶Logs            0 waiting ·  ?  keys
+Graphics   ¹Workspaces  ²Backlog  ³Skills  ⁴Requirements  ⁵Settings  ⁶Chat      0 waiting ·  ?  keys
 ╭─────‹ Templates  MCP servers ╮╭─ diff v1 → v2 ───────────────────────────────────────────────────╮
 │ vulkan-tutorials             ││--- implement v1                                                  │
 │   fix           v1   phase   ││+++ implement v2                                                  │

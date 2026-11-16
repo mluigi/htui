@@ -138,7 +138,7 @@ Windows `Ctrl+\` arrives as itself, so there only a physical `Ctrl+4` toggles th
 | | Pane title | Status line |
 |---|---|---|
 | the editor has the keys | `<value> · Ctrl+4 to htui` | `the editor has the keys · Ctrl+4 to htui` |
-| htui has the keys, on the editor's tab | `<value> · htui has the keys` | `Ctrl+4 to the editor · Ctrl+x abort · Tab/Shift+Tab switch tabs · q quit · ? help` |
+| htui has the keys, on the editor's tab | `<value> · htui has the keys` | `Ctrl+4 to the editor · Ctrl+x abort · Ctrl+PgDn/Ctrl+PgUp switch tabs · q quit · ? help` |
 | a modal pop-up over the editor's tab | `<value> · htui has the keys` | `the editor is open: close this first` |
 | on another tab | (the pane is not drawn) | `editing in <Tab> · Ctrl+4 back · `, then that tab's own line |
 
@@ -157,9 +157,9 @@ Both keys are generated from htui's key catalogue (the `editor` context: `editor
 The editor waits in its pane, with the tab that asked for it; the rest of htui keeps working.
 
 **The editor's tab stays locked.** On that tab, while htui has the keys, only the editor's keys
-and the global keys act: `Ctrl+4`, `Ctrl+x`, `Tab`/`Shift+Tab` and `1` … `6` (switch tabs), `w`
-(switch workspace), `Ctrl+F` (find), `Ctrl+W` (waiting), `Ctrl+Q` (queue), `q`, `?`/`F1` and
-`Ctrl+C`, or the keys `keys.toml` gives them. Every other key is refused with
+and the global keys act: `Ctrl+4`, `Ctrl+x`, `Ctrl+PgDn`/`Ctrl+PgUp` and `1` … `7` (switch
+tabs), `w` (the Workspaces tab), `Ctrl+F` (find), `Ctrl+W` (waiting), `Ctrl+Q` (queue), `q`,
+`?`/`F1` and `Ctrl+C`, or the keys `keys.toml` gives them. Every other key is refused with
 `the editor is open: Ctrl+4 to the editor · Ctrl+x abort` and never reaches the view: a `Ctrl+S`
 there would save the text the editor has not handed back yet. A paste is dropped there; while the
 editor has the keys it goes to the editor (as a bracketed paste when the editor asked for one).
@@ -167,27 +167,32 @@ editor has the keys it goes to the editor (as a bracketed paste when the editor 
 **Every other tab is free.** Switch away and that tab works as it does without an editor: its
 keys, pastes, pop-ups and mouse are its own, and `Ctrl+x` is that tab's key, if it has one (the
 abort acts only on the editor's tab). `Ctrl+4` from any tab brings the editor's tab back with the
-editor holding the keys (and closes the `?` box). Switching back by hand (`Tab`, a number key)
+editor holding the keys (and closes the `?` box). Switching back by hand (`Ctrl+PgDn`, a number key)
 lands on the editor's tab with htui holding the keys; `Ctrl+4` then hands them to the editor.
 
 **Nothing steers the editor's tab.** Two things that would reset or re-select it are refused
 while an edit is open, with `the editor is open in <Tab>: finish or abort it first` on the status
 line (the pop-up that asked closes; nothing else changes):
 
-- a workspace switch: picking a workspace with `w`;
+- a workspace switch: `o` on a workspace in the Workspaces tab;
 - opening a result in the editor's tab: `Enter` on an item, document or step in find, the queue
   or the waiting list, which opens it in Backlog, while the edit is in Backlog. A result that
   opens in another tab opens as usual.
 
-**Settings › Hierarchy's own scope changes are refused too, and not retried.** Creating or deleting
-a project there, or deleting the workspace htui is in, normally moves htui's scope with it. During
-an edit that move is refused with the same sentence, and nothing repeats it when the edit ends:
-htui stays on the old scope (the other tabs keep the old project list, or the deleted workspace)
-until Settings › Hierarchy next re-reads its tree or you pick a workspace. After the edit, press
-`w` and pick the workspace you are in (or, after deleting it, another one): every tab reloads.
+**The Workspaces tab's and Settings › Hierarchy's own scope changes are refused too.** On the
+Workspaces tab, creating the first workspace (htui opens it), deleting the workspace htui is in
+(htui opens the first one left) or creating a project in it normally moves htui's scope with it;
+in Settings › Hierarchy, creating or deleting a project does. (Renaming the workspace htui is in
+moves no scope: the header takes the new name from the list.)
+During an edit that move is refused with the same sentence. A project's move is asked again the
+next time its tab re-reads what it shows (the Workspaces tab its list, Settings › Hierarchy its
+tree), so the other tabs keep the old project list until then. Creating the first workspace and
+deleting the one htui is in move once, and nothing repeats them: htui stays on the old scope (no
+workspace, or the deleted one) until you pick a workspace. After the edit, press `w`, select the
+workspace you are in (or, after deleting it, another one) and press `o`: every tab reloads.
 
 **A modal pop-up over the editor's tab** takes htui's keys, whether a reply opened it (a migration
-prompt, say), you did (find, the queue, the waiting list, the workspace switcher), or it is one of
+prompt, say), you did (find, the queue, the waiting list), or it is one of
 the [questions](#the-leave-dialog-and-the-abort-question). The status line reads
 `the editor is open: close this first`. Keys and pastes go to the pop-up; `Ctrl+4` does not act
 there (under the leave dialog it says `the editor is open: answer the question first`), and
@@ -230,6 +235,33 @@ Leaving closes htui. Work it is running stops with it:
 - An editor that exits while the dialog is up leaves it up: `Enter` still leaves, `Esc` closes it.
 
 To keep an edit, leave the editor normally (`:wq`, nano's `Ctrl+X`) and save the view with `Ctrl+S`.
+
+The dialog also lists, under the open workspace's row, every other workspace that has work in the
+background or is stopping (MOD-116, `R-TUI-18`): `◐ 1 working · ⚠ 1 waiting · 1 queued   Platform`,
+with `  ◌ stopping…` after a workspace whose stop is being applied. When any of them, or the open
+one, has work it could stop, the dialog offers `S` (`leave.stop`):
+
+```text
+S stops them gracefully first, waits up to 20 s for their runs to stop,
+then leaves; each resumes later.
+
+ Enter  leave   Esc  stay   S  stop first
+```
+
+`S` writes a graceful stop for every workspace with live work and no stop yet, as `htui stop` does,
+then waits:
+
+```text
+Stopping 2 workspaces gracefully, then leaving…
+  waiting for 1 running run to stop (17 s left)
+
+ Enter  leave now   Esc  stay (the stops stand)
+```
+
+It leaves once no stopped workspace has a running run, or after 20 s. `Enter` (or a second
+`Ctrl+C`) leaves at once; `Esc` closes the dialog and the stops stay written (`htui resume`, or `r`
+on the Workspaces tab, resumes them). A stop the database refuses is said in the box
+(`Could not stop: <message>`) and `S` is offered again.
 
 ### The abort question
 

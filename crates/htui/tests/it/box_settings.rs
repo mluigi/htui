@@ -1551,10 +1551,11 @@ async fn w_while_a_save_is_in_flight_opens_nothing() {
     );
 }
 
-/// MOD-41 plan D10: `w` shadows the global workspace switcher only over a listed box. Before the
-/// first read, over a refused read and over an empty list it passes, so the switcher still opens.
+/// MOD-41 plan D10: `w` shadows the global `w` (the Workspaces tab since MOD-116 M1) only over a
+/// listed box. Before the first read, over a refused read and over an empty list it passes, so
+/// `w` still reaches the Workspaces tab.
 #[tokio::test]
-async fn w_passes_to_the_workspace_switcher_with_no_box_to_act_on() {
+async fn w_passes_to_the_workspaces_tab_with_no_box_to_act_on() {
     let bench = SectionBench::new().await;
     let mut section = BoxesSection::new();
     assert_eq!(bench.key(&mut section, "w"), Handled::Pass, "not read yet");

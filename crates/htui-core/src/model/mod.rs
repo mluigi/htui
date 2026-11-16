@@ -134,9 +134,9 @@ pub use document::{
 pub use event::{EventKind, EventRole, SessionEvent};
 pub use hand_written::HandWrittenError;
 pub use hierarchy::{
-    NewProject, NewRepo, NewWorkspace, Project, ProjectPatch, ProjectRef, ProjectType, Repo,
-    RepoBoxPath, RepoPatch, WORKSPACES_DIR, Workspace, WorkspaceBoxPath, WorkspacePatch,
-    WorkspaceProject, WorkspaceSummary, workspace_folder,
+    NewProject, NewRepo, NewWorkspace, PROJECTS_DIR, Project, ProjectPatch, ProjectRef,
+    ProjectType, Repo, RepoBoxPath, RepoPatch, WORKSPACES_DIR, Workspace, WorkspaceBoxPath,
+    WorkspacePatch, WorkspaceProject, WorkspaceSummary, project_folder, slug_of, workspace_folder,
 };
 pub use ids::{
     AgentId, ArtifactLinkId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId,
@@ -239,7 +239,10 @@ pub use skill::{
 };
 pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
-pub use stop::{PendingStop, StopMode, WorkspaceStop, WorkspaceStopState};
+pub use stop::{
+    InBackground, PendingStop, StopMode, WorkspaceLifecycle, WorkspaceRunCounts, WorkspaceStop,
+    WorkspaceStopState,
+};
 pub use target::{
     AttachedBox, DEFAULT_TARGET_KEY, DefaultTarget, NewChildBox, NewTarget, RUNNABLE_KINDS,
     ResolvedTarget, Target, TargetBinding, TargetEdit, TargetKind, TargetLevels, TargetRefusal,

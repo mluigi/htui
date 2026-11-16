@@ -270,7 +270,6 @@ pub const HIERARCHY_BROWSE: Stack<'static> = Stack::new(&[
     Layer::view(
         Context::SettingsHierarchy,
         &[
-            Act::HierarchyNewWorkspace,
             Act::HierarchyPrimary,
             Act::HierarchyChoosePath,
             Act::HierarchyInfer,
@@ -714,15 +713,6 @@ pub const CONCEPTS_QUERY: Stack<'static> = Stack::new(&[
     HELP.with_modal_filter(),
 ]);
 
-/// The workspace switcher overlay.
-pub const SWITCHER: Stack<'static> = Stack::new(&[
-    Layer::view(Context::Switcher, &[Act::SwitcherSwitch]),
-    LIST,
-    OVERLAY,
-    QUIT,
-    HELP,
-]);
-
 /// The schema migration prompt overlay.
 pub const MIGRATION: Stack<'static> = Stack::new(&[
     Layer::view(Context::Migration, &[]),
@@ -738,10 +728,13 @@ pub const MIGRATION: Stack<'static> = Stack::new(&[
 pub const ABORT_CONFIRM: Stack<'static> =
     Stack::new(&[Layer::only(Context::Editor, &[Act::EditorAbort]), QUIT]);
 
-/// The leave dialog (MOD-115 M2 D6): its own two answers, then `global ∩ {help}`. No quit layer:
-/// its `ctrl-c` is `leave.confirm`.
+/// The leave dialog (MOD-115 M2 D6): its own answers (MOD-116 M2 D9 added `leave.stop`), then
+/// `global ∩ {help}`. No quit layer: its `ctrl-c` is `leave.confirm`.
 pub const LEAVE: Stack<'static> = Stack::new(&[
-    Layer::view(Context::Leave, &[Act::LeaveConfirm, Act::LeaveStay]),
+    Layer::view(
+        Context::Leave,
+        &[Act::LeaveConfirm, Act::LeaveStay, Act::LeaveStop],
+    ),
     HELP,
 ]);
 
@@ -1047,6 +1040,11 @@ pub const RUNS_CONFIRM: Stack<'static> = Stack::new(&[
 pub const RUNS_CANCEL: Stack<'static> =
     Stack::new(&[Layer::view(Context::BacklogRuns, &[]), CONFIRM, MODAL]);
 
+/// The Workspaces tab's stop or resume question (MOD-116 M2 D6): yes or no, no choice; the
+/// `[workspaces]` view default adds `enter` to `confirm.yes`.
+pub const WORKSPACES_CONFIRM: Stack<'static> =
+    Stack::new(&[Layer::view(Context::Workspaces, &[]), CONFIRM, MODAL]);
+
 /// Backlog > Runs, while the close-out counts (it can only be left).
 pub const RUNS_COUNTING: Stack<'static> =
     Stack::new(&[Layer::view(Context::BacklogRuns, &[]), NO, MODAL]);
@@ -1264,6 +1262,44 @@ pub const LOGS_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
+/// The Workspaces tab (MOD-116 M1 D10): its own verbs (open, MOD-116 M2 D6's stop and resume,
+/// M3 D1's new, D9's default target), M3 D14's common edit and delete, every list act (the moves
+/// and the fold), the pane scroll, then the layout and history layers of a list + detail tab.
+pub const WORKSPACES_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Workspaces,
+        &[
+            Act::WorkspacesOpen,
+            Act::WorkspacesStop,
+            Act::WorkspacesResume,
+            Act::WorkspacesNew,
+            Act::WorkspacesTarget,
+        ],
+    ),
+    Layer::only(Context::Common, &[Act::Edit, Act::Delete]),
+    LIST_ALL,
+    PANE_SCROLL,
+    LAYOUT,
+    HISTORY,
+    GLOBAL,
+]);
+
+/// The Workspaces tab's chooser (MOD-116 M3 D1, D14): `j`/`k` move, `y` (or `Enter`, the
+/// `[workspaces]` view default) chooses, `n`/`Esc` closes.
+pub const WORKSPACES_PICK: Stack<'static> =
+    Stack::new(&[Layer::view(Context::Workspaces, &[]), CONFIRM, LIST, MODAL]);
+
+/// The Workspaces tab's forms (MOD-116 M3 D14): the focused field first, the source choice's
+/// `h`/`l`, then the form's own `Tab`/`Down` moves (`ITEM_FORM`'s shape, with no save chord and
+/// no external editor).
+pub const WORKSPACES_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Workspaces, &[]),
+    FIELD,
+    PICK,
+    FORM_FIELDS,
+    MODAL,
+]);
+
 /// The shell's activity panel while it holds the keys (MOD-122 M3 D10): its own verbs, the
 /// list moves **with** `list.bottom` (blueprint F8: no layer here binds `G`), then the layout and
 /// history layers of a list + detail tab. No `list.fold` and no `backlog` layer, so `enter` and
@@ -1378,7 +1414,6 @@ mod tests {
         source!("ui/overlay/queue.rs"),
         source!("ui/overlay/leave.rs"),
         source!("ui/overlay/waiting_list.rs"),
-        source!("ui/overlay/workspace_switcher.rs"),
         source!("ui/tabs/skills/mod.rs"),
         source!("ui/tabs/skills/library.rs"),
         source!("ui/tabs/skills/mcp.rs"),
@@ -1401,6 +1436,10 @@ mod tests {
         source!("ui/tabs/backlog/detail/runs.rs"),
         source!("ui/tabs/chat/mod.rs"),
         source!("ui/tabs/logs/mod.rs"),
+        source!("ui/tabs/workspaces/mod.rs"),
+        source!("ui/tabs/workspaces/chooser.rs"),
+        source!("ui/tabs/workspaces/forms.rs"),
+        source!("ui/tabs/workspaces/delete.rs"),
         source!("ui/shell/activity.rs"),
     ];
 
@@ -1508,7 +1547,6 @@ mod tests {
         PROJECT_TYPES_BROWSE,
         LOGGING_BROWSE,
         CONCEPTS_QUERY,
-        SWITCHER,
         MIGRATION,
         ABORT_CONFIRM,
         WAITING_LIST,
@@ -1556,6 +1594,10 @@ mod tests {
         CHAT_LIVE,
         CHAT_REPLAY,
         LOGS_BROWSE,
+        WORKSPACES_BROWSE,
+        WORKSPACES_CONFIRM,
+        WORKSPACES_PICK,
+        WORKSPACES_FORM,
         ACTIVITY_BROWSE,
         QUEUE_OVERLAY,
         HIERARCHY_PICKER,
@@ -1684,6 +1726,8 @@ mod tests {
         assert_eq!(resolve(KINDS_BROWSE, "ctrl-d"), []);
         assert_eq!(resolve(HIERARCHY_BROWSE, "d"), [Act::Delete]);
         assert_eq!(resolve(HIERARCHY_BROWSE, "down"), [Act::ListDown]);
+        // MOD-116 M3 D14: `N` is the Workspaces tab's now; Hierarchy binds nothing on it.
+        assert_eq!(resolve(HIERARCHY_BROWSE, "N"), []);
         // MOD-115 M2 D4: `Tab` moves the pane focus (nothing on a single-pane tab).
         assert_eq!(resolve(HIERARCHY_BROWSE, "tab"), [Act::NextPane]);
         assert_eq!(resolve(HIERARCHY_BROWSE, "ctrl-pgdn"), [Act::NextTab]);
@@ -1748,8 +1792,6 @@ mod tests {
             resolve(MIGRATION, "esc"),
             [Act::ConfirmNo, Act::OverlayClose]
         );
-        assert_eq!(resolve(SWITCHER, "enter"), [Act::SwitcherSwitch]);
-        assert_eq!(resolve(SWITCHER, "2"), []);
         // MOD-163 D22: the Hierarchy memory pane; `e` is the clash's own act there, the common
         // edit in the list, and the pane captures input so `h` cycles no section.
         assert_eq!(resolve(HIERARCHY_BROWSE, "m"), [Act::HierarchyMemory]);
@@ -1811,6 +1853,9 @@ mod tests {
         assert_eq!(resolve(LEAVE, "n"), [Act::LeaveStay]);
         assert_eq!(resolve(LEAVE, "?"), [Act::Help]);
         assert_eq!(resolve(LEAVE, "f1"), [Act::Help]);
+        // MOD-116 M2 D9: `S` stops every live workspace gracefully first; `s` is nothing.
+        assert_eq!(resolve(LEAVE, "S"), [Act::LeaveStop]);
+        assert_eq!(resolve(LEAVE, "s"), []);
         for spec in ["q", "y", "Y"] {
             assert_eq!(resolve(LEAVE, spec), [], "{spec}");
         }
@@ -2021,6 +2066,50 @@ mod tests {
         assert_eq!(resolve(LOGS_BROWSE, "end"), []);
         assert_eq!(resolve(LOGS_BROWSE, "k"), [Act::ListUp]);
         assert_eq!(resolve(LOGS_BROWSE, "K"), [Act::PaneScrollUp]);
+        // MOD-116 M1 D10: the Workspaces tab opens on `o`, folds on `enter` (the whole `list`
+        // layer), scrolls the detail on `J`/`K`, and keeps `w` (now the tab's own offer).
+        assert_eq!(resolve(WORKSPACES_BROWSE, "o"), [Act::WorkspacesOpen]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "j"), [Act::ListDown]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "enter"), [Act::ListFold]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "G"), [Act::ListBottom]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "J"), [Act::PaneScrollDown]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "w"), [Act::Workspaces]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "backspace"), [Act::HistoryBack]);
+        // MOD-116 M2 D6: `s` stops, `r` resumes; the question answers `y`/`enter` and `n`/`esc`,
+        // and swallows the list's keys.
+        assert_eq!(resolve(WORKSPACES_BROWSE, "s"), [Act::WorkspacesStop]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "r"), [Act::WorkspacesResume]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "y"), [Act::ConfirmYes]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "enter"), [Act::ConfirmYes]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "n"), [Act::ConfirmNo]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "esc"), [Act::ConfirmNo]);
+        assert_eq!(resolve(WORKSPACES_CONFIRM, "j"), []);
+        // MOD-116 M3 D14: `N` opens the chooser, which moves on `j`/`k` and answers
+        // `y`/`enter` and `n`/`esc`; the forms capture text, `tab`/`down` move, `h`/`l` cycle
+        // the source and `enter` submits.
+        assert_eq!(resolve(WORKSPACES_BROWSE, "N"), [Act::WorkspacesNew]);
+        // MOD-116 M3 D14 (T4): `e` edits, `d` deletes, `T` sets the default target.
+        assert_eq!(resolve(WORKSPACES_BROWSE, "e"), [Act::Edit]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "d"), [Act::Delete]);
+        assert_eq!(resolve(WORKSPACES_BROWSE, "T"), [Act::WorkspacesTarget]);
+        assert_eq!(resolve(WORKSPACES_PICK, "j"), [Act::ListDown]);
+        assert_eq!(resolve(WORKSPACES_PICK, "k"), [Act::ListUp]);
+        assert_eq!(resolve(WORKSPACES_PICK, "enter"), [Act::ConfirmYes]);
+        assert_eq!(resolve(WORKSPACES_PICK, "y"), [Act::ConfirmYes]);
+        assert_eq!(resolve(WORKSPACES_PICK, "esc"), [Act::ConfirmNo]);
+        assert_eq!(resolve(WORKSPACES_PICK, "n"), [Act::ConfirmNo]);
+        assert_eq!(resolve(WORKSPACES_PICK, "q"), []);
+        assert_eq!(resolve(WORKSPACES_FORM, "tab"), [Act::FormNextField]);
+        assert_eq!(
+            resolve(WORKSPACES_FORM, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(WORKSPACES_FORM, "l"), [Act::ChoiceNext]);
+        assert_eq!(resolve(WORKSPACES_FORM, "h"), [Act::ChoicePrev]);
+        assert_eq!(resolve(WORKSPACES_FORM, "enter"), [Act::FieldSubmit]);
+        assert_eq!(resolve(WORKSPACES_FORM, "esc"), [Act::FieldCancel]);
+        assert_eq!(resolve(WORKSPACES_FORM, "q"), []);
+        assert_eq!(resolve(WORKSPACES_FORM, "f1"), [Act::Help]);
         // MOD-122 M3 D10: the activity panel's `enter` and `f` are its own (no `list.fold`, no
         // `backlog` layer), its `G` is `list.bottom` (F8), and it has no pane scroll.
         assert_eq!(resolve(ACTIVITY_BROWSE, "enter"), [Act::ActivityOpen]);
@@ -2220,6 +2309,7 @@ mod tests {
                 "NOTES_COMPOSE",
                 "BACKLOG_FILTER",
                 "ITEM_FORM",
+                "WORKSPACES_FORM",
             ]
         );
         for &(phrase, stack) in DECLARED {
@@ -2302,8 +2392,10 @@ mod tests {
         // Settings > Logging's the 77th, D4: the Logs tab's the 78th; MOD-163 D22 (and O-1): the
         // Hierarchy memory pane's six, 84; MOD-141 D12: the graph editor's six, 90; MOD-141 M2
         // D14: the part form's, 91; MOD-147 M3 D9: the owner documents pane's three, 94; MOD-122
-        // M3 D10: the activity panel's, 95; MOD-127 M2 T8: the MCP servers view's three, 98.
-        assert_eq!(views.len(), 98);
+        // M3 D10: the activity panel's, 95; MOD-127 M2 T8: the MCP servers view's three, 98;
+        // MOD-116 M1 D10: the Workspaces tab's took the retired switcher's place, still 98;
+        // MOD-116 M2 D6: its question's, 99; MOD-116 M3 D14: its chooser's and forms', 101.
+        assert_eq!(views.len(), 101);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

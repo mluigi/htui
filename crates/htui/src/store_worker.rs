@@ -30,8 +30,9 @@ use htui_core::model::{
     Note, PermissionId, Persona, PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId,
     ProjectPatch, ProjectRef, ProjectType, RelayView, RepoId, RepoPatch, RequirementAreaId,
     RequirementId, RunCommandId, RunStatus, RunSummary, Scope, SessionEvent, SkillId, SkillPatch,
-    SpecChanges, StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount,
-    WaitingPermission, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    SpecChanges, StepGraphId, StepGraphPatch, StepId, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount,
+    WaitingPermission, WorkspaceId, WorkspacePatch, WorkspaceRunCounts, WorkspaceStop,
+    WorkspaceSummary,
 };
 use htui_core::model::{
     LogShipLevel, MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemorySubject, OwnerDocument,
@@ -78,10 +79,13 @@ use crate::run_worker::{LiveChats, RunRuntime, RunServed, TuiRuns as _};
 use crate::secrets_settings::{self, IdentityEntry, Redacted, SecretCheck, SecretsSnapshot};
 use crate::skill_import::SkillImports;
 use crate::skills::{self, McpServerDraft, McpServerWrite, SkillWrite, SkillsSnapshot, StaleWhat};
+use crate::stop_report::{ResumeWrite, StopTarget, StopWrite};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 use crate::worker_log::ship::{PER_BOX_CAP, retention_cut};
+use crate::workspace_setup::{self, EditOutcome, ProjectSource, TargetChoices, TargetWrite};
+use crate::workspaces::{self, WorkspaceOverview};
 
 /// Monotonic request counter, minted by `App::dispatch` (blueprint C.2).
 pub type Seq = u64;
@@ -473,6 +477,101 @@ pub enum StoreRequest {
     /// writer: `project_type` is not mirrored, so offline it is refused with
     /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::ProjectTypes`].
     ProjectTypes,
+    /// MOD-116 M1 D6: every workspace's run counts and stop row
+    /// (`WriteStore::workspace_run_counts`), through the writer; offline `Unreachable`
+    /// (`workspace_stop` is not mirrored). Asked by the shell once a second and on a scope change
+    /// (D5). Answered with [`StoreReply::WorkspaceRunCounts`].
+    WorkspaceRunCounts,
+    /// MOD-116 M1 D7: one workspace's overview for the Workspaces tab (its tree, folder, goals,
+    /// counts, default target and per-project counts), served by [`crate::workspaces::serve`]
+    /// through the writer; offline `Unreachable`. Answered with
+    /// [`StoreReply::WorkspaceOverview`].
+    WorkspaceOverview(WorkspaceId),
+    /// MOD-116 M2 D4: stop each target workspace in `mode`, in order, each re-read against the
+    /// stop row its question was decided on (`stop_report::write_stop`, D3), as this user at the
+    /// worker's clock. Served by [`crate::workspaces::serve`] through the writer; offline
+    /// `Unreachable` before any write (`workspace_stop` is not mirrored). One batched request,
+    /// since a newer request of the same name supersedes an older one's reply: the leave dialog
+    /// stops several workspaces, the Workspaces tab one. A target that fails is its outcome and the
+    /// next is still written (M2 R1 F1); a lost connection ends the batch, failing that target and
+    /// every untried one (M3 T2). Answered with [`StoreReply::StopsWritten`].
+    StopWorkspaces {
+        /// The stop's mode.
+        mode: StopMode,
+        /// The workspaces, each with the stop row it was decided on.
+        targets: Vec<StopTarget>,
+    },
+    /// MOD-116 M2 D4: resume `workspace` when its stop row is still `decided_on`
+    /// (`stop_report::write_resume`, D3). Served as [`Self::StopWorkspaces`]. Answered with
+    /// [`StoreReply::ResumeWritten`].
+    ResumeWorkspace {
+        /// The workspace to resume.
+        workspace: WorkspaceId,
+        /// The stop row read when the question was built; `None` when it had none.
+        decided_on: Option<WorkspaceStop>,
+    },
+    /// MOD-116 M3 D4: create a workspace and prepare its folder on this box (made when missing,
+    /// used as it is when present, refused when it is a file or a git repository), recording a
+    /// folder row only when the folder is not the slug's default. Served by
+    /// [`crate::workspace_setup::serve`] through the writer; offline `Unreachable` before any disk
+    /// or store work. Answered with [`StoreReply::WorkspaceCreated`] or
+    /// [`StoreReply::SetupRefused`].
+    NewWorkspace {
+        /// `workspace.slug`.
+        slug: String,
+        /// `workspace.name`.
+        name: String,
+        /// `workspace.description`.
+        description: String,
+        /// The folder, absolute, as typed (a leading `~` already expanded by the tab).
+        folder: String,
+    },
+    /// MOD-116 M3 D5: edit a workspace under compare-and-set on `updated_at` and point it at a
+    /// folder (prepared as for [`Self::NewWorkspace`]; the old folder is never moved). Served as
+    /// [`Self::NewWorkspace`]. Answered with [`StoreReply::WorkspaceEdited`] or
+    /// [`StoreReply::SetupRefused`].
+    EditWorkspace {
+        /// The workspace.
+        id: WorkspaceId,
+        /// The `updated_at` the form opened on.
+        expected: DateTime<Utc>,
+        /// The columns to change.
+        patch: WorkspacePatch,
+        /// The folder, absolute, as typed.
+        folder: String,
+    },
+    /// MOD-116 M3 D6: create a project in `workspace` from an existing checkout, a clone of a git
+    /// URL or a new repository, and register its primary repo and this box's path. Served by
+    /// [`crate::workspace_setup::serve`]; the loop answers it from its own task (D7: a clone may
+    /// take minutes). Answered with [`StoreReply::ProjectCreated`] or
+    /// [`StoreReply::SetupRefused`].
+    NewProject {
+        /// The workspace the project joins, last.
+        workspace: WorkspaceId,
+        /// `project.slug`; also the folder name of a clone or a new repository.
+        slug: String,
+        /// `project.name`.
+        name: String,
+        /// `project.description`.
+        description: String,
+        /// Where the project's repository comes from.
+        source: ProjectSource,
+    },
+    /// MOD-116 M3 D9: what the workspace's default target may be set to: its scope row's token
+    /// and current target, the Settings default's name and every live target. Served as
+    /// [`Self::NewWorkspace`]. Answered with [`StoreReply::TargetChoices`].
+    TargetChoices(WorkspaceId),
+    /// MOD-116 M3 D9: set or clear the target the workspace's scope row names, under
+    /// compare-and-set on the row's `updated_at`. Served as [`Self::NewWorkspace`]. Answered with
+    /// [`StoreReply::WorkspaceTargetSet`] or [`StoreReply::SetupRefused`] (no scope row).
+    SetWorkspaceTarget {
+        /// The workspace.
+        workspace: WorkspaceId,
+        /// The scope row's `updated_at` the picker opened on.
+        expected: DateTime<Utc>,
+        /// The target; `None` inherits the Settings default.
+        target: Option<htui_core::model::TargetId>,
+    },
     /// This user's headless workers' log lines (MOD-122 M2 D10): `id > after`, oldest first, at
     /// most 2 000; `after: None` is the newest 2 000. Served in `try_serve` through
     /// `Backend::worker_logs`, so offline it is answered empty rather than refused, and an
@@ -1482,6 +1581,16 @@ impl StoreRequest {
             Self::DeletePersona { .. } => "delete_persona",
             Self::ImportPersonas { .. } => "import_personas",
             Self::ProjectTypes => "project_types",
+            Self::WorkspaceRunCounts => "workspace_run_counts",
+            Self::WorkspaceOverview(..) => "workspace_overview",
+            Self::StopWorkspaces { .. } => "stop_workspaces",
+            Self::ResumeWorkspace { .. } => "resume_workspace",
+            // The five of `workspace_setup::REQUEST_NAMES`, in that order (MOD-116 M3 D15).
+            Self::NewWorkspace { .. } => "new_workspace",
+            Self::EditWorkspace { .. } => "edit_workspace",
+            Self::NewProject { .. } => "new_project",
+            Self::TargetChoices(..) => "target_choices",
+            Self::SetWorkspaceTarget { .. } => "set_workspace_target",
             Self::WorkerLogs { .. } => "worker_logs",
             Self::Activity { .. } => "activity",
             Self::SweepRetention => "sweep_retention",
@@ -1967,6 +2076,83 @@ pub enum StoreReply {
     /// The project type registry in slug order: the answer to [`StoreRequest::ProjectTypes`]
     /// (MOD-146 D8). Read-only; nothing writes a type yet.
     ProjectTypes(Vec<ProjectType>),
+    /// The answer to [`StoreRequest::WorkspaceRunCounts`] (MOD-116 M1 D6): one row per
+    /// workspace, zeros included, in workspace-id order.
+    WorkspaceRunCounts(Vec<WorkspaceRunCounts>),
+    /// The answer to [`StoreRequest::WorkspaceOverview`] (MOD-116 M1 D7): the asked workspace
+    /// and its overview, `None` when the workspace does not exist.
+    WorkspaceOverview {
+        /// The workspace asked about.
+        workspace: WorkspaceId,
+        /// Its overview; `None` for an unknown workspace.
+        overview: Option<Box<WorkspaceOverview>>,
+    },
+    /// The answer to [`StoreRequest::StopWorkspaces`] (MOD-116 M2 D4): what each target's write
+    /// did, in target order.
+    StopsWritten {
+        /// The mode asked for.
+        mode: StopMode,
+        /// Each target workspace and what its write did.
+        outcomes: Vec<(WorkspaceId, StopWrite)>,
+        /// MOD-116 M3 T2 (M2 R1 carried): the [`StoreError::Unreachable`] that ended the batch,
+        /// so `lost_the_store` drops the backend onto the mirror as it would for an `Err`.
+        lost: Option<StoreError>,
+    },
+    /// The answer to [`StoreRequest::ResumeWorkspace`] (MOD-116 M2 D4).
+    ResumeWritten {
+        /// The workspace asked about.
+        workspace: WorkspaceId,
+        /// What the write did.
+        outcome: ResumeWrite,
+    },
+    /// The answer to [`StoreRequest::NewWorkspace`] (MOD-116 M3 D4).
+    WorkspaceCreated {
+        /// The new workspace, with no project.
+        workspace: WorkspaceSummary,
+        /// Its folder on this box, canonical.
+        folder: String,
+        /// Whether the request made the folder.
+        made: bool,
+    },
+    /// The answer to [`StoreRequest::EditWorkspace`] (MOD-116 M3 D5).
+    WorkspaceEdited {
+        /// The workspace asked about.
+        workspace: WorkspaceId,
+        /// Applied, or stale with the row as it is now.
+        outcome: EditOutcome,
+    },
+    /// The answer to [`StoreRequest::NewProject`] (MOD-116 M3 D6).
+    ProjectCreated {
+        /// The workspace the project joined.
+        workspace: WorkspaceId,
+        /// The project as the switcher lists it.
+        project: ProjectRef,
+        /// Its primary repo's checkout on this box, canonical.
+        repo_path: String,
+    },
+    /// The answer to [`StoreRequest::TargetChoices`] (MOD-116 M3 D9).
+    TargetChoices {
+        /// The workspace asked about.
+        workspace: WorkspaceId,
+        /// What its default target may be.
+        choices: Box<TargetChoices>,
+    },
+    /// The answer to [`StoreRequest::SetWorkspaceTarget`] (MOD-116 M3 D9).
+    WorkspaceTargetSet {
+        /// The workspace asked about.
+        workspace: WorkspaceId,
+        /// Applied, or stale (nothing written).
+        outcome: TargetWrite,
+    },
+    /// MOD-116 M3 D13: a refusal of one of `workspace_setup::REQUEST_NAMES` the person can act on
+    /// (a path, a slug, a taken destination, git's own line), in a sentence with no "constraint
+    /// violated" prefix. Nothing was written, or what was written was undone.
+    SetupRefused {
+        /// [`StoreRequest::name`] of the refused request.
+        request: &'static str,
+        /// The sentence.
+        reason: String,
+    },
     /// The answer to [`StoreRequest::WorkerLogs`] (MOD-122 M2 D10): rows oldest first, empty
     /// offline.
     WorkerLogs(Vec<WorkerLogLine>),
@@ -2480,7 +2666,7 @@ pub(crate) fn permissions_or_unknown(
 /// `read_permissions` is the writer's permission read. [`try_serve`] passes
 /// [`WriteStore::open_permissions`]; it is a parameter only so a test can make it fail with
 /// something other than `Unreachable`, which no [`Backend`] can be made to do (review R2).
-async fn serve_waiting(
+pub(crate) async fn serve_waiting(
     backend: &Backend,
     scope: &Scope,
     read_permissions: impl AsyncFnOnce(&Writer, &Scope) -> StoreResult<Vec<WaitingPermission>>,
@@ -2763,6 +2949,30 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 .writer()
                 .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
             StoreReply::ProjectTypes(WriteStore::project_types(&writer).await?)
+        }
+        // MOD-116 M1 D6: the workspaces' run counts, through the writer as `ProjectTypes` is:
+        // `workspace_stop` is not mirrored, so offline it is refused before any read.
+        StoreRequest::WorkspaceRunCounts => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            StoreReply::WorkspaceRunCounts(WriteStore::workspace_run_counts(&writer).await?)
+        }
+        // MOD-116 M1 D7: the Workspaces tab's overview, assembled in its own module as the
+        // hierarchy snapshot is; the `?` keeps `go_offline` working for an `Unreachable`.
+        // MOD-116 M2 D4: the stop and resume writes are served there too, through the writer.
+        StoreRequest::WorkspaceOverview(..)
+        | StoreRequest::StopWorkspaces { .. }
+        | StoreRequest::ResumeWorkspace { .. } => workspaces::serve(backend, request).await?,
+        // MOD-116 M3 D4-D9: creating and editing workspaces and projects, and the default
+        // target. The loop answers `NewProject` from its own task (D7); this arm is the rest's,
+        // and `serve`'s for all five (the harness, `--demo`). The `?` keeps `go_offline` working.
+        StoreRequest::NewWorkspace { .. }
+        | StoreRequest::EditWorkspace { .. }
+        | StoreRequest::NewProject { .. }
+        | StoreRequest::TargetChoices(..)
+        | StoreRequest::SetWorkspaceTarget { .. } => {
+            workspace_setup::serve(backend, request).await?
         }
         // MOD-122 M2 D10, blueprint F5/F11: one read, inline. Offline answers empty (the tab
         // merges it, adding nothing); the `?` keeps `go_offline` working for an `Unreachable`.
@@ -3238,6 +3448,33 @@ where
         .map_err(|err| StoreError::Backend(err.to_string()))?
         .map_err(|refusal| StoreError::Constraint(refusal.to_string()))?;
     Ok(StoreReply::DirListing(listing))
+}
+
+/// MOD-116 M3 D7: `serve` answered from a task of its own, at `seq`'s address. R1a A6: the
+/// answer is awaited through the serving task's `JoinHandle`, so a task that panics (or is
+/// cancelled) is still answered, `Failed` under `request`: the asking view hears back exactly
+/// once, and a gate it holds until then (the tab's "a project is still being created") lifts.
+fn answer_from_own_task<F>(
+    tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+    seq: Seq,
+    origin: Origin,
+    request: &'static str,
+    serve: F,
+) where
+    F: Future<Output = Result<StoreReply, StoreError>> + Send + 'static,
+{
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let reply = match tokio::spawn(serve).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => failed(request, &err),
+            Err(ended) => failed(
+                request,
+                &StoreError::Backend(format!("its task ended without an answer: {ended}")),
+            ),
+        };
+        let _ = tx.send(ReplyEnvelope { seq, origin, reply });
+    });
 }
 
 /// Renders a store error into the reply the asking view receives.
@@ -3874,6 +4111,19 @@ pub(crate) fn spawn_with_concepts(
                             });
                             continue;
                         }
+                        // MOD-116 M3 D7: a new project may clone for minutes (bounded by
+                        // `CLONE_TIMEOUT`), so it is answered from its own task, as a listing is:
+                        // `continue` is the whole of `R-NF-3` for it. The task's errors are its
+                        // own `Failed`; the loop's `lost_the_store` does not see them, and the next
+                        // read that meets a lost server drops the backend as usual.
+                        request @ StoreRequest::NewProject { .. } => {
+                            let (request, backend) = (request.clone(), backend.clone());
+                            let (seq, origin) = (envelope.seq, envelope.origin.clone());
+                            let name = request.name();
+                            let serve = async move { workspace_setup::serve(&backend, &request).await };
+                            answer_from_own_task(&tx, seq, origin, name, serve);
+                            continue;
+                        }
                         other => {
                             let served = try_serve(&backend, other).await;
                             if matches!(other, StoreRequest::ResumeQueue { .. }) && served.is_ok() {
@@ -4202,13 +4452,18 @@ fn go_offline(
     true
 }
 
-/// The [`StoreError::Unreachable`] a served request met, if it met one: its own `Err`, or the
+/// The [`StoreError::Unreachable`] a served request met, if it met one: its own `Err`, the
 /// re-read a persona import carries beside its report (R1 L-2 keeps the report, so that loss
-/// arrives inside an `Ok`; R1 ADV-1). Any other failure is not a loss of the store.
+/// arrives inside an `Ok`; R1 ADV-1), or the loss a batch stop carries beside its outcomes
+/// (MOD-116 M3 T2). Any other failure is not a loss of the store.
 fn lost_the_store(served: &StoreResult<StoreReply>) -> Option<&StoreError> {
     let err = match served {
         Err(err) => err,
         Ok(StoreReply::PersonaImports(imports)) => imports.personas.as_ref().err()?,
+        // MOD-116 M3 T2 (M2 R1 carried): a batch stop keeps its outcomes and carries its loss.
+        Ok(StoreReply::StopsWritten {
+            lost: Some(err), ..
+        }) => err,
         Ok(_) => return None,
     };
     matches!(err, StoreError::Unreachable(_)).then_some(err)
@@ -5869,6 +6124,62 @@ mod tests {
         cache.close().await;
     }
 
+    /// MOD-116 M1 D6: one row per demo workspace, through the writer, with its runs counted by
+    /// unfinished status (`fixtures.rs`: Platform's `RUN_4` running, a queued and a parked run;
+    /// Graphics' `RUN_8` stopped) and no stop row.
+    #[tokio::test]
+    async fn serve_workspace_run_counts_answers_every_demo_workspace() {
+        let reply = serve(&demo(), &StoreRequest::WorkspaceRunCounts).await;
+        let StoreReply::WorkspaceRunCounts(rows) = reply else {
+            panic!("expected the counts, got {reply:?}");
+        };
+        let counts = |workspace| {
+            let row = rows
+                .iter()
+                .find(|row| row.workspace_id == workspace)
+                .unwrap_or_else(|| panic!("a row for {workspace}: {rows:?}"));
+            (
+                row.queued,
+                row.running,
+                row.awaiting_approval,
+                row.stopped,
+                row.stop.clone(),
+            )
+        };
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(counts(ids::WORKSPACE_GRAPHICS), (0, 0, 0, 1, None));
+        assert_eq!(counts(ids::WORKSPACE_PLATFORM), (1, 1, 1, 0, None));
+    }
+
+    /// MOD-116 M1 D6: `workspace_stop` is not mirrored, so offline (and while connecting) the
+    /// counts are refused before any read, named `workspace_run_counts`; the shell absorbs it.
+    #[tokio::test]
+    async fn an_offline_backend_refuses_the_run_counts_read() {
+        let _keyring = htui_store::testkit::mock_keyring().await;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "run-counts-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        for since in [Some(Utc::now()), None] {
+            let backend = Backend::Offline {
+                cache: cache.clone(),
+                since,
+            };
+            let reply = serve(&backend, &StoreRequest::WorkspaceRunCounts).await;
+            assert!(
+                matches!(
+                    &reply,
+                    StoreReply::Failed {
+                        request: "workspace_run_counts",
+                        message,
+                    } if message.ends_with(DATABASE_UNREACHABLE)
+                ),
+                "since {since:?}: {reply:?}"
+            );
+        }
+        cache.close().await;
+    }
+
     /// An `Online` backend over a database nobody listens on, and its mirror.
     async fn unreachable_online(name: &str) -> (Backend, CacheStore, tempfile::TempDir) {
         let identity = Identity {
@@ -6825,6 +7136,62 @@ mod tests {
     #[test]
     fn name_arms_are_stable() {
         assert_eq!(StoreRequest::ProjectTypes.name(), "project_types");
+        // MOD-116 M3 D15: the five of `workspace_setup::REQUEST_NAMES`, in that order.
+        let setup = [
+            StoreRequest::NewWorkspace {
+                slug: String::new(),
+                name: String::new(),
+                description: String::new(),
+                folder: String::new(),
+            },
+            StoreRequest::EditWorkspace {
+                id: ids::WORKSPACE_PLATFORM,
+                expected: Utc::now(),
+                patch: WorkspacePatch::default(),
+                folder: String::new(),
+            },
+            StoreRequest::NewProject {
+                workspace: ids::WORKSPACE_PLATFORM,
+                slug: String::new(),
+                name: String::new(),
+                description: String::new(),
+                source: ProjectSource::NewRepo,
+            },
+            StoreRequest::TargetChoices(ids::WORKSPACE_PLATFORM),
+            StoreRequest::SetWorkspaceTarget {
+                workspace: ids::WORKSPACE_PLATFORM,
+                expected: Utc::now(),
+                target: None,
+            },
+        ];
+        assert_eq!(
+            setup.iter().map(StoreRequest::name).collect::<Vec<_>>(),
+            workspace_setup::REQUEST_NAMES
+        );
+        assert_eq!(
+            StoreRequest::WorkspaceRunCounts.name(),
+            "workspace_run_counts"
+        );
+        assert_eq!(
+            StoreRequest::WorkspaceOverview(ids::WORKSPACE_PLATFORM).name(),
+            "workspace_overview"
+        );
+        assert_eq!(
+            StoreRequest::StopWorkspaces {
+                mode: StopMode::Graceful,
+                targets: Vec::new(),
+            }
+            .name(),
+            "stop_workspaces"
+        );
+        assert_eq!(
+            StoreRequest::ResumeWorkspace {
+                workspace: ids::WORKSPACE_PLATFORM,
+                decided_on: None,
+            }
+            .name(),
+            "resume_workspace"
+        );
         assert_eq!(
             StoreRequest::WorkerLogs { after: None }.name(),
             "worker_logs"
@@ -7796,6 +8163,187 @@ mod tests {
         assert_eq!(lost_the_store(&Err(lost.clone())), Some(&lost));
         assert_eq!(lost_the_store(&Err(other)), None);
         assert_eq!(lost_the_store(&Ok(StoreReply::Personas(Vec::new()))), None);
+    }
+
+    /// MOD-116 M3 T2 (M2 R1 carried): a batch stop that lost the store keeps its outcomes
+    /// (`Ok(StopsWritten)`) and still tells the loop the store is gone; another failure, or none,
+    /// is not a loss.
+    #[test]
+    fn a_batch_stop_that_lost_the_store_still_reports_the_loss() {
+        let lost = StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned());
+        let other = StoreError::Backend("not a loss".to_owned());
+        let stops = |lost| {
+            Ok(StoreReply::StopsWritten {
+                mode: StopMode::Graceful,
+                outcomes: vec![(
+                    ids::WORKSPACE_PLATFORM,
+                    StopWrite::Failed("gone".to_owned()),
+                )],
+                lost,
+            })
+        };
+
+        assert_eq!(lost_the_store(&stops(Some(lost.clone()))), Some(&lost));
+        assert_eq!(lost_the_store(&stops(Some(other))), None);
+        assert_eq!(lost_the_store(&stops(None)), None);
+    }
+
+    /// A local http server whose first connection is held open with no answer until `release`
+    /// is sent (or dropped); `accepted` hears when it arrives. Later connections are closed at
+    /// once. The URL of a repository on it.
+    fn hanging_server() -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let port = listener.local_addr().expect("its address").port();
+        let (accepted_tx, accepted) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let Ok((held, _)) = listener.accept() else {
+                return;
+            };
+            let _ = accepted_tx.send(());
+            let _ = released.recv();
+            drop(held);
+            listener
+                .set_nonblocking(true)
+                .expect("the listener goes non-blocking");
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < until {
+                match listener.accept() {
+                    Ok((stream, _)) => drop(stream),
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        });
+        (
+            format!("http://127.0.0.1:{port}/api.git"),
+            accepted,
+            release,
+        )
+    }
+
+    /// MOD-116 M3 D7, R1a A9: the loop answers a new project from its own task, at the request's
+    /// own address, and serves the request after it meanwhile: the clone's remote holds the
+    /// connection and answers nothing, and the listing sent after it is answered first. The loop
+    /// serves the real home, so Platform first gets a folder row on the memory store's box
+    /// pointing at a temp dir.
+    #[tokio::test]
+    async fn a_new_project_is_answered_from_its_own_task() {
+        let Some(_git) = htui_orch::skip_without_git!() else {
+            return;
+        };
+        let backend = demo();
+        let folder = tempfile::tempdir().expect("a throwaway workspace folder");
+        let canonical = std::fs::canonicalize(folder.path()).expect("the folder resolves");
+        let this_box = backend
+            .box_info()
+            .await
+            .expect("a memory read")
+            .expect("the demo has a box")
+            .box_id;
+        backend
+            .writer()
+            .expect("a memory backend writes")
+            .upsert_workspace_box_path(&htui_core::model::WorkspaceBoxPath {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                box_id: this_box,
+                folder_path: canonical.display().to_string(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .expect("the folder row is written");
+        let (url, accepted, release) = hanging_server();
+        let (tx, mut rx, _worker) = detached(backend);
+        let send = |seq, request| {
+            tx.send(RequestEnvelope {
+                seq,
+                origin: Origin::App,
+                request,
+            })
+            .expect("the worker is alive");
+        };
+        let within = std::time::Duration::from_secs(30);
+
+        send(
+            3,
+            StoreRequest::NewProject {
+                workspace: ids::WORKSPACE_PLATFORM,
+                slug: "fresh".to_owned(),
+                name: "Fresh".to_owned(),
+                description: String::new(),
+                source: ProjectSource::Clone { url },
+            },
+        );
+        tokio::task::spawn_blocking(move || accepted.recv_timeout(within))
+            .await
+            .expect("the wait joins")
+            .expect("the clone reaches its remote, which answers nothing");
+        send(4, StoreRequest::Workspaces);
+
+        let first = tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("the listing is answered while the clone hangs")
+            .expect("the worker answers");
+        assert!(
+            matches!(
+                &first,
+                ReplyEnvelope {
+                    seq: 4,
+                    origin: Origin::App,
+                    reply: StoreReply::Workspaces(_),
+                }
+            ),
+            "{first:?}"
+        );
+
+        release.send(()).expect("the server holds the connection");
+        let second = tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("the new project is answered once its remote lets go")
+            .expect("the worker answers");
+        let ReplyEnvelope {
+            seq: 3,
+            origin: Origin::App,
+            reply: StoreReply::SetupRefused { request, reason },
+        } = &second
+        else {
+            panic!("the clone fails at its own address: {second:?}");
+        };
+        assert_eq!(*request, "new_project");
+        assert!(reason.starts_with("git clone: "), "{reason}");
+        assert!(!canonical.join("projects").join("fresh").exists());
+    }
+
+    /// MOD-116 M3 R1a A6: a new project's task that panics is still answered, `Failed` under the
+    /// request's own name at its own address, so the tab's "a project is still being created"
+    /// gate is lifted.
+    #[tokio::test]
+    async fn a_new_project_task_that_panics_is_still_answered() {
+        async fn panics() -> Result<StoreReply, StoreError> {
+            panic!("a seam that panics")
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        answer_from_own_task(&tx, 7, Origin::App, "new_project", panics());
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the panic is answered")
+            .expect("the sender lives");
+        assert!(
+            matches!(
+                &reply,
+                ReplyEnvelope {
+                    seq: 7,
+                    origin: Origin::App,
+                    reply: StoreReply::Failed { request: "new_project", message },
+                } if message.contains("panicked")
+            ),
+            "{reply:?}"
+        );
     }
 
     /// MOD-37 M4 D3 (R-46), review M1: a read that fails `Unreachable` swaps to the mirror but

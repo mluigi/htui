@@ -1,0 +1,28 @@
+---
+source: crates/htui/tests/it/workspaces_tab.rs
+expression: frame
+---
+Graphics   ¹Workspaces     0 working · 0 waiting · memory ·  F9  about   ?  keys
+╭─ Workspaces ─────────────────────────╮╭─ Graphics ───────────────── overview ╮
+│▌▾ Graphics  ● open                   ││● open                                │
+│     overview                         ││                                      │
+│     Vulkan Tutorials                 ││folder on this box  /srv/graphics     │
+│ ▾ Platform  ◐ background · 1 running ││default target      inherits the      │
+│     overview                         ││                    Settings default  │
+│     htui                             ││                    (this box)        │
+│     agy                              ││held runs           1                 │
+│                                      ││                                      │
+│                                      ││Runs                                  │
+│                                      ││FEAT-1  stopped, no box               │
+│                                      ││  cannot be resumed: cancel it from   │
+│                                      ││  the Runs pane                       │
+│                                      ││                                      │
+│                                      ││Rendering experiments                 │
+│                                      ││                                      │
+│                                      ││Goals                                 │
+│                                      ││no goals yet                          │
+│                                      ││                                      │
+│                                      ││Projects                              │
+│                                      ││Vulkan Tutorials  no repos yet        │
+│                                      ││  2 items · 0 running · 0 waiting     │
+╰─o open · N new · j/k move …──────────╯╰──────────────────────────────────────╯

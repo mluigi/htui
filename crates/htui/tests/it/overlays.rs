@@ -1,13 +1,13 @@
-//! The workspace switcher and the migration prompt at 80 columns (MOD-115 M4 E6), end to end
-//! through a `Harness` over the demo world: on the kit's modal each keeps every datum it shows at
-//! 100 columns, and its keys on the bottom border. `tests/shell.rs` covers their behaviour at the
-//! default 100x30.
+//! The migration prompt at 80 columns (MOD-115 M4 E6), end to end through a `Harness` over the
+//! demo world: on the kit's modal it keeps every datum it shows at 100 columns, and its keys on
+//! the bottom border. `tests/shell.rs` covers its behaviour at the default 100x30. (The workspace
+//! switcher's case went with it, MOD-116 M1; the Workspaces tab's 80 columns are
+//! `tests/workspaces_tab.rs`'.)
 #![cfg(feature = "testkit")]
 
 use htui::agent_worker::AgentRuntime;
 use htui::app::register_all;
 use htui::testkit::Harness;
-use htui::ui::overlay::workspace_switcher::WorkspaceSwitcher;
 use htui_agent::registry::DriverFactory;
 
 /// `harness` with the agent runtime and every view, settled.
@@ -41,28 +41,6 @@ fn modal(frame: &str, title: &str) -> Vec<String> {
         .position(|line| line.starts_with('\u{2570}'))
         .expect("the box's bottom border");
     cut[..=bottom].to_vec()
-}
-
-#[tokio::test]
-async fn the_switcher_at_80_columns_keeps_every_row_and_its_keys() {
-    let mut harness =
-        settled(Harness::demo().with_overlay(Box::new(WorkspaceSwitcher::new()))).await;
-    harness.resize(80, 30);
-    let frame = harness.render();
-    let inside = modal(&frame, "Workspaces");
-    let text = inside.join("\n");
-    for datum in [
-        "Graphics  1 project",
-        "Platform  2 projects",
-        "j/k move \u{b7} Enter switch \u{b7} Esc close",
-    ] {
-        assert!(text.contains(datum), "`{datum}`: {frame}");
-    }
-    assert!(
-        inside.last().is_some_and(|line| line.contains("Esc close")),
-        "the keys ride the bottom border: {frame}"
-    );
-    insta::assert_snapshot!("switcher_80", frame);
 }
 
 #[tokio::test]

@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/it/workspaces_manage.rs
+expression: frame
+---
+Graphics   ¹Workspaces         0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+╭─ Workspaces ───────────────────────────────────╮╭─ Edit Platform ────────────────────────────────╮
+│ ▾ Graphics  ● open                             ││▌name          Platform                         │
+│     overview                                   ││ slug          platform                         │
+│     Vulkan Tutorials                           ││ folder        ~/platform                       │
+│▌▾ Platform  ◐ background · 1 running           ││ description   …e agent platform and its driver │
+│     overview                                   ││                                                │
+│     htui                                       ││A changed folder is made if missing and used    │
+│     agy                                        ││from now on; the old folder and what it holds   │
+│                                                ││stay where they are.                            │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+╰────────────────────────────────────────────────╯╰─Enter save · Esc cancel · Tab field────────────╯

@@ -48,11 +48,15 @@ async fn open_platform_in(mut harness: Harness) -> Harness {
     harness.settle().await;
     harness.key("w");
     harness.settle().await;
-    harness.key("j");
-    harness.key("enter");
+    // MOD-116 M1: the Workspaces tab lists Graphics, its overview, Vulkan Tutorials, then
+    // Platform; `o` opens the row's workspace and the focus stays on the tab.
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("o");
     harness.settle().await;
     assert_eq!(harness.app().top_bar.workspace, "Platform");
-    harness.key("3");
+    harness.key("4");
     harness.settle().await;
     assert_eq!(harness.app().tabs.active_id(), Some(RequirementsTab::ID));
     harness
@@ -149,7 +153,8 @@ async fn the_tab_is_third_in_the_strip() {
     let frame = harness.render();
     assert!(
         frame.contains(
-            " \u{b9}Backlog  \u{b2}Skills  \u{b3}Requirements  \u{2074}Settings  \u{2075}Chat"
+            " \u{b9}Workspaces  \u{b2}Backlog  \u{b3}Skills  \u{2074}Requirements  \u{2075}Settings  \
+             \u{2076}Chat"
         ),
         "{frame}"
     );
@@ -760,7 +765,7 @@ async fn the_hint_row_greys_the_write_keys_where_a_write_is_refused() {
     let wide = |store: MemStore| Harness::over(store).size(200, 30);
     let mut harness = open_platform_in(wide(stranger_first())).await;
     let buffer = harness.render_buffer();
-    let dim = style_at(&buffer, 0, "\u{b2}Skills");
+    let dim = style_at(&buffer, 0, "\u{b3}Skills");
     let y = border_y(&buffer);
     assert_eq!(style_at(&buffer, y, "a area"), dim, "not the maintainer");
     assert_ne!(style_at(&buffer, y, "j/k move"), dim);

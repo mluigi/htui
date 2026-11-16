@@ -51,7 +51,8 @@ use htui_core::model::{
     SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
     StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, UserId, VerifyOutcome,
     WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop, canonical_declared_tags, missing_tags_failure, moved_order, overlaps, scope_of,
+    WorkspaceRunCounts, WorkspaceStop, canonical_declared_tags, missing_tags_failure, moved_order,
+    overlaps, scope_of,
 };
 use htui_core::model::{ArtifactLinkId, DocumentId};
 use htui_core::model::{
@@ -9197,6 +9198,66 @@ impl WriteStore for PgStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)
+    }
+
+    /// MOD-116 M1 D3: one query on the pool, every `workspace` row `LEFT JOIN`ed to its unfinished
+    /// runs (served by `idx_run_workspace_status`, `0019_stop_runs.sql`, or one scan of `run`) and
+    /// its `workspace_stop` row (its primary key, so `s.*` depends on the `GROUP BY`). A stop is read
+    /// only when its three columns are all present.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures; [`StoreError::Backend`] for a count past `u32::MAX`.
+    async fn workspace_run_counts(&self) -> Result<Vec<WorkspaceRunCounts>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT w.id AS "workspace_id!: WorkspaceId",
+                   COUNT(r.id) FILTER (WHERE r.status = 'queued')            AS "queued!",
+                   COUNT(r.id) FILTER (WHERE r.status = 'running')           AS "running!",
+                   COUNT(r.id) FILTER (WHERE r.status = 'awaiting_approval') AS "awaiting_approval!",
+                   COUNT(r.id) FILTER (WHERE r.status = 'stopped')           AS "stopped!",
+                   s.mode         AS "mode?: StopMode",
+                   s.requested_by AS "requested_by?: UserId",
+                   s.requested_at AS "requested_at?"
+              FROM workspace w
+              LEFT JOIN run r ON r.workspace_id = w.id
+                             AND r.status IN ('queued', 'running', 'awaiting_approval', 'stopped')
+              LEFT JOIN workspace_stop s ON s.workspace_id = w.id
+             GROUP BY w.id, s.workspace_id
+             ORDER BY w.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let count = |value: i64, status: &str| {
+            u32::try_from(value).map_err(|_| {
+                StoreError::Backend(format!(
+                    "workspace_run_counts: {value} {status} runs do not fit a u32"
+                ))
+            })
+        };
+        rows.into_iter()
+            .map(|row| {
+                let stop = match (row.mode, row.requested_by, row.requested_at) {
+                    (Some(mode), Some(requested_by), Some(requested_at)) => Some(WorkspaceStop {
+                        workspace_id: row.workspace_id,
+                        mode,
+                        requested_by,
+                        requested_at,
+                    }),
+                    _ => None,
+                };
+                Ok(WorkspaceRunCounts {
+                    workspace_id: row.workspace_id,
+                    queued: count(row.queued, "queued")?,
+                    running: count(row.running, "running")?,
+                    awaiting_approval: count(row.awaiting_approval, "awaiting_approval")?,
+                    stopped: count(row.stopped, "stopped")?,
+                    stop,
+                })
+            })
+            .collect()
     }
 
     /// MOD-125 D4: one `DELETE`; zero rows are told apart from an unknown workspace by one

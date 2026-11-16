@@ -43,7 +43,7 @@ async fn open() -> Harness {
     let mut harness = Harness::over(MemStore::demo());
     register_all(harness.app());
     harness.settle().await;
-    harness.key("2");
+    harness.key("3");
     harness.key("l");
     harness.settle().await;
     harness
@@ -512,7 +512,7 @@ async fn the_editor_waits_while_another_tab_works_and_reads_back_on_return() {
     .await;
 
     harness.key("ctrl-4");
-    harness.key("1");
+    harness.key("2");
     harness.settle().await;
     assert_eq!(
         harness
@@ -521,7 +521,7 @@ async fn the_editor_waits_while_another_tab_works_and_reads_back_on_return() {
             .active()
             .map(|tab| tab.title().to_owned()),
         Some("Backlog".to_owned()),
-        "`1` from the asking tab switches"
+        "`2` from the asking tab switches"
     );
     assert!(harness.app().editor_open(), "the editor waits");
     let frame = harness.render();

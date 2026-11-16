@@ -41,6 +41,11 @@ pub struct Keys {
     /// defaults and a `version = 2` file, `1` for a file that says `version = 1` or nothing.
     /// A version-1 file's entries take a `since: 2` default's chord (D8).
     version: u8,
+    /// MOD-116 M1 D10: one notice per retired table the file holds (`[switcher]`, the workspace
+    /// switcher's), whose entries were ignored unchecked, and (M3 D14) one per retired action an
+    /// entry of a live table names (`[settings.hierarchy] new_workspace`), on the entry's line.
+    /// Left out of equality, as `version` is.
+    retired: Vec<KeyFileError>,
 }
 
 impl PartialEq for Keys {
@@ -164,6 +169,7 @@ impl Keys {
         let mut keys = Self {
             rows: catalogue.chain(derived).collect(),
             version: VERSION,
+            retired: Vec::new(),
         };
         keys.derive(&[]);
         keys
@@ -283,10 +289,12 @@ impl Keys {
 
     /// One notice per chord an entry of the file took from an action it left at its default
     /// (MOD-12 M3 R1 H1), on the entry's line and sorted by it, e.g. `[global] quit = "ctrl-q"
-    /// takes "ctrl-q" from global.queue, which is now unbound`. Empty for the defaults.
+    /// takes "ctrl-q" from global.queue, which is now unbound`; one per retired table the file
+    /// holds, on its line (MOD-116 M1 D10); and one per retired action an entry names, on the
+    /// entry's line (MOD-116 M3 D14). Empty for the defaults.
     #[must_use]
     pub fn notices(&self) -> Vec<KeyFileError> {
-        let mut out: Vec<KeyFileError> = Vec::new();
+        let mut out: Vec<KeyFileError> = self.retired.clone();
         for row in &self.rows {
             let table = row.context.table();
             let name = row.act.spec().map_or("", |spec| spec.name);

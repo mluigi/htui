@@ -1,5 +1,7 @@
 //! The hierarchy section of the Settings tab: the workspace, its projects, their repos and this
-//! box's paths, editable in place (MOD-15 milestone 3, D11/D12/D13; `R-ENT-1..4`, `R-BOX-4`).
+//! box's paths, editable in place (MOD-15 milestone 3, D11/D12/D13; `R-ENT-1..4`, `R-BOX-4`). The
+//! workspace row heads the tree read only since MOD-116 M3 D17: `e`, `b` and `d` on it name the
+//! Workspaces tab's keys, where workspaces are created, edited and deleted.
 //!
 //! It holds **no store handle, no `UserId` and no `BoxId`** (`R-NF-3`): it names one read
 //! ([`StoreRequest::Hierarchy`]), is handed the tree that comes back, and every write leaves
@@ -27,14 +29,11 @@
 //! `kit::form`, the notice a `kit::text` notice line and the empty states `kit::empty` with a next
 //! step; the picker is a `kit::modal` ([`PathPicker`]).
 
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use htui_core::model::{
-    IntegrateMode, ProjectId, ProjectPatch, RepoId, RepoPatch, Scope, WorkspaceId, WorkspacePatch,
-};
+use htui_core::model::{IntegrateMode, ProjectId, ProjectPatch, RepoId, RepoPatch, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -72,18 +71,23 @@ use crossterm::event::KeyEvent;
 /// state's first line; [`creates_one`] is its next step (MOD-115 M3).
 const NO_WORKSPACE: &str = "no workspace";
 
-/// The next step of [`NO_WORKSPACE`]. `new` is the label of `settings.hierarchy.new_workspace`
-/// (MOD-67 M6 D4): `` `N` creates one`` under the defaults; unbound, no key is named and the
-/// step is the one left, a workspace made elsewhere.
+/// The tab where workspaces are created, edited and deleted (MOD-116 M3 D17): this section keeps
+/// the workspace row as the tree's head, read only, and its notices send the person there.
+const WORKSPACES_TAB: &str = "the Workspaces tab";
+
+/// The next step of [`NO_WORKSPACE`]. `new` is the label of `workspaces.new` through
+/// [`views::WORKSPACES_BROWSE`] (MOD-116 M3 D17; MOD-67 M6 D4): `` `N` on the Workspaces tab
+/// creates one`` under the defaults; unbound, no key is named and the step is the one left, a
+/// workspace made elsewhere.
 fn creates_one(new: Option<&str>) -> String {
     match new {
-        Some(new) => format!("`{new}` creates one"),
+        Some(new) => format!("`{new}` on {WORKSPACES_TAB} creates one"),
         None => "a workspace created elsewhere shows up here".to_owned(),
     }
 }
 
-/// The refusal a key gets with no workspace: `` no workspace — `N` creates one`` under the
-/// defaults, and no key named when it is unbound.
+/// The refusal a key gets with no workspace: `` no workspace — `N` on the Workspaces tab creates
+/// one`` under the defaults, and no key named when it is unbound.
 fn no_workspace(new: Option<&str>) -> String {
     match new {
         Some(_) => format!("{NO_WORKSPACE} \u{2014} {}", creates_one(new)),
@@ -108,7 +112,6 @@ fn unavailable_next(reload: Option<&str>) -> String {
 /// Browse's keys.
 const HINT_BROWSE: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, ""),
-    Hint::One(Act::HierarchyNewWorkspace, "workspace"),
     Hint::One(Act::New, "project/repo"),
     Hint::One(Act::Edit, "edit"),
     Hint::One(Act::HierarchyPrimary, "primary"),
@@ -121,11 +124,9 @@ const HINT_BROWSE: HintSpec = &[
     Hint::One(Act::Reload, "reload"),
 ];
 
-/// Browse's keys with nothing read: only the two that do not need a tree.
-const HINT_NO_WORKSPACE: HintSpec = &[
-    Hint::One(Act::HierarchyNewWorkspace, "workspace"),
-    Hint::One(Act::Reload, "reload"),
-];
+/// Browse's keys with nothing read: only the one that does not need a tree. A workspace is
+/// created on the Workspaces tab (MOD-116 M3 D17), whose key the empty state names.
+const HINT_NO_WORKSPACE: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
 /// Browse's keys with the read refused: nothing here can be created against a store that did not
 /// answer, so the only offer is to ask again.
@@ -166,7 +167,8 @@ const HINT_PICKING: HintSpec = &[
     Hint::One(Act::Back, "cancel"),
 ];
 
-/// The workspace row's and the workspace editor's words for the folder (MOD-147 M3 D12).
+/// The workspace row's words for the folder (MOD-147 M3 D12), read only here since MOD-116 M3
+/// D17: the Workspaces tab's edit form sets it.
 const FOLDER_ON_THIS_BOX: &str = "folder on this box";
 
 /// What a folder with no `workspace_box_path` row for this box adds after it (D12).
@@ -300,10 +302,6 @@ enum Row {
 /// item O-2). [`PathTarget::RepoPath`] carries it for the same reason (MOD-49).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorKind {
-    /// `N`: a workspace the shell then enters (D11).
-    NewWorkspace,
-    /// `e` on the workspace row.
-    EditWorkspace(WorkspaceId),
     /// `n` on the workspace row.
     NewProject,
     /// `e` on a project row.
@@ -319,12 +317,11 @@ enum EditorKind {
     },
 }
 
-/// Which row `b` writes a path for (MOD-49, blueprint D7): the two path writes, out of
-/// [`EditorKind`] now that no editor types them.
+/// Which row `b` writes a path for (MOD-49, blueprint D7), out of [`EditorKind`] now that no
+/// editor types it. A repo's checkout alone since MOD-116 M3 D17: the workspace's folder is set on
+/// the Workspaces tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathTarget {
-    /// `b` on the workspace row: this box's root.
-    WorkspaceRoot(WorkspaceId),
     /// `b` on a repo row: this box's checkout.
     RepoPath {
         /// The repo's project.
@@ -339,7 +336,6 @@ impl PathTarget {
     /// stored, so the chosen path goes out as navigated.
     fn request(self, path: String) -> StoreRequest {
         match self {
-            Self::WorkspaceRoot(id) => StoreRequest::SetWorkspaceRoot { id, path },
             Self::RepoPath { project, id } => StoreRequest::SetRepoPath {
                 project,
                 repo: id,
@@ -400,10 +396,12 @@ enum Mode {
     Browse,
     /// One row being typed into.
     Editing(Editor),
-    /// One row being deleted, behind PRD D13's two confirmations.
+    /// One project being deleted, behind PRD D13's two confirmations. A workspace is deleted on
+    /// the Workspaces tab (MOD-116 M3 D17), so a project is all this mode can name (R1b B10): no
+    /// workspace delete's reply, which goes to that tab, is ever waited on here.
     Deleting {
-        /// What the two `Delete*` requests would name.
-        target: DeleteTarget,
+        /// The project `DeleteReach` and `DeleteProject` name.
+        target: ProjectId,
         /// The slug the second confirmation asks to be typed.
         slug: String,
         /// How far the confirmation has got.
@@ -621,39 +619,11 @@ impl HierarchySection {
         let theme = ctx.theme;
         match &self.mode {
             Mode::Browse => Vec::new(),
-            Mode::Editing(editor) => {
-                let form = editor.form();
-                // The workspace editor shows the folder too, read only (MOD-147 M3 D12): the
-                // path is not one of its fields, so the line names the key that picks it.
-                let form = match (editor.kind, &self.snapshot) {
-                    (EditorKind::EditWorkspace(_), Some(snapshot)) => {
-                        let folder = folder_on_this_box(snapshot, self.home.as_deref());
-                        let choose = ctx
-                            .keys()
-                            .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
-                        let line = match choose {
-                            Some(choose) => format!(
-                                "{folder} \u{b7} `{choose}` on the workspace row picks another"
-                            ),
-                            None => folder,
-                        };
-                        form.field(form::Field::new(
-                            FOLDER_ON_THIS_BOX,
-                            Value::ReadOnly(Cow::Owned(line)),
-                        ))
-                    }
-                    _ => form,
-                };
-                form.lines(width, ctx.accent(), theme)
-            }
+            Mode::Editing(editor) => editor.form().lines(width, ctx.accent(), theme),
             // MOD-49 P2: the popup draws over the section in `render`, so the pane stays empty;
             // the memory pane draws over the whole section too (MOD-163 D20).
             Mode::Picking { .. } | Mode::Memory { .. } | Mode::Documents { .. } => Vec::new(),
-            Mode::Deleting {
-                target,
-                slug,
-                stage,
-            } => delete_pane(*target, slug, stage, width, theme),
+            Mode::Deleting { slug, stage, .. } => delete_pane(slug, stage, width, theme),
         }
     }
 
@@ -747,42 +717,29 @@ impl HierarchySection {
             match act {
                 Act::ListDown => self.move_cursor(true),
                 Act::ListUp => self.move_cursor(false),
-                Act::HierarchyNewWorkspace => {
-                    if !self.refuse(act, ctx.keys()) {
-                        self.open(
-                            EditorKind::NewWorkspace,
-                            vec![
-                                Field::required("slug", ""),
-                                Field::required("name", ""),
-                                Field::optional("description", ""),
-                            ],
-                            None,
-                        );
-                    }
-                }
                 Act::New => {
-                    if !self.refuse(act, ctx.keys())
+                    if !self.refuse(ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.open_new_child(row);
                     }
                 }
                 Act::Edit => {
-                    if !self.refuse(act, ctx.keys())
+                    if !self.refuse(ctx.keys())
                         && let Some(row) = self.selected()
                     {
-                        self.open_edit(row);
+                        self.open_edit(row, ctx.keys());
                     }
                 }
                 Act::HierarchyPrimary => {
-                    if !self.refuse(act, ctx.keys())
+                    if !self.refuse(ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.move_primary(row, ctx);
                     }
                 }
                 Act::HierarchyChoosePath => {
-                    if !self.refuse(act, ctx.keys())
+                    if !self.refuse(ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.open_path(row, ctx);
@@ -791,7 +748,7 @@ impl HierarchySection {
                 // MOD-7 milestone 4 (D114): infer this box's repo paths under the workspace root.
                 // A write, so it is refused while another is in flight, as the other writes are.
                 Act::HierarchyInfer => {
-                    if !self.refuse(act, ctx.keys())
+                    if !self.refuse(ctx.keys())
                         && let Some(snapshot) = &self.snapshot
                     {
                         let request = StoreRequest::InferRepoPaths(snapshot.workspace.id);
@@ -801,7 +758,7 @@ impl HierarchySection {
                     }
                 }
                 Act::Delete => {
-                    if !self.refuse(act, ctx.keys())
+                    if !self.refuse(ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.begin_delete(row, ctx);
@@ -810,7 +767,7 @@ impl HierarchySection {
                 // MOD-163 D20: a project row opens its memory pane. A read, so not `busy`; refused
                 // like the other keys while a write is in flight or the tree is not there.
                 Act::HierarchyMemory => {
-                    if !self.refuse(act, ctx.keys()) {
+                    if !self.refuse(ctx.keys()) {
                         match self.selected() {
                             Some(Row::Project { index }) => self.open_memory(index, ctx),
                             _ => self.notice = Some(PICK_A_PROJECT.to_owned()),
@@ -820,7 +777,7 @@ impl HierarchySection {
                 // MOD-147 M3 D9: the workspace row or a project row opens its owner documents; a
                 // read, so refused only as the memory pane's key is.
                 Act::HierarchyDocuments => {
-                    if !self.refuse(act, ctx.keys()) {
+                    if !self.refuse(ctx.keys()) {
                         match self.selected() {
                             Some(row @ (Row::Workspace | Row::Project { .. })) => {
                                 self.open_documents(row, ctx);
@@ -849,19 +806,20 @@ impl HierarchySection {
     /// Two refusals, in this order: a write in flight (a second one of the same kind would lose a
     /// reply), then a tree that is not there to edit. `r` is deliberately **not** on this path —
     /// re-reading is how a section that lost a reply recovers. `keys` name the key that creates a
-    /// workspace in the no-workspace refusal (MOD-67 M6 D4).
-    fn refuse(&mut self, act: Act, keys: &Keys) -> bool {
+    /// workspace in the no-workspace refusal (MOD-67 M6 D4): the Workspaces tab's `new` since
+    /// MOD-116 M3 D17, so with no tree every key here is refused.
+    fn refuse(&mut self, keys: &Keys) -> bool {
         if self.in_flight() {
             return true;
         }
-        // The read was refused, so there is nothing to edit and nothing to create against either:
-        // `N` is refused here too, and a notice offering it would name a key that does not work.
+        // The read was refused, so there is nothing to edit and nothing to create against either,
+        // and a notice offering the Workspaces tab's `N` would name a key that does not work.
         if let Some(why) = &self.unavailable {
             self.notice = Some(format!("{UNAVAILABLE}: {why}"));
             return true;
         }
-        if self.snapshot.is_none() && act != Act::HierarchyNewWorkspace {
-            let new = keys.label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace);
+        if self.snapshot.is_none() {
+            let new = keys.label(views::WORKSPACES_BROWSE, Act::WorkspacesNew);
             self.notice = Some(no_workspace(new.as_deref()));
             return true;
         }
@@ -978,24 +936,19 @@ impl HierarchySection {
         }
     }
 
-    /// `e`: the row under the cursor, prefilled, with its `updated_at` as the CAS token.
-    fn open_edit(&mut self, row: Row) {
+    /// `e`: the row under the cursor, prefilled, with its `updated_at` as the CAS token. The
+    /// workspace row names the Workspaces tab's `edit` instead (MOD-116 M3 D17).
+    fn open_edit(&mut self, row: Row, keys: &Keys) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
         match row {
             Row::Workspace => {
-                let workspace = &snapshot.workspace;
-                let (kind, expected) = (
-                    EditorKind::EditWorkspace(workspace.id),
-                    Some(workspace.updated_at),
-                );
-                let fields = vec![
-                    Field::required("slug", &workspace.slug),
-                    Field::required("name", &workspace.name),
-                    Field::optional("description", &workspace.description),
-                ];
-                self.open(kind, fields, expected);
+                let edit = keys.label(views::WORKSPACES_BROWSE, Act::Edit);
+                self.notice = Some(match edit {
+                    Some(edit) => format!("`{edit}` on {WORKSPACES_TAB} edits the workspace"),
+                    None => format!("edit the workspace on {WORKSPACES_TAB}"),
+                });
             }
             Row::Project { index } => {
                 let Some(entry) = snapshot.projects.get(index) else {
@@ -1052,9 +1005,10 @@ impl HierarchySection {
         }
     }
 
-    /// `b`: the directory picker on this box's path for the workspace or for a repo (MOD-49 P1,
-    /// P7). The listing goes out through `ctx.request`, not `send`: it is a read and marks nothing
-    /// busy (P11).
+    /// `b`: the directory picker on this box's path for a repo (MOD-49 P1, P7). The listing goes
+    /// out through `ctx.request`, not `send`: it is a read and marks nothing busy (P11). The
+    /// workspace row names the Workspaces tab's `edit`, whose form sets the folder (MOD-116 M3
+    /// D17).
     fn open_path(&mut self, row: Row, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
             return;
@@ -1064,19 +1018,21 @@ impl HierarchySection {
             .as_ref()
             .map(|path| path.folder_path.as_str());
         let (target, title, stored, fallback) = match row {
-            Row::Workspace => (
-                PathTarget::WorkspaceRoot(snapshot.workspace.id),
-                format!("Root of `{}` on this box", snapshot.workspace.slug),
-                workspace_root,
-                None,
-            ),
+            Row::Workspace => {
+                let edit = ctx.keys().label(views::WORKSPACES_BROWSE, Act::Edit);
+                self.notice = Some(match edit {
+                    Some(edit) => format!("`{edit}` on {WORKSPACES_TAB} sets its folder"),
+                    None => format!("set the workspace's folder on {WORKSPACES_TAB}"),
+                });
+                return;
+            }
             Row::Project { .. } => {
                 let choose = ctx
                     .keys()
                     .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
                 self.notice = Some(match choose {
-                    Some(choose) => format!("`{choose}` wants the workspace or a repo row"),
-                    None => "pick a path on the workspace or a repo row".to_owned(),
+                    Some(choose) => format!("`{choose}` wants a repo row"),
+                    None => "pick a path on a repo row".to_owned(),
                 });
                 return;
             }
@@ -1157,24 +1113,26 @@ impl HierarchySection {
     ///
     /// The counting is a request of its own so the numbers on screen are the store's and not this
     /// section's arithmetic; `delete_reach` and `delete_*` share one implementation, so what is
-    /// shown is what will go (M1 D4).
+    /// shown is what will go (M1 D4). The workspace row names the Workspaces tab's `delete`
+    /// instead (MOD-116 M3 D17).
     fn begin_delete(&mut self, row: Row, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
         let (target, slug) = match row {
-            Row::Workspace => (
-                DeleteTarget::Workspace(snapshot.workspace.id),
-                snapshot.workspace.slug.clone(),
-            ),
+            Row::Workspace => {
+                let delete = ctx.keys().label(views::WORKSPACES_BROWSE, Act::Delete);
+                self.notice = Some(match delete {
+                    Some(delete) => format!("`{delete}` on {WORKSPACES_TAB} deletes it"),
+                    None => format!("delete the workspace on {WORKSPACES_TAB}"),
+                });
+                return;
+            }
             Row::Project { index } => {
                 let Some(entry) = snapshot.projects.get(index) else {
                     return;
                 };
-                (
-                    DeleteTarget::Project(entry.project.id),
-                    entry.project.slug.clone(),
-                )
+                (entry.project.id, entry.project.slug.clone())
             }
             // A repo is removed by deleting its project or not at all: `delete_repo` is not on the
             // seam and this milestone adds no method to it.
@@ -1189,7 +1147,10 @@ impl HierarchySection {
             slug,
             stage: DeleteStage::Counting,
         };
-        self.send(StoreRequest::DeleteReach(target), ctx);
+        self.send(
+            StoreRequest::DeleteReach(DeleteTarget::Project(target)),
+            ctx,
+        );
     }
 
     /// One key while a delete is being confirmed (D9, flag B).
@@ -1235,13 +1196,9 @@ impl HierarchySection {
             DeleteStage::Typed { reach, field } => match field.on_key(key) {
                 FieldOutcome::Submit => {
                     if field.text() == Some(slug.as_str()) {
-                        let request = match target {
-                            DeleteTarget::Workspace(id) => StoreRequest::DeleteWorkspace(id),
-                            DeleteTarget::Project(id) => StoreRequest::DeleteProject(id),
-                        };
                         *stage = DeleteStage::InFlight(reach.clone());
                         self.notice = None;
-                        self.send(request, ctx);
+                        self.send(StoreRequest::DeleteProject(target), ctx);
                     } else {
                         field.clear();
                         self.notice = Some(WRONG_SLUG.to_owned());
@@ -1442,26 +1399,6 @@ impl HierarchySection {
         }
         let expected = editor.expected;
         let request = match editor.kind {
-            EditorKind::NewWorkspace => StoreRequest::CreateWorkspace {
-                slug: editor.text(0),
-                name: editor.text(1),
-                description: editor.text(2),
-            },
-            EditorKind::EditWorkspace(id) => {
-                let Some(expected) = expected else {
-                    self.notice = Some(DELETED_ELSEWHERE.to_owned());
-                    return;
-                };
-                StoreRequest::UpdateWorkspace {
-                    id,
-                    expected,
-                    patch: WorkspacePatch {
-                        slug: Some(editor.text(0)),
-                        name: Some(editor.text(1)),
-                        description: Some(editor.text(2)),
-                    },
-                }
-            }
             EditorKind::NewProject => {
                 let Some(snapshot) = &self.snapshot else {
                     return;
@@ -1537,24 +1474,25 @@ impl HierarchySection {
     fn on_tree(&mut self, snapshot: &HierarchySnapshot, ctx: &Ctx<'_>) {
         let write = self.busy.take();
         self.unavailable = None;
-        // MOD-7 milestone 4 (D114, D136): a write that can change what inference reads — the root
-        // (now chosen in the picker, MOD-49 blueprint D20), or a repo's name or remote — is
-        // followed by one inference. Captured here, before the editor or picker is closed below;
-        // `p` has neither, so it is never followed, and a repo path (`set_repo_path`) isn't either.
-        let follow = write.is_some_and(|name| {
-            matches!(name, "set_workspace_root" | "create_repo" | "update_repo")
-        }) && match &self.mode {
-            Mode::Editing(editor) => {
-                matches!(
-                    editor.kind,
-                    EditorKind::NewRepo(_) | EditorKind::EditRepo { .. }
-                )
-            }
-            Mode::Picking { target, .. } => matches!(target, PathTarget::WorkspaceRoot(_)),
-            Mode::Browse | Mode::Deleting { .. } | Mode::Memory { .. } | Mode::Documents { .. } => {
-                false
-            }
-        };
+        // MOD-7 milestone 4 (D114, D136): a write that can change what inference reads — a
+        // repo's name or remote — is followed by one inference. Captured here, before the editor
+        // is closed below; `p` has none, so it is never followed, and a repo path
+        // (`set_repo_path`) isn't either. The root's write left with the workspace row's verbs
+        // (MOD-116 M3 D17).
+        let follow = write.is_some_and(|name| matches!(name, "create_repo" | "update_repo"))
+            && match &self.mode {
+                Mode::Editing(editor) => {
+                    matches!(
+                        editor.kind,
+                        EditorKind::NewRepo(_) | EditorKind::EditRepo { .. }
+                    )
+                }
+                Mode::Picking { .. }
+                | Mode::Browse
+                | Mode::Deleting { .. }
+                | Mode::Memory { .. }
+                | Mode::Documents { .. } => false,
+            };
         if let Some(name) = write {
             self.notice = self.written(name, snapshot);
             // An **editor** or the picker only (MOD-49 D8). A reply carries no correlation, so a
@@ -1618,9 +1556,9 @@ impl HierarchySection {
 
     /// What a write that applied has to say, if anything.
     ///
-    /// Only the two path writes do: the guard canonicalises what was chosen (D8), and a path stored
-    /// under a name the user did not navigate to is a surprise worth one line. Both come from the
-    /// picker now (MOD-49 blueprint D7), which holds the path it sent in `chosen`.
+    /// Only the path write does: the guard canonicalises what was chosen (D8), and a path stored
+    /// under a name the user did not navigate to is a surprise worth one line. It comes from the
+    /// picker (MOD-49 blueprint D7), which holds the path it sent in `chosen`.
     fn written(&self, request: &'static str, snapshot: &HierarchySnapshot) -> Option<String> {
         let Mode::Picking {
             target,
@@ -1631,10 +1569,6 @@ impl HierarchySection {
             return None;
         };
         let stored = match *target {
-            PathTarget::WorkspaceRoot(_) if request == "set_workspace_root" => snapshot
-                .folder_path
-                .as_ref()
-                .map(|path| path.folder_path.clone())?,
             PathTarget::RepoPath { id, .. } if request == "set_repo_path" => snapshot
                 .projects
                 .iter()
@@ -1859,7 +1793,12 @@ impl SettingsSection for HierarchySection {
                 let choose = ctx
                     .keys()
                     .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
-                let report = inferred_notice(report, choose.as_deref());
+                let edit = ctx.keys().label(views::WORKSPACES_BROWSE, Act::Edit);
+                let infer = ctx
+                    .keys()
+                    .label(views::HIERARCHY_BROWSE, Act::HierarchyInfer);
+                let report =
+                    inferred_notice(report, choose.as_deref(), edit.as_deref(), infer.as_deref());
                 self.notice = Some(match before {
                     Some(before) => format!("{before} \u{b7} {report}"),
                     None => report,
@@ -1880,41 +1819,18 @@ impl SettingsSection for HierarchySection {
                 self.notice = Some("already gone".to_owned());
                 ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
             }
+            // The fresh tree is what moves the scope: D11's arm emits `SetScope` because the
+            // project list changed, and that is how the Backlog stops listing it. A project is the
+            // one thing deleted here: a workspace is deleted on the Workspaces tab, and its reply
+            // goes there (MOD-116 M3 D17).
             StoreReply::Deleted {
-                target,
+                target: DeleteTarget::Project(_),
                 reach,
                 mirror,
             } => {
                 let slug = self.deleting_slug().unwrap_or_default();
                 self.deleted(&slug, reach, mirror);
-                match target {
-                    // The fresh tree is what moves the scope: D11's arm emits `SetScope` because
-                    // the project list changed, and that is how the Backlog stops listing it.
-                    DeleteTarget::Project(_) => {
-                        ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
-                    }
-                    // The workspace the shell is inside is gone, so there is no tree to re-read:
-                    // the list of what is left is what decides where it lands next. The tree goes
-                    // with it — an empty list leaves this pane reading "no workspace", and a tree
-                    // left on screen would aim `e`/`n`/`b`/`d` at ids that no longer exist.
-                    DeleteTarget::Workspace(_) => {
-                        self.snapshot = None;
-                        self.clamp_cursor();
-                        ctx.request(StoreRequest::Workspaces);
-                    }
-                }
-            }
-            // Only ever after a workspace delete (the switcher asks for its own): the first
-            // workspace left is entered, and an empty list leaves the pane saying so.
-            StoreReply::Workspaces(list) => {
-                let stranded = self.snapshot.as_ref().is_none_or(|tree| {
-                    !list.iter().any(|row| row.workspace_id == tree.workspace.id)
-                });
-                if stranded && let Some(first) = list.first() {
-                    ctx.emit(Action::SetScope {
-                        workspace: first.clone(),
-                    });
-                }
+                ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
             }
             // MOD-10 M4 (blueprint A-1): the Secrets section's scope write. The tree is adopted so
             // the tokens stay current; nothing else here is this section's — no `busy`, no
@@ -2029,7 +1945,7 @@ impl SettingsSection for HierarchySection {
         } else if self.snapshot.is_none() {
             let new = ctx
                 .keys()
-                .label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace);
+                .label(views::WORKSPACES_BROWSE, Act::WorkspacesNew);
             empty::render(
                 frame,
                 rows,
@@ -2195,14 +2111,7 @@ enum Reload {
 /// The token an open editor should retry against after a reload.
 fn reload(snapshot: &HierarchySnapshot, kind: EditorKind) -> Reload {
     match kind {
-        EditorKind::NewWorkspace | EditorKind::NewProject => Reload::Keep,
-        EditorKind::EditWorkspace(id) => {
-            if snapshot.workspace.id == id {
-                Reload::Token(snapshot.workspace.updated_at)
-            } else {
-                Reload::Gone
-            }
-        }
+        EditorKind::NewProject => Reload::Keep,
         EditorKind::EditProject(id) => snapshot
             .projects
             .iter()
@@ -2250,16 +2159,23 @@ pub fn joined_notice(project: &str, workspace: &str, prefixes: &[String]) -> Str
 /// repo is named, not explained: its sentence may name a path, and the notice is one line.
 ///
 /// `choose` is the label of `settings.hierarchy.choose_path` (MOD-67 M6 D4), the key the notice
-/// sends the user to (`b` under the defaults); unbound, the notice names no key.
-pub(crate) fn inferred_notice(report: &InferReport, choose: Option<&str>) -> String {
+/// sends the user to on a repo row (`b` under the defaults), `edit` the Workspaces tab's `edit`,
+/// whose form sets the workspace's folder (MOD-116 M3 D17), and `infer` the label of
+/// `settings.hierarchy.infer`, which runs the pass once the folder is set: that edit runs none
+/// (R1b B9). Unbound, the notice names no key; `infer` unbound drops its step.
+pub(crate) fn inferred_notice(
+    report: &InferReport,
+    choose: Option<&str>,
+    edit: Option<&str>,
+    infer: Option<&str>,
+) -> String {
     if report.root.is_none() {
-        return match choose {
-            Some(choose) => format!(
-                "no root on this box for this workspace \u{2014} {choose} on the workspace row sets it"
-            ),
-            None => "no root on this box for this workspace \u{2014} set one on the workspace row"
-                .to_owned(),
+        let set = match edit {
+            Some(edit) => format!("{edit} on {WORKSPACES_TAB} sets its folder"),
+            None => format!("set its folder on {WORKSPACES_TAB}"),
         };
+        let then = infer.map_or_else(String::new, |infer| format!(", then {infer} here"));
+        return format!("no root on this box for this workspace \u{2014} {set}{then}");
     }
     if report.truncated {
         return format!(
@@ -2340,16 +2256,12 @@ fn in_flight(busy: &str) -> String {
 fn doing(busy: &str) -> &'static str {
     match busy {
         "hierarchy" => "reading the tree",
-        "create_workspace" => "adding the workspace",
-        "update_workspace" => "saving the workspace",
-        "set_workspace_root" => "saving the root",
         "create_project" => "adding the project",
         "update_project" => "saving the project",
         "create_repo" => "adding the repo",
         "update_repo" => "saving the repo",
         "set_repo_path" => "saving the checkout",
         "delete_reach" => "counting rows",
-        "delete_workspace" => "deleting the workspace",
         "delete_project" => "deleting the project",
         "infer_repo_paths" => "inferring the repo paths",
         _ => "writing",
@@ -2361,17 +2273,11 @@ fn repo_at(owner: &ProjectEntry, index: usize) -> Option<(ProjectId, &RepoEntry)
     owner.repos.get(index).map(|repo| (owner.project.id, repo))
 }
 
-/// The pane of a delete, every warning line in `theme.error` (D9).
+/// The pane of a project's delete, every warning line in `theme.error` (D9).
 ///
 /// The counts are the store's own, in [`DeleteReach`]'s field order and with the zeros left out:
 /// the pane lists what a delete takes, and "0 runs" is not something being taken.
-fn delete_pane(
-    target: DeleteTarget,
-    slug: &str,
-    stage: &DeleteStage,
-    width: u16,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+fn delete_pane(slug: &str, stage: &DeleteStage, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let reach = match stage {
         DeleteStage::Counting => {
             return vec![notice("counting rows\u{2026}", Tone::Info, theme)];
@@ -2386,45 +2292,14 @@ fn delete_pane(
         DeleteStage::Warn(reach) | DeleteStage::Typed { reach, .. } => reach,
     };
 
-    let headline = match target {
-        DeleteTarget::Project(_) => {
-            let parts = reach_parts(reach);
-            let taken = if parts.is_empty() {
-                "no other rows".to_owned()
-            } else {
-                parts.join(", ")
-            };
-            format!("This deletes project `{slug}` and its entire history. Gone for good: {taken}.")
-        }
-        DeleteTarget::Workspace(_) => {
-            let mut headline = format!(
-                "This deletes workspace `{slug}`: {} and {}. Its projects survive and stay reachable from other workspaces.",
-                plural(
-                    usize::try_from(reach.workspace_links).unwrap_or(usize::MAX),
-                    "project link",
-                    "project links"
-                ),
-                plural(
-                    usize::try_from(reach.workspace_box_paths).unwrap_or(usize::MAX),
-                    "box root path",
-                    "box root paths"
-                ),
-            );
-            // MOD-147 A1: the rest of the reach goes with the workspace, named as a project delete
-            // names them: everything its scope row owns, summed with the workspace's own
-            // workspace-scoped graphs (their step graphs, phases and phase agents). Only the two
-            // counts above are left out here, rather than said twice.
-            let owned = reach_parts(&DeleteReach {
-                workspace_links: 0,
-                workspace_box_paths: 0,
-                ..**reach
-            });
-            if !owned.is_empty() {
-                headline.push_str(&format!(" Gone for good with it: {}.", owned.join(", ")));
-            }
-            headline
-        }
+    let parts = reach_parts(reach);
+    let taken = if parts.is_empty() {
+        "no other rows".to_owned()
+    } else {
+        parts.join(", ")
     };
+    let headline =
+        format!("This deletes project `{slug}` and its entire history. Gone for good: {taken}.");
 
     let room = usize::from(width).max(1);
     let mut lines: Vec<Line<'static>> = wrapped(&headline, room)
@@ -2482,13 +2357,7 @@ mod tests {
             field: TextField::with_text(&"x".repeat(60)),
         };
 
-        let lines = delete_pane(
-            DeleteTarget::Project(ProjectId::new()),
-            &"\u{6f22}".repeat(8),
-            &stage,
-            width,
-            &Theme::default(),
-        );
+        let lines = delete_pane(&"\u{6f22}".repeat(8), &stage, width, &Theme::default());
 
         let last = lines.last().expect("the confirm line");
         let prompt = format!("Type `{}` to confirm: ", "\u{6f22}".repeat(8));
@@ -2530,7 +2399,10 @@ mod tests {
         let (picker, _) = PathPicker::open("Root", "/srv".to_owned());
         let mut section = HierarchySection {
             mode: Mode::Picking {
-                target: PathTarget::WorkspaceRoot(WorkspaceId::new()),
+                target: PathTarget::RepoPath {
+                    project: ProjectId::new(),
+                    id: RepoId::new(),
+                },
                 picker,
                 chosen: None,
             },
@@ -2544,11 +2416,23 @@ mod tests {
         assert_eq!(section.key_stack(), Some(views::CAPTURE));
     }
 
-    /// MOD-115 M3: a write in flight reads in words. Every request name has its own phrase, and
-    /// neither the refusal nor the Browse hint prints the name itself.
+    /// MOD-115 M3: a write in flight reads in words. Every request name the section sends has its
+    /// own phrase, and neither the refusal nor the Browse hint prints the name itself. The four the
+    /// workspace row's verbs sent are the Workspaces tab's now (MOD-116 M3 D17): still served, but
+    /// never in flight here.
     #[test]
     fn a_write_in_flight_reads_in_words() {
+        const NOT_SENT_HERE: [&str; 4] = [
+            "create_workspace",
+            "update_workspace",
+            "set_workspace_root",
+            "delete_workspace",
+        ];
         for name in REQUEST_NAMES {
+            if NOT_SENT_HERE.contains(&name) {
+                assert_eq!(doing(name), doing("unknown"), "`{name}` is not sent here");
+                continue;
+            }
             assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
             assert!(!in_flight(name).contains('_'), "{}", in_flight(name));
         }
@@ -2582,10 +2466,13 @@ mod tests {
     fn the_prose_names_the_keys_in_force() {
         assert_eq!(
             no_workspace(Some("W")),
-            "no workspace \u{2014} `W` creates one"
+            "no workspace \u{2014} `W` on the Workspaces tab creates one"
         );
         assert_eq!(no_workspace(None), "no workspace");
-        assert_eq!(creates_one(Some("W")), "`W` creates one");
+        assert_eq!(
+            creates_one(Some("W")),
+            "`W` on the Workspaces tab creates one"
+        );
         assert_eq!(
             creates_one(None),
             "a workspace created elsewhere shows up here"
@@ -2611,11 +2498,11 @@ mod tests {
             }],
         };
         assert_eq!(
-            inferred_notice(&unmatched, Some("B")),
+            inferred_notice(&unmatched, Some("B"), Some("E"), Some("I")),
             "inferred 0 of 1 \u{b7} no checkout: docs \u{2014} B on a repo sets it by hand"
         );
         assert_eq!(
-            inferred_notice(&unmatched, None),
+            inferred_notice(&unmatched, None, None, None),
             "inferred 0 of 1 \u{b7} no checkout: docs \u{2014} set it by hand on a repo row"
         );
 
@@ -2624,13 +2511,24 @@ mod tests {
             truncated: false,
             repos: Vec::new(),
         };
+        // R1b B9: the folder set, `infer` here runs the pass (the tab's edit runs none).
         assert_eq!(
-            inferred_notice(&rootless, Some("B")),
-            "no root on this box for this workspace \u{2014} B on the workspace row sets it"
+            inferred_notice(&rootless, Some("B"), Some("E"), Some("I")),
+            "no root on this box for this workspace \u{2014} E on the Workspaces tab sets its \
+             folder, then I here"
         );
         assert_eq!(
-            inferred_notice(&rootless, None),
-            "no root on this box for this workspace \u{2014} set one on the workspace row"
+            inferred_notice(&rootless, None, None, Some("I")),
+            "no root on this box for this workspace \u{2014} set its folder on the Workspaces tab, \
+             then I here"
+        );
+        assert_eq!(
+            inferred_notice(&rootless, Some("B"), Some("E"), None),
+            "no root on this box for this workspace \u{2014} E on the Workspaces tab sets its folder"
+        );
+        assert_eq!(
+            inferred_notice(&rootless, None, None, None),
+            "no root on this box for this workspace \u{2014} set its folder on the Workspaces tab"
         );
     }
 }

@@ -96,8 +96,14 @@ async fn in_platform(mut harness: Harness) -> Harness {
     harness.drive_to_end().await;
     harness.key("w");
     harness.drive_to_end().await;
-    harness.key("j");
-    harness.key("enter");
+    // MOD-116 M1: the Workspaces tab lists Graphics, its overview, Vulkan Tutorials, then
+    // Platform; `o` opens the row's workspace and the focus stays on the tab.
+    for _ in 0..3 {
+        harness.key("j");
+    }
+    harness.key("o");
+    harness.drive_to_end().await;
+    harness.key("2");
     harness.drive_to_end().await;
     assert_eq!(harness.app().top_bar.workspace, "Platform");
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
@@ -192,7 +198,7 @@ async fn ctrl_f_opens_the_search_from_every_tab() {
     }
 
     // F7: with the Chat composer open, the chord is still the shell's.
-    harness.key("5");
+    harness.key("6");
     harness.drive_to_end().await;
     assert_eq!(harness.app().tabs.active_id(), Some(ChatTab::ID));
     harness.key("i");
@@ -256,7 +262,7 @@ async fn enter_searches_and_lists_hits_in_rank_order() {
 async fn enter_on_an_item_hit_reveals_it_in_the_backlog() {
     let index = seeded().await;
     let mut harness = open(Some(Arc::clone(&index))).await;
-    harness.key("3");
+    harness.key("4");
     harness.drive_to_end().await;
     search(&mut harness, MIXED).await;
     let hits = expected(&index, MIXED, platform_scope().await.1.project_ids, false).await;

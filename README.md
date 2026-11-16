@@ -178,19 +178,21 @@ and says why on the status line; update `htui` to connect.
 
 ## Using htui
 
-Everything happens in a **workspace**. Press `w` to switch workspaces. If the database has none
-yet, create one in **Settings › Hierarchy** with `N`.
+Everything happens in a **workspace**. Press `w` for the **Workspaces** tab, select one and press
+`o` to open it; htui reopens the last one you opened when it starts. If the database has none yet,
+press `N` on the Workspaces tab to create one.
 
-`htui` has six tabs. Switch with `Tab` / `Shift+Tab` or the number keys `1` to `6`.
+`htui` has seven tabs. Switch with `Ctrl+PgDn` / `Ctrl+PgUp` or the number keys `1` to `7`.
 
 | Tab | What it is for |
 |---|---|
-| **1 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
-| **2 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
-| **3 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
-| **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile, agent personas and logging. |
-| **5 Chat** | A live conversation with an agent, and replays of recorded ones. |
-| **6 Logs** | htui's own log as it runs, by source (store, orchestrator, agents and so on), with a minimum level and follow, and the log each headless worker ships to the database. |
+| **1 Workspaces** | Every workspace with its state (open, in the background, stopping, stopped) and an overview of each, its runs and its projects; `o` opens one, `s` stops its runs, `r` resumes them, `N` creates a workspace or a project (an existing git folder, a git URL it clones, or a new repo), `e` edits a workspace, `d` deletes it, `T` sets its default target. |
+| **2 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
+| **3 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
+| **4 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
+| **5 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile, agent personas and logging. |
+| **6 Chat** | A live conversation with an agent, and replays of recorded ones. |
+| **7 Logs** | htui's own log as it runs, by source (store, orchestrator, agents and so on), with a minimum level and follow, and the log each headless worker ships to the database. |
 
 **Press `?` on any screen for its full list of keys.** The ones below are the essentials.
 
@@ -198,11 +200,11 @@ yet, create one in **Settings › Hierarchy** with `N`.
 
 | Key | Action |
 |---|---|
-| `q` / `Ctrl+c` | Leave htui: a dialog lists the work leaving stops; `Enter` or a second `Ctrl+c` leaves, `Esc` stays |
+| `q` / `Ctrl+c` | Leave htui: a dialog lists every live workspace; `Enter` or a second `Ctrl+c` leaves, `S` stops them gracefully first, `Esc` stays |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab |
-| `1` … `6` | Go to a tab |
-| `w` | Switch workspace |
+| `1` … `7` | Go to a tab |
+| `w` | Go to the Workspaces tab (`o` there opens the selected workspace) |
 | `?` | Show or hide the key help |
 | `Esc` | Close the open pop-up |
 
@@ -454,7 +456,7 @@ Settings › Boxes. `all` stays this process's own lines only.
 | Section | What you do there |
 |---|---|
 | **Agents** | See which agents work on this machine (`r` checks again), install an agent's adapter (`i`), and log in (`a`). |
-| **Hierarchy** | Create and edit workspaces (`N`), projects and repositories (`n`), and tell `htui` where each repository lives on this machine (`b` picks a directory, or `i` detects them). |
+| **Hierarchy** | The open workspace's projects and repositories (`n` creates, `e` edits), and where each repository lives on this machine (`b` picks a directory, or `i` detects them). The workspace heads the tree, read only: workspaces are created, edited and deleted on the Workspaces tab. |
 | **Kinds** | Item kinds, their phases and step graphs; a phase's `persona` field binds a persona to it. |
 | **Prompt** | Prompt settings such as the token budget. |
 | **Connection** | The database connection string (`e` edit, `c` clear) and rebuilding the local copy (`R`). |
@@ -463,8 +465,8 @@ Settings › Boxes. `all` stays this process's own lines only.
 | **Personas** | Agent personas: create (`n`), edit the fields (`e`), the body (`b`) and the permission rules (`r`), delete (`d`), and import `.md` persona files (`I`). See [`docs/personas.md`](docs/personas.md). |
 | **Logging** | Which lines `htui` keeps (the filter, an `EnvFilter` directive such as `info` or `htui=debug`) and a file to append its log to (`e` edits; `~/` is your home directory, and a path that is not a regular file, such as a pipe, is refused). Both apply at once and are kept in `ui-state.toml`; a field set by `--log` or `HTUI_LOG_FILTER` says so and cannot be changed here for that session. |
 
-Deleting in **Hierarchy** shows what would be removed and asks you to type a confirmation, because
-it cannot be undone.
+Deleting a project in **Hierarchy** or a workspace on the Workspaces tab shows what would be removed
+and asks you to type a confirmation, because it cannot be undone.
 
 ## Setting up agents
 
