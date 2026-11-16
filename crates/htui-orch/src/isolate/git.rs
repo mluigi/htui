@@ -44,6 +44,10 @@ pub const VERB_TIMEOUT: Duration = Duration::from_secs(120);
 /// [`VERB_TIMEOUT`].
 pub const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// MOD-132 plan P10: the budget of a verb that moves a whole history — `bundle create` and both
+/// `index-pack`s — taken through [`Cli::with_transfer_budget`]: 15 minutes.
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// MOD-133 F2 M1: the ssh options both network verbs append: never prompt, and give up on a host
 /// that does not answer the connect within 20 s (ssh has no connect timeout of its own).
 pub const SSH_OPTIONS: &str = "-o BatchMode=yes -o ConnectTimeout=20";
@@ -181,6 +185,52 @@ fn killed_by_signal(verb: &str) -> String {
     format!("git {verb}: killed by signal")
 }
 
+/// MOD-132: a verb's stdin file could not be opened or positioned.
+fn stdin_unreadable(verb: &str, path: &Path, err: &std::io::Error) -> String {
+    format!("git {verb}: cannot read {}: {err}", path.display())
+}
+
+/// MOD-132: [`Cli::bundle_create`] never overwrites; `out` is already there.
+#[must_use]
+pub fn bundle_out_exists(out: &Path) -> String {
+    format!("git bundle create: {} already exists", out.display())
+}
+
+/// MOD-132: `git bundle verify` in `repo` refused `file`; `line` is its classifying stderr line.
+#[must_use]
+pub fn bundle_unverified(repo: &Path, file: &Path, line: &str) -> String {
+    format!(
+        "git bundle verify in {}: {} does not verify: {line}",
+        repo.display(),
+        file.display()
+    )
+}
+
+/// MOD-132: `git index-pack` in `repo` refused the pack in `file`; `line` is its stderr line.
+#[must_use]
+pub fn pack_refused(repo: &Path, file: &Path, line: &str) -> String {
+    format!(
+        "git index-pack in {}: the pack in {} is refused: {line}",
+        repo.display(),
+        file.display()
+    )
+}
+
+/// MOD-132: [`Cli::bundle_create`] takes a full ref name and an absolute output path.
+#[must_use]
+pub fn bundle_args_refused(full_ref: &str, out: &Path) -> String {
+    format!(
+        "git bundle create: {full_ref} must be a full ref name and {} an absolute path",
+        out.display()
+    )
+}
+
+/// MOD-132: [`Cli::connected`] was handed something that is not a full hash.
+#[must_use]
+pub fn not_a_hash(repo: &Path, text: &str) -> String {
+    format!("in {}: {text} is not a full lowercase hash", repo.display())
+}
+
 /// `120s` for the production budget, `200ms` for a test's; never `0s` for a sub-second one.
 fn budget_text(budget: Duration) -> String {
     if budget.subsec_millis() == 0 {
@@ -201,6 +251,21 @@ pub struct Cli {
     version: (u32, u32, u32),
     /// [`VERB_TIMEOUT`] in production; a test injects a short one through `Cli::with_budget`.
     budget: Duration,
+    /// MOD-132 R1b M4: the object quarantine every verb reads and writes through, if any.
+    quarantine: Option<ObjectQuarantine>,
+}
+
+/// MOD-132 R1b M4: an object directory a verb writes into instead of the repository's, reading
+/// the repository's own objects as an alternate, as `git receive-pack` quarantines a push. A
+/// [`Cli`] made by [`Cli::in_quarantine`] runs every verb with `GIT_OBJECT_DIRECTORY` set to
+/// [`dir`](Self::dir) and `GIT_ALTERNATE_OBJECT_DIRECTORIES` to [`objects`](Self::objects), so
+/// nothing it indexes reaches the repository until [`migrate_quarantine`] moves it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectQuarantine {
+    /// The quarantine object directory: absolute, and holding a `pack/` directory.
+    pub dir: PathBuf,
+    /// The repository's own object directory, absolute ([`objects_dir`]).
+    pub objects: PathBuf,
 }
 
 impl Cli {
@@ -291,6 +356,7 @@ impl Cli {
             binary,
             version,
             budget: VERB_TIMEOUT,
+            quarantine: None,
         })
     }
 
@@ -331,6 +397,28 @@ impl Cli {
         }
     }
 
+    /// MOD-132 plan P10: the same `git` under [`TRANSFER_TIMEOUT`], for the verbs that move a
+    /// whole history ([`bundle_create`](Cli::bundle_create), [`index_pack`](Cli::index_pack)).
+    /// Every verb runs under the budget of the `Cli` it is called on; this is how a caller asks
+    /// for the long one.
+    #[must_use]
+    pub fn with_transfer_budget(&self) -> Self {
+        Self {
+            budget: TRANSFER_TIMEOUT,
+            ..self.clone()
+        }
+    }
+
+    /// MOD-132 R1b M4: the same `git`, every verb of it run through `quarantine`: objects are
+    /// written into [`ObjectQuarantine::dir`] and read from it and from the repository's own.
+    #[must_use]
+    pub fn in_quarantine(&self, quarantine: &ObjectQuarantine) -> Self {
+        Self {
+            quarantine: Some(quarantine.clone()),
+            ..self.clone()
+        }
+    }
+
     /// The one place a `git` child's environment and stdio are shaped.
     ///
     /// `SCRUBBED_ENV` is removed, and so is `HTUI_OWN_ENV` (MOD-158 D5, `R-SEC-2`: a verb runs
@@ -340,7 +428,9 @@ impl Cli {
     /// `GIT_OPTIONAL_LOCKS=0` stops `git` refreshing the index opportunistically and taking
     /// `index.lock` under a concurrent `gix` read; `GIT_ADVICE=0` suppresses the `hint:` lines
     /// 2.42+ would otherwise print after the `fatal:` one. The last two are simply ignored by a
-    /// `git` that predates them and neither changes an exit status (blueprint H-21).
+    /// `git` that predates them and neither changes an exit status (blueprint H-21). An
+    /// [`ObjectQuarantine`] sets its two variables after the scrub, so they are the ones `git`
+    /// reads.
     fn command(&self, cwd: &Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.binary);
         command.current_dir(cwd);
@@ -359,6 +449,12 @@ impl Cli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(quarantine) = &self.quarantine {
+            command.env("GIT_OBJECT_DIRECTORY", &quarantine.dir).env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                alternate_entry(&quarantine.objects),
+            );
+        }
         command
     }
 
@@ -397,7 +493,7 @@ impl Cli {
         stdout: Capture,
     ) -> Result<Exited, IsolateError> {
         let captured = self
-            .run_captured(verb, cwd, args, extra_env, stdout)
+            .run_captured(verb, cwd, args, extra_env, stdout, Input::Null)
             .await?;
         Ok(Exited {
             code: captured.code,
@@ -408,7 +504,8 @@ impl Cli {
 
     /// MOD-9 D130: [`run_capturing`](Cli::run_capturing)'s body, with stdout handed back as the
     /// undecoded sink, so [`name_only`](Cli::name_only) can read bytes where every other verb
-    /// reads text.
+    /// reads text. `stdin` is [`Input::Null`] for every verb but
+    /// [`index_pack`](Cli::index_pack) and [`connected`](Cli::connected) (MOD-132).
     async fn run_captured(
         &self,
         verb: &'static str,
@@ -416,18 +513,60 @@ impl Cli {
         args: &[&OsStr],
         extra_env: &[(&str, &str)],
         stdout: Capture,
+        stdin: Input<'_>,
     ) -> Result<Captured, IsolateError> {
-        let build = || {
-            let mut command = self.command(cwd);
-            command.args(args);
-            for (key, value) in extra_env {
-                command.env(key, value);
-            }
-            command
+        let (file, bytes) = match stdin {
+            Input::Null => (None, None),
+            Input::File { path, offset } => (
+                Some((
+                    open_at(path, offset)
+                        .map_err(|err| IsolateError::Git(stdin_unreadable(verb, path, &err)))?,
+                    path,
+                )),
+                None,
+            ),
+            Input::Bytes(bytes) => (None, Some(bytes)),
         };
-
-        let mut child = spawn_supervised(build)
-            .map_err(|err| IsolateError::Git(cannot_spawn(verb, &self.binary, &err)))?;
+        // A stdin handle that cannot be cloned fails the verb: run with a null stdin instead, it
+        // would read an empty input rather than the file.
+        let unreadable = std::sync::Mutex::new(None);
+        let spawned = {
+            let build = || {
+                let mut command = self.command(cwd);
+                command.args(args);
+                for (key, value) in extra_env {
+                    command.env(key, value);
+                }
+                // A clone of the one open handle, so a second build (Windows' job-object
+                // downgrade) reads on from the same offset.
+                if let Some((file, path)) = &file {
+                    match file.try_clone() {
+                        Ok(clone) => {
+                            command.stdin(clone);
+                        }
+                        Err(err) => {
+                            let sentence = stdin_unreadable(verb, path, &err);
+                            *unreadable
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(sentence);
+                            return Err(err);
+                        }
+                    }
+                }
+                if bytes.is_some() {
+                    command.stdin(Stdio::piped());
+                }
+                Ok(command)
+            };
+            spawn_supervised(build)
+        };
+        let mut child = spawned.map_err(|err| {
+            let unreadable = unreadable
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            IsolateError::Git(unreadable.unwrap_or_else(|| cannot_spawn(verb, &self.binary, &err)))
+        })?;
         let out = std::sync::Mutex::new(match stdout {
             Capture::Tail => Sink::Tail(TailBuffer::new(CAPTURE_TAIL)),
             Capture::Head => Sink::Head(HeadBuffer::new(DIFF_CAP)),
@@ -436,9 +575,14 @@ impl Cli {
         let err = std::sync::Mutex::new(Sink::Tail(TailBuffer::new(CAPTURE_TAIL)));
         let stdout = child.stdout().take();
         let stderr = child.stderr().take();
+        let stdin_pipe = child.stdin().take();
         // Boxed rather than pinned on the stack so that dropping it drops the pipes with it.
         let mut reading = Box::pin(async {
-            tokio::join!(read_tail(stdout, &out), read_tail(stderr, &err));
+            tokio::join!(
+                read_tail(stdout, &out),
+                read_tail(stderr, &err),
+                write_input(stdin_pipe, bytes)
+            );
         });
 
         let waited = tokio::time::timeout(self.budget, async {
@@ -483,6 +627,42 @@ enum Capture {
     Head,
     /// MOD-9 D130: the first [`DIFF_CAP`] bytes, never decoded.
     HeadBytes,
+}
+
+/// MOD-132: what a verb reads on stdin.
+#[derive(Debug, Clone, Copy)]
+enum Input<'a> {
+    /// Nothing: every verb but [`Cli::index_pack`] and [`Cli::connected`].
+    Null,
+    /// These bytes, then end of file ([`Cli::connected`]'s revisions).
+    Bytes(&'a [u8]),
+    /// A file on this box, read from `offset` to its end.
+    File {
+        /// The file.
+        path: &'a Path,
+        /// The first byte read.
+        offset: u64,
+    },
+}
+
+/// Writes `bytes` into the child's stdin pipe and closes it. A write the child refuses (it exited
+/// first) is left to the child's exit status to report.
+async fn write_input(pipe: Option<tokio::process::ChildStdin>, bytes: Option<&[u8]>) {
+    use tokio::io::AsyncWriteExt as _;
+
+    if let (Some(mut pipe), Some(bytes)) = (pipe, bytes) {
+        let _ = pipe.write_all(bytes).await;
+        let _ = pipe.shutdown().await;
+    }
+}
+
+/// `path` opened for reading and positioned at `offset`.
+fn open_at(path: &Path, offset: u64) -> std::io::Result<std::fs::File> {
+    use std::io::{Seek as _, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    Ok(file)
 }
 
 /// MOD-9 D130: one verb's exit and its undecoded stdout sink.
@@ -1016,7 +1196,7 @@ impl Cli {
             OsStr::new("--"),
         ];
         let captured = self
-            .run_captured("diff", repo, &args, &[], Capture::HeadBytes)
+            .run_captured("diff", repo, &args, &[], Capture::HeadBytes, Input::Null)
             .await?;
         if captured.code != Some(0) {
             return Err(Exited {
@@ -1031,32 +1211,398 @@ impl Cli {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// MOD-132: the bundle verbs a target's seed and collect are built from. None runs a hook: each
+// is spawned under `-c core.hooksPath=/dev/null`, and none of them checks a tree out.
+// ---------------------------------------------------------------------------------------------
+
+/// The config pair every bundle verb runs under.
+const NO_HOOKS: [&str; 2] = ["-c", "core.hooksPath=/dev/null"];
+
+impl Cli {
+    /// MOD-132 plan P5: `git bundle create <out> <full_ref>` in `repo`: every commit `full_ref`
+    /// reaches, as one bundle file. `full_ref` must be a full ref name (B3: a bundle tip is a
+    /// ref, never a bare hash) and `out` an absolute path that does not exist yet; nothing is ever
+    /// overwritten. Runs under this `Cli`'s budget: call it on
+    /// [`with_transfer_budget`](Cli::with_transfer_budget).
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`bundle_out_exists`] or [`bundle_args_refused`];
+    /// [`IsolateError::Git`] for a spawn or budget failure, a non-zero exit (B2's empty bundle
+    /// among them), or no file written.
+    pub async fn bundle_create(
+        &self,
+        repo: &Path,
+        full_ref: &str,
+        out: &Path,
+    ) -> Result<(), IsolateError> {
+        if !full_ref.starts_with("refs/")
+            || gix::validate::reference::name(full_ref.as_bytes().into()).is_err()
+            || out.is_relative()
+        {
+            return Err(IsolateError::Refused(bundle_args_refused(full_ref, out)));
+        }
+        if out.symlink_metadata().is_ok() {
+            return Err(IsolateError::Refused(bundle_out_exists(out)));
+        }
+        let exited = self
+            .run(
+                "bundle create",
+                repo,
+                &[
+                    OsStr::new(NO_HOOKS[0]),
+                    OsStr::new(NO_HOOKS[1]),
+                    OsStr::new("bundle"),
+                    OsStr::new("create"),
+                    out.as_os_str(),
+                    OsStr::new(full_ref),
+                ],
+                &[],
+            )
+            .await?;
+        if !exited.ok() {
+            return Err(exited.failure("bundle create"));
+        }
+        if !out.is_file() {
+            return Err(broken_post_condition(
+                "bundle create",
+                "no bundle file was written",
+            ));
+        }
+        Ok(())
+    }
+
+    /// MOD-132 plan P6: `git bundle verify <file>` in `repo`: the file is a bundle and `repo`
+    /// holds every prerequisite it names.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`bundle_unverified`] for a non-zero exit;
+    /// [`IsolateError::Git`] for a spawn or budget failure or a signal.
+    pub async fn bundle_verify(&self, repo: &Path, file: &Path) -> Result<(), IsolateError> {
+        let exited = self
+            .run(
+                "bundle verify",
+                repo,
+                &[
+                    OsStr::new(NO_HOOKS[0]),
+                    OsStr::new(NO_HOOKS[1]),
+                    OsStr::new("bundle"),
+                    OsStr::new("verify"),
+                    file.as_os_str(),
+                ],
+                &[],
+            )
+            .await?;
+        refused_unless_ok(&exited, "bundle verify", |line| {
+            bundle_unverified(repo, file, line)
+        })
+    }
+
+    /// MOD-132 plan P6: `git index-pack --stdin --fix-thin --strict --max-input-size=<max>` in
+    /// `repo`, its stdin the bytes of `file` from `offset` on (a bundle's pack starts after its
+    /// header). Every object is fsck'd before any is kept (B6): the check `git fetch` skips on a
+    /// bundle (B5). A refused pack leaves no object behind. Runs under this `Cli`'s budget: call
+    /// it on [`with_transfer_budget`](Cli::with_transfer_budget), and on
+    /// [`in_quarantine`](Cli::in_quarantine) to keep the pack out of `repo` (R1b M4).
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`pack_refused`] for a non-zero exit (a pack over
+    /// `max_input_size` bytes among them); [`IsolateError::Git`] when `file` cannot be read, for
+    /// a spawn or budget failure, or a signal.
+    pub async fn index_pack(
+        &self,
+        repo: &Path,
+        file: &Path,
+        offset: u64,
+        max_input_size: u64,
+    ) -> Result<(), IsolateError> {
+        let max = format!("--max-input-size={max_input_size}");
+        let args = [
+            OsStr::new(NO_HOOKS[0]),
+            OsStr::new(NO_HOOKS[1]),
+            OsStr::new("index-pack"),
+            OsStr::new("--stdin"),
+            OsStr::new("--fix-thin"),
+            OsStr::new("--strict"),
+            OsStr::new(&max),
+        ];
+        let captured = self
+            .run_captured(
+                "index-pack",
+                repo,
+                &args,
+                &[],
+                Capture::Tail,
+                Input::File { path: file, offset },
+            )
+            .await?;
+        let exited = Exited {
+            code: captured.code,
+            stdout: String::new(),
+            stderr: captured.stderr,
+        };
+        refused_unless_ok(&exited, "index-pack", |line| pack_refused(repo, file, line))
+    }
+
+    /// MOD-132 plan P6: whether `tip` is connected in `repo`: `git rev-list --objects --quiet
+    /// --stdin` fed `<tip>` and `^<not>` for each of `not` exits 0, so every object `tip` reaches,
+    /// short of the commits in `not`, is present. A missing parent, tree or blob is `false`. The
+    /// revisions go on stdin, so a long `not` list never meets an argv limit. Not retried: a read.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`not_a_hash`] when `tip` or an entry of `not` is not a
+    /// full lowercase hash (so none can be read as an option); [`IsolateError::Git`] for a spawn
+    /// or budget failure or a signal.
+    pub async fn connected(
+        &self,
+        repo: &Path,
+        tip: &str,
+        not: &[String],
+    ) -> Result<bool, IsolateError> {
+        if let Some(bad) = std::iter::once(tip)
+            .chain(not.iter().map(String::as_str))
+            .find(|hash| !crate::target::bundle::is_full_hash(hash))
+        {
+            return Err(IsolateError::Refused(not_a_hash(repo, bad)));
+        }
+        let mut revisions = format!("{tip}\n");
+        for hash in not {
+            revisions.push('^');
+            revisions.push_str(hash);
+            revisions.push('\n');
+        }
+        let args = [
+            OsStr::new("rev-list"),
+            OsStr::new("--objects"),
+            OsStr::new("--quiet"),
+            OsStr::new("--stdin"),
+        ];
+        let captured = self
+            .run_captured(
+                "rev-list",
+                repo,
+                &args,
+                &[],
+                Capture::Tail,
+                Input::Bytes(revisions.as_bytes()),
+            )
+            .await?;
+        match captured.code {
+            Some(0) => Ok(true),
+            Some(_) => Ok(false),
+            None => Err(IsolateError::Git(killed_by_signal("rev-list"))),
+        }
+    }
+
+    /// MOD-132 R1b M1: the kind `git cat-file -t` names for `hash` in `repo` (`"commit"`,
+    /// `"tree"`, `"tag"`, `"blob"`), or `None` when `repo` does not hold it. Read through this
+    /// `Cli`'s [`ObjectQuarantine`], if it has one. Not retried: a read.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`not_a_hash`] when `hash` is not a full lowercase hash;
+    /// [`IsolateError::Git`] for a spawn or budget failure or a signal.
+    pub async fn object_kind(
+        &self,
+        repo: &Path,
+        hash: &str,
+    ) -> Result<Option<String>, IsolateError> {
+        if !crate::target::bundle::is_full_hash(hash) {
+            return Err(IsolateError::Refused(not_a_hash(repo, hash)));
+        }
+        let args = [OsStr::new("cat-file"), OsStr::new("-t"), OsStr::new(hash)];
+        let exited = self.run("cat-file", repo, &args, &[]).await?;
+        match exited.code {
+            Some(0) => Ok(Some(exited.stdout.trim().to_owned())),
+            Some(_) => Ok(None),
+            None => Err(exited.failure("cat-file")),
+        }
+    }
+
+    /// MOD-132 R1b M4: whether the commit `ancestor` is reachable from the commit `descendant`
+    /// in `repo` (`git merge-base --is-ancestor`), read through this `Cli`'s
+    /// [`ObjectQuarantine`], if it has one: the `gix` read [`is_ancestor`] does not see a
+    /// quarantine. Not retried: a read.
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`not_a_hash`] when either is not a full lowercase hash;
+    /// [`IsolateError::Git`] for any exit but 0 and 1 (a missing commit among them), a spawn or
+    /// budget failure, or a signal.
+    pub async fn is_ancestor_of(
+        &self,
+        repo: &Path,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, IsolateError> {
+        if let Some(bad) = [ancestor, descendant]
+            .into_iter()
+            .find(|hash| !crate::target::bundle::is_full_hash(hash))
+        {
+            return Err(IsolateError::Refused(not_a_hash(repo, bad)));
+        }
+        let args = [
+            OsStr::new("merge-base"),
+            OsStr::new("--is-ancestor"),
+            OsStr::new(ancestor),
+            OsStr::new(descendant),
+        ];
+        let exited = self.run("merge-base", repo, &args, &[]).await?;
+        match exited.code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(exited.failure("merge-base")),
+        }
+    }
+}
+
+/// The `GIT_ALTERNATE_OBJECT_DIRECTORIES` entry naming `dir`: as it is, unless it holds the list
+/// separator or starts with `"`, in which case it is C-quoted, as `git` reads such an entry.
+fn alternate_entry(dir: &Path) -> std::ffi::OsString {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    match dir.to_str() {
+        Some(text) if text.contains(separator) || text.starts_with('"') => {
+            let mut quoted = String::with_capacity(text.len() + 2);
+            quoted.push('"');
+            for c in text.chars() {
+                if matches!(c, '"' | '\\') {
+                    quoted.push('\\');
+                }
+                quoted.push(c);
+            }
+            quoted.push('"');
+            quoted.into()
+        }
+        // A non-UTF-8 path is passed as it is: a separator byte in one splits the entry, and
+        // the alternate is then simply not found, which fails the verb rather than widening it.
+        _ => dir.as_os_str().to_owned(),
+    }
+}
+
+/// MOD-132 R1b M4: `repo`'s own object directory, absolute (the common directory's `objects`,
+/// so a linked worktree names its main repository's).
+///
+/// # Errors
+/// [`IsolateError::Git`] when the repository cannot be opened or its path made absolute.
+pub fn objects_dir(repo: &Path) -> Result<PathBuf, IsolateError> {
+    let objects = open(repo)?.common_dir().join("objects");
+    std::path::absolute(&objects).map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot resolve the object directory {}: {err}",
+            objects.display()
+        ))
+    })
+}
+
+/// MOD-132 R1b M4: moves every pack `quarantine` holds into its repository's `objects/pack/`:
+/// the `.pack` and its other files first and the `.idx` last, since a pack is visible once its
+/// index is. Each is renamed; across filesystems it is copied beside its destination under a
+/// temporary name and renamed from there, so a reader never sees half a file. A synchronous
+/// filesystem call: an async caller runs it on the blocking pool.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the quarantine cannot be read or a file cannot be moved.
+pub fn migrate_quarantine(quarantine: &ObjectQuarantine) -> Result<(), IsolateError> {
+    let from = quarantine.dir.join("pack");
+    let to = quarantine.objects.join("pack");
+    let failed = |what: &Path, err: &std::io::Error| {
+        IsolateError::Git(format!(
+            "cannot move {} into {}: {err}",
+            what.display(),
+            to.display()
+        ))
+    };
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(&from) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<_, _>>()
+            .map_err(|err| failed(&from, &err))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(failed(&from, &err)),
+    };
+    // Packs only: `index-pack`'s own `tmp_*` leftovers stay behind with the quarantine.
+    files.retain(|file| {
+        file.file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("pack-"))
+    });
+    files.sort_by_key(|file| {
+        (
+            file.extension().is_some_and(|ext| ext == "idx"),
+            file.clone(),
+        )
+    });
+    std::fs::create_dir_all(&to).map_err(|err| failed(&to, &err))?;
+    for file in files {
+        let name = file.file_name().expect("a directory entry has a name");
+        let dest = to.join(name);
+        if std::fs::rename(&file, &dest).is_ok() {
+            continue;
+        }
+        let mut staged_name = std::ffi::OsString::from("tmp_htui_");
+        staged_name.push(name);
+        let staged = to.join(staged_name);
+        std::fs::copy(&file, &staged)
+            .and_then(|_| std::fs::rename(&staged, &dest))
+            .map_err(|err| {
+                let _ = std::fs::remove_file(&staged);
+                failed(&file, &err)
+            })?;
+    }
+    Ok(())
+}
+
+/// `Ok` for exit 0; a signal is [`IsolateError::Git`]; any other exit is
+/// [`IsolateError::Refused`] with `sentence` over the classifying stderr line.
+fn refused_unless_ok(
+    exited: &Exited,
+    verb: &str,
+    sentence: impl FnOnce(&str) -> String,
+) -> Result<(), IsolateError> {
+    match exited.code {
+        Some(0) => Ok(()),
+        None => Err(exited.failure(verb)),
+        Some(code) => {
+            let fallback = format!("exit status {code} with no stderr");
+            Err(IsolateError::Refused(sentence(
+                exited.message().unwrap_or(&fallback),
+            )))
+        }
+    }
+}
+
 /// MOD-9 D119: one range's changed names, in git's order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NameOnly {
     /// Repo-relative, `/`-separated names; a non-UTF-8 or empty one was dropped.
     pub paths: Vec<String>,
+    /// MOD-132 P9: the non-UTF-8 names [`paths`](Self::paths) dropped, lossily decoded, in git's
+    /// order. A lossy decode keeps every ASCII byte, so a reader matching ASCII patterns (collect's
+    /// host-executing paths) still sees a name it must not miss; never a path to open.
+    pub unreadable: Vec<String>,
     /// The output overflowed [`DIFF_CAP`]; the partial last entry was dropped.
     pub truncated: bool,
 }
 
 /// MOD-9 D130: NUL-split; the final segment is always dropped (empty when git finished its last
-/// entry, partial when the cap cut it); a non-UTF-8 or empty entry is dropped; `truncated =
-/// overflowed`.
+/// entry, partial when the cap cut it); an empty entry is dropped, a non-UTF-8 one goes to
+/// `unreadable` lossily decoded (MOD-132 P9); `truncated = overflowed`.
 fn parse_name_only(bytes: &[u8], overflowed: bool) -> NameOnly {
     let mut segments: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
     // `-z` ends every whole entry with a NUL, so the last segment is empty when git finished and
     // the cut entry when the cap stopped it: either way it is not a name.
     segments.pop();
-    NameOnly {
-        paths: segments
-            .into_iter()
-            .filter(|segment| !segment.is_empty())
-            .filter_map(|segment| std::str::from_utf8(segment).ok())
-            .map(str::to_owned)
-            .collect(),
+    let mut names = NameOnly {
         truncated: overflowed,
+        ..NameOnly::default()
+    };
+    for segment in segments.into_iter().filter(|segment| !segment.is_empty()) {
+        match std::str::from_utf8(segment) {
+            Ok(path) => names.paths.push(path.to_owned()),
+            Err(_) => names
+                .unreadable
+                .push(String::from_utf8_lossy(segment).into_owned()),
+        }
     }
+    names
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1753,13 +2299,13 @@ pub(crate) async fn kill_within_grace(
 /// a job object, with the same refused-job-object downgrade `launch.rs` takes — a supervision
 /// mode, not a dead verb.
 fn spawn_supervised(
-    build: impl Fn() -> tokio::process::Command,
+    build: impl Fn() -> std::io::Result<tokio::process::Command>,
 ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
     use process_wrap::tokio::CommandWrap;
 
     #[cfg(unix)]
     {
-        let mut wrapped = CommandWrap::from(build());
+        let mut wrapped = CommandWrap::from(build()?);
         wrapped.wrap(process_wrap::tokio::ProcessGroup::leader());
         wrapped.spawn()
     }
@@ -1769,14 +2315,14 @@ fn spawn_supervised(
         use process_wrap::tokio::{CreationFlags, JobObject};
         use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
-        let mut wrapped = CommandWrap::from(build());
+        let mut wrapped = CommandWrap::from(build()?);
         wrapped.wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)));
         wrapped.wrap(JobObject);
         match wrapped.spawn() {
             Ok(child) => Ok(child),
             Err(error) => {
                 tracing::warn!(%error, "job object assignment refused; spawning the verb without it");
-                let mut wrapped = CommandWrap::from(build());
+                let mut wrapped = CommandWrap::from(build()?);
                 wrapped.wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)));
                 wrapped.spawn()
             }
@@ -2332,18 +2878,74 @@ fn busy_with(admin: &Path, full_ref: &str) -> bool {
 /// # Errors
 /// [`IsolateError::Git`] when the ref store cannot be read or the reference does not peel.
 pub fn branch_target(path: &Path, name: &str) -> Result<Option<String>, IsolateError> {
+    ref_target(path, &format!("refs/heads/{name}"))
+}
+
+/// MOD-132: what the full ref `full_ref` points at, peeled, or `None` when it does not exist:
+/// [`branch_target`] for any ref, collect's temp ref (`refs/htui-collect/…`) among them.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the ref store cannot be read or the reference does not peel.
+pub fn ref_target(path: &Path, full_ref: &str) -> Result<Option<String>, IsolateError> {
     let repo = open(path)?;
-    let full = format!("refs/heads/{name}");
     let Some(mut reference) = repo
-        .try_find_reference(full.as_str())
-        .map_err(|err| IsolateError::Git(format!("cannot look up {full}: {err}")))?
+        .try_find_reference(full_ref)
+        .map_err(|err| IsolateError::Git(format!("cannot look up {full_ref}: {err}")))?
     else {
         return Ok(None);
     };
     let id = reference
         .peel_to_id()
-        .map_err(|err| IsolateError::Git(format!("cannot peel {full}: {err}")))?;
+        .map_err(|err| IsolateError::Git(format!("cannot peel {full_ref}: {err}")))?;
     Ok(Some(id.detach().to_hex().to_string()))
+}
+
+/// MOD-132 plan P6: creates the full ref `full_ref` at `target`, refusing one that exists
+/// (`PreviousValue::MustNotExist`): [`create_branch`] for any ref, collect's temp ref among
+/// them. Called through [`with_retry`], as [`create_branch`] is.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the name is invalid, the target is not a hash, or the reference
+/// already exists.
+pub fn create_ref(path: &Path, full_ref: &str, target: &str) -> Result<(), IsolateError> {
+    let id = parse_oid(target)?;
+    let repo = open(path)?;
+    repo.reference(
+        full_ref,
+        id,
+        gix::refs::transaction::PreviousValue::MustNotExist,
+        "htui: collect",
+    )
+    .map(|_| ())
+    .map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot create {full_ref} in {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+/// MOD-132 plan P6: deletes the full ref `full_ref`: `true` when it was there, `false` when it
+/// was already absent. The delete is a compare-and-swap on the target just read, so a ref
+/// moved in between is refused rather than deleted. Called through [`with_retry`].
+///
+/// # Errors
+/// [`IsolateError::Git`] when the ref store cannot be read or the delete fails.
+pub fn delete_ref(path: &Path, full_ref: &str) -> Result<bool, IsolateError> {
+    let repo = open(path)?;
+    let Some(reference) = repo
+        .try_find_reference(full_ref)
+        .map_err(|err| IsolateError::Git(format!("cannot look up {full_ref}: {err}")))?
+    else {
+        return Ok(false);
+    };
+    reference.delete().map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot delete {full_ref} in {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(true)
 }
 
 /// The `<s>` of every `refs/heads/htui/<s>` label whose target lies on the first-parent line of
@@ -2938,6 +3540,43 @@ mod tests {
         SCRUBBED_ENV, TailBuffer, ancestor_walk, is_lock_error, merge_walk, parse_name_only,
     };
     use crate::isolate::IsolateError;
+
+    /// MOD-132 P10: the transfer budget replaces the verb budget and nothing else.
+    /// MOD-132 R1b M4: an alternate holding the list separator, or starting with `"`, is
+    /// C-quoted as `git` reads it; any other is passed as it is.
+    #[test]
+    fn an_alternate_entry_is_quoted_only_when_it_must_be() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        assert_eq!(
+            super::alternate_entry(std::path::Path::new("/repo/.git/objects")),
+            std::ffi::OsString::from("/repo/.git/objects")
+        );
+        assert_eq!(
+            super::alternate_entry(std::path::Path::new(&format!("/a{sep}b/\\x\"y/objects"))),
+            std::ffi::OsString::from(format!("\"/a{sep}b/\\\\x\\\"y/objects\""))
+        );
+        assert_eq!(
+            super::alternate_entry(std::path::Path::new("\"q/objects")),
+            std::ffi::OsString::from("\"\\\"q/objects\"")
+        );
+    }
+
+    #[test]
+    fn the_transfer_budget_is_fifteen_minutes() {
+        let cli = Cli {
+            binary: PathBuf::from("git"),
+            version: MIN_GIT,
+            budget: super::VERB_TIMEOUT,
+            quarantine: None,
+        };
+        let long = cli.with_transfer_budget();
+        assert_eq!(long.budget, super::TRANSFER_TIMEOUT);
+        assert_eq!(super::TRANSFER_TIMEOUT, Duration::from_secs(900));
+        assert_eq!(
+            (long.binary(), long.version()),
+            (cli.binary(), cli.version())
+        );
+    }
 
     /// A repository this crate made with `gix` alone reads back through this crate's own `head`.
     #[test]
@@ -5026,12 +5665,14 @@ mod tests {
                 ]
                 .map(str::to_owned)
                 .to_vec(),
+                unreadable: Vec::new(),
                 truncated: false,
             }
         );
     }
 
-    /// MOD-9 D119: a name that is not UTF-8 is dropped, never decoded into a plausible path.
+    /// MOD-9 D119: a name that is not UTF-8 is dropped from `paths`, never decoded into a
+    /// plausible path; MOD-132 P9 keeps its lossy decoding apart in `unreadable`.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn name_only_drops_a_non_utf8_name() {
@@ -5054,6 +5695,7 @@ mod tests {
                 .expect("the names read"),
             NameOnly {
                 paths: vec!["ok.rs".to_owned()],
+                unreadable: vec!["\u{fffd}\u{fffd}.rs".to_owned()],
                 truncated: false,
             }
         );
@@ -5098,6 +5740,7 @@ mod tests {
     fn name_only_drops_a_partial_last_entry_when_capped() {
         let names = |paths: &[&str], truncated: bool| NameOnly {
             paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            unreadable: Vec::new(),
             truncated,
         };
         assert_eq!(
@@ -5115,6 +5758,15 @@ mod tests {
             names(&["a.rs", "b.rs"], false)
         );
         assert_eq!(parse_name_only(b"", false), NameOnly::default());
+        assert_eq!(
+            parse_name_only(b"a.rs\0\xffb.rs\0", false),
+            NameOnly {
+                paths: vec!["a.rs".to_owned()],
+                unreadable: vec!["\u{fffd}b.rs".to_owned()],
+                truncated: false,
+            },
+            "a non-UTF-8 name is kept apart, lossily decoded"
+        );
     }
 
     /// A-3's read: whether an object database holds a commit, with no subprocess.
@@ -5195,6 +5847,7 @@ mod tests {
             binary: PathBuf::from("git"),
             version: MIN_GIT,
             budget: super::VERB_TIMEOUT,
+            quarantine: None,
         };
         assert_eq!(super::LS_REMOTE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(cli.ls_remote_budget(), Duration::from_secs(30));
