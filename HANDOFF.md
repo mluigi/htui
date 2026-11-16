@@ -445,6 +445,15 @@ items it follows are done.
   `stage` role and positions -3..-1 with these keys are reserved in `0029`; writing the rows is this item's.
   MOD-130 is done (`docs/decisions/mod/mod-130.md`: `target`, child boxes, the cascade and the driver-keyed queue);
   nothing blocks this item.
+  **Phase M1 landed (`738f1d3c`..`1e4b30ad`, 2026-11-16, on `hr/MOD-132`):** PRD
+  `.claude/prds/mod-132-target-prepare-and-collect.prd.md` (D1-D5, maintainer 2026-11-15), plan
+  `.claude/plans/mod-132-m1-channel-and-bundles.plan.md`. The argv-only `TargetChannel` seam with a test-only
+  stand-in (`htui-agent`), `target::seed` (a push-disabled clone seeded by bundle through `index-pack --stdin`) and
+  `target::collect` (bundle into a capped quarantine, header, `bundle verify`, `index-pack --strict` into a quarantine
+  object dir, commit and connectivity checks, consent bound to tip, local tip and path list, compare-and-swap). git
+  2.43 skips fsck on a bundle fetch, hence `index-pack --strict`. Host-executing paths widened to nested tool files
+  (maintainer 2026-11-16). No engine, store or TUI change. M2 (stage rows, waiting at collect) and M3 (surfaces,
+  MOD-44/131/117 notes) remain.
 - [ ] **MOD-134 - Forge adapter and push/forge credentials** (from ANA-34, `docs/ANA-34.md` §7.4,
   §7.5). `R-ORCH-14`, `R-BOX-4`, `R-STO-1`, `R-SEC-2`, `R-SEC-3`, `R-SEC-4`. A forge adapter with four
   verbs (push a branch, open or update a PR, set auto-merge, read PR state); OneDev REST first

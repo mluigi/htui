@@ -172,13 +172,13 @@ Also in scope:
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Channel and bundle mechanics | The target channel and stand-in exist; prepare seeds a push-disabled clone by bundle; collect brings a branch home under every refusal, proved against hostile clones and crafted bundles. No engine change. | in-progress | `.claude/plans/mod-132-m1-channel-and-bundles.plan.md` |
+| 1 | Channel and bundle mechanics | The target channel and stand-in exist; prepare seeds a push-disabled clone by bundle; collect brings a branch home under every refusal, proved against hostile clones and crafted bundles. No engine change. | complete | `.claude/plans/mod-132-m1-channel-and-bundles.plan.md` |
 | 2 | Target runs prepare and wait to be collected | A run on the stand-in writes `prepare` (-2) and `collect` (-1); it waits at collect, is collected by a store-backed verb with the config-path confirmation, then finishes `done` and integrates from the collected branch; stop/resume and refusals hold on both stores. | pending | — |
 | 3 | Collect is visible and keyed | The run graph names the stages; Waiting shows the collect row with its reason, keys and confirmation; HANDOFF notes on MOD-44, MOD-131, MOD-117. | pending | — |
 
 ## Open Questions
 
-- [ ] **Host-executing path list.** `scripts/hr` lists htui's own paths. The product default must cover
+- [x] **Host-executing path list.** Settled in the M1 plan (P9), widened to nested tool files by the maintainer on 2026-11-16. `scripts/hr` lists htui's own paths. The product default must cover
   agent instruction and config files, git and environment hooks, and build or toolchain config that runs
   code; whether a project can extend it is TBD — decided in the M1 plan from the agents htui drives
   (`docs/` agent notes), not invented.

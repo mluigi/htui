@@ -3,7 +3,11 @@
 **Source PRD**: `.claude/prds/mod-132-target-prepare-and-collect.prd.md`
 **Selected Milestone**: 1 — Channel and bundle mechanics
 **Complexity**: Medium-Large
-**Status**: planned (2026-11-15)
+**Status**: complete (`738f1d3c`..`1e4b30ad`, 2026-11-16). Review fix round R1a `c47d8088`, R1b `9a0d6301`; R1b's
+verifier low (quarantine vs a dropped collect's blocking steps) fixed on the main thread, `1e4b30ad`. Deviations from
+this text: the temp ref (P6 step 5, P8) is gone, because objects wait in a quarantine object dir until the move;
+`Consent` gained `from` (the local tip). P9 was widened to nested `.cargo/` and to `rust-toolchain(.toml)`,
+`package.json` and `.envrc` anywhere (maintainer, 2026-11-16).
 **Routing**: PRD path, ultracode for implement accepted (`/handoff-run MOD-132`, `hr/MOD-132` sandbox). One serial
 lane of four tasks through `scripts/task-lane.js` (every task after T1 reads an earlier one's files; T3 and T4 both
 add a line to `target.rs`). No `code-architect`: the one new seam is a single trait whose shape is fixed by the probes
