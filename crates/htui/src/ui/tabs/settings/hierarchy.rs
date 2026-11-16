@@ -585,11 +585,7 @@ impl HierarchySection {
             // MOD-49 P2: the popup draws over the section in `render`, so the pane stays empty;
             // the memory pane draws over the whole section too (MOD-163 D20).
             Mode::Picking { .. } | Mode::Memory { .. } | Mode::Documents { .. } => Vec::new(),
-            Mode::Deleting {
-                target,
-                slug,
-                stage,
-            } => delete_pane(slug, stage, width, theme),
+            Mode::Deleting { slug, stage, .. } => delete_pane(slug, stage, width, theme),
         }
     }
 
