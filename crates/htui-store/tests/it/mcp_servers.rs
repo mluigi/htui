@@ -19,8 +19,9 @@ use htui_core::model::{
     EnvValue, ItemKindId, McpServer, McpServerId, McpTransport, NewMcpServer, PhaseId, ProjectId,
     ResolveScope, WorkspaceId,
 };
-use htui_core::store::{MemStore, WriteStore};
+use htui_core::store::{MemStore, StoreError, WriteStore};
 use sqlx::postgres::{PgPool, PgQueryResult};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// A stdio server request with a fresh id and one env entry of each reference kind.
@@ -517,4 +518,166 @@ async fn the_checks_refuse_what_the_rules_refuse() {
     )
     .await
     .expect("a pinned glob skill row inserts");
+}
+
+/// The global `always` attachment of `server`.
+fn global_attach(server: McpServerId) -> (BindingKey, BindingChange) {
+    (
+        BindingKey::global(BindingRef::McpServer(server)),
+        BindingChange::Attach(Attachment {
+            pinned_version: None,
+            position: 0,
+            activation: Activation::Always,
+            globs: Vec::new(),
+            languages: Vec::new(),
+        }),
+    )
+}
+
+/// How many `toolbox_binding` rows name `server`.
+async fn rows_naming(pool: &PgPool, server: McpServerId) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM toolbox_binding WHERE ref_id = $1")
+        .bind(server.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("count the rows")
+}
+
+/// Review R1 finding 1, the first interleaving: a delete that committed before the attach leaves
+/// the attach the not-found sentence, and no row.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attach_after_a_committed_delete_is_refused_and_leaves_no_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let server = db
+        .store
+        .create_mcp_server(stdio("gone"))
+        .await
+        .expect("create");
+    db.store.delete_mcp_server(server.id).await.expect("delete");
+    let (key, change) = global_attach(server.id);
+    let err = db
+        .store
+        .set_skill_binding(key, None, change)
+        .await
+        .expect_err("the server is gone");
+    assert!(
+        matches!(
+            &err,
+            StoreError::NotFound {
+                entity: "mcp_server",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(rows_naming(&db.pool, server.id).await, 0);
+}
+
+/// Review R1 finding 1, the second interleaving: a delete is in flight (the server row deleted,
+/// not committed) when the attach starts. The attach must wait on the server row, not read the
+/// old row and insert beside the delete; after the delete commits it is refused, and no
+/// `mcp_server` binding row names the server. The wait is asserted, not assumed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attach_that_meets_a_delete_in_flight_waits_and_is_refused() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let server = db
+        .store
+        .create_mcp_server(stdio("racing"))
+        .await
+        .expect("create");
+
+    // The delete, spelled as `delete_mcp_server` does: the server first, its attachments second.
+    let mut tx = db.pool.begin().await.expect("begin the delete");
+    sqlx::query("DELETE FROM mcp_server WHERE id = $1")
+        .bind(server.id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("delete the server row");
+
+    let store = db.store.clone();
+    let (key, change) = global_attach(server.id);
+    let mut attach = tokio::spawn(async move { store.set_skill_binding(key, None, change).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut attach)
+            .await
+            .is_err(),
+        "the attach must wait for the delete that holds the server row"
+    );
+
+    sqlx::query("DELETE FROM toolbox_binding WHERE kind = 'mcp_server' AND ref_id = $1")
+        .bind(server.id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("delete the attachments");
+    tx.commit().await.expect("commit the delete");
+
+    let err = attach
+        .await
+        .expect("the attach task")
+        .expect_err("the server is gone");
+    assert!(
+        matches!(
+            &err,
+            StoreError::NotFound {
+                entity: "mcp_server",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        rows_naming(&db.pool, server.id).await,
+        0,
+        "no binding row names a deleted server"
+    );
+}
+
+/// Review R1 finding 1, the other order: an attach is in flight (it holds the server row
+/// key-shared and has inserted its binding, not committed) when `delete_mcp_server` runs. The
+/// delete waits on the server row, then removes the binding the attach wrote, so no orphan row
+/// remains and the count includes it. The attach transaction is raw: it takes the lock the store's
+/// attach takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_that_meets_an_attach_in_flight_waits_and_removes_its_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let server = db
+        .store
+        .create_mcp_server(stdio("racing"))
+        .await
+        .expect("create");
+
+    let mut tx = db.pool.begin().await.expect("begin the attach");
+    sqlx::query("SELECT 1 FROM mcp_server WHERE id = $1 FOR KEY SHARE")
+        .bind(server.id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("lock the server row");
+    sqlx::query(
+        "INSERT INTO toolbox_binding (kind, ref_id, activation) VALUES ('mcp_server', $1, 'always')",
+    )
+    .bind(server.id.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .expect("insert the binding");
+
+    let store = db.store.clone();
+    let id = server.id;
+    let mut delete = tokio::spawn(async move { store.delete_mcp_server(id).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut delete)
+            .await
+            .is_err(),
+        "the delete must wait for the attach that holds the server row"
+    );
+    tx.commit().await.expect("commit the attach");
+
+    let removed = delete.await.expect("the delete task").expect("delete");
+    assert_eq!(removed, 1, "the delete removed the attach's row");
+    assert_eq!(rows_naming(&db.pool, server.id).await, 0);
 }

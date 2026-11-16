@@ -1284,7 +1284,8 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for
     /// [`new_skill_refusal`]'s sentences, a taken name (`already_exists("skill", name)`), a taken
-    /// id, or a `created_by` that names no user. Nothing is written.
+    /// id, an id an MCP server holds (`already_exists("mcp_server", id)`), or a `created_by` that
+    /// names no user. Nothing is written.
     async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)>;
 
     /// Renames and/or re-describes under CAS on `skill.updated_at` (D76, OQ-17). Order: `NotFound`
@@ -1344,9 +1345,11 @@ pub trait WriteStore: ReadStore {
     async fn mcp_servers(&self) -> Result<Vec<McpServer>>;
 
     /// Inserts one server; both stamps are the store's clock. Order:
-    /// [`new_mcp_server_refusal`](crate::model::new_mcp_server_refusal)'s sentences, then a taken id
-    /// (`already_exists("mcp_server", id)`), then a taken name
-    /// (`already_exists("mcp_server", name)`), then a `created_by` that names no user.
+    /// [`new_mcp_server_refusal`](crate::model::new_mcp_server_refusal)'s sentences, then a
+    /// `created_by` that names no user, then a taken id (`already_exists("mcp_server", id)`), then
+    /// an id a skill holds (`already_exists("skill", id)`: one id is never both kinds, since a
+    /// binding row's `ref_id` holds either), then a taken name
+    /// (`already_exists("mcp_server", name)`).
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as above. Nothing is

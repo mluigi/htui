@@ -164,15 +164,19 @@ pub struct SkillVersion {
     pub created_at: DateTime<Utc>,
 }
 
-/// A `kind = 'skill'` row of `toolbox_binding` (§5.6 as amended by ANA-22 §7.1 and MOD-127): one
-/// attachment of a skill, globally, to a workspace, a project, an item kind or one phase of it.
+/// A row of `toolbox_binding` (§5.6 as amended by ANA-22 §7.1 and MOD-127): one
+/// attachment of a skill, or of an MCP server (M2), globally, to a workspace, a project, an item kind or one phase of it.
 /// `UNIQUE NULLS NOT DISTINCT (kind, ref_id, workspace_id, project_id, item_kind_id, phase_id)`
 /// allows one attachment per skill per level, which is why [`resolve`] has to pick one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     /// `toolbox_binding.id`.
     pub id: SkillBindingId,
-    /// `toolbox_binding.ref_id`.
+    /// `toolbox_binding.ref_id`. For a row of kind `mcp_server` this holds the **server's** id,
+    /// typed as a [`SkillId`]; the row does not say which kind it is, so a caller tells the kinds
+    /// apart by the [`BindingRef`] it asked under (a `target` key) or by looking the id up. The
+    /// stores keep the two id spaces disjoint (`create_skill` and `create_mcp_server` refuse an id
+    /// the other kind holds).
     pub skill_id: SkillId,
     /// `toolbox_binding.workspace_id`; `Some` is a workspace attachment and excludes every other
     /// key.
@@ -301,7 +305,10 @@ pub struct BindingKey {
 }
 
 impl BindingKey {
-    /// The key a stored row sits under.
+    /// The key a stored **skill** row sits under: `target` is always [`BindingRef::Skill`]. A
+    /// [`Binding`] of kind `mcp_server` holds the server's id in `skill_id` and carries no kind, so
+    /// this would name a skill that is not there; a caller holding such a row builds its key from
+    /// the `target` it read the row under, not from here.
     #[must_use]
     pub fn of(binding: &Binding) -> Self {
         Self {

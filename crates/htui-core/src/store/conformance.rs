@@ -16824,12 +16824,22 @@ async fn mcp_server_create_edit_delete_with_cas<S: WriteStore>(store: &S) {
     );
     let mut stranger = new_mcp("stranger");
     stranger.created_by = UserId::new();
-    assert!(
-        matches!(
-            store.create_mcp_server(stranger).await,
-            Err(StoreError::Constraint(_))
-        ),
-        "{CASE}: a created_by that names no app_user is Constraint"
+    constraint_exactly(
+        CASE,
+        store.create_mcp_server(stranger.clone()).await,
+        &references_no_row("mcp_server.created_by", stranger.created_by, "app_user"),
+        "a created_by that names no app_user",
+    );
+    // The creator is judged before the id and the name: a request that is wrong in all three is
+    // refused with the creator sentence.
+    let mut everything_wrong = new_mcp("docs");
+    everything_wrong.id = docs.id;
+    everything_wrong.created_by = stranger.created_by;
+    constraint_exactly(
+        CASE,
+        store.create_mcp_server(everything_wrong).await,
+        &references_no_row("mcp_server.created_by", stranger.created_by, "app_user"),
+        "an unknown creator beside a taken id and a taken name",
     );
     assert_eq!(
         store.mcp_servers().await.expect(CASE).len(),
@@ -17123,6 +17133,32 @@ async fn mcp_server_refuses_by_rule<S: WriteStore>(store: &S) {
             NewMcpServer {
                 headers: vec![("Authorization".to_owned(), literal("sentinel-not-a-secret"))],
                 ..http("https://x.test")
+            },
+        ),
+        (
+            "a url with userinfo",
+            http("https://user:sentinel-not-a-secret@x.test/rpc"),
+        ),
+        (
+            "a url query key that looks secret",
+            http("https://x.test/rpc?api_key=sentinel-not-a-secret"),
+        ),
+        (
+            "a line break in the url",
+            http("https://x.test/rpc\r\nHost: y"),
+        ),
+        (
+            "a line break in a header value",
+            NewMcpServer {
+                headers: vec![("X-Tenant".to_owned(), literal("a\r\nX-Evil: 1"))],
+                ..http("https://x.test")
+            },
+        ),
+        (
+            "a literal under a pwd key",
+            NewMcpServer {
+                env: vec![("MYSQL_PWD".to_owned(), literal("sentinel-not-a-secret"))],
+                ..new_mcp("docs")
             },
         ),
         (
@@ -17552,6 +17588,8 @@ async fn deleting_a_server_takes_its_bindings<S: WriteStore>(store: &S) {
 
 /// MOD-127 M2 D1: `kind` is part of the attachment's key, so a skill and a server that share a
 /// name are two entries with their own rows, and neither's delete or detach touches the other's.
+/// Review R1: a binding row holds a skill's or a server's id in one column, so the two id spaces
+/// are disjoint: a server may not take a skill's id, nor a skill a server's.
 async fn a_skill_and_a_server_of_one_name_do_not_collide<S: WriteStore>(store: &S) {
     const CASE: &str = "a_skill_and_a_server_of_one_name_do_not_collide";
     let (skill, _) = store
@@ -17560,43 +17598,116 @@ async fn a_skill_and_a_server_of_one_name_do_not_collide<S: WriteStore>(store: &
         .expect(CASE);
     let server = made_mcp(CASE, store, "docs").await;
     let global = BindingHome::Global;
-    let skill_row = applied(
-        CASE,
-        store
-            .set_skill_binding(
-                key(skill.id, None, None),
-                None,
-                BindingChange::Attach(attachment(Activation::Always, 0)),
-            )
-            .await
-            .expect(CASE),
-    )
-    .expect("an attach carries its row");
-    let server_row = applied(
-        CASE,
-        store
-            .set_skill_binding(
-                mcp_key(server.id, None, None, None, None),
-                None,
-                BindingChange::Attach(attachment(Activation::Always, 0)),
-            )
-            .await
-            .expect(CASE),
-    )
-    .expect("an attach carries its row");
+    let skill_key = key(skill.id, None, None);
+    let server_key = mcp_key(server.id, None, None, None, None);
+    let attach = |key: BindingKey| async move {
+        applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    key,
+                    None,
+                    BindingChange::Attach(attachment(Activation::Always, 0)),
+                )
+                .await
+                .expect(CASE),
+        )
+        .expect("an attach carries its row")
+    };
+    let listed = |row: &Binding| {
+        let row = row.clone();
+        async move {
+            store
+                .skill_bindings(global)
+                .await
+                .expect(CASE)
+                .contains(&row)
+        }
+    };
+    let skill_row = attach(skill_key).await;
+    let server_row = attach(server_key).await;
     assert_ne!(skill_row.id, server_row.id, "{CASE}: two rows");
-    assert_eq!(
-        store
-            .skill_bindings(global)
-            .await
-            .expect(CASE)
-            .into_iter()
-            .filter(|row| row.id == skill_row.id || row.id == server_row.id)
-            .count(),
-        2,
+    assert!(
+        listed(&skill_row).await && listed(&server_row).await,
         "{CASE}: both list"
     );
 
+    let counts = (
+        store.skills().await.expect(CASE).len(),
+        store.mcp_servers().await.expect(CASE).len(),
+    );
+
+    // One id is one kind.
+    constraint_exactly(
+        CASE,
+        store
+            .create_mcp_server(NewMcpServer {
+                id: McpServerId::from_uuid(skill.id.as_uuid()),
+                ..new_mcp("other")
+            })
+            .await,
+        &already_exists("skill", skill.id),
+        "a server that takes a skill's id",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_skill(NewSkill {
+                id: SkillId::from_uuid(server.id.as_uuid()),
+                ..new_skill("other", "Other.")
+            })
+            .await,
+        &already_exists("mcp_server", server.id),
+        "a skill that takes a server's id",
+    );
+    assert_eq!(
+        (
+            store.skills().await.expect(CASE).len(),
+            store.mcp_servers().await.expect(CASE).len()
+        ),
+        counts,
+        "{CASE}: the refusals wrote nothing"
+    );
+
+    // Detaching one kind's row leaves the other's.
+    assert_eq!(
+        applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    server_key,
+                    Some(server_row.updated_at),
+                    BindingChange::Detach
+                )
+                .await
+                .expect(CASE),
+        ),
+        None,
+        "{CASE}: the server's row detaches"
+    );
+    assert!(
+        listed(&skill_row).await && !listed(&server_row).await,
+        "{CASE}: detaching the server's row left the skill's"
+    );
+    let server_row = attach(server_key).await;
+    assert_eq!(
+        applied(
+            CASE,
+            store
+                .set_skill_binding(skill_key, Some(skill_row.updated_at), BindingChange::Detach)
+                .await
+                .expect(CASE),
+        ),
+        None,
+        "{CASE}: the skill's row detaches"
+    );
+    assert!(
+        listed(&server_row).await && !listed(&skill_row).await,
+        "{CASE}: detaching the skill's row left the server's"
+    );
+    let skill_row = attach(skill_key).await;
+
+    // Deleting the server takes its own attachment and not the skill's.
     assert_eq!(
         store.delete_mcp_server(server.id).await.expect(CASE),
         1,

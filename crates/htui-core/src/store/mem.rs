@@ -5042,7 +5042,8 @@ impl State {
     }
 
     /// Order: [`new_mcp_server_refusal`]; `require_user(created_by, "mcp_server.created_by")`; a
-    /// taken id → `already_exists("mcp_server", id)`; a taken name → `already_exists("mcp_server",
+    /// taken id → `already_exists("mcp_server", id)`; an id a skill holds →
+    /// `already_exists("skill", id)`; a taken name → `already_exists("mcp_server",
     /// name)`. Both stamps are `now`.
     fn create_mcp_server(&mut self, new: NewMcpServer, now: DateTime<Utc>) -> Result<McpServer> {
         if let Some(refusal) = new_mcp_server_refusal(&new) {
@@ -5051,6 +5052,12 @@ impl State {
         self.require_user(new.created_by, "mcp_server.created_by")?;
         if self.mcp_servers.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists("mcp_server", new.id)));
+        }
+        if self
+            .skills
+            .contains_key(&SkillId::from_uuid(new.id.as_uuid()))
+        {
+            return Err(StoreError::Constraint(already_exists("skill", new.id)));
         }
         if self.mcp_servers.values().any(|row| row.name == new.name) {
             return Err(StoreError::Constraint(already_exists(
@@ -5135,7 +5142,8 @@ impl State {
     }
 
     /// Order: `new_skill_refusal`; `require_user(created_by, "skill.created_by")`; a taken id →
-    /// `already_exists("skill", id)`; a taken name → `already_exists("skill", name)`. Writes the
+    /// `already_exists("skill", id)`; an id an MCP server holds → `already_exists("mcp_server",
+    /// id)`; a taken name → `already_exists("skill", name)`. Writes the
     /// row and its version 1, both stamped `now`.
     fn create_skill(&mut self, new: NewSkill, now: DateTime<Utc>) -> Result<(Skill, SkillVersion)> {
         if let Some(refusal) = new_skill_refusal(&new.name, &new.description, &new.body) {
@@ -5144,6 +5152,12 @@ impl State {
         self.require_user(new.created_by, "skill.created_by")?;
         if self.skills.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists("skill", new.id)));
+        }
+        if self
+            .mcp_servers
+            .contains_key(&McpServerId::from_uuid(new.id.as_uuid()))
+        {
+            return Err(StoreError::Constraint(already_exists("mcp_server", new.id)));
         }
         if self.skills.values().any(|row| row.name == new.name) {
             return Err(StoreError::Constraint(already_exists("skill", &new.name)));

@@ -2780,6 +2780,22 @@ fn skill_insert_refused(err: sqlx::Error, new: &NewSkill) -> StoreError {
     }
 }
 
+/// MOD-127 M2 R1: a skill and an `mcp_server` never share an id, because a `toolbox_binding` row
+/// holds either one in `ref_id` and the binding reads (`Binding.skill_id`) tell the kinds apart
+/// only by lookup. No constraint spans the two tables, so each create takes this transaction-scoped
+/// lock on the id (the same key on both sides) and then reads the other table: two creates of one
+/// id in two kinds serialise, and the second sees the first.
+async fn lock_shared_id(conn: &mut PgConnection, id: Uuid) -> Result<()> {
+    sqlx::query_scalar!(
+        r#"SELECT 1 AS "locked!" FROM (SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))) AS l"#,
+        id.to_string(),
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
+}
+
 /// `MemStore`'s refusal of a `created_by` that names no `app_user`, the nil UUID worded apart.
 fn unknown_author(column: &str, id: UserId) -> String {
     if id.as_uuid().is_nil() {
@@ -6673,6 +6689,17 @@ impl WriteStore for PgStore {
                 new.created_by,
             )));
         }
+        lock_shared_id(&mut tx, new.id.as_uuid()).await?;
+        let server_holds_id = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM mcp_server WHERE id = $1) AS "held!""#,
+            new.id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if server_holds_id {
+            return Err(StoreError::Constraint(already_exists("mcp_server", new.id)));
+        }
         let skill = sqlx::query_as!(
             Skill,
             r#"
@@ -6967,9 +6994,31 @@ impl WriteStore for PgStore {
         .map_err(StoreError::Constraint)?;
 
         let written = match &current {
-            None => sqlx::query_as!(
-                Binding,
-                r#"
+            None => {
+                // MOD-127 M2 R1: an `mcp_server` binding row has no foreign key, so the check
+                // that its server exists and the INSERT are one transaction under a key-share
+                // lock on the server row. `delete_mcp_server` deletes the server first and the
+                // bindings second, so a delete in flight makes this wait, then refuse; one that
+                // commits after this commit removes the row this wrote.
+                let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+                if let BindingRef::McpServer(server) = key.target {
+                    let held = sqlx::query_scalar!(
+                        "SELECT id FROM mcp_server WHERE id = $1 FOR KEY SHARE",
+                        server.as_uuid(),
+                    )
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?;
+                    if held.is_none() {
+                        return Err(StoreError::NotFound {
+                            entity: "mcp_server",
+                            id: server.to_string(),
+                        });
+                    }
+                }
+                let inserted = sqlx::query_as!(
+                    Binding,
+                    r#"
                 INSERT INTO toolbox_binding
                        (id, kind, ref_id, workspace_id, project_id, item_kind_id, phase_id,
                         pinned_version, position, activation, globs, languages)
@@ -6989,22 +7038,25 @@ impl WriteStore for PgStore {
                           languages,
                           updated_at
                 "#,
-                SkillBindingId::new().as_uuid(),
-                skill_id.as_uuid(),
-                key.workspace.map(WorkspaceId::as_uuid),
-                key.project.map(ProjectId::as_uuid),
-                key.item_kind.map(ItemKindId::as_uuid),
-                key.phase.map(PhaseId::as_uuid),
-                attachment.pinned_version,
-                attachment.position,
-                attachment.activation.as_str(),
-                &stored.globs[..],
-                &stored.languages[..],
-                key.target.kind().as_str(),
-            )
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?,
+                    SkillBindingId::new().as_uuid(),
+                    skill_id.as_uuid(),
+                    key.workspace.map(WorkspaceId::as_uuid),
+                    key.project.map(ProjectId::as_uuid),
+                    key.item_kind.map(ItemKindId::as_uuid),
+                    key.phase.map(PhaseId::as_uuid),
+                    attachment.pinned_version,
+                    attachment.position,
+                    attachment.activation.as_str(),
+                    &stored.globs[..],
+                    &stored.languages[..],
+                    key.target.kind().as_str(),
+                )
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+                tx.commit().await.map_err(map_sqlx)?;
+                inserted
+            }
             Some(row) => sqlx::query_as!(
                 Binding,
                 r#"
@@ -7104,11 +7156,12 @@ impl WriteStore for PgStore {
         if let Some(refusal) = new_mcp_server_refusal(&new) {
             return Err(StoreError::Constraint(refusal));
         }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let known = sqlx::query_scalar!(
             r#"SELECT EXISTS (SELECT 1 FROM app_user WHERE id = $1) AS "known!""#,
             new.created_by.as_uuid(),
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_sqlx)?;
         if !known {
@@ -7119,7 +7172,18 @@ impl WriteStore for PgStore {
         }
         let headers = persona_json("mcp_server.headers", &new.headers)?;
         let env = persona_json("mcp_server.env", &new.env)?;
-        sqlx::query_as!(
+        lock_shared_id(&mut tx, new.id.as_uuid()).await?;
+        let skill_holds_id = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM skill WHERE id = $1) AS "held!""#,
+            new.id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if skill_holds_id {
+            return Err(StoreError::Constraint(already_exists("skill", new.id)));
+        }
+        let server = sqlx::query_as!(
             McpServerRow,
             r#"
             INSERT INTO mcp_server
@@ -7154,10 +7218,12 @@ impl WriteStore for PgStore {
             &new.deny[..],
             new.created_by.as_uuid(),
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map(McpServer::from)
-        .map_err(|err| mcp_insert_refused(err, &new))
+        .map_err(|err| mcp_insert_refused(err, &new))?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(server)
     }
 
     /// `update_skill`'s order, which `MemStore` keeps: the row is read first (`NotFound`, then
