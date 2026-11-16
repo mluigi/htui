@@ -1624,9 +1624,11 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
         })
         .collect();
     // MOD-127 M2: `skill_bindings` lists both kinds and a row's `skill_id` holds its `ref_id`
-    // whichever it is, so each row is told apart by the table its id is found in. A server
-    // attachment is copied like a skill's, under its own kind; an id found in neither is the
-    // `NotFound` the writer would answer.
+    // whichever it is, so each row is told apart by the table its id is found in (`Binding`
+    // carries no kind). A server attachment is copied like a skill's, under its own kind, so a
+    // phase-level server attachment follows the phase into the clone (the plan had it left behind:
+    // a clone that dropped it would run its phase without a server the source's did); an id found
+    // in neither table is the `NotFound` the writer would answer.
     let mut copies: Vec<(Binding, BindingRef)> = Vec::new();
     let mut skills = Vec::new();
     if !phase_rows.is_empty() {
@@ -7926,19 +7928,22 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
     }
 
-    /// D3, D6: the snapshot carries the names of secrets, never a value; neither does its Debug.
+    /// D3, D6: the snapshot carries the names of secrets, in the `{"secret": name}` shape the
+    /// launch resolves by.
+    ///
+    /// The freeze (`resolve`) is handed a store and a source and no secret provider, so it has no
+    /// value to leak and a sentinel here could not fail; the value side, a provider that holds one
+    /// for a name a bound server uses, is pinned through the whole engine by
+    /// `engine::tests::mcp_launch::the_frozen_set_names_the_secret_and_never_its_value`.
     #[tokio::test]
-    async fn the_snapshot_carries_secret_names_not_values() {
-        // What `RunSecrets::env_for` would supply: it is in no row, so it cannot be in the
-        // snapshot, and the test fails if a later change reads it in.
-        const SENTINEL: &str = "sentinel-secret-value-3f9c1b";
+    async fn the_snapshot_keeps_secret_names_in_their_shape() {
         let store = MemStore::demo();
         let stdio = store
             .create_mcp_server(NewMcpServer {
                 env: vec![
                     (
                         "API_TOKEN".to_owned(),
-                        EnvValue::Secret("billing".to_owned()),
+                        EnvValue::Secret("BILLING_TOKEN".to_owned()),
                     ),
                     ("REGION".to_owned(), EnvValue::Literal("eu-west".to_owned())),
                 ],
@@ -7954,7 +7959,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 url: Some("https://mcp.example.test/v1".to_owned()),
                 headers: vec![(
                     "Authorization".to_owned(),
-                    EnvValue::Secret("gateway".to_owned()),
+                    EnvValue::Secret("GATEWAY_KEY".to_owned()),
                 )],
                 ..new_server_of("gateway")
             })
@@ -7977,11 +7982,13 @@ question and not a test fix. Decide the version bump first, then paste the new d
         let json = serde_json::to_string(&snapshot).expect("encodes");
         let debug = format!("{snapshot:?}");
         for text in [&json, &debug] {
-            assert!(text.contains("billing"), "the secret's name is kept");
-            assert!(text.contains("gateway"), "the header secret's name is kept");
-            assert!(!text.contains(SENTINEL), "no value, ever");
+            assert!(text.contains("BILLING_TOKEN"), "the secret's name is kept");
+            assert!(
+                text.contains("GATEWAY_KEY"),
+                "the header secret's name is kept"
+            );
         }
-        assert!(json.contains(r#"{"secret":"billing"}"#), "{json}");
+        assert!(json.contains(r#"{"secret":"BILLING_TOKEN"}"#), "{json}");
     }
 
     /// A stdio server record for `name`, to build a variant of.

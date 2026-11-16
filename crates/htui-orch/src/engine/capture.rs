@@ -342,6 +342,8 @@ where
         let opening = SessionOpening::Fresh(&prompt.text);
         let driving = Box::pin(self.drive_once(
             run,
+            // The capture phase binds no server, so nothing here reads the snapshot.
+            None,
             row,
             &phase,
             None,

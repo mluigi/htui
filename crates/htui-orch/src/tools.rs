@@ -226,8 +226,9 @@ pub struct McpPlan {
 /// - the server's name is htui's own: `reserved_name`;
 /// - the agent carries neither transport: `agent_unsupported`; carries the other one:
 ///   `transport_unsupported`;
-/// - a `Secret` the env or a header names is not in `secrets`: `secret_missing` with that **name**
-///   (keys are case-sensitive, as the provider's are). The first one in header, env order.
+/// - a `Secret` the transport's own field names (stdio: `env`; http: `headers`; a leftover field
+///   of the other transport is neither resolved nor sent) is not in `secrets`: `secret_missing`
+///   with that **name** (keys are case-sensitive, as the provider's are). The first one in order.
 ///
 /// A pick whose index is outside the toolbox is dropped: a snapshot is written whole, so none is.
 /// `toolbox: None` (a run made before M2) yields no pick and an empty plan.
@@ -305,25 +306,27 @@ fn launch_of(
             SkipReason::AgentUnsupported
         });
     }
-    let headers = substitute(&server.headers, secrets)?;
-    let env = substitute(&server.env, secrets)?;
-    Ok(McpServerSpec {
-        name: server.name.clone(),
-        command: match server.transport {
-            McpTransport::Stdio => server.command.clone(),
-            McpTransport::Http => String::new(),
+    // Only the transport's own fields are resolved and sent: a leftover `headers` on a stdio row
+    // (or `env` on an http one) cannot cause `secret_missing` and reaches no spec.
+    Ok(match server.transport {
+        McpTransport::Stdio => McpServerSpec {
+            name: server.name.clone(),
+            command: server.command.clone(),
+            args: server.args.clone(),
+            env: substitute(&server.env, secrets)?,
+            transport: McpTransport::Stdio,
+            url: None,
+            headers: BTreeMap::new(),
         },
-        args: match server.transport {
-            McpTransport::Stdio => server.args.clone(),
-            McpTransport::Http => Vec::new(),
+        McpTransport::Http => McpServerSpec {
+            name: server.name.clone(),
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            transport: McpTransport::Http,
+            url: server.url.clone(),
+            headers: substitute(&server.headers, secrets)?,
         },
-        env,
-        transport: server.transport,
-        url: match server.transport {
-            McpTransport::Stdio => None,
-            McpTransport::Http => server.url.clone(),
-        },
-        headers,
     })
 }
 
@@ -944,6 +947,74 @@ mod tests {
         // An empty map (a provider-less project) skips every secret-bearing server.
         let bare = plan_mcp(Some(&toolbox), &picks, caps(true, true), &BTreeMap::new());
         assert_eq!(names(&bare), ["plain"]);
+    }
+
+    /// R2: a server resolves its own transport's fields only. A leftover `headers` on a stdio
+    /// row, or a leftover `env` on an http row, is neither resolved nor sent, so it cannot cause
+    /// `secret_missing` and cannot put a value in a spec that has no use for it.
+    #[test]
+    fn a_leftover_field_of_the_other_transport_is_neither_resolved_nor_sent() {
+        let mut stdio = frozen("local", McpTransport::Stdio);
+        stdio.headers = vec![(
+            "Authorization".to_owned(),
+            EnvValue::Secret("LEFTOVER_HEADER".to_owned()),
+        )];
+        stdio.env = vec![("MODE".to_owned(), EnvValue::Literal("fast".to_owned()))];
+        let mut http = frozen("web", McpTransport::Http);
+        http.env = vec![(
+            "API".to_owned(),
+            EnvValue::Secret("LEFTOVER_ENV".to_owned()),
+        )];
+        http.headers = vec![("X-Mode".to_owned(), EnvValue::Literal("fast".to_owned()))];
+        let (toolbox, picks) = toolbox(vec![stdio, http]);
+        // Neither leftover secret is supplied; a value is supplied under both names to show it is
+        // never read either.
+        let secrets = BTreeMap::from([
+            ("LEFTOVER_HEADER".to_owned(), DOCS_TOKEN.to_owned()),
+            ("LEFTOVER_ENV".to_owned(), DOCS_TOKEN.to_owned()),
+        ]);
+        for secrets in [&BTreeMap::new(), &secrets] {
+            let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), secrets);
+            assert_eq!(
+                outcomes(&plan),
+                [
+                    ("local", McpOutcome::Rendered),
+                    ("web", McpOutcome::Rendered)
+                ]
+            );
+            let (local, web) = (&plan.specs[0], &plan.specs[1]);
+            assert!(local.headers.is_empty(), "stdio sends no headers");
+            assert_eq!(local.env.get("MODE").map(String::as_str), Some("fast"));
+            assert!(web.env.is_empty(), "http sends no env");
+            assert_eq!(web.headers.get("X-Mode").map(String::as_str), Some("fast"));
+            assert!(!format!("{plan:?}").contains(DOCS_TOKEN));
+        }
+    }
+
+    #[test]
+    fn a_missing_secret_in_the_transports_own_field_still_skips() {
+        let mut stdio = frozen("local", McpTransport::Stdio);
+        stdio.env = vec![("API".to_owned(), EnvValue::Secret("GONE_ENV".to_owned()))];
+        let mut http = frozen("web", McpTransport::Http);
+        http.headers = vec![(
+            "Authorization".to_owned(),
+            EnvValue::Secret("GONE_HEADER".to_owned()),
+        )];
+        let (toolbox, picks) = toolbox(vec![stdio, http]);
+        let plan = plan_mcp(Some(&toolbox), &picks, caps(true, true), &BTreeMap::new());
+        assert_eq!(
+            outcomes(&plan),
+            [
+                (
+                    "local",
+                    McpOutcome::Skipped(SkipReason::SecretMissing("GONE_ENV".to_owned()))
+                ),
+                (
+                    "web",
+                    McpOutcome::Skipped(SkipReason::SecretMissing("GONE_HEADER".to_owned()))
+                )
+            ]
+        );
     }
 
     #[test]
