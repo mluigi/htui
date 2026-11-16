@@ -15,7 +15,15 @@
   Also refresh "Parallel runs" below: drop the closed ID and promote what it unblocked.
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-15):** **MOD-159 is done** (`docs/decisions/mod/mod-159.md`; M1 and M2 merged on main, M3
+**Current status (2026-11-16):** **MOD-116 is done** (`docs/decisions/mod/mod-116.md`; on `hr/MOD-116`, to
+collect): Workspaces is tab 1 with every workspace's derived state (open, background, stopping, stopped; no column),
+overviews, `o` to open without stopping another, `s`/`s`/`r` to stop, force and resume (the words `htui stop` prints),
+`N` to create a workspace or a project (existing git folder, git URL clone, new repo), `e`/`d`/`T` to edit, delete
+and set the default target; the leave dialog lists every live workspace and `S` stops them first; the `w` switcher
+is gone and Settings › Hierarchy keeps projects and repos only. No migration; conformance `CASES` 344. Owed on the
+host: `scripts/hr collect MOD-116`, the merged-tree Postgres gate, the live-Qdrant suites, real use and the Windows
+build (the write-up lists them). MOD-117 and MOD-118 are unblocked.
+**MOD-159 is done** (`docs/decisions/mod/mod-159.md`; M1 and M2 merged on main, M3
 on `hr/MOD-159`, to collect): each Qdrant collection has one indexer, the holder of its `indexer_lease` row (worker or
 TUI); one collection per workspace (`htui_ws_<uuid>`) plus `htui_global` replace `htui_concepts_v2`; a 60 s
 incremental cycle runs between full reconciles; `Ctrl+R` and `--index-items` take a free lease, or ask the live holder
@@ -24,9 +32,7 @@ lets the leases go. M3 adds no migration. MOD-112 (4), MOD-161 and MOD-167 plug 
 on it. Owed on the host: `scripts/hr collect MOD-159`, the merged-tree Postgres gate, the live-Qdrant suites, and
 `cache::the_spawned_refresher_passes_and_follows_the_scope` (fails in the sandbox and on main alike; M3 touches no
 `cache/` code).
-**ANA-42 is concluded** (`docs/decisions/ana/ana-42.md`): the maintainer accepted
-all six §8 decisions; MOD-130, MOD-131 and MOD-132 are no longer pending it, and MOD-43's queued-until-claimed rule
-now covers the enrolled kind only. **MOD-125 is done** (`docs/decisions/mod/mod-125.md`; merged on
+**MOD-125 is done** (`docs/decisions/mod/mod-125.md`; merged on
 main): `htui stop [--force] <workspace>` and `htui resume <workspace>` stop every run of a workspace (graceful at
 the turn boundary, forced mid-turn) and resume each on its box through its saved session, confirmed by a prompt
 (`--yes`), with a report of how each run resumes. Migration `0037_stopped_run_index` (`0036` on the branch, renumbered behind MOD-122 M3's at the merge). Owed on the host: after the
@@ -116,19 +122,19 @@ items it follows are done.
 
 - MOD-130: opus
 - MOD-133: opus
-- MOD-116: sonnet
 - MOD-127: sonnet
 - ANA-39: none (analysis)
 - MOD-43: opus
 - MOD-166: opus
 - MOD-112: opus
+- MOD-117: sonnet
+- MOD-118: sonnet
 
 **Wave 2**
 
 - MOD-132: opus
 - MOD-135: sonnet
 - MOD-143: opus
-- MOD-117: sonnet
 - MOD-128: sonnet
 - MOD-161: sonnet
 - MOD-167: opus
@@ -136,7 +142,6 @@ items it follows are done.
 
 **Wave 3**
 
-- MOD-118: sonnet
 - MOD-136: opus
 - MOD-154: sonnet
 - MOD-155: opus
@@ -923,41 +928,6 @@ items it follows are done.
   `item.resolution` (`shipped` → `done`), write-ups to `summary` documents and each analysis doc to
   the `verdict` document, and scan body `R-` IDs once into `addresses` citations.
 
-- [ ] **MOD-116 - Workspaces tab and workspace lifecycle** (from the UI redesign review,
-  `docs/ui-redesign-findings-2026-10-15.md` §4.1). `R-TUI-14`, `R-ENT-2`, `R-ORCH-16`, `R-TUI-18`. A new tab listing every saved
-  workspace with its state (open, background with runs going, stopping, stopped), an overview and
-  its projects; opening one backgrounds the current one without interrupting its runs; stopping and
-  resuming runs from here (MOD-125, done: `docs/decisions/mod/mod-125.md`; the store verbs `stop_workspace`,
-  `resume_workspace`, `workspace_live_runs` and `WorkspaceStopState`, as `htui stop`/`htui resume` use them), both stops confirmed; the overview (state, folder, description,
-  goals, projects, components, the default target with `T`, stopped runs); new-workspace form with
-  its folder (default `~/workspaces/<name>`) and a preview of what is created there; new-project form
-  (existing folder, git URL, new repo), each getting a coordinator chat. Replaces the workspace
-  switcher overlay and Settings' workspace field. The lifecycle lives in the store and the worker;
-  the TUI reflects it. From ANA-35 (`docs/ANA-35.md` §9): an existing folder registers as `git` when it
-  opens as a repository and `folder` otherwise, the person confirming; a git URL clones into the
-  workspace folder as `git`; a new repo is a new directory there, `git init` with one empty commit
-  before it is registered (`R-ID-4`); the lifecycle states live on the `workspace` row or derive from
-  runs, never on the scope row. MOD-115 is done (`docs/decisions/mod/mod-115.md`); the folder is MOD-147's
-  (done, `docs/decisions/mod/mod-147.md`).
-  PRD `.claude/prds/mod-116-workspaces-tab.prd.md` (gate 2026-11-15: coordinator chats wait for MOD-136/MOD-121; a
-  plain folder is refused until MOD-145; the workspace row leaves Settings › Hierarchy, projects and repos stay until
-  MOD-123; an idle workspace reads `○ stopped` with no stop row; 3 milestones).
-  **Phase M1 landed (`01cdb979`..`f8037cd8`, 2026-11-15):** Workspaces is tab 1 (every other digit +1): each workspace
-  with its derived state (`● open`, `◐ background · n running`, `◌ stopping…`, `○ stopped · n held`; no column, no
-  migration), workspace and project overviews, `o` opens (runs keep walking), `w` jumps to the tab, the switcher
-  overlay is gone (a `keys.toml` `[switcher]` table loads with a notice), the header's `+N in background ◐ n`, the
-  last open workspace remembered in `ui-state.toml` (not under `--demo`). `WriteStore::workspace_run_counts`
-  (conformance `CASES` 344). Plan `.claude/plans/mod-116-m1-workspaces-tab.plan.md`; review fix round R1. Owed on the host: the merged-tree Postgres gate (the sandbox gate's one red test was
-  the `cache::the_spawned_refresher_passes_and_follows_the_scope` load flake, untouched; 5 of 6 alone runs passed).
-  **Phase M2 landed (`266f3896`..`5c8926a3`, 2026-11-15):** `s` stops a workspace's runs gracefully, `s` again forces,
-  `r` resumes, each asked first with a per-run preview (the shared `stop_report` module; `htui stop`/`resume` print
-  as before and no longer read steps); a stop changed while asking is refused and said; the open workspace reads
-  `● open · … · stopping…`/`· stopped · n held`; the overview's Runs section; the leave dialog lists every live
-  workspace and `S` stops them gracefully, waits up to 20 s (wall time), then leaves. Plan
-  `.claude/plans/mod-116-m2-stop-resume-leave.plan.md`; review fix round R1. Deferred: the race rule is
-  check-then-act (a stop replaced between re-read and write is still overwritten, as in `htui stop`; a store-level
-  conditional write would close it). Next: M3 (create and edit). Owed on the host: the merged-tree Postgres gate
-  (sandbox gate: 9200/9201, the one red the same cache load flake), real use of `s`/`r`/`S` beside `htui stop`.
 - [ ] **MOD-117 - Workspace components: catalogue, compose, start and stop** (from the UI redesign
   review, `docs/ui-redesign-findings-2026-10-15.md` §4.1 Components). `R-ENT-17`, `R-SEC-5`, `R-TUI-14`. The catalogue in
   Postgres (types, kinds, images, versions, emulated services or clouds), seeded at first start and
@@ -967,7 +937,8 @@ items it follows are done.
   Secrets, named volumes, floci's AWS 4566, Azure 4577 with the docker socket, GCP 4588, Oracle 4599
   and console 4500, only the clouds chosen); per-project use (the workspace's, its own on a free
   port, none) and the env each project gets; `Space` starts or stops one component; the `.env` in
-  Infisical at `/<workspace>/<project>` or beside the compose file. Blocked on MOD-116.
+  Infisical at `/<workspace>/<project>` or beside the compose file. MOD-116 is done (`docs/decisions/mod/mod-116.md`: the
+  Workspaces tab, its `overview` sub-tab chip strip and the workspace folder this item writes into).
 - [ ] **MOD-118 - Requirements in Workspaces: nesting, splits, graph** (from the UI redesign review,
   `docs/ui-redesign-findings-2026-10-15.md` §4.1 Requirements). `R-ENT-14`, `R-ENT-15`, `R-TUI-14`, `R-TUI-17`, `R-ID-6`.
   Requirements move from their own tab into Workspaces, per workspace and per project: a tree with
@@ -976,7 +947,7 @@ items it follows are done.
   there (history), a graph view (`v`); new requirements through the describe → rewrite → review
   modal, scope picked, "refines" guessed; a workspace requirement split into project requirements
   (keep or drop each), shown as "split into ⇢" and "↑ from" rows, its coverage derived from theirs;
-  agent proposals and edits as drafts a person accepts. Blocked on MOD-116; MOD-149 is done (`docs/decisions/mod/mod-149.md`: `W-` keys, nesting,
+  agent proposals and edits as drafts a person accepts. MOD-116 is done (`docs/decisions/mod/mod-116.md`); MOD-149 is done (`docs/decisions/mod/mod-149.md`: `W-` keys, nesting,
   `refines_id`, `requirement_coverage_state`, not authoritative offline; seed fixtures cannot hold nested rows yet).
   ANA-36 §7.2 adds design input: `requirement_propose` (amends, withdraws) and `draft_update` as the
   modal chats' tools, validated in the write tool with typed refusals.
@@ -1233,6 +1204,6 @@ items it follows are done.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 5 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows) |
-| MOD-N   | 74 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-176 worktree resume without reflogs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 73 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-148 per-type seeds, MOD-151 tool guidance, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-140 planner tools and run-time changes, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-171 per-graph run bounds, MOD-172 part keys with / or @, MOD-173 new key defaults give way, MOD-174 graph editor polish, MOD-175 Qdrant admin deadline, MOD-176 worktree resume without reflogs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 3 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check, TOOL-18 dev Postgres crash) |

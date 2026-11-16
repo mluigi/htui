@@ -141,7 +141,7 @@ Decided from the item and requirements (no question needed):
 |---|---|---|---|---|
 | 1 | The tab, states and opening | Workspaces is tab 1; every workspace with its derived state, workspace and project overviews (state, folder, description, goals, projects with counts, default target, held runs); `o` opens and backgrounds; `w` jumps to the tab and the switcher overlay is gone; the header's `+N in background`; the last open workspace persists | complete | `.claude/plans/mod-116-m1-workspaces-tab.plan.md` |
 | 2 | Stop, resume and leaving | `s`, `s` again and `r` from the tab, each confirmed with a per-run preview shared with `htui stop`; the overview lists held runs and how each resumes; the leave dialog lists every live workspace and offers "stop gracefully first" | complete | `.claude/plans/mod-116-m2-stop-resume-leave.plan.md` |
-| 3 | Creating and editing | `N` chooser; new-workspace form with folder and preview, creating the folder; new-project form (existing git folder, git URL clone, new repo); workspace edit and delete on the tab, removed from Hierarchy; `T` sets the workspace's default target | in-progress | `.claude/plans/mod-116-m3-create-and-edit.plan.md` |
+| 3 | Creating and editing | `N` chooser; new-workspace form with folder and preview, creating the folder; new-project form (existing git folder, git URL clone, new repo); workspace edit and delete on the tab, removed from Hierarchy; `T` sets the workspace's default target | complete | `.claude/plans/mod-116-m3-create-and-edit.plan.md` |
 
 ## Open Questions
 
@@ -163,4 +163,4 @@ Decided from the item and requirements (no question needed):
 | Parallel items touch the same files (MOD-127, MOD-130 M2+ in wave 1) | Medium | Merge conflicts at collect | Keep store additions additive; note touched files in the plan |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE — all three milestones landed; item closed 2026-11-16 (`docs/decisions/mod/mod-116.md`).*

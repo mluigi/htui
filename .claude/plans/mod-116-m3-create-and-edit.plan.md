@@ -18,7 +18,7 @@ clones go), `R-ID-4` (no htui file in a managed repo's tree), `R-NF-3` (no long 
 them off the store-worker loop; a chooser, three forms, a delete flow and a target picker on the tab; Settings ›
 Hierarchy loses its workspace row's verbs; two new acts, one retired act, two new stacks; no migration, no store
 trait change, no `.sqlx`)
-**Status**: DRAFT, fact-checked at `d6cd0909` (79 claims: 56 true, 11 false and amended, 12 amended)
+**Status**: COMPLETE (2026-11-16; T1-T5 `133d6b4e`..`30f4fb69`, review fix rounds R1a `604a1244`..`bbe85787`, R1b `be6726d0`..`e7840b36`). Fact-checked at `d6cd0909` (see "Verified claims")
 
 ## Summary
 
