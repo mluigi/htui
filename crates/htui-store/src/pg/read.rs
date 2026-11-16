@@ -2203,7 +2203,7 @@ impl PgStore {
 
     /// A step's MCP servers (MOD-127 M2 D5): the `kind = 'mcp_server'` attachments that apply in
     /// `scope` (the `WHERE` of [`bound_skills`](Self::bound_skills), over the same five levels),
-    /// then the records they name, resolved by [`resolve_mcp`](htui_core::model::resolve_mcp),
+    /// then the records they name, resolved by [`resolve_mcp`],
     /// the one rule `MemStore` calls too. An `off` winner is included, inactive. An attachment
     /// whose server is gone (`ref_id` has no foreign key; a delete takes its attachments, but a
     /// read can land between the two statements) is dropped.
@@ -2329,7 +2329,7 @@ impl PgStore {
     /// Every `app_setting` row, keyed by name: the last rung of the prompt's settings chain
     /// (`docs/ANA-5.md` §4.4).
     ///
-    /// A [`BTreeMap`] and not a [`HashMap`](std::collections::HashMap): the assembler records
+    /// A [`BTreeMap`] and not a [`HashMap`]: the assembler records
     /// which rung answered, and a map iterated in hash order would make that record depend on the
     /// process's random state.
     ///
