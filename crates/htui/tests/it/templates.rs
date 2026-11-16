@@ -1032,14 +1032,6 @@ async fn h_and_l_switch_from_templates_but_ctrl_h_does_not() {
         let frame = harness.render();
         assert!(on_templates(&frame), "`{key}` did not switch: {frame}");
     }
-    // MOD-127 M2 T8: the switch cycles Skills, Templates, MCP servers.
-    harness.key("h");
-    harness.settle().await;
-    let frame = harness.render();
-    assert!(
-        !on_templates(&frame),
-        "`h` left the Templates view: {frame}"
-    );
     harness.key("h");
     harness.settle().await;
     let frame = harness.render();
@@ -1087,7 +1079,7 @@ async fn a_rebound_diff_default_diffs_and_capital_d_is_inert() {
 async fn a_templates_switch_view_rebind_is_templates_only() {
     let mut harness = open_with_keys(
         MemStore::demo(),
-        "[skills.templates]\nswitch_view = [\"f6\"]\n",
+        "[skills.templates]\nswitch_view = [\"f6\"]\nprev_view = [\"f5\"]\n",
     )
     .await;
     let on_library = |frame: &str| hint(frame).contains("I import");
@@ -1107,8 +1099,9 @@ async fn a_templates_switch_view_rebind_is_templates_only() {
             "`{key}` no longer leaves Templates: {frame}"
         );
     }
-    // MOD-127 M2 T8: the switch cycles, so `F6` leaves Templates for the MCP servers view, where
-    // it is no switch; `l` goes on to the Library.
+    // MOD-127 M2 T8, R3: the switch is forward only (`skills.prev_view` is its own act), so
+    // `F6` leaves Templates for the MCP servers view, where it is no switch; `l` goes on to the
+    // Library.
     harness.key("f6");
     harness.settle().await;
     let frame = harness.render();
@@ -1616,9 +1609,7 @@ async fn back_lands_on_the_template_left_after_a_create_moved_its_row() {
     let mut harness = open_over(store.clone()).await;
     select(&mut harness, "implement");
     // To the Skills view and back: the tree's place is in the history.
-    // (MOD-127 M2 T8: around the cycle through the MCP servers view.)
-    harness.key("l");
-    harness.key("l");
+    harness.key("h");
     harness.key("l");
     harness.settle().await;
     harness.key("n");
@@ -1631,11 +1622,9 @@ async fn back_lands_on_the_template_left_after_a_create_moved_its_row() {
         head(&store, "aaa-triage").await.is_some(),
         "the new name was saved"
     );
-    for _ in 0..2 {
-        harness.key("backspace");
-        harness.settle().await;
-        harness.render();
-    }
+    harness.key("backspace");
+    harness.settle().await;
+    harness.render();
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();

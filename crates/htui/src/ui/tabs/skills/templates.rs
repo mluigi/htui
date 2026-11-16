@@ -169,7 +169,7 @@ const BROWSE_HINT: HintSpec = &[
     Hint::One(Act::SkillsEditExternally, "$EDITOR"),
     Hint::One(Act::New, "new"),
     Hint::One(Act::Reload, "reload"),
-    Hint::Two(Act::SkillsSwitchView, "view"),
+    Hint::Pair(Act::SkillsPrevView, Act::SkillsSwitchView, "view"),
 ];
 
 /// The tree pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): the

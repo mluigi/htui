@@ -52,7 +52,11 @@ const CHAT: About = About {
 const SKILLS: About = About {
     purpose: "The skills and prompt templates your agents draw on, and their versions.",
     actions: &[
-        (Act::SkillsSwitchView, "library, templates or servers"),
+        (
+            Act::SkillsSwitchView,
+            "next view: library, templates or servers",
+        ),
+        (Act::SkillsPrevView, "previous view"),
         (Act::New, "new"),
         (Act::Edit, "edit"),
         (Act::LibraryImport, "import"),

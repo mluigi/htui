@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
     }
 
-    /// MOD-67 M4 R1 L1: `skills.switch_view` is offered only by the Library and Templates
+    /// MOD-67 M4 R1 L1: `skills.switch_view` and `skills.prev_view` are offered only by the Library and Templates
     /// browse stacks, so a global chord on its `h` is refused naming those views, never a Skills
     /// stack no view is ever in.
     #[test]
@@ -510,7 +510,7 @@ mod tests {
             messages,
             [
                 r#"[global] help = "h": "h" is already settings.prev_section (default) in Settings"#,
-                r#"[global] help = "h": "h" is already skills.switch_view (default) in Skills > Library"#,
+                r#"[global] help = "h": "h" is already skills.prev_view (default) in Skills > Library"#,
                 // MOD-67 M5: and the Backlog's sub-tab cycling.
                 r#"[global] help = "h": "h" is already pane.prev_subtab (default) in Backlog > Body"#,
             ]

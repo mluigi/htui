@@ -99,14 +99,18 @@ const PANE_SCROLL: Layer = Layer::only(
     ],
 );
 
-/// `skills ∩ {switch_view}`.
-const SKILLS_SWITCH: Layer = Layer::only(Context::Skills, &[Act::SkillsSwitchView]);
+/// `skills ∩ {switch_view, prev_view}`.
+const SKILLS_SWITCH: Layer = Layer::only(
+    Context::Skills,
+    &[Act::SkillsSwitchView, Act::SkillsPrevView],
+);
 
 /// `skills ∩` the verbs Library and Templates browse share.
 const SKILLS_BROWSE: Layer = Layer::only(
     Context::Skills,
     &[
         Act::SkillsSwitchView,
+        Act::SkillsPrevView,
         Act::SkillsPrevVersion,
         Act::SkillsNextVersion,
         Act::SkillsBase,
@@ -1817,6 +1821,10 @@ mod tests {
     fn the_skills_and_requirements_stacks_resolve_as_designed() {
         assert_eq!(resolve(LIBRARY_BROWSE, "l"), [Act::SkillsSwitchView]);
         assert_eq!(resolve(TEMPLATES_BROWSE, "l"), [Act::SkillsSwitchView]);
+        // R3: the back half of the switch is its own act, on the same stacks.
+        assert_eq!(resolve(LIBRARY_BROWSE, "h"), [Act::SkillsPrevView]);
+        assert_eq!(resolve(TEMPLATES_BROWSE, "["), [Act::SkillsPrevView]);
+        assert_eq!(resolve(MCP_BROWSE, "shift-left"), [Act::SkillsPrevView]);
         for spec in ["ctrl-l", "ctrl-h", "alt-l"] {
             assert_eq!(resolve(LIBRARY_BROWSE, spec), [], "{spec}");
             assert_eq!(resolve(TEMPLATES_BROWSE, spec), [], "{spec}");
@@ -2274,10 +2282,12 @@ mod tests {
             // Where a row of the act could sit: a `skills` layer, or a view layer inheriting it.
             for (index, layer) in stack.layers().iter().enumerate() {
                 let holds = layer.context() == Context::Skills || layer.inherits();
-                assert!(
-                    !(holds && stack.admits(index, Act::SkillsSwitchView)),
-                    "{phrase}: layer {index} offers skills.switch_view"
-                );
+                for act in [Act::SkillsSwitchView, Act::SkillsPrevView] {
+                    assert!(
+                        !(holds && stack.admits(index, act)),
+                        "{phrase}: layer {index} offers {act:?}"
+                    );
+                }
             }
         }
     }

@@ -86,6 +86,15 @@ impl View {
         }
     }
 
+    /// The view before this one, wrapping: what `skills.prev_view` shows.
+    const fn prev(self) -> Self {
+        match self {
+            Self::Skills => Self::McpServers,
+            Self::Templates => Self::Skills,
+            Self::McpServers => Self::Templates,
+        }
+    }
+
     /// The view's id in a history location (MOD-115 M2 §8).
     const fn id(self) -> &'static str {
         match self {
@@ -312,6 +321,11 @@ impl SkillsTab {
     fn toggle(&mut self) {
         self.view = self.view.next();
     }
+
+    /// The previous view.
+    fn toggle_back(&mut self) {
+        self.view = self.view.prev();
+    }
 }
 
 impl Tab for SkillsTab {
@@ -379,15 +393,22 @@ impl Tab for SkillsTab {
             View::Templates => self.templates.captures_input(),
             View::McpServers => self.mcp.captures_input(),
         };
-        if !captured
-            && ctx
+        if !captured {
+            match ctx
                 .keys()
                 .actions(self.stack(), KeyChord::from_event(key))
                 .first()
-                == Some(&Act::SkillsSwitchView)
-        {
-            self.toggle();
-            return Handled::Consumed;
+            {
+                Some(&Act::SkillsSwitchView) => {
+                    self.toggle();
+                    return Handled::Consumed;
+                }
+                Some(&Act::SkillsPrevView) => {
+                    self.toggle_back();
+                    return Handled::Consumed;
+                }
+                _ => {}
+            }
         }
         match self.view {
             View::Skills => self.library.on_key(key, ctx),
